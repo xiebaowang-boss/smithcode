@@ -115,6 +115,16 @@ def test_user_rules_override_defaults(make_perm, monkeypatch):
     assert perm.check("read_file", {"path": "secret.env"}) is False
 
 
+def test_rule_order_broad_first_narrow_last(make_perm, monkeypatch):
+    """宽泛规则在前、精确规则在后（后者覆盖前者），配置文件书写顺序即优先级。"""
+    refuse_input(monkeypatch)
+    perm = make_perm(
+        permissions={"run_command": {"*": "ask", "git status": "allow", "rm -rf*": "deny"}}
+    )
+    assert perm.check("run_command", {"command": "git status"}) is True
+    assert perm.check("run_command", {"command": "rm -rf /"}) is False
+
+
 def test_unknown_action_degrades_to_ask(make_perm, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _: "n")
     perm = make_perm(permissions={"write_file": {"*.env": "block"}})

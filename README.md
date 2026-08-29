@@ -124,14 +124,15 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 
 ### 自定义权限规则（codeagent.json）
 
-在工作区根目录创建 `codeagent.json` 可覆盖默认规则，支持字符串简写和按模式细分两种写法：
+在工作区根目录创建 `codeagent.json` 可覆盖默认规则，支持字符串简写和按模式细分两种写法。**注意顺序：由于最后一条匹配的规则生效，宽泛规则要写在前、精确规则写在后**：
 
 ```json
 {
   "permissions": {
     "read_file": "allow",
-    "write_file": {"*.env": "deny", "*": "ask"},
+    "write_file": {"*": "ask", "*.env": "deny"},
     "run_command": {
+      "*": "ask",
       "git *": "allow",
       "rm -rf*": "deny"
     }
@@ -139,7 +140,7 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 }
 ```
 
-上面的例子表示：文件读取放行；写 `.env` 直接拒绝、写其他文件需确认；git 命令放行，`rm -rf` 直接拒绝，其余命令需确认。
+上面的例子表示：文件读取放行；写其他文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
 
 ## 开发
 

@@ -63,7 +63,7 @@ CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（A
 ### 权限求值细节
 
 1. 每个工具注册时通过 schema 的 `pattern_arg` 声明权限模式来源（如 `run_command` 用 `command` 参数、文件工具用 `path`），该键不会发送给 LLM。
-2. 求值顺序：`DEFAULT_RULES` → `codeagent.json` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。
+2. 求值顺序：`DEFAULT_RULES` → `codeagent.json` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。因此配置文件中宽泛规则写在前、精确规则写在后。
 3. `deny` 不询问用户直接拒绝；`-y`（approved_all）只覆盖 `ask`，`deny` 依然生效。
 
 ## 如何新增一个工具
