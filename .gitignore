@@ -1,0 +1,32 @@
+# 环境变量与密钥（绝不提交）
+.env
+.env.local
+.env.*.local
+
+# 会话记录（可能含对话与工作区内容）
+sessions/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Ruff 缓存
+.ruff_cache/

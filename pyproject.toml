@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeagent"
+version = "0.1.0"
+description = "终端 AI 编程助手：教学级 mini coding agent"
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+codeagent = "codeagent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codeagent*"]
