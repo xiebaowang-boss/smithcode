@@ -12,8 +12,18 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
 [project.scripts]
 codeagent = "codeagent.cli:main"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["codeagent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -4,6 +4,7 @@ import sys
 from . import __version__, config
 from .agent import Agent
 from .session import Session
+from .utils.terminal import setup_console_encoding
 
 HELP = """命令:
   /help   显示帮助
@@ -88,24 +89,7 @@ def run_once(agent: Agent, task: str):
 
 
 def main(argv=None):
-    import io
-    import os
-    
-    # 强制设置 UTF-8 编码
-    os.environ['PYTHONIOENCODING'] = 'utf-8'
-    
-    # 重新配置 stdout 为 UTF-8
-    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-        try:
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-        except Exception:
-            pass
-    
-    if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
-        try:
-            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-        except Exception:
-            pass
+    setup_console_encoding()
 
     args = build_parser().parse_args(argv)
     if args.workspace:

@@ -1,8 +1,22 @@
 import subprocess
 
 from .. import config
+from .base import register
 
 
+@register(
+    {
+        "name": "run_command",
+        "description": "在工作区根目录执行一条 shell 命令并返回输出",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "要执行的命令"},
+            },
+            "required": ["command"],
+        },
+    }
+)
 def run_command(command: str) -> str:
     try:
         result = subprocess.run(
@@ -21,20 +35,3 @@ def run_command(command: str) -> str:
         return output.strip() or "(无输出)"
     except subprocess.TimeoutExpired:
         return f"错误: 命令超时 ({config.COMMAND_TIMEOUT}s)"
-
-
-SCHEMAS = [
-    {
-        "name": "run_command",
-        "description": "在工作区根目录执行一条 shell 命令并返回输出",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "要执行的命令"},
-            },
-            "required": ["command"],
-        },
-    }
-]
-
-FUNCTIONS = {"run_command": run_command}

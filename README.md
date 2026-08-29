@@ -7,7 +7,7 @@ CodeAgent 采用 **Agent 循环（Agentic Loop）** 架构：模型收到任务�
 ## 功能特性
 
 - **Agent 循环**：模型自主规划并多次调用工具，直到完成任务，支持配置最大迭代轮数
-- **工具调用**：内置 5 个工具——读文件、写文件、精确编辑文件、列目录、执行 shell 命令
+- **工具调用**：内置 5 个工具——读文件、写文件、精确编辑文件、列目录、执行 shell 命令；新增工具只需一个 `@register` 装饰器
 - **权限控制**：读文件 / 列目录自动放行；写文件、执行命令等敏感操作需逐个确认，或选择"本次会话总是允许"
 - **沙箱约束**：所有文件操作限制在工作区内，路径越界直接拒绝；shell 命令带超时保护
 - **会话管理**：多轮对话上下文，支持开启新会话、保存会话记录为 JSON
@@ -15,31 +15,42 @@ CodeAgent 采用 **Agent 循环（Agentic Loop）** 架构：模型收到任务�
 
 ## 代码结构
 
+采用 src 布局：`src/` 是源码，根目录是项目配置，测试与文档独立成目录。
+
 ```
-codeagent/
-├── main.py                 # 程序入口，处理 Windows 控制台 UTF-8 编码后启动 CLI
-├── pyproject.toml          # 项目元信息与依赖（openai、python-dotenv）
-├── .env                    # 环境变量（API Key 等，不入库）
-└── codeagent/              # 核心包
-    ├── __init__.py         # 版本号
-    ├── __main__.py         # 支持 python -m codeagent 方式启动
-    ├── cli.py              # 命令行入口：参数解析、交互式 REPL、单次任务模式
-    ├── agent.py            # Agent 循环：调模型 → 执行工具 → 回传结果，直至任务完成
-    ├── llm.py              # LLM 客户端封装（OpenAI 兼容接口）
-    ├── config.py           # 配置加载：从 .env 读取 API Key、模型名、工作区等
-    ├── permission.py       # 权限控制：敏感工具调用前询问用户批准
-    ├── session.py          # 会话管理：系统提示词、消息历史、会话保存与重置
-    └── tools/              # 工具实现
-        ├── __init__.py     # 汇总所有工具的 schema 与实现
-        ├── files.py        # read_file / write_file / edit_file / list_dir（含路径越界检查）
-        └── shell.py        # run_command（带超时保护）
+code_agent/                        # 仓库根目录
+├── src/
+│   └── codeagent/                 # Python 主包（pip 安装的就是它）
+│       ├── __init__.py            # 版本号
+│       ├── __main__.py            # python -m codeagent 方式启动
+│       ├── cli.py                 # 命令行解析、交互式 REPL、单次任务模式
+│       ├── agent.py               # Agent 循环：调模型 → 执行工具 → 回传结果
+│       ├── llm.py                 # LLM 客户端封装（OpenAI 兼容接口）
+│       ├── config.py              # 配置加载：从 .env 读取密钥、模型名、工作区
+│       ├── permission.py          # 权限控制：敏感工具调用前询问用户批准
+│       ├── prompts.py             # 系统提示词（人设与行为规则）
+│       ├── session.py             # 会话管理：消息历史、保存与重置
+│       ├── tools/                 # 工具子系统
+│       │   ├── base.py            # 工具注册表（@register 装饰器）
+│       │   ├── files.py           # read_file / write_file / edit_file / list_dir
+│       │   └── shell.py           # run_command（带超时保护）
+│       └── utils/
+│           └── terminal.py        # 终端 UTF-8 编码处理
+├── tests/                         # pytest 测试，与源码模块一一对应
+├── docs/
+│   └── architecture.md            # 架构说明与"如何新增工具"指南
+├── examples/                      # 示例任务
+├── pyproject.toml                 # 项目元信息、依赖、构建配置
+├── .env.example                   # 环境变量模板（复制为 .env 使用）
+├── CHANGELOG.md                   # 版本变更记录
+└── LICENSE                        # MIT
 ```
 
-核心流程一句话概括：`cli.py` 接收用户输入 → `agent.py` 把消息交给 `llm.py` 调用模型 → 模型返回工具调用 → `agent.py` 经 `permission.py` 确认后执行 `tools/` 中的工具 → 结果回传模型循环推理 → 最终回复打印给用户。
+核心流程：`cli.py` 接收用户输入 → `agent.py` 把消息交给 `llm.py` 调用模型 → 模型返回工具调用 → 经 `permission.py` 确认后由 `tools/` 执行 → 结果回传模型循环推理 → 最终回复打印给用户。详见 [docs/architecture.md](docs/architecture.md)。
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装
 
 要求 Python >= 3.9。
 
@@ -49,7 +60,11 @@ pip install -e .
 
 ### 2. 配置环境变量
 
-在项目根目录创建 `.env` 文件（参照下面的模板，填入你自己的信息）：
+复制 `.env.example` 为 `.env`，填入你自己的配置：
+
+```bash
+cp .env.example .env
+```
 
 ```dotenv
 OPENAI_API_KEY=你的API密钥
@@ -61,16 +76,10 @@ OPENAI_MODEL=你的模型名
 
 ### 3. 运行
 
-**交互模式**（进入 REPL，多轮对话）：
-
 ```bash
-python main.py
-```
-
-**单次任务模式**（执行完自动退出）：
-
-```bash
-python main.py 帮我写一个斐波那契函数并测试
+codeagent                     # 交互模式（REPL，多轮对话）
+python -m codeagent           # 等价的另一种启动方式
+codeagent 帮我写个斐波那契函数  # 单次任务模式，执行完自动退出
 ```
 
 ## 使用方法
@@ -112,6 +121,14 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 - `n`：拒绝，Agent 会收到"用户拒绝了此操作"
 - `a`：本次会话内该工具不再询问
 - `-y` 参数可跳过全部确认（信任环境下使用）
+
+## 开发
+
+```bash
+pip install -e ".[dev]"   # 安装测试与 lint 工具
+pytest                    # 运行测试（不依赖真实 API）
+ruff check src tests      # 代码检查
+```
 
 ## 安全说明
 
