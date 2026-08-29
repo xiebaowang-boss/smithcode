@@ -6,10 +6,11 @@ CodeAgent 采用 **Agent 循环（Agentic Loop）** 架构：模型收到任务�
 
 ## 功能特性
 
-- **Agent 循环**：模型自主规划并多次调用工具，直到完成任务，支持配置最大迭代轮数
-- **工具调用**：内置 5 个工具——读文件、写文件、精确编辑文件、列目录、执行 shell 命令；新增工具只需一个 `@register` 装饰器
+- **Agent 循环**：模型自主规划并多次调用工具，直到完成任务，支持配置最大迭代轮数，回复流式输出
+- **工具调用**：内置 7 个工具——读文件、写文件、精确编辑文件、列目录、glob 文件名搜索、grep 内容搜索、执行 shell 命令；新增工具只需一个 `@register` 装饰器
+- **LLM 健壮性**：限流 / 断网自动指数退避重试，请求超时保护
 - **权限控制**：读文件 / 列目录自动放行；写文件、执行命令等敏感操作需逐个确认，或选择"本次会话总是允许"
-- **沙箱约束**：所有文件操作限制在工作区内，路径越界直接拒绝；shell 命令带超时保护
+- **沙箱约束**：所有文件操作限制在工作区内，路径越界直接拒绝；shell 命令带超时保护，超长工具输出自动截断
 - **会话管理**：多轮对话上下文，支持开启新会话、保存会话记录为 JSON
 - **跨平台**：Windows / Linux / macOS 均可运行，自动适配系统编码与 shell 命令风格
 
@@ -25,7 +26,7 @@ code_agent/                        # 仓库根目录
 │       ├── __main__.py            # python -m codeagent 方式启动
 │       ├── cli.py                 # 命令行解析、交互式 REPL、单次任务模式
 │       ├── agent.py               # Agent 循环：调模型 → 执行工具 → 回传结果
-│       ├── llm.py                 # LLM 客户端封装（OpenAI 兼容接口）
+│       ├── llm.py                 # LLM 客户端封装（OpenAI 兼容接口，流式 + 自动重试）
 │       ├── config.py              # 配置加载：从 .env 读取密钥、模型名、工作区
 │       ├── permission.py          # 权限控制：敏感工具调用前询问用户批准
 │       ├── prompts.py             # 系统提示词（人设与行为规则）
@@ -33,6 +34,7 @@ code_agent/                        # 仓库根目录
 │       ├── tools/                 # 工具子系统
 │       │   ├── base.py            # 工具注册表（@register 装饰器）
 │       │   ├── files.py           # read_file / write_file / edit_file / list_dir
+│       │   ├── search.py          # glob 文件名搜索 / grep 内容搜索
 │       │   └── shell.py           # run_command（带超时保护）
 │       └── utils/
 │           └── terminal.py        # 终端 UTF-8 编码处理
@@ -155,5 +157,7 @@ ruff check src tests      # 代码检查
 - API Key 仅通过 `.env` 或环境变量加载，不会被提交到仓库
 - 所有文件操作限制在工作区内，访问工作区之外的路径会被拒绝
 - shell 命令默认 60 秒超时（可通过 `config.py` 中的 `COMMAND_TIMEOUT` 调整）
+- LLM 请求默认 120 秒超时，瞬时错误自动重试 3 次（可通过 `config.py` 中的 `LLM_TIMEOUT`、`MAX_RETRIES` 调整）
+- 单次工具输出超过 `MAX_TOOL_OUTPUT`（默认 2 万字符，可在 `config.py` 调整）时自动截断为头尾各半，防止撑爆模型上下文
 - 权限规则三层叠加：内置默认规则 < `codeagent.json` 用户规则 < 会话内"总是允许"
 - 请谨慎使用 `-y` 参数：它跳过所有 `ask` 确认，但 `deny` 规则仍然生效

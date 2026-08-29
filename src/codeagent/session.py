@@ -6,7 +6,6 @@ from . import config
 from .prompts import SYSTEM_PROMPT
 
 
-
 class Session:
     def __init__(self):
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]

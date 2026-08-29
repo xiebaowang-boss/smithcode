@@ -73,17 +73,15 @@ def repl(agent: Agent):
             continue
 
         try:
-            reply = agent.run(user_input)
-            print(f"\n助手> {reply}\n")
-        except Exception as e:
+            agent.run(user_input)  # 回复已在流式过程中实时打印
+        except Exception as e:  # noqa: BLE001
             print(f"\n[错误] {type(e).__name__}: {e}")
 
 
 def run_once(agent: Agent, task: str):
     try:
-        reply = agent.run(task)
-        print(f"\n助手> {reply}\n")
-    except Exception as e:
+        agent.run(task)  # 回复已在流式过程中实时打印
+    except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         sys.exit(1)
 

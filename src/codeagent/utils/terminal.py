@@ -12,6 +12,7 @@ def setup_console_encoding():
     """
     if sys.platform == "win32":
         os.system("chcp 65001 > nul 2>&1")
+        os.system("")  # 触发旧版控制台启用 ANSI 转义序列解析（Windows 10+）
     os.environ["PYTHONIOENCODING"] = "utf-8"
 
     for name in ("stdout", "stderr"):
@@ -19,5 +20,6 @@ def setup_console_encoding():
         if stream.encoding and stream.encoding.lower() != "utf-8":
             try:
                 setattr(sys, name, io.TextIOWrapper(stream.buffer, encoding="utf-8"))
-            except Exception:
+            # 尽力而为：编码设置失败不应阻止程序启动
+            except Exception:  # noqa: BLE001, S110
                 pass

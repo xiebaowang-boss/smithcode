@@ -28,6 +28,7 @@ def run_command(command: str) -> str:
             timeout=config.COMMAND_TIMEOUT,
             cwd=config.WORKSPACE_ROOT,
             errors="replace",
+            check=False,  # 退出码由下方返回给模型自行判断，不抛异常
         )
         output = result.stdout or ""
         if result.stderr:

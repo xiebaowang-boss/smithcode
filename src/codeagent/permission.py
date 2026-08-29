@@ -8,6 +8,8 @@
 2. 工作区 codeagent.json 中的用户规则
 3. 会话内"总是允许"积累的规则（仅本会话有效）
 """
+from __future__ import annotations
+
 import fnmatch
 
 from . import config
@@ -18,6 +20,8 @@ ALLOW, ASK, DENY = "allow", "ask", "deny"
 DEFAULT_RULES = [
     ("read_file", "*", ALLOW),
     ("list_dir", "*", ALLOW),
+    ("glob", "*", ALLOW),
+    ("grep", "*", ALLOW),
     ("write_file", "*", ASK),
     ("edit_file", "*", ASK),
     ("run_command", "*", ASK),

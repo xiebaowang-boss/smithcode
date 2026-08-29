@@ -11,7 +11,9 @@ def _root() -> Path:
 def _resolve(path: str) -> Path:
     root = _root()
     p = (root / path).resolve()
-    if not str(p).startswith(str(root)):
+    # 用 is_relative_to 而非 startswith：目录名共享前缀的兄弟路径（如
+    # ../codeagent-x）用前缀匹配会被误判为工作区内
+    if not p.is_relative_to(root):
         raise PermissionError(f"路径越界: {path}")
     return p
 

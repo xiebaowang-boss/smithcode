@@ -14,6 +14,9 @@ MODEL = os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
 WORKSPACE_ROOT = os.getenv("CODEAGENT_ROOT", os.getcwd())
 MAX_ITERATIONS = 30
 COMMAND_TIMEOUT = 60
+MAX_TOOL_OUTPUT = 20_000  # 单次工具输出进入上下文的最大字符数，超出则头尾截断
+MAX_RETRIES = 3  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
+LLM_TIMEOUT = 120  # 单次 LLM 请求超时（秒）
 
 # 操作系统信息
 OS_INFO = platform.platform()

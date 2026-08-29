@@ -43,3 +43,25 @@ def test_list_dir(workspace):
 def test_path_outside_workspace_rejected(workspace):
     with pytest.raises(PermissionError):
         files.read_file("../outside.txt")
+
+
+def test_path_escape_via_sibling_prefix_rejected(workspace):
+    """兄弟目录名与工作区共享前缀：旧的 startswith 检查会误放行。"""
+    with pytest.raises(PermissionError):
+        files.read_file(f"../{workspace.name}-evil/secrets.txt")
+
+
+def test_path_escape_via_parent_rejected(workspace):
+    with pytest.raises(PermissionError):
+        files.write_file("../../evil.txt", "x")
+
+
+def test_absolute_path_outside_rejected(workspace):
+    with pytest.raises(PermissionError):
+        files.read_file(str(workspace.parent / "elsewhere.txt"))
+
+
+def test_dotdot_within_workspace_still_allowed(workspace):
+    """工作区内的 .. 相对路径正常解析，不误伤。"""
+    files.write_file("sub/f.txt", "x")
+    assert files.read_file("sub/../sub/f.txt") == "x"
