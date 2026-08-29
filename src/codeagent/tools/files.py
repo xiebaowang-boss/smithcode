@@ -19,6 +19,7 @@ def _resolve(path: str) -> Path:
 @register(
     {
         "name": "read_file",
+        "pattern_arg": "path",
         "description": "读取工作区内一个文本文件的内容",
         "parameters": {
             "type": "object",
@@ -37,6 +38,7 @@ def read_file(path: str) -> str:
 @register(
     {
         "name": "write_file",
+        "pattern_arg": "path",
         "description": "创建或覆盖写入文件",
         "parameters": {
             "type": "object",
@@ -58,6 +60,7 @@ def write_file(path: str, content: str) -> str:
 @register(
     {
         "name": "edit_file",
+        "pattern_arg": "path",
         "description": "精确替换文件中的一段文本，old_string 必须唯一匹配",
         "parameters": {
             "type": "object",

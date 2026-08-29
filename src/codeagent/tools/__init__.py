@@ -3,5 +3,6 @@ from . import base, files, shell
 
 SCHEMAS = base.SCHEMAS
 FUNCTIONS = base.FUNCTIONS
+PATTERN_ARGS = base.PATTERN_ARGS
 
 SAFE_TOOLS = {"read_file", "list_dir"}

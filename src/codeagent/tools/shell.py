@@ -7,6 +7,7 @@ from .base import register
 @register(
     {
         "name": "run_command",
+        "pattern_arg": "command",
         "description": "在工作区根目录执行一条 shell 命令并返回输出",
         "parameters": {
             "type": "object",

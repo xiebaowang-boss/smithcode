@@ -56,9 +56,15 @@ CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（A
 ## 安全边界
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，解析后必须位于工作区内。
-- **权限门控**：写文件 / 编辑 / 执行命令默认需要用户确认。
+- **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `codeagent.json` 用户规则 < 会话内"总是允许"（按模式记忆）。
 - **超时保护**：shell 命令默认 60 秒超时。
 - **迭代上限**：默认 30 轮，防止 Agent 无限循环消耗 token。
+
+### 权限求值细节
+
+1. 每个工具注册时通过 schema 的 `pattern_arg` 声明权限模式来源（如 `run_command` 用 `command` 参数、文件工具用 `path`），该键不会发送给 LLM。
+2. 求值顺序：`DEFAULT_RULES` → `codeagent.json` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。
+3. `deny` 不询问用户直接拒绝；`-y`（approved_all）只覆盖 `ask`，`deny` 依然生效。
 
 ## 如何新增一个工具
 
@@ -80,4 +86,15 @@ def search_code(pattern: str) -> str:
     ...
 ```
 
-若该工具属于敏感操作，还需把工具名加入 `permission.py` 的确认逻辑（`SAFE_TOOLS` 之外的工具默认都需要确认）。
+若该工具属于敏感操作，可通过 schema 的 `pattern_arg` 声明权限模式来源，并在 `codeagent.json` 中为它配置规则：
+
+```python
+@register({
+    "name": "search_code",
+    "pattern_arg": "pattern",
+    "description": "在工作区内搜索代码片段",
+    ...
+})
+```
+
+未声明 `pattern_arg` 的工具，其权限模式固定为 `*`；默认规则中未覆盖的新工具按 `ask` 处理。

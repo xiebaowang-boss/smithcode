@@ -39,10 +39,11 @@ class Agent:
         print(f"  [Tool] {name}({args_json[:80]})")
 
         try:
-            if not self.permission.check(name):
+            # 先解析参数，权限引擎需要用参数（路径/命令）做模式匹配
+            args = json.loads(args_json or "{}")
+            if not self.permission.check(name, args):
                 result = "用户拒绝了此操作"
             else:
-                args = json.loads(args_json or "{}")
                 result = str(FUNCTIONS[name](**args))
         except Exception as e:
             result = f"错误: {type(e).__name__}: {e}"
