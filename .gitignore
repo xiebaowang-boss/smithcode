@@ -33,3 +33,6 @@ Thumbs.db
 
 # pytest
 .pytest_cache/
+
+# ZCode 会话工具产物
+.zcode/
