@@ -4,12 +4,15 @@ from pathlib import Path
 
 from . import config
 from .prompts import build_system_prompt
+from .usage import UsageTracker
 
 
 class Session:
     def __init__(self):
         self.messages = [{"role": "system", "content": build_system_prompt()}]
         self.created_at = time.time()
+        # 双口径用量账本：reset 只清会话口径，"应用启动以来"随进程存活
+        self.usage = UsageTracker()
 
     def add(self, role: str, content: str = "", **kwargs) -> dict:
         msg = {"role": role, "content": content, **kwargs}
@@ -19,6 +22,7 @@ class Session:
     def reset(self):
         self.messages = [{"role": "system", "content": build_system_prompt()}]
         self.created_at = time.time()
+        self.usage.reset_session()
 
     def save(self) -> Path:
         sessions_dir = Path(config.WORKSPACE_ROOT) / "sessions"

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import config
 from .tools import PATTERN_ARGS
+from .utils.terminal import flush_pending_input
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 
@@ -90,9 +91,15 @@ class Permission:
         print(f"   {raw_path}")
         print(f"   解析为 {target}")
         print(f"   将信任目录: {root}")
-        answer = input(
-            "   允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: "
-        ).strip().lower()
+        flush_pending_input()
+        while True:
+            answer = input(
+                "   允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: "
+            ).strip().lower()
+            if answer in ("y", "n", "a"):
+                break
+            shown = f"（收到: {answer[:40]!r}）" if answer else ""
+            print(f"   无效输入{shown}，请输入 y / a / n")
         if answer == "y":
             return "once", root
         if answer == "a":
@@ -131,7 +138,15 @@ class Permission:
     def _ask(self, tool_name: str, pattern: str) -> bool:
         print(f"\n⚠️  Agent 请求执行: {tool_name}")
         print(f"   模式: {pattern}")
-        answer = input("   允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ").strip().lower()
+        flush_pending_input()  # 丢弃提前键入/粘贴的排队内容，防止被误当成回答
+        while True:
+            answer = input(
+                "   允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: "
+            ).strip().lower()
+            if answer in ("y", "n", "a"):
+                break
+            shown = f"（收到: {answer[:40]!r}）" if answer else ""
+            print(f"   无效输入{shown}，请输入 y / n / a")
         if answer == "a":
             self.session_rules.append((tool_name, pattern, ALLOW))
             return True

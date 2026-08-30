@@ -23,3 +23,38 @@ def setup_console_encoding():
             # 尽力而为：编码设置失败不应阻止程序启动
             except Exception:  # noqa: BLE001, S110
                 pass
+
+
+def stdin_has_pending() -> bool:
+    """控制台输入缓冲区里是否已有排队内容（粘贴的后续行会先进入缓冲区）。
+
+    仅在 Windows 控制台生效；标准输入被重定向（管道、测试）时一律返回 False。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import msvcrt
+
+        return bool(msvcrt.kbhit())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def flush_pending_input():
+    """清空控制台输入缓冲区（尽力而为）。
+
+    弹出交互确认前调用：提前键入或粘贴进缓冲区的内容会被就地丢弃，
+    而不是被随后的 input() 误当成确认回答——后者正是"权限确认莫名被拒"
+    的根源。标准输入被重定向时 msvcrt 探测不到控制台，自动退化为空操作。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import msvcrt
+
+        for _ in range(4096):  # 上限保护：异常情况下不陷入死循环
+            if not msvcrt.kbhit():
+                return
+            msvcrt.getwch()
+    except Exception:  # noqa: BLE001
+        return

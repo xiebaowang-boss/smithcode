@@ -138,10 +138,49 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
     monkeypatch.setattr("codeagent.agent.LLMClient", ThinkThenAnswerLLM)
     agent = Agent(session=Session())
 
-    assert agent._chat() == {"role": "assistant", "content": "答案"}
+    msg, usage = agent._chat()
+    assert msg == {"role": "assistant", "content": "答案"}
+    assert usage is None  # 假 LLM 没发 usage 事件
 
     out = capsys.readouterr().out
     assert "\x1b[90m[Thinking] 想一想\x1b[0m\n助手> 答案" in out
+
+
+# ---------- 用量统计：双口径累计与 /new 重置 ----------
+
+def test_run_accumulates_usage(monkeypatch):
+    """usage 事件应累计进会话双口径，并作为 last_usage 供 CLI 展示。"""
+
+    class UsageLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            self.calls += 1
+            yield (
+                "usage",
+                {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            )
+            yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
+
+    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    agent = Agent(session=Session())
+
+    agent.run("第一条")
+    agent.run("第二条")
+
+    assert agent.last_usage.get("total_tokens") == 15  # last_usage 只含最后一轮
+    assert agent.session.usage.current_session.get("total_tokens") == 30
+    assert agent.session.usage.since_start.get("total_tokens") == 30
+
+    agent.session.reset()  # /new 语义：会话口径清零，启动口径保留
+    assert agent.session.usage.current_session.get("total_tokens") == 0
+    assert agent.session.usage.since_start.get("total_tokens") == 30
+
+
+def test_run_without_usage_keeps_counters_clean(monkeypatch):
+    """服务商不返回 usage（无 usage 事件）时，统计静默为空、主流程不受影响。"""
+    agent = _make_agent(monkeypatch)
+    agent.run("打个招呼")
+    assert agent.session.usage.since_start.calls == 0
+    assert agent.last_usage.calls == 0
 
 
 # ---------- 路径预检：授权目录之外的访问确认 ----------
@@ -163,7 +202,7 @@ def _outside_agent(monkeypatch, tmp_path):
 
 def test_execute_outside_path_denied(monkeypatch, tmp_path):
     """越界路径被用户拒绝时，工具不执行，返回统一的拒绝结果。"""
-    outside, arg = _outside_file(tmp_path)
+    _outside, arg = _outside_file(tmp_path)
     agent = _outside_agent(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda _: "n")
 
@@ -174,7 +213,7 @@ def test_execute_outside_path_denied(monkeypatch, tmp_path):
 
 def test_execute_outside_path_once_approval(monkeypatch, tmp_path):
     """[y] 仅本次：本次调用放行且拿到内容，但不留下会话级授权。"""
-    outside, arg = _outside_file(tmp_path)
+    _outside, arg = _outside_file(tmp_path)
     agent = _outside_agent(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda _: "y")
 

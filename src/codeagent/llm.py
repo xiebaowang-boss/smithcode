@@ -5,6 +5,7 @@ import time
 from openai import (
     APIConnectionError,
     APITimeoutError,
+    BadRequestError,
     InternalServerError,
     OpenAI,
     RateLimitError,
@@ -37,11 +38,17 @@ class LLMClient:
           ("reasoning", 文本)  — 模型思考内容（如有），仅供展示
           ("content", 文本)    — 正文片段
           ("message", dict)    — 流结束时组装好的完整 assistant 消息
+          ("usage", dict)      — 流中携带的 token 用量（服务商支持才发）
 
         瞬时错误按指数退避自动重试；失败前已输出过内容则不重试，
         避免把已打印的文本重放一遍。
         """
-        kwargs = {"model": config.MODEL, "messages": messages, "stream": True}
+        kwargs = {
+            "model": config.MODEL,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
         if tools:
             kwargs["tools"] = [
                 {"type": "function", "function": schema} for schema in tools
@@ -66,11 +73,14 @@ class LLMClient:
                 time.sleep(wait)
 
     def _stream_once(self, kwargs):
-        """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息。"""
+        """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息与用量。"""
         content_parts = []
         calls = {}  # 工具调用 index -> 累积中的 {"id", "name", "arguments"}
+        latest_usage = None  # 有的服务商每个 chunk 都带 usage，始终记住最新一份
 
-        for chunk in self.client.chat.completions.create(**kwargs):
+        for chunk in self._open_stream(kwargs):
+            if getattr(chunk, "usage", None) is not None:
+                latest_usage = _usage_to_dict(chunk.usage)
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -106,3 +116,28 @@ class LLMClient:
                 for _, slot in sorted(calls.items())
             ]
         yield ("message", msg)
+        if latest_usage is not None:
+            yield ("usage", latest_usage)
+
+    def _open_stream(self, kwargs):
+        """发起流式请求；个别兼容服务不认识 stream_options 时自动降级重连。
+
+        降级后只是拿不到用量，对话本身不受影响。
+        """
+        try:
+            return self.client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            if "stream_options" in kwargs and "stream_options" in str(e):
+                kwargs.pop("stream_options")
+                return self.client.chat.completions.create(**kwargs)
+            raise
+
+
+def _usage_to_dict(usage):
+    """把 SDK 的 usage 对象展平为普通 dict；结构异常时返回 None，绝不影响对话流。"""
+    try:
+        if isinstance(usage, dict):
+            return dict(usage)
+        return usage.model_dump()
+    except Exception:  # noqa: BLE001
+        return None

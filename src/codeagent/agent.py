@@ -8,6 +8,7 @@ from .llm import LLMClient
 from .permission import Permission
 from .session import Session
 from .tools import FUNCTIONS, SCHEMAS
+from .usage import UsageAccumulator
 
 # ANSI 转义：思考内容以灰色展示（90m 比 dim/2m 在 Windows 终端上兼容性好得多）
 DIM, RESET = "\033[90m", "\033[0m"
@@ -35,15 +36,20 @@ class Agent:
         self.session = session or Session()
         self.permission = Permission()
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
+        self.last_usage = UsageAccumulator()  # 最近一次 run 的用量合计，供 CLI 展示
 
     def run(self, user_input: str) -> str:
         self.session.add("user", user_input)
+        run_usage = UsageAccumulator()  # 本次任务所有 LLM 调用的用量
 
         for _ in range(self.max_iterations):
-            msg = self._chat()
+            msg, usage = self._chat()
+            run_usage.add(usage)
+            self.session.usage.add(usage)
             self.session.messages.append(msg)
 
             if not msg.get("tool_calls"):
+                self.last_usage = run_usage
                 return msg.get("content", "")
 
             for tc in msg["tool_calls"]:
@@ -52,33 +58,38 @@ class Agent:
                     {"role": "tool", "content": result, "tool_call_id": tc["id"]}
                 )
 
+        self.last_usage = run_usage
         return "达到最大迭代次数，任务中止。"
 
-    def _chat(self) -> dict:
-        """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀），返回完整消息。
+    def _chat(self) -> tuple[dict, dict | None]:
+        """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀）。
 
-        思考内容（reasoning_content，仅部分模型返回）以灰色实时展示，
-        但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
+        返回 (完整消息, 本次用量)；用量由 llm 层从流中提取，服务商
+        不提供时为 None。思考内容（reasoning_content，仅部分模型返回）
+        以灰色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
         """
         msg = {}
+        usage = None
         mode = None  # 当前流式内容类型："reasoning" / "content"
         for kind, payload in self.llm.chat_stream(self.session.messages, tools=SCHEMAS):
             if kind == "message":
                 msg = payload
-                continue
-            if kind != mode:
-                if mode == "reasoning":  # 思考段结束，恢复正常样式
-                    print(RESET, end="", flush=True)
-                print("\n助手> ", end="", flush=True)
-                if kind == "reasoning":
-                    print(f"{DIM}[Thinking] ", end="", flush=True)
-                mode = kind
-            print(payload, end="", flush=True)
+            elif kind == "usage":
+                usage = payload
+            else:
+                if kind != mode:
+                    if mode == "reasoning":  # 思考段结束，恢复正常样式
+                        print(RESET, end="", flush=True)
+                    print("\n助手> ", end="", flush=True)
+                    if kind == "reasoning":
+                        print(f"{DIM}[Thinking] ", end="", flush=True)
+                    mode = kind
+                print(payload, end="", flush=True)
         if mode == "reasoning":  # 流在思考段中结束（如模型直接发起工具调用）
             print(RESET, end="")
         if mode is not None:
             print()
-        return msg
+        return msg, usage
 
     def _execute(self, tc: dict) -> str:
         name = tc["function"]["name"]

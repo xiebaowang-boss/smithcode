@@ -240,3 +240,40 @@ def test_widen_roots_is_temporary(tmp_path, monkeypatch):
         assert len(widened) == len(base) + 1
         assert widened[-1] == extra.resolve()
     assert config.allowed_roots() == base
+
+
+# ---------- 交互确认：非法输入重问，而不是静默判拒 ----------
+
+def test_ask_reprompts_on_invalid_answer(make_perm, monkeypatch):
+    """空行、乱文本等非 y/n/a 回答应重新询问，而不是当作拒绝。"""
+    perm = make_perm()
+    answers = iter(["", "随便粘贴的一行", "y"])
+    prompts = []
+
+    def _input(prompt=""):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", _input)
+    assert perm.check("run_command", {"command": "ls"}) is True
+    assert len(prompts) == 3  # 前两次无效、第三次 y，共问三轮
+
+
+def test_ask_still_accepts_valid_answers(make_perm, monkeypatch):
+    perm = make_perm()
+    for answer, expected in (("y", True), ("n", False)):
+        monkeypatch.setattr("builtins.input", lambda _, a=answer: a)
+        assert perm.check("run_command", {"command": "ls"}) is expected
+
+
+def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
+    """越界路径确认同样对非法输入重问。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-out2")
+    outside.mkdir()
+    perm = Permission()
+
+    answers = iter(["糊了", "n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
