@@ -3,12 +3,12 @@ import time
 from pathlib import Path
 
 from . import config
-from .prompts import SYSTEM_PROMPT
+from .prompts import build_system_prompt
 
 
 class Session:
     def __init__(self):
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = [{"role": "system", "content": build_system_prompt()}]
         self.created_at = time.time()
 
     def add(self, role: str, content: str = "", **kwargs) -> dict:
@@ -17,7 +17,7 @@ class Session:
         return msg
 
     def reset(self):
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = [{"role": "system", "content": build_system_prompt()}]
         self.created_at = time.time()
 
     def save(self) -> Path:

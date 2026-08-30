@@ -1,6 +1,7 @@
 import json
 import os
 import platform
+from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,6 +28,43 @@ OS_TYPE = platform.system().lower()  # 'windows', 'linux', 'darwin'
 def set_workspace(path):
     global WORKSPACE_ROOT
     WORKSPACE_ROOT = str(Path(path).resolve())
+
+
+# 附加授权目录：cli 的 --add 可重复传入，供一个会话内跨项目访问
+EXTRA_ROOTS: list[str] = []
+# 会话内通过"越界确认"积累的信任目录（/new 时清空）
+SESSION_EXTRA_ROOTS: list[str] = []
+# 仅单次工具调用期间临时放行的目录（由 widen_roots 维护，正常情况下为空）
+_WIDENED_ROOTS: list[str] = []
+
+
+def add_workspace(path):
+    """把一个目录加入附加授权列表，与主工作区享有同等的工具访问权。"""
+    EXTRA_ROOTS.append(str(Path(path).resolve()))
+
+
+def allowed_roots() -> list[Path]:
+    """全部授权目录（主工作区在前）：工具沙箱与权限模式归一化的共同依据。"""
+    return (
+        [Path(WORKSPACE_ROOT).resolve()]
+        + [Path(p) for p in EXTRA_ROOTS]
+        + [Path(p) for p in SESSION_EXTRA_ROOTS]
+        + [Path(p) for p in _WIDENED_ROOTS]
+    )
+
+
+@contextmanager
+def widen_roots(roots):
+    """把目录临时加入授权列表，仅覆盖 with 块内的那次工具调用（"仅本次"语义）。"""
+    added = [str(Path(r).resolve()) for r in roots]
+    if not added:
+        yield
+        return
+    _WIDENED_ROOTS.extend(added)
+    try:
+        yield
+    finally:
+        del _WIDENED_ROOTS[-len(added):]
 
 
 def load_permissions(path=None):

@@ -25,12 +25,15 @@ MAX_LINE_LEN = 200  # 单行匹配内容展示的最大长度
 
 
 def _roots(path: str) -> tuple:
-    """解析搜索起始路径，返回 (工作区根, 起始路径)。越界直接拒绝。"""
-    root = Path(config.WORKSPACE_ROOT).resolve()
-    base = (root / path).resolve()
-    if not base.is_relative_to(root):
-        raise PermissionError(f"路径越界: {path}")
-    return root, base
+    """解析搜索起始路径，返回 (命中的授权根, 起始路径)。越界直接拒绝。
+
+    相对路径锚定主工作区；结果落在任一授权目录内即放行，展示路径相对该根。
+    """
+    base = (Path(config.WORKSPACE_ROOT) / path).resolve()
+    for root in config.allowed_roots():
+        if base.is_relative_to(root):
+            return root, base
+    raise PermissionError(f"路径越界: {path}")
 
 
 @register(

@@ -74,3 +74,25 @@ def test_grep_invalid_regex_returns_message(workspace):
 def test_grep_outside_workspace_rejected(workspace):
     with pytest.raises(PermissionError):
         search.grep("needle", "../elsewhere")
+
+
+# ---------- 多根授权（--add） ----------
+
+def test_glob_in_extra_root(workspace, monkeypatch):
+    """附加授权目录可检索，展示路径相对该根。"""
+    extra = workspace.parent / (workspace.name + "-extra")
+    (extra / "src").mkdir(parents=True)
+    (extra / "src" / "x.py").write_text("y = 1\n", encoding="utf-8")
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    out = search.glob("**/*.py", str(extra))
+    assert "src/x.py" in out
+
+
+def test_grep_in_extra_root(workspace, monkeypatch):
+    extra = workspace.parent / (workspace.name + "-extra")
+    extra.mkdir()
+    (extra / "m.py").write_text("needle\n", encoding="utf-8")
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    assert "m.py:1" in search.grep("needle", str(extra))

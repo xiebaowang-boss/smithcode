@@ -27,6 +27,10 @@ def build_parser():
         help="工作区目录（默认当前目录）",
     )
     parser.add_argument(
+        "--add", action="append", default=None, metavar="DIR",
+        help="追加授权目录（可重复传入），供一个会话内跨项目访问",
+    )
+    parser.add_argument(
         "-m", "--model",
         help=f"模型名（默认 {config.MODEL}）",
     )
@@ -62,6 +66,8 @@ def repl(agent: Agent):
             break
         if user_input == "/new":
             agent.session.reset()
+            agent.permission.session_rules.clear()
+            config.SESSION_EXTRA_ROOTS.clear()
             print("已开启新会话。")
             continue
         if user_input == "/save":
@@ -92,6 +98,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.workspace:
         config.set_workspace(args.workspace)
+    for extra in args.add or []:
+        config.add_workspace(extra)
     if args.model:
         config.MODEL = args.model
 

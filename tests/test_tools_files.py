@@ -65,3 +65,37 @@ def test_dotdot_within_workspace_still_allowed(workspace):
     """工作区内的 .. 相对路径正常解析，不误伤。"""
     files.write_file("sub/f.txt", "x")
     assert files.read_file("sub/../sub/f.txt") == "x"
+
+
+# ---------- 多根授权（--add） ----------
+
+def test_extra_root_read_and_write(workspace, monkeypatch):
+    """附加授权目录内可正常读写。"""
+    extra = workspace.parent / (workspace.name + "-extra")
+    extra.mkdir()
+    (extra / "b.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    assert files.read_file(str(extra / "b.txt")) == "x"
+    assert "已写入" in files.write_file(str(extra / "c.txt"), "y")
+    assert (extra / "c.txt").read_text(encoding="utf-8") == "y"
+
+
+def test_dotdot_into_extra_root_allowed(workspace, monkeypatch):
+    """相对主工作区的 .. 逃逸若落在附加授权目录内，应放行。"""
+    extra = workspace.parent / (workspace.name + "-extra")
+    extra.mkdir()
+    (extra / "d.txt").write_text("z", encoding="utf-8")
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    assert files.read_file(f"../{extra.name}/d.txt") == "z"
+
+
+def test_outside_all_roots_still_rejected(workspace, monkeypatch):
+    """有附加授权目录时，未授权路径依然被拒。"""
+    extra = workspace.parent / (workspace.name + "-extra")
+    extra.mkdir()
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    with pytest.raises(PermissionError):
+        files.read_file(str(workspace.parent / "unrelated.txt"))

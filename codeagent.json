@@ -3,12 +3,10 @@
     "read_file": "allow",
     "list_dir": "allow",
     "write_file": {
-      "*": "ask",
-      "*.env": "deny"
+      "*": "ask"
     },
     "edit_file": {
-      "*": "ask",
-      "*.env": "deny"
+      "*": "ask"
     },
     "run_command": {
       "*": "ask",

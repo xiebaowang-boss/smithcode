@@ -4,7 +4,7 @@ import json
 import pytest
 
 from codeagent import config
-from codeagent.permission import DEFAULT_RULES, Permission, evaluate
+from codeagent.permission import DEFAULT_RULES, Permission, evaluate, infer_trust_root
 
 
 def refuse_input(monkeypatch):
@@ -145,3 +145,98 @@ def test_broken_json_degrades_gracefully(make_perm, monkeypatch, capsys):
     perm = make_perm(raw="{ not valid json")
     assert perm.user_rules == []
     assert "警告" in capsys.readouterr().out
+
+
+# ---------- 路径模式归一化（多根授权 --add） ----------
+
+def test_pattern_normalizes_to_root_relative(make_perm, tmp_path, monkeypatch):
+    """相对、绝对、跨根三种写法归一化到同一种"相对授权根"模式。"""
+    make_perm()  # 把 WORKSPACE_ROOT 指到 tmp_path
+    extra = tmp_path.parent / (tmp_path.name + "-extra")
+    extra.mkdir()
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+
+    assert Permission._pattern("edit_file", {"path": "src/a.py"}) == "src/a.py"
+    assert (
+        Permission._pattern("edit_file", {"path": str(tmp_path / "src" / "a.py")})
+        == "src/a.py"
+    )
+    assert (
+        Permission._pattern("edit_file", {"path": f"../{extra.name}/src/a.py"})
+        == "src/a.py"
+    )
+
+
+def test_pattern_keeps_command_text_verbatim(make_perm, tmp_path, monkeypatch):
+    """command 类参数不做路径归一化，保持原文以便命令模式匹配。"""
+    make_perm()
+    assert (
+        Permission._pattern("run_command", {"command": "git status"})
+        == "git status"
+    )
+
+
+def test_user_rule_matches_extra_root_path(make_perm, tmp_path, monkeypatch):
+    """附加授权根内的路径与主工作区按同一模式约定匹配用户规则。"""
+    refuse_input(monkeypatch)
+    extra = tmp_path.parent / (tmp_path.name + "-extra")
+    extra.mkdir()
+    monkeypatch.setattr(config, "EXTRA_ROOTS", [str(extra)])
+    perm = make_perm(permissions={"write_file": {"src/*.py": "allow"}})
+
+    assert perm.check("write_file", {"path": f"../{extra.name}/src/a.py"}) is True
+
+
+# ---------- 越界访问确认（运行时动态信任） ----------
+
+def test_infer_trust_root_finds_git_project_root(tmp_path):
+    """目标路径的祖先存在 .git 时，信任整个项目根。"""
+    proj = tmp_path / "projB"
+    (proj / "src" / "deep").mkdir(parents=True)
+    (proj / ".git").mkdir()
+    target = proj / "src" / "deep" / "a.py"
+
+    assert infer_trust_root(target) == proj
+
+
+def test_infer_trust_root_falls_back_to_parent(tmp_path):
+    """无 .git 祖先时退回目标所在目录。"""
+    target = tmp_path / "plain" / "a.txt"
+    assert infer_trust_root(target) == tmp_path / "plain"
+
+
+def test_ask_outside_access_once_always_deny(tmp_path, monkeypatch):
+    """[y] 仅本次不入库；[a] 信任根写入会话列表；[n] 拒绝。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-out")
+    outside.mkdir()
+    perm = Permission()
+
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    assert perm.ask_outside_access("x.py", outside / "x.py") == ("once", outside)
+    assert config.SESSION_EXTRA_ROOTS == []
+
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    action, root = perm.ask_outside_access("x.py", outside / "x.py")
+    assert (action, root) == ("always", outside)
+    assert config.SESSION_EXTRA_ROOTS == [str(outside)]
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+
+
+def test_widen_roots_is_temporary(tmp_path, monkeypatch):
+    """widen_roots 只在 with 块内生效，退出后授权列表还原。"""
+    extra = tmp_path / "widen-me"
+    extra.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(config, "_WIDENED_ROOTS", [])
+
+    base = config.allowed_roots()
+    with config.widen_roots([extra]):
+        widened = config.allowed_roots()
+        assert len(widened) == len(base) + 1
+        assert widened[-1] == extra.resolve()
+    assert config.allowed_roots() == base
