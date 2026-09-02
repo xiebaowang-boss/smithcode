@@ -1,6 +1,6 @@
 # 架构说明
 
-CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（Agentic Loop）**。
+CodeAgent 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop）**。
 
 ## 核心循环
 
