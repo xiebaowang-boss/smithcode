@@ -36,10 +36,17 @@ def _roots(path: str) -> tuple:
     raise PermissionError(f"路径越界: {path}")
 
 
+def _describe_glob(args: dict) -> str:
+    path = args.get("path")
+    suffix = "" if not path or path == "." else f" {path}"
+    return f"glob {args.get('pattern', '?')}{suffix}"
+
+
 @register(
     {
         "name": "glob",
         "pattern_arg": "path",
+        "describe": _describe_glob,
         "description": "按通配符模式搜索工作区内的文件，支持 ** 递归，"
         "返回相对路径列表。示例：**/*.py、docs/**/*.md",
         "parameters": {
@@ -79,10 +86,21 @@ def glob(pattern: str, path: str = ".") -> str:
     return "\n".join(out) + note
 
 
+def _describe_grep(args: dict) -> str:
+    parts = [f"grep {args.get('pattern', '?')}"]
+    path = args.get("path")
+    if path and path != ".":
+        parts.append(str(path))
+    if args.get("include"):
+        parts.append(f"--include={args['include']}")
+    return " ".join(parts)
+
+
 @register(
     {
         "name": "grep",
         "pattern_arg": "path",
+        "describe": _describe_grep,
         "description": "在工作区文件内容中按正则表达式搜索，"
         "返回「路径:行号: 内容」列表。可用 include 按文件名过滤（如 *.py）。",
         "parameters": {

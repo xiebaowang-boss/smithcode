@@ -3,8 +3,9 @@
 import sys
 
 from codeagent.agent import Agent
-from codeagent.cli import _print_usage_hint, read_user_input
+from codeagent.cli import _print_usage_hint
 from codeagent.session import Session
+from codeagent.utils.terminal import read_user_input
 
 
 def _agent_with_usage(monkeypatch, usage):
@@ -75,7 +76,7 @@ def test_read_user_input_merges_pasted_lines(monkeypatch):
     monkeypatch.setattr("builtins.input", _fake_input(replies, calls))
     # 首行后两次检测到排队内容，随后缓冲区静默
     pending = iter([True, True, False, False])
-    monkeypatch.setattr("codeagent.cli.stdin_has_pending", lambda: next(pending))
+    monkeypatch.setattr("codeagent.utils.terminal.stdin_has_pending", lambda: next(pending))
 
     assert read_user_input() == "第一行\n第二行\n第三行"
     assert len(calls) == 3
@@ -87,7 +88,7 @@ def test_read_user_input_single_line_when_buffer_silent(monkeypatch):
     replies = ["就这一句"]
     calls = []
     monkeypatch.setattr("builtins.input", _fake_input(replies, calls))
-    monkeypatch.setattr("codeagent.cli.stdin_has_pending", lambda: False)
+    monkeypatch.setattr("codeagent.utils.terminal.stdin_has_pending", lambda: False)
 
     assert read_user_input() == "就这一句"
     assert len(calls) == 1

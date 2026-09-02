@@ -7,11 +7,14 @@ from . import config
 from .llm import LLMClient
 from .permission import Permission
 from .session import Session
-from .tools import FUNCTIONS, SCHEMAS
+from .tools import DESCRIBERS, FUNCTIONS, PATHS_EXTRACTORS, SCHEMAS
 from .usage import UsageAccumulator
 
 # ANSI 转义：思考内容以灰色展示（90m 比 dim/2m 在 Windows 终端上兼容性好得多）
 DIM, RESET = "\033[90m", "\033[0m"
+
+# 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
+MAX_SUMMARY_LEN = 80
 
 
 def truncate_output(text: str, limit: int) -> str:
@@ -36,6 +39,7 @@ class Agent:
         self.session = session or Session()
         self.permission = Permission()
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
+        self.display_mode = config.load_tool_display()  # 工具调用展示粒度：summary / detail
         self.last_usage = UsageAccumulator()  # 最近一次 run 的用量合计，供 CLI 展示
 
     def run(self, user_input: str) -> str:
@@ -94,13 +98,53 @@ class Agent:
     def _execute(self, tc: dict) -> str:
         name = tc["function"]["name"]
         args_json = tc["function"]["arguments"]
-        print(f"  [Tool] {name}({args_json[:80]})")
 
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
+            print(f"  [Tool] {name}({args_json[:80]})")
             return self._finish(f"错误: JSONDecodeError: {e}")
 
+        line = self._describe(name, args)
+        print(f"  {line[:MAX_SUMMARY_LEN]}{'...' if len(line) > MAX_SUMMARY_LEN else ''}")
+
+        # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
+        extractor = PATHS_EXTRACTORS.get(name)
+        if extractor is not None:
+            try:
+                paths = [str(p) for p in extractor(args)]
+            except Exception as e:  # noqa: BLE001
+                return self._finish(f"错误: 无法解析目标路径: {type(e).__name__}: {e}")
+            if paths:
+                return self._execute_with_paths(name, args, paths)
+        return self._execute_single(name, args)
+
+    def _execute_with_paths(self, name: str, args: dict, paths: list[str]) -> str:
+        """多路径工具：任一路径越界被拒则整体拒绝；聚合权限检查；整体原子执行。
+
+        路径预检（根信任门）→ 聚合操作权限门 → 执行，两道关卡有序，与单路径工具一致。
+        """
+        widened = []
+        for raw in paths:
+            pre = self._preflight_path(raw)
+            if pre == "deny":
+                return self._finish("用户拒绝了此操作")
+            if isinstance(pre, Path):
+                widened.append(pre)
+
+        if not self.permission.check_paths(name, paths):
+            return self._finish("用户拒绝了此操作")
+
+        try:
+            with config.widen_roots(widened):
+                result = str(FUNCTIONS[name](**args))
+        except Exception as e:  # noqa: BLE001
+            # 工具执行的任何失败都只作为结果回传给模型，不中断循环
+            result = f"错误: {type(e).__name__}: {e}"
+
+        return self._finish(result)
+
+    def _execute_single(self, name: str, args: dict) -> str:
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
         preflight = self._preflight_outside_path(args)
         if preflight == "deny":
@@ -121,21 +165,33 @@ class Agent:
         return self._finish(result)
 
     def _finish(self, result: str) -> str:
+        """回传前截断超长输出；终端展示按 display_mode 分支：summary 模式只有
+        执行前那行短摘要，detail 模式追加结果内容。失败信息（错误/用户拒绝）
+        无论何种模式都原样展示——失败的细节比格式化摘要更重要。"""
         result = truncate_output(result, config.MAX_TOOL_OUTPUT)
-        display = result[:500] + ("..." if len(result) > 500 else "")
-        print(f"  [Result] {display}\n")
+        if result.startswith("错误:") or result == "用户拒绝了此操作":
+            print(f"  {result}\n")
+            return result
+        if self.display_mode == "detail":
+            display = result[:500] + ("..." if len(result) > 500 else "")
+            print(f"  [Result] {display}\n")
         return result
 
-    def _preflight_outside_path(self, args: dict) -> Path | str | None:
-        """检查 path 参数是否落在授权目录之外；之外时先交互确认。
+    @staticmethod
+    def _describe(name: str, args) -> str:
+        """工具调用的一行短摘要；未注册 describe 的工具回退为 [Tool] 名字(参数) 格式。"""
+        describe = DESCRIBERS.get(name)
+        if describe is not None and isinstance(args, dict):
+            return describe(args)
+        return f"[Tool] {name}({json.dumps(args, ensure_ascii=False)[:80]})"
+
+    def _preflight_path(self, raw: str) -> Path | str | None:
+        """检查单个路径是否落在授权目录之外；之外时先交互确认。
 
         返回 "deny"（用户拒绝本次访问）、Path（"仅本次"，执行时需临时放行该信任根）、
         None（路径在授权范围内，或用户已选"本会话总是"——信任根已入库）。
         与工具内部的越界检查互为备份：预检管交互体验，工具侧管强制执行。
         """
-        raw = args.get("path")
-        if raw is None:
-            return None
         target = (Path(config.WORKSPACE_ROOT) / str(raw)).resolve()
         if any(target.is_relative_to(r) for r in config.allowed_roots()):
             return None
@@ -143,3 +199,8 @@ class Agent:
         if action == "deny":
             return "deny"
         return root if action == "once" else None
+
+    def _preflight_outside_path(self, args: dict) -> Path | str | None:
+        """单路径工具（path 参数）的越界预检入口。"""
+        raw = args.get("path")
+        return self._preflight_path(raw) if raw else None

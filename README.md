@@ -7,7 +7,8 @@ CodeAgent 采用 **Agent 循环（Agentic Loop）** 架构：模型收到任务�
 ## 功能特性
 
 - **Agent 循环**：模型自主规划并多次调用工具，直到完成任务，支持配置最大迭代轮数，回复流式输出
-- **工具调用**：内置 7 个工具——读文件、写文件、精确编辑文件、列目录、glob 文件名搜索、grep 内容搜索、执行 shell 命令；新增工具只需一个 `@register` 装饰器
+- **工具调用**：内置 9 个工具——读文件、写文件、精确编辑文件、apply_patch 批量改文件、列目录、glob 文件名搜索、grep 内容搜索、执行 shell 命令、向用户提问（ask_user）；新增工具只需一个 `@register` 装饰器
+- **工具调用展示**：每个工具调用打印一行短摘要（`read src/a.py`、`command git push`），可在 `codeagent.json` 中切换 detail 模式追加查看结果内容
 - **LLM 健壮性**：限流 / 断网自动指数退避重试，请求超时保护
 - **权限控制**：读文件 / 列目录自动放行；写文件、执行命令等敏感操作需逐个确认，或选择"本次会话总是允许"
 - **沙箱约束**：所有文件操作限制在工作区内，路径越界直接拒绝；shell 命令带超时保护，超长工具输出自动截断
@@ -32,10 +33,12 @@ code_agent/                        # 仓库根目录
 │       ├── prompts.py             # 系统提示词（人设与行为规则）
 │       ├── session.py             # 会话管理：消息历史、保存与重置
 │       ├── tools/                 # 工具子系统
-│       │   ├── base.py            # 工具注册表（@register 装饰器）
+│       │   ├── base.py            # 工具注册表（@register 装饰器，支持 family / 路径提取）
 │       │   ├── files.py           # read_file / write_file / edit_file / list_dir
 │       │   ├── search.py          # glob 文件名搜索 / grep 内容搜索
-│       │   └── shell.py           # run_command（带超时保护）
+│       │   ├── shell.py           # run_command（带超时保护）
+│       │   ├── patch.py           # apply_patch（批量原子改文件）
+│       │   └── ask.py             # ask_user（任务中途向用户提问）
 │       └── utils/
 │           └── terminal.py        # 终端 UTF-8 编码处理
 ├── tests/                         # pytest 测试，与源码模块一一对应
@@ -106,7 +109,7 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 | `task`               | 一次性任务描述；留空则进入交互模式             |
 | `-w, --workspace`    | 指定工作区目录（默认当前目录）                 |
 | `-m, --model`        | 指定模型名（覆盖 `.env` 中的配置）             |
-| `-y, --yes`          | 自动批准所有工具调用，不再逐个询问             |
+| `-y, --yes`          | 自动批准所有工具调用（含工作区外路径访问），不再逐个询问；`deny` 规则依然生效 |
 | `--max-iterations N` | 单次任务最大迭代轮数（默认 30）                |
 | `-V, --version`      | 显示版本号                                     |
 
@@ -114,7 +117,7 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 
 权限采用三级动作规则引擎：每条规则 = `(工具名, 参数模式, 动作)`，动作支持 `allow`（静默放行）、`ask`（交互确认）、`deny`（直接拒绝）。规则用通配符匹配参数——文件工具匹配路径、`run_command` 匹配命令串。求值时**最后一条匹配的规则生效**，无匹配默认 `ask`。
 
-默认规则：读文件 / 列目录自动放行，写文件、编辑、执行命令需要确认：
+默认规则：读文件 / 列目录自动放行，写文件、编辑、执行命令需要确认；`ask_user` 提问默认放行（可用 `"ask_user": "deny"` 禁用）；保护路径 `.git` 目录只读：
 
 ```
 ⚠️  Agent 请求执行: run_command
@@ -122,7 +125,9 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
    允许? [y]本次 / [n]拒绝 / [a]总是允许该模式:
 ```
 
-选 `a` 后该**模式**（而非整个工具）在本会话内静默放行，退出后清零；`-y` 参数可跳过所有 `ask`，但显式声明的 `deny` 依然生效。
+选 `a` 后该**模式**（而非整个工具）在本会话内静默放行，退出后清零；`-y` 参数可跳过所有 `ask`（含工作区外路径的访问确认），但显式声明的 `deny` 依然生效。
+
+**权限族（family）**：工具注册时可声明 `family` 继承其他工具的权限规则。`apply_patch` 声明 `family="edit_file"`，因此它自动受 `edit_file` 的规则约束（含 `.git` 保护路径），无需重复配置；想单独收紧可写 `"apply_patch": "deny"` 且排在 `edit_file` 规则之后（last match wins）。多路径工具（apply_patch）做**聚合检查**：任一路径 `deny` → 整体拒绝；任一 `ask` → 只询问一次；全部放行才执行。
 
 ### 自定义权限规则（codeagent.json）
 
@@ -144,6 +149,21 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
 
 上面的例子表示：文件读取放行；写其他文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
 
+### 工具调用展示（codeagent.json）
+
+每次工具调用在终端打印一行短摘要（`describe`），格式为「短名 + 目标」：`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`。展示粒度由 `codeagent.json` 的 `tool_display` 字段控制：
+
+```json
+{
+  "tool_display": "summary"
+}
+```
+
+- `"summary"`（默认）：只显示短摘要行，结果内容仅回传给模型，不在终端展示
+- `"detail"`：短摘要行之外，再以 `[Result]` 展示结果内容（前 500 字符）
+
+无论何种粒度，失败信息（`错误: ...`、用户拒绝）始终原样展示；摘要行超长时截断到 80 字符显示，不影响回传内容。
+
 ## 开发
 
 ```bash
@@ -156,8 +176,10 @@ ruff check src tests      # 代码检查
 
 - API Key 仅通过 `.env` 或环境变量加载，不会被提交到仓库
 - 所有文件操作限制在工作区内，访问工作区之外的路径会被拒绝
+- 保护路径：`.git` 目录只读，禁止写入与编辑
+- 非交互模式（管道 / CI / 脚本）：标准输入非终端时无法弹确认，所有 `ask` 一律**失败降级为拒绝**并回传模型，不会因无法询问而崩溃
 - shell 命令默认 60 秒超时（可通过 `config.py` 中的 `COMMAND_TIMEOUT` 调整）
 - LLM 请求默认 120 秒超时，瞬时错误自动重试 3 次（可通过 `config.py` 中的 `LLM_TIMEOUT`、`MAX_RETRIES` 调整）
 - 单次工具输出超过 `MAX_TOOL_OUTPUT`（默认 2 万字符，可在 `config.py` 调整）时自动截断为头尾各半，防止撑爆模型上下文
 - 权限规则三层叠加：内置默认规则 < `codeagent.json` 用户规则 < 会话内"总是允许"
-- 请谨慎使用 `-y` 参数：它跳过所有 `ask` 确认，但 `deny` 规则仍然生效
+- 请谨慎使用 `-y` 参数：它跳过所有 `ask` 确认（含工作区外路径访问，按"仅本次"授权），但 `deny` 规则仍然生效

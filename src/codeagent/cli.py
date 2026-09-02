@@ -1,11 +1,10 @@
 import argparse
 import sys
-import time
 
 from . import __version__, config
 from .agent import Agent
 from .session import Session
-from .utils.terminal import setup_console_encoding, stdin_has_pending
+from .utils.terminal import read_user_input, setup_console_encoding
 
 HELP = """命令:
   /help   显示帮助
@@ -38,7 +37,7 @@ def build_parser():
     )
     parser.add_argument(
         "-y", "--yes", action="store_true",
-        help="自动批准所有工具调用，不再逐个询问",
+        help="自动批准所有工具调用（含工作区外路径访问），不再逐个询问；deny 规则依然生效",
     )
     parser.add_argument(
         "--max-iterations", type=int, default=None, metavar="N",
@@ -59,26 +58,6 @@ def _print_usage_hint(agent: Agent):
     acc = agent.session.usage.current_session
     print(f"\n[tokens] 本轮 {run.humanize()}")
     print(f"         会话累计 {acc.humanize()}")
-
-
-def read_user_input() -> str:
-    """读一条用户输入；粘贴的后续行会合并进同一条多行消息。
-
-    input() 是按行读的，多行粘贴会被逐行消费成多条独立消息（还会在工具
-    确认时被误当成回答）。交互模式下首次回车后，只要控制台缓冲区仍有
-    排队内容就继续读取，直到出现短暂静默——手动输入的下一句话必然晚于
-    该静默窗口，不会被误并进来。非交互 stdin（管道）不做合并，行为不变。
-    """
-    first = input("\n你> ")
-    if not sys.stdin.isatty():
-        return first
-    lines = [first]
-    while True:
-        if not stdin_has_pending():
-            time.sleep(0.05)
-            if not stdin_has_pending():
-                return "\n".join(lines)
-        lines.append(input())
 
 
 def repl(agent: Agent):

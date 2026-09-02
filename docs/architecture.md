@@ -40,6 +40,8 @@ CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（A
 
 模型输出以流式方式逐字显示；思考内容（如 DeepSeek-R1 类模型的 `reasoning_content`）以暗色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
 
+工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `codeagent.json` 的 `tool_display` 控制：`summary`（默认）到此为止，`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
+
 ## 模块职责
 
 | 模块 | 职责 |
@@ -50,16 +52,21 @@ CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（A
 | `prompts.py` | 系统提示词（行为规则） |
 | `session.py` | 消息历史的增删存取 |
 | `permission.py` | 敏感操作的用户确认 |
-| `config.py` | `.env` 配置加载 |
-| `tools/base.py` | 工具注册表（`@register` 装饰器） |
+| `config.py` | `.env` 与 `codeagent.json` 配置加载（权限规则、展示粒度） |
+| `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
 | `tools/shell.py` | 命令执行，含超时保护 |
+| `tools/patch.py` | apply_patch 批量原子改文件 |
+| `tools/ask.py` | ask_user 任务中途向用户提问 |
 
 ## 安全边界
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，用 `Path.is_relative_to` 确认解析后的真实路径位于工作区内（目录名共享前缀的兄弟路径不会被误判为放行）。
-- **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `codeagent.json` 用户规则 < 会话内"总是允许"（按模式记忆）。
+- **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `codeagent.json` 用户规则 < 会话内"总是允许"（按模式记忆）。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
+- **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
+- **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
+- **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
 - **超时保护**：shell 命令默认 60 秒超时。
 - **请求保护**：LLM 请求默认 120 秒超时；限流、断网、服务端 5xx 按指数退避自动重试（默认 3 次），已开始输出的流不重试。
 - **输出截断**：单次工具返回超过 `MAX_TOOL_OUTPUT`（默认 2 万字符）时保留头尾、省略中间，防止超长输出撑爆上下文窗口。
@@ -69,7 +76,9 @@ CodeAgent 是一个教学级的 mini coding agent，核心是 **Agent 循环（A
 
 1. 每个工具注册时通过 schema 的 `pattern_arg` 声明权限模式来源（如 `run_command` 用 `command` 参数、文件工具用 `path`），该键不会发送给 LLM。
 2. 求值顺序：`DEFAULT_RULES` → `codeagent.json` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。因此配置文件中宽泛规则写在前、精确规则写在后。
-3. `deny` 不询问用户直接拒绝；`-y`（approved_all）只覆盖 `ask`，`deny` 依然生效。
+3. `deny` 不询问用户直接拒绝；`-y`（approved_all）跳过所有 `ask`（含越界访问确认），但显式声明的 `deny` 依然生效。
+4. **权限族（family）**：规则匹配同时看「工具名」与「family」。`apply_patch` 声明 `family="edit_file"`，因此自动继承 `edit_file` 全部规则（含 `.git` 保护路径），避免"换个工具绕过规则"；工具名精确规则排在 family 规则之后可单独收紧。
+5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次，全部放行才执行。
 
 ## 如何新增一个工具
 
@@ -98,6 +107,18 @@ def search_code(pattern: str) -> str:
     "name": "search_code",
     "pattern_arg": "pattern",
     "description": "在工作区内搜索代码片段",
+    ...
+})
+```
+
+若新工具与既有工具权限语义一致，用 `family` 继承其规则（`apply_patch` 即继承 `edit_file`）；若一次操作触及多个路径（如 patch），用 `paths_from` 提供 `(args) -> [路径...]` 提取函数，走逐路径预检 + 聚合权限检查。
+
+终端展示的短摘要用 `describe` 声明，签名 `(args) -> str`，格式为「短名 + 目标」（如 `read src/a.py`、`command git status`）；未声明时回退为 `[Tool] 名字(参数)` 格式：
+
+```python
+@register({
+    "name": "search_code",
+    "describe": lambda args: f"search {args.get('pattern', '?')}",
     ...
 })
 ```

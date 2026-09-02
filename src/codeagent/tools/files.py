@@ -17,6 +17,7 @@ def _resolve(path: str) -> Path:
     {
         "name": "read_file",
         "pattern_arg": "path",
+        "describe": lambda args: f"read {args.get('path', '?')}",
         "description": "读取工作区内一个文本文件的内容",
         "parameters": {
             "type": "object",
@@ -36,6 +37,7 @@ def read_file(path: str) -> str:
     {
         "name": "write_file",
         "pattern_arg": "path",
+        "describe": lambda args: f"write {args.get('path', '?')}",
         "description": "创建或覆盖写入文件",
         "parameters": {
             "type": "object",
@@ -58,6 +60,7 @@ def write_file(path: str, content: str) -> str:
     {
         "name": "edit_file",
         "pattern_arg": "path",
+        "describe": lambda args: f"edit {args.get('path', '?')}",
         "description": "精确替换文件中的一段文本，old_string 必须唯一匹配",
         "parameters": {
             "type": "object",
@@ -85,6 +88,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 @register(
     {
         "name": "list_dir",
+        "describe": lambda args: f"ls {args.get('path', '.')}",
         "description": "列出目录内容",
         "parameters": {
             "type": "object",

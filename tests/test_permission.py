@@ -1,10 +1,25 @@
 """权限系统测试：三级动作、通配符匹配、最后匹配优先、模式级记忆、配置加载。"""
 import json
+import sys
 
 import pytest
 
 from codeagent import config
-from codeagent.permission import DEFAULT_RULES, Permission, evaluate, infer_trust_root
+from codeagent.permission import (
+    ALLOW,
+    ASK,
+    DEFAULT_RULES,
+    DENY,
+    Permission,
+    evaluate,
+    infer_trust_root,
+)
+
+
+@pytest.fixture(autouse=True)
+def enable_prompting(monkeypatch):
+    """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
+    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: True)
 
 
 def refuse_input(monkeypatch):
@@ -51,6 +66,24 @@ def test_default_rules_actions():
     assert evaluate("list_dir", ".", DEFAULT_RULES)[2] == "allow"
     assert evaluate("write_file", "a.txt", DEFAULT_RULES)[2] == "ask"
     assert evaluate("run_command", "ls", DEFAULT_RULES)[2] == "ask"
+
+
+def test_default_protected_paths():
+    """保护路径：.git 只读（禁止写入/编辑），读取放行；.gitignore 不受影响。"""
+    assert evaluate("read_file", ".git/config", DEFAULT_RULES)[2] == "allow"
+    assert evaluate("write_file", ".git/config", DEFAULT_RULES)[2] == "deny"
+    assert evaluate("write_file", "src/.git/hooks/x.py", DEFAULT_RULES)[2] == "deny"
+    assert evaluate("edit_file", ".git/index", DEFAULT_RULES)[2] == "deny"
+    assert evaluate("write_file", ".gitignore", DEFAULT_RULES)[2] == "ask"
+
+
+def test_windows_case_insensitive_matching():
+    """Windows 下规则匹配大小写不敏感（对齐 opencode v2），其他平台保持大小写敏感。"""
+    result = evaluate("read_file", "SRC/A.PY", [("read_file", "src/*.py", ALLOW)])[2]
+    if sys.platform == "win32":
+        assert result == ALLOW
+    else:
+        assert result == ASK
 
 
 # ---------- check：基础动作 ----------
@@ -277,3 +310,88 @@ def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
     answers = iter(["糊了", "n"])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
     assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+
+
+# ---------- 非交互 fail-closed ----------
+
+def test_non_interactive_ask_denied(make_perm, monkeypatch):
+    """非交互 stdin 下 ask 操作直接拒绝，不调用 input、不因 EOFError 崩溃。"""
+    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    refuse_input(monkeypatch)
+    perm = make_perm()
+
+    assert perm.check("write_file", {"path": "a.txt"}) is False
+
+
+def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
+    """非交互 stdin 下越界访问直接拒绝，不尝试询问。"""
+    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-out")
+    outside.mkdir()
+    perm = Permission()
+
+    assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+
+
+def test_approved_all_auto_approves_outside_access(tmp_path, monkeypatch):
+    """/-y（approved_all）覆盖越界访问确认：静默放行本次访问，不弹确认、不留会话级信任。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-out")
+    outside.mkdir()
+    perm = Permission()
+    perm.approved_all = True
+
+    action, root = perm.ask_outside_access("x.py", outside / "x.py")
+    assert (action, root) == ("once", outside)
+    assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义，不写入会话级信任
+
+
+# ---------- family 机制与多资源聚合 ----------
+
+def test_evaluate_multi_key_family():
+    """evaluate 的 permission 参数支持 (工具名, family) 元组，任一 key 命中即匹配。"""
+    rules = [("edit_file", "*", ASK)]
+    assert evaluate(("apply_patch", "edit_file"), "src/a.py", rules)[2] == ASK
+    assert evaluate(("apply_patch", "edit_file"), "x", [])[0] == "apply_patch"  # 无匹配默认用工具名
+
+
+def test_apply_patch_inherits_edit_protected_paths():
+    """apply_patch（family=edit_file）自动继承 edit_file 的 .git 保护规则。"""
+    keys = ("apply_patch", "edit_file")
+    assert evaluate(keys, ".git/config", DEFAULT_RULES)[2] == "deny"
+    assert evaluate(keys, "src/.git/hooks/x.py", DEFAULT_RULES)[2] == "deny"
+    assert evaluate(keys, "src/main.py", DEFAULT_RULES)[2] == "ask"
+
+
+def test_specific_rule_overrides_family_rule():
+    """工具名精确规则排在 family 规则之后时覆盖 family（last match wins）。"""
+    rules = [("edit_file", "*", ASK), ("apply_patch", "*", DENY)]
+    assert evaluate(("apply_patch", "edit_file"), "a.py", rules)[2] == "deny"
+    assert evaluate(("edit_file",), "a.py", rules)[2] == "ask"
+
+
+def test_check_paths_any_deny_rejects(make_perm, monkeypatch):
+    """聚合检查：任一路径命中 deny（.git 保护路径）即整体拒绝，不询问。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    assert perm.check_paths("apply_patch", ["src/a.py", ".git/config"]) is False
+    assert perm.check_paths("apply_patch", ["src/a.py", "x/.git/hooks/y.py"]) is False
+
+
+def test_check_paths_any_ask_prompts(make_perm, monkeypatch):
+    """聚合检查：任一 ask 弹一次交互确认（而非每路径各问一次）。"""
+    perm = make_perm()
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
+
+
+def test_check_paths_approved_all_skips_ask(make_perm, monkeypatch):
+    """-y（approved_all）跳过聚合检查中的 ask，但 deny 依然生效。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    perm.approved_all = True
+    assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
+    assert perm.check_paths("apply_patch", ["a.py", ".git/config"]) is False

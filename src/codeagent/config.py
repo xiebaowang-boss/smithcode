@@ -67,21 +67,24 @@ def widen_roots(roots):
         del _WIDENED_ROOTS[-len(added):]
 
 
+def _read_workspace_config(path=None) -> dict:
+    """读取工作区 codeagent.json；文件缺失返回 {}，损坏时打印警告并降级为 {}。"""
+    path = Path(path) if path else Path(WORKSPACE_ROOT) / "codeagent.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[警告] 无法读取 {path}，已忽略该文件中的自定义配置: {e}")
+        return {}
+
+
 def load_permissions(path=None):
     """读取工作区 codeagent.json 的 permissions 字段，返回 [(工具, 模式, 动作)]。
 
     支持两种写法：字符串简写对该工具全部模式生效；对象写法按模式细分。
-    文件缺失返回空列表；解析失败打印警告并降级，不中断程序。
     """
-    path = Path(path) if path else Path(WORKSPACE_ROOT) / "codeagent.json"
-    if not path.is_file():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        permissions = data.get("permissions") or {}
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"[警告] 无法读取 {path}，已忽略自定义权限规则: {e}")
-        return []
+    permissions = _read_workspace_config(path).get("permissions") or {}
 
     rules = []
     for tool, value in permissions.items():
@@ -93,3 +96,25 @@ def load_permissions(path=None):
         else:
             print(f"[警告] permissions.{tool} 的值类型无效，已忽略")
     return rules
+
+
+# 工具调用的终端展示粒度：summary 只打印一行短摘要，detail 追加结果内容
+TOOL_DISPLAYS = ("summary", "detail")
+DEFAULT_TOOL_DISPLAY = "summary"
+
+
+def load_tool_display(path=None):
+    """读取工作区 codeagent.json 的 tool_display 字段，决定工具调用的展示粒度。
+
+    缺失用 summary；非法值打印警告并降级，不中断程序。
+    """
+    value = _read_workspace_config(path).get("tool_display")
+    if value is None:
+        return DEFAULT_TOOL_DISPLAY
+    if value in TOOL_DISPLAYS:
+        return value
+    print(
+        f"[警告] tool_display 的值 {value!r} 无效"
+        f"（可选 {' / '.join(TOOL_DISPLAYS)}），已用默认值 {DEFAULT_TOOL_DISPLAY}"
+    )
+    return DEFAULT_TOOL_DISPLAY

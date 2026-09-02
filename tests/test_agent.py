@@ -2,10 +2,18 @@
 
 import json
 
+import pytest
+
 from codeagent import config
 from codeagent.agent import Agent, truncate_output
 from codeagent.session import Session
 from codeagent.tools import FUNCTIONS
+
+
+@pytest.fixture(autouse=True)
+def enable_prompting(monkeypatch):
+    """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
+    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: True)
 
 
 def _fake_tool_call(name="list_dir", args="{}"):
@@ -237,3 +245,59 @@ def test_execute_outside_path_always_approval(monkeypatch, tmp_path):
     assert config.SESSION_EXTRA_ROOTS == [str(outside)]
 
     assert agent._execute(call) == "s"
+
+
+def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
+    """-y（approved_all）覆盖越界访问：静默放行本次调用，不弹确认、不留会话级信任。"""
+    _outside, arg = _outside_file(tmp_path)
+    agent = _outside_agent(monkeypatch, tmp_path)
+    agent.permission.approved_all = True
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("不应弹出交互确认"))
+
+    call = _fake_tool_call("read_file", json.dumps({"path": arg}))
+    assert agent._execute(call) == "s"
+    assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义
+
+
+def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
+    """非交互 stdin 下越界访问直接拒绝，不调用 input、不因 EOFError 崩溃。"""
+    _outside, arg = _outside_file(tmp_path)
+    agent = _outside_agent(monkeypatch, tmp_path)
+    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("非交互不应调用 input"))
+
+    call = _fake_tool_call("read_file", json.dumps({"path": arg}))
+    assert agent._execute(call) == "用户拒绝了此操作"
+
+
+# ---------- apply_patch：多路径工具流程 ----------
+
+def _patch_agent(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr("codeagent.agent.LLMClient", FakeLLM)
+    return Agent(session=Session())
+
+
+def test_execute_apply_patch_creates_file(monkeypatch, tmp_path):
+    """apply_patch 走多路径流程：聚合权限（edit_file 族 ask）确认后执行并落盘。"""
+    agent = _patch_agent(monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+
+    call = _fake_tool_call("apply_patch", json.dumps({"patch": "*** Add File: hi.txt\n+hi\n"}))
+    result = agent._execute(call)
+    assert "已应用" in result
+    assert (tmp_path / "hi.txt").read_text(encoding="utf-8") == "hi"
+
+
+def test_execute_apply_patch_denied_for_git(monkeypatch, tmp_path):
+    """apply_patch 触及 .git（继承 edit_file 的 deny 保护）直接拒绝，不弹确认、不落盘。"""
+    agent = _patch_agent(monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("deny 不应弹交互确认"))
+
+    call = _fake_tool_call(
+        "apply_patch",
+        json.dumps({"patch": "*** Add File: .git/hooks/pre-commit\n+echo x\n"}),
+    )
+    assert agent._execute(call) == "用户拒绝了此操作"
+    assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()

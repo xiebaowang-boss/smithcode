@@ -2,6 +2,7 @@
 import io
 import os
 import sys
+import time
 
 
 def setup_console_encoding():
@@ -58,3 +59,31 @@ def flush_pending_input():
             msvcrt.getwch()
     except Exception:  # noqa: BLE001
         return
+
+
+def confirmations_available() -> bool:
+    """交互确认是否可用：标准输入被重定向（管道/CI/脚本）时无法询问用户，一律 fail-closed 拒绝。"""
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError):
+        return False
+
+
+def read_user_input(prompt: str = "\n你> ") -> str:
+    """读一条用户输入（可指定提示符）；粘贴的后续行会合并进同一条消息。
+
+    input() 是按行读的，多行粘贴会被逐行消费成多条独立消息（还会在工具
+    确认时被误当成回答）。交互模式下首次回车后，只要控制台缓冲区仍有
+    排队内容就继续读取，直到出现短暂静默——手动输入的下一句话必然晚于
+    该静默窗口，不会被误并进来。非交互 stdin（管道）不做合并，行为不变。
+    """
+    first = input(prompt)
+    if not sys.stdin.isatty():
+        return first
+    lines = [first]
+    while True:
+        if not stdin_has_pending():
+            time.sleep(0.05)
+            if not stdin_has_pending():
+                return "\n".join(lines)
+        lines.append(input())
