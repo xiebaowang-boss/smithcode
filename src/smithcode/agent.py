@@ -18,7 +18,6 @@ from .llm import LLMClient
 from .permission import Permission
 from .session import Session
 from .tools import DESCRIBERS, FUNCTIONS, PATHS_EXTRACTORS, SCHEMAS
-from .usage import format_call
 
 # ANSI 转义：思考内容以灰色展示（90m 比 dim/2m 在 Windows 终端上兼容性好得多）
 DIM, RESET = "\033[90m", "\033[0m"
@@ -44,9 +43,6 @@ class Agent:
             msg, usage = self._chat_with_recovery()
             self.session.usage.add(usage)
             self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
-            if isinstance(usage, dict):
-                # 每次交互一行：输入即该次请求的上下文，随任务增长可见轨迹
-                print(f"  [tokens] {format_call(usage)}")
             self.session.messages.append(msg)
 
             if not msg.get("tool_calls"):

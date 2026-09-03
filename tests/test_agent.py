@@ -189,36 +189,6 @@ def test_run_without_usage_keeps_counters_clean(monkeypatch):
     assert agent.session.usage.since_start.calls == 0
 
 
-def test_run_prints_per_call_usage(monkeypatch, capsys):
-    """每次 LLM 调用结束后打印一行单次用量（不聚合本轮），usage 缺失时不打印。"""
-
-    class UsageLLM(FakeLLM):
-        def chat_stream(self, messages, tools=None):
-            self.calls += 1
-            yield (
-                "usage",
-                {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-            )
-            yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
-
-    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
-    agent = Agent(session=Session())
-
-    agent.run("第一次")
-    agent.run("第二次")
-
-    out = capsys.readouterr().out
-    assert out.count("[tokens]") == 2  # 每次调用各一行
-    assert "输入 10 / 输出 5 / 合计 15" in out
-
-
-def test_run_prints_no_token_line_without_usage(monkeypatch, capsys):
-    """usage 事件缺失时不打印 [tokens] 行。"""
-    agent = _make_agent(monkeypatch)
-    agent.run("打个招呼")
-    assert "[tokens]" not in capsys.readouterr().out
-
-
 # ---------- 路径预检：授权目录之外的访问确认 ----------
 
 def _outside_file(tmp_path):
