@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from . import __version__, config
+from . import __version__, config, context
 from .agent import Agent
 from .session import Session
 from .utils.terminal import read_user_input, setup_console_encoding
@@ -11,6 +11,7 @@ HELP = """命令:
   /new    开启新会话
   /save   保存会话记录
   /usage  显示 token 用量统计
+  /context 显示上下文占用分布
   /exit   退出"""
 
 
@@ -87,6 +88,16 @@ def repl(agent: Agent):
             continue
         if user_input == "/usage":
             print(agent.session.usage.summary())
+            continue
+        if user_input == "/context":
+            print(
+                context.report(
+                    agent.session.messages,
+                    config.CONTEXT_TOKEN_BUDGET,
+                    config.COMPACT_TRIGGER,
+                    agent.context.last_actual,
+                )
+            )
             continue
         if user_input == "/help":
             print(HELP)

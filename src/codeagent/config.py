@@ -16,6 +16,10 @@ WORKSPACE_ROOT = os.getenv("CODEAGENT_ROOT", os.getcwd())
 MAX_ITERATIONS = 30
 COMMAND_TIMEOUT = 60
 MAX_TOOL_OUTPUT = 20_000  # 单次工具输出进入上下文的最大字符数，超出则头尾截断
+CONTEXT_TOKEN_BUDGET = int(
+    os.getenv("CODEAGENT_CONTEXT_BUDGET", "65536")
+)  # 上下文窗口预算（token 估算基准），/context 展示与压缩阈值的依据
+COMPACT_TRIGGER = 0.8  # 占预算的比例；越过即临近压缩（当前仅用于展示与提醒）
 MAX_RETRIES = 3  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
 LLM_TIMEOUT = 120  # 单次 LLM 请求超时（秒）
 

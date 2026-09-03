@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from . import config
+from .context import ContextMeter
 from .llm import LLMClient
 from .permission import Permission
 from .session import Session
@@ -38,18 +39,26 @@ class Agent:
         self.llm = LLMClient()
         self.session = session or Session()
         self.permission = Permission()
+        self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
         self.display_mode = config.load_tool_display()  # 工具调用展示粒度：summary / detail
         self.last_usage = UsageAccumulator()  # 最近一次 run 的用量合计，供 CLI 展示
 
     def run(self, user_input: str) -> str:
         self.session.add("user", user_input)
+        self.context.new_run()  # 临近压缩阈值的提醒每次任务最多一次
         run_usage = UsageAccumulator()  # 本次任务所有 LLM 调用的用量
 
         for _ in range(self.max_iterations):
+            self.context.warn_once(
+                self.session.messages,
+                config.CONTEXT_TOKEN_BUDGET,
+                config.COMPACT_TRIGGER,
+            )
             msg, usage = self._chat()
             run_usage.add(usage)
             self.session.usage.add(usage)
+            self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
             self.session.messages.append(msg)
 
             if not msg.get("tool_calls"):
