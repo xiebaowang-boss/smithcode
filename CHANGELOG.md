@@ -7,8 +7,8 @@
 ### 新增
 
 - 运行时上下文压缩（opencode 式 checkpoint）：估算越过阈值（预算 × `COMPACT_TRIGGER`）自动把中段历史替换为结构化摘要（目标/关键决策/已完成/阻碍/下一步/相关文件，缺必需标题自动重试一次，仍失败则放弃压缩原样继续），保留系统提示词与近期尾部（`COMPACT_KEEP_TOKENS` 默认 15000，尾部超长工具结果截断到 2000 字符）；摘要以 `<context-summary>` 标记注入。provider 返回上下文溢出错误时压缩后重试一次（每步至多一次）。新增 `/compact` 手动压缩命令、`/context` 显示压缩次数；压缩只改运行时上下文，`/save` 行为不变
-- 上下文计量：新增 context 模块与 `/context` 命令，按角色分桶（系统提示词 / 用户 / 助手 / 工具结果）展示当前上下文的 token 占用；估算以字符构成启发式计算，并用上次请求的真实 `prompt_tokens` 锚点校准偏差。任务中估算越过压缩阈值 90% 时提醒一次。新增配置 `CONTEXT_TOKEN_BUDGET` 与 `COMPACT_TRIGGER`，均可用环境变量 `CODEAGENT_CONTEXT_BUDGET` / `CODEAGENT_COMPACT_TRIGGER` 覆盖（无效值打印警告并降级默认），为后续压缩功能预留
-- 工具调用展示粒度可配置：`codeagent.json` 新增 `tool_display` 字段（`summary` / `detail`，默认 `summary`）。`summary` 模式下每个工具调用只打印一行「短名 + 目标」摘要（`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`），不再展示结果内容；`detail` 模式保留原有 `[Result]` 内容展示。失败信息（`错误: ...`、用户拒绝）无论何种粒度始终原样展示
+- 上下文计量：新增 context 模块与 `/context` 命令，按角色分桶（系统提示词 / 用户 / 助手 / 工具结果）展示当前上下文的 token 占用；估算以字符构成启发式计算，并用上次请求的真实 `prompt_tokens` 锚点校准偏差。任务中估算越过压缩阈值 90% 时提醒一次。新增配置 `CONTEXT_TOKEN_BUDGET` 与 `COMPACT_TRIGGER`，均可用环境变量 `CONTEXT_BUDGET` / `COMPACT_TRIGGER` 覆盖（无效值打印警告并降级默认），为后续压缩功能预留
+- 工具调用展示粒度可配置：`smithcode.json` 新增 `tool_display` 字段（`summary` / `detail`，默认 `summary`）。`summary` 模式下每个工具调用只打印一行「短名 + 目标」摘要（`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`），不再展示结果内容；`detail` 模式保留原有 `[Result]` 内容展示。失败信息（`错误: ...`、用户拒绝）无论何种粒度始终原样展示
 - 工具注册表支持 `describe` 钩子：`(args) -> str` 生成终端短摘要，与 `pattern_arg` / `family` / `paths_from` 同为注册时可声明的可选扩展点，不会发送给 LLM；未声明的工具回退为原 `[Tool] 名字(参数)` 格式
 - 新工具 `apply_patch`：opencode 信封格式的批量多文件修改（Add / Update / Delete），逐文件解析后**原子落盘**（任一文件失败整体不生效）；声明 `family="edit_file"` 自动继承其权限规则与 `.git` 保护路径
 - 新工具 `ask_user`：Agent 任务中途向用户提问，回答作为工具结果回传；与 REPL 共用 `read_user_input`（多行粘贴合并），非交互 stdin 下 fail-closed 返回"已取消"
@@ -17,6 +17,8 @@
 
 ### 变更
 
+- 项目更名为 **SmithCode**：Python 包 `codeagent` → `smithcode`，CLI 命令、项目配置文件（`codeagent.json` → `smithcode.json`）同步更名
+- 环境变量去掉项目名前缀：`CODEAGENT_ROOT` / `CODEAGENT_CONTEXT_BUDGET` / `CODEAGENT_COMPACT_TRIGGER` / `CODEAGENT_COMPACT_KEEP_TOKENS` → `ROOT` / `CONTEXT_BUDGET` / `COMPACT_TRIGGER` / `COMPACT_KEEP_TOKENS`
 - 工具调用展示由 `[Tool] 名字(原始 JSON 参数)` 改为一行短摘要（超长截断到 80 字符显示）；回传给模型的结果（含 2 万字符截断）完全不变
 - `-y`（approved_all）覆盖工作区外路径访问确认（按"仅本次"静默放行），显式 `deny` 依然生效
 - 权限匹配大小写行为对齐 opencode v2：Windows 下大小写不敏感
@@ -40,7 +42,7 @@
 
 ### 新增
 
-- 多根授权：`--add DIR` 可重复传入，把其他项目加入授权目录列表，一个会话内跨项目读写与检索；`codeagent.json` 权限模式对附加授权根同样生效
+- 多根授权：`--add DIR` 可重复传入，把其他项目加入授权目录列表，一个会话内跨项目读写与检索；`smithcode.json` 权限模式对附加授权根同样生效
 - 越界访问确认：工具路径落在授权目录之外时先交互确认——`[y]` 仅本次 / `[a]` 本会话总是（按 `.git` 向上识别项目根作为信任范围）/ `[n]` 拒绝；`/new` 时清空会话级信任
 - 系统提示词 V2：按节组织（工作方式 / 工具细节 / 错误处理 / 安全边界 / 沟通），运行时注入主工作区与全部授权目录，新增 glob/grep 定位路由、edit_file 精确匹配规范、截断输出应对、"拒绝后不得绕道 shell" 等规则
 
@@ -69,7 +71,7 @@
 
 ### 修复
 
-- 路径沙箱逃逸：原 `startswith` 前缀匹配可被共享前缀的兄弟目录绕过（如 `../codeagent-evil/x` 会被误判为工作区内），改用 `Path.is_relative_to` 精确判断
+- 路径沙箱逃逸：原 `startswith` 前缀匹配可被共享前缀的兄弟目录绕过（如 `../smithcode-evil/x` 会被误判为工作区内），改用 `Path.is_relative_to` 精确判断
 - Python 3.9 兼容：`permission.py` / `agent.py` 的 `X | Y` 类型注解要求 3.10+，补充 `from __future__ import annotations`
 
 ### 新增
@@ -86,7 +88,7 @@
 ### 新增
 
 - 权限规则引擎（参考 opencode 模型）：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效
-- `codeagent.json` 配置文件：用户可自定义权限规则，支持字符串简写与按模式细分两种写法
+- `smithcode.json` 配置文件：用户可自定义权限规则，支持字符串简写与按模式细分两种写法
 - 交互确认升级为 `[y]本次 / [n]拒绝 / [a]总是允许该模式`，"总是允许"按参数模式记忆（仅当前会话）
 - 工具注册支持 `pattern_arg` 声明权限模式来源（该字段不会发送给 LLM）
 - `-y` 参数语义收紧：跳过所有 `ask`，但显式 `deny` 规则依然生效

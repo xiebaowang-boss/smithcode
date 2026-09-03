@@ -2,10 +2,10 @@
 
 import sys
 
-from codeagent.agent import Agent
-from codeagent.cli import _print_usage_hint
-from codeagent.session import Session
-from codeagent.utils.terminal import read_user_input
+from smithcode.agent import Agent
+from smithcode.cli import _print_usage_hint
+from smithcode.session import Session
+from smithcode.utils.terminal import read_user_input
 
 
 def _agent_with_usage(monkeypatch, usage):
@@ -14,7 +14,7 @@ def _agent_with_usage(monkeypatch, usage):
             yield ("usage", usage)
             yield ("message", {"role": "assistant", "content": "ok"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
     agent.run("hi")
     return agent
@@ -78,7 +78,7 @@ def test_read_user_input_merges_pasted_lines(monkeypatch):
     monkeypatch.setattr("builtins.input", _fake_input(replies, calls))
     # 首行后两次检测到排队内容，随后缓冲区静默
     pending = iter([True, True, False, False])
-    monkeypatch.setattr("codeagent.utils.terminal.stdin_has_pending", lambda: next(pending))
+    monkeypatch.setattr("smithcode.utils.terminal.stdin_has_pending", lambda: next(pending))
 
     assert read_user_input() == "第一行\n第二行\n第三行"
     assert len(calls) == 3
@@ -90,7 +90,7 @@ def test_read_user_input_single_line_when_buffer_silent(monkeypatch):
     replies = ["就这一句"]
     calls = []
     monkeypatch.setattr("builtins.input", _fake_input(replies, calls))
-    monkeypatch.setattr("codeagent.utils.terminal.stdin_has_pending", lambda: False)
+    monkeypatch.setattr("smithcode.utils.terminal.stdin_has_pending", lambda: False)
 
     assert read_user_input() == "就这一句"
     assert len(calls) == 1

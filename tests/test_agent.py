@@ -4,16 +4,16 @@ import json
 
 import pytest
 
-from codeagent import config
-from codeagent.agent import Agent, truncate_output
-from codeagent.session import Session
-from codeagent.tools import FUNCTIONS
+from smithcode import config
+from smithcode.agent import Agent, truncate_output
+from smithcode.session import Session
+from smithcode.tools import FUNCTIONS
 
 
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
 
 
 def _fake_tool_call(name="list_dir", args="{}"):
@@ -37,7 +37,7 @@ class FakeLLM:
 
 
 def _make_agent(monkeypatch) -> Agent:
-    monkeypatch.setattr("codeagent.agent.LLMClient", FakeLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     return Agent(session=Session())
 
 
@@ -63,7 +63,7 @@ def test_agent_loop_stops_at_max_iterations(monkeypatch):
                 {"role": "assistant", "content": "", "tool_calls": [_fake_tool_call()]},
             )
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", ToolCallLoopLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", ToolCallLoopLLM)
     agent = Agent(session=Session(), max_iterations=2)
     assert agent.run("死循环") == "达到最大迭代次数，任务中止。"
 
@@ -99,10 +99,10 @@ def test_run_truncates_oversized_tool_result(monkeypatch):
             else:
                 yield ("message", {"role": "assistant", "content": "完成"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", OneToolThenDoneLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", OneToolThenDoneLLM)
     monkeypatch.setitem(FUNCTIONS, "big_tool", lambda: "x" * 5000)
     # 把上限调小，避免测试里塞几万字符
-    monkeypatch.setattr("codeagent.config.MAX_TOOL_OUTPUT", 1000)
+    monkeypatch.setattr("smithcode.config.MAX_TOOL_OUTPUT", 1000)
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
 
@@ -123,7 +123,7 @@ def test_reasoning_shown_but_not_persisted(monkeypatch, capsys):
             yield ("content", "你好")
             yield ("message", {"role": "assistant", "content": "你好"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", ReasoningLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", ReasoningLLM)
     agent = Agent(session=Session())
 
     assert agent.run("打个招呼") == "你好"
@@ -143,7 +143,7 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
             yield ("content", "答案")
             yield ("message", {"role": "assistant", "content": "答案"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", ThinkThenAnswerLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", ThinkThenAnswerLLM)
     agent = Agent(session=Session())
 
     msg, usage = agent._chat()
@@ -168,7 +168,7 @@ def test_run_accumulates_usage(monkeypatch):
             )
             yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
 
     agent.run("第一条")
@@ -201,7 +201,7 @@ def test_run_prints_per_call_usage(monkeypatch, capsys):
             )
             yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
 
     agent.run("第一次")
@@ -232,7 +232,7 @@ def _outside_file(tmp_path):
 def _outside_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
-    monkeypatch.setattr("codeagent.agent.LLMClient", FakeLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     return Agent(session=Session())
 
 
@@ -291,7 +291,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
     """非交互 stdin 下越界访问直接拒绝，不调用 input、不因 EOFError 崩溃。"""
     _outside, arg = _outside_file(tmp_path)
     agent = _outside_agent(monkeypatch, tmp_path)
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("非交互不应调用 input"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
@@ -303,7 +303,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
 def _patch_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
-    monkeypatch.setattr("codeagent.agent.LLMClient", FakeLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     return Agent(session=Session())
 
 

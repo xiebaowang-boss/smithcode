@@ -1,57 +1,38 @@
-# CodeAgent
+# SmithCode
 
-终端 AI 编程助手：一个 mini coding agent。让大模型通过调用工具，帮你读写文件、执行命令、完成编程任务。
+终端 AI 编程助手：让大模型调用工具，帮你读写文件、执行命令、完成编程任务。
 
-CodeAgent 采用 **Agent 循环（Agentic Loop）** 架构：模型收到任务后自主决定调用哪些工具，工具的执行结果会回传给模型继续推理，如此往复直到任务完成。
+你用自然语言描述任务，SmithCode 自主规划步骤、调用工具、根据结果继续推理，直到任务完成——全程流式输出，敏感操作逐个向你确认。
 
 ## 功能特性
 
-- **Agent 循环**：模型自主规划并多次调用工具，直到完成任务，支持配置最大迭代轮数，回复流式输出
-- **工具调用**：内置 9 个工具——读文件、写文件、精确编辑文件、apply_patch 批量改文件、列目录、glob 文件名搜索、grep 内容搜索、执行 shell 命令、向用户提问（ask_user）；新增工具只需一个 `@register` 装饰器
-- **工具调用展示**：每个工具调用打印一行短摘要（`read src/a.py`、`command git push`），可在 `codeagent.json` 中切换 detail 模式追加查看结果内容
-- **LLM 健壮性**：限流 / 断网自动指数退避重试，请求超时保护
-- **权限控制**：读文件 / 列目录自动放行；写文件、执行命令等敏感操作需逐个确认，或选择"本次会话总是允许"
-- **沙箱约束**：所有文件操作限制在工作区内，路径越界直接拒绝；shell 命令带超时保护，超长工具输出自动截断
-- **会话管理**：多轮对话上下文，支持开启新会话、保存会话记录为 JSON
-- **跨平台**：Windows / Linux / macOS 均可运行，自动适配系统编码与 shell 命令风格
+### 智能体
 
-## 代码结构
+- **9 个内置工具**：读 / 写 / 精确编辑文件、apply_patch 批量原子改文件、列目录、glob 文件名搜索、grep 内容搜索、执行 shell 命令（60 秒超时）、任务中途向用户提问（ask_user）
+- **自主多步执行**：模型自主决定调用哪些工具、调用几次，直到完成任务；可配置单次任务最大迭代轮数
+- **流式输出**：回复与思考内容实时逐字显示，工具调用打印一行短摘要（如 `read src/agent.py`）
 
-采用 src 布局：`src/` 是源码，根目录是项目配置，测试与文档独立成目录。
+### 上下文管理
 
-```
-code_agent/                        # 仓库根目录
-├── src/
-│   └── codeagent/                 # Python 主包（pip 安装的就是它）
-│       ├── __init__.py            # 版本号
-│       ├── __main__.py            # python -m codeagent 方式启动
-│       ├── cli.py                 # 命令行解析、交互式 REPL、单次任务模式
-│       ├── agent.py               # Agent 循环：调模型 → 执行工具 → 回传结果
-│       ├── llm.py                 # LLM 客户端封装（OpenAI 兼容接口，流式 + 自动重试）
-│       ├── config.py              # 配置加载：从 .env 读取密钥、模型名、工作区
-│       ├── permission.py          # 权限控制：敏感工具调用前询问用户批准
-│       ├── prompts.py             # 系统提示词（人设与行为规则）
-│       ├── session.py             # 会话管理：消息历史、保存与重置
-│       ├── tools/                 # 工具子系统
-│       │   ├── base.py            # 工具注册表（@register 装饰器，支持 family / 路径提取）
-│       │   ├── files.py           # read_file / write_file / edit_file / list_dir
-│       │   ├── search.py          # glob 文件名搜索 / grep 内容搜索
-│       │   ├── shell.py           # run_command（带超时保护）
-│       │   ├── patch.py           # apply_patch（批量原子改文件）
-│       │   └── ask.py             # ask_user（任务中途向用户提问）
-│       └── utils/
-│           └── terminal.py        # 终端 UTF-8 编码处理
-├── tests/                         # pytest 测试，与源码模块一一对应
-├── docs/
-│   └── architecture.md            # 架构说明与"如何新增工具"指南
-├── examples/                      # 示例任务
-├── pyproject.toml                 # 项目元信息、依赖、构建配置
-├── .env.example                   # 环境变量模板（复制为 .env 使用）
-├── CHANGELOG.md                   # 版本变更记录
-└── LICENSE                        # MIT
-```
+- **占用可视化**：`/context` 按角色分桶查看当前上下文的 token 占用与压缩阈值距离
+- **自动摘要压缩**：上下文越过阈值时自动把早期历史压缩为结构化摘要（任务目标、关键决策、已完成、下一步），保留近期对话，任务不中断
+- **手动压缩**：`/compact` 随时主动释放上下文空间
+- **溢出自愈**：服务商返回上下文超限错误时，自动压缩后重试，无需人工干预
+- **用量统计**：`/usage` 查看 token 消耗（按"应用启动以来 / 当前会话"两个口径），每轮任务结束显示本轮用量速览
 
-核心流程：`cli.py` 接收用户输入 → `agent.py` 把消息交给 `llm.py` 调用模型 → 模型返回工具调用 → 经 `permission.py` 确认后由 `tools/` 执行 → 结果回传模型循环推理 → 最终回复打印给用户。详见 [docs/architecture.md](docs/architecture.md)。
+### 权限与安全
+
+- **三级权限规则**：`allow` / `ask` / `deny`，按工具与参数通配符匹配，通过工作区 `smithcode.json` 自定义
+- **保护路径**：`.env` 禁止读写、`.git` 目录只读，防止密钥泄露与仓库破坏
+- **工作区沙箱**：文件操作默认限制在工作区内，越界访问需逐次确认
+- **非交互安全**：管道 / CI 环境下无法弹确认时，所有需确认的操作一律拒绝（fail-closed），不会崩溃
+
+### 使用体验
+
+- **会话管理**：多轮对话、`/new` 开新会话、`/save` 保存会话记录
+- **多行输入**：粘贴多行文本自动合并为一条消息
+- **跨平台**：Windows / Linux / macOS，自动适配系统编码与 shell 风格（Windows 下提醒模型用 cmd 语法）
+- **模型无关**：任何 OpenAI 兼容接口均可接入（DeepSeek、通义、Kimi 等）
 
 ## 快速开始
 
@@ -63,61 +44,62 @@ code_agent/                        # 仓库根目录
 pip install -e .
 ```
 
-### 2. 配置环境变量
+### 2. 配置
 
-复制 `.env.example` 为 `.env`，填入你自己的配置：
-
-```bash
-cp .env.example .env
-```
+复制 `.env.example` 为 `.env`，填入密钥：
 
 ```dotenv
 OPENAI_API_KEY=你的API密钥
-OPENAI_API_BASE=https://api.example.com/v1
-OPENAI_MODEL=你的模型名
+OPENAI_API_BASE=https://api.deepseek.com/v1
+OPENAI_MODEL=deepseek-chat
 ```
 
-> CodeAgent 使用 OpenAI 兼容接口，因此任何兼容 OpenAI 协议的服务（DeepSeek、通义、Kimi 等）都可以接入，只需修改 `OPENAI_API_BASE` 和 `OPENAI_MODEL`。
+可选配置（同样写在 `.env`）：
+
+| 变量 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `ROOT` | 当前目录 | 工作区根目录 |
+| `CONTEXT_BUDGET` | 65536 | 上下文预算（token），建议设为模型窗口大小 |
+| `COMPACT_TRIGGER` | 0.8 | 占预算的比例，越过即触发自动压缩 |
+| `COMPACT_KEEP_TOKENS` | 15000 | 压缩时尾部原样保留的 token 数 |
 
 ### 3. 运行
 
 ```bash
-codeagent                     # 交互模式（REPL，多轮对话）
-python -m codeagent           # 等价的另一种启动方式
-codeagent 帮我写个斐波那契函数  # 单次任务模式，执行完自动退出
+smithcode                        # 交互模式（REPL，多轮对话）
+smithcode 帮我写个斐波那契函数    # 单次任务模式，完成即退出
+python -m smithcode              # 等价的另一种启动方式
 ```
 
 ## 使用方法
 
-### 交互模式内置命令
+### 交互模式命令
 
-| 命令   | 说明             |
-| ------ | ---------------- |
-| `/help` | 显示帮助         |
-| `/new`  | 开启新会话       |
-| `/save` | 保存会话记录到 `sessions/` 目录（JSON 格式） |
-| `/exit` | 退出程序         |
+| 命令 | 说明 |
+| ---- | ---- |
+| `/help` | 显示帮助 |
+| `/new` | 开启新会话 |
+| `/save` | 保存会话记录到 `sessions/` 目录 |
+| `/usage` | 查看 token 用量统计 |
+| `/context` | 查看上下文占用分布与压缩次数 |
+| `/compact` | 手动压缩上下文 |
+| `/exit` | 退出程序 |
 
 ### 命令行参数
 
-```
-usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [task ...]
-```
+| 参数 | 说明 |
+| ---- | ---- |
+| `task` | 一次性任务描述；留空则进入交互模式 |
+| `-w, --workspace` | 指定工作区目录（默认当前目录） |
+| `--add DIR` | 追加授权目录（可重复传入），跨项目访问用 |
+| `-m, --model` | 指定模型名（覆盖 `.env` 配置） |
+| `-y, --yes` | 自动批准所有确认（deny 规则依然生效），慎用 |
+| `--max-iterations N` | 单次任务最大迭代轮数（默认 30） |
+| `-V, --version` | 显示版本号 |
 
-| 参数                 | 说明                                           |
-| -------------------- | ---------------------------------------------- |
-| `task`               | 一次性任务描述；留空则进入交互模式             |
-| `-w, --workspace`    | 指定工作区目录（默认当前目录）                 |
-| `-m, --model`        | 指定模型名（覆盖 `.env` 中的配置）             |
-| `-y, --yes`          | 自动批准所有工具调用（含工作区外路径访问），不再逐个询问；`deny` 规则依然生效 |
-| `--max-iterations N` | 单次任务最大迭代轮数（默认 30）                |
-| `-V, --version`      | 显示版本号                                     |
+### 权限确认
 
-### 权限控制
-
-权限采用三级动作规则引擎：每条规则 = `(工具名, 参数模式, 动作)`，动作支持 `allow`（静默放行）、`ask`（交互确认）、`deny`（直接拒绝）。规则用通配符匹配参数——文件工具匹配路径、`run_command` 匹配命令串。求值时**最后一条匹配的规则生效**，无匹配默认 `ask`。
-
-默认规则：读文件 / 列目录自动放行，写文件、编辑、执行命令需要确认；`ask_user` 提问默认放行（可用 `"ask_user": "deny"` 禁用）；保护路径 `.git` 目录只读：
+默认情况下：读文件、列目录自动放行；写文件、编辑、执行命令需要你确认：
 
 ```
 ⚠️  Agent 请求执行: run_command
@@ -125,13 +107,11 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
    允许? [y]本次 / [n]拒绝 / [a]总是允许该模式:
 ```
 
-选 `a` 后该**模式**（而非整个工具）在本会话内静默放行，退出后清零；`-y` 参数可跳过所有 `ask`（含工作区外路径的访问确认），但显式声明的 `deny` 依然生效。
+选 `a` 后该模式在本会话内静默放行，`/new` 或退出后清零。
 
-**权限族（family）**：工具注册时可声明 `family` 继承其他工具的权限规则。`apply_patch` 声明 `family="edit_file"`，因此它自动受 `edit_file` 的规则约束（含 `.git` 保护路径），无需重复配置；想单独收紧可写 `"apply_patch": "deny"` 且排在 `edit_file` 规则之后（last match wins）。多路径工具（apply_patch）做**聚合检查**：任一路径 `deny` → 整体拒绝；任一 `ask` → 只询问一次；全部放行才执行。
+### 自定义权限规则（smithcode.json）
 
-### 自定义权限规则（codeagent.json）
-
-在工作区根目录创建 `codeagent.json` 可覆盖默认规则，支持字符串简写和按模式细分两种写法。**注意顺序：由于最后一条匹配的规则生效，宽泛规则要写在前、精确规则写在后**：
+在工作区根目录创建 `smithcode.json`。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：
 
 ```json
 {
@@ -143,26 +123,35 @@ usage: codeagent [-h] [-w WORKSPACE] [-m MODEL] [-y] [--max-iterations N] [-V] [
       "git *": "allow",
       "rm -rf*": "deny"
     }
-  }
-}
-```
-
-上面的例子表示：文件读取放行；写其他文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
-
-### 工具调用展示（codeagent.json）
-
-每次工具调用在终端打印一行短摘要（`describe`），格式为「短名 + 目标」：`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`。展示粒度由 `codeagent.json` 的 `tool_display` 字段控制：
-
-```json
-{
+  },
   "tool_display": "summary"
 }
 ```
 
-- `"summary"`（默认）：只显示短摘要行，结果内容仅回传给模型，不在终端展示
-- `"detail"`：短摘要行之外，再以 `[Result]` 展示结果内容（前 500 字符）
+上例含义：文件读取放行；写文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
 
-无论何种粒度，失败信息（`错误: ...`、用户拒绝）始终原样展示；摘要行超长时截断到 80 字符显示，不影响回传内容。
+`tool_display` 控制工具调用的终端展示粒度：`summary`（默认）只显示短摘要行，`detail` 追加结果内容（前 500 字符）。
+
+### 典型用法
+
+```bash
+# 修 bug：在当前项目里描述现象即可
+smithcode 运行 pytest 里有 3 个失败，帮我修掉
+
+# 跨项目操作：主工作区之外再授权一个目录
+smithcode --add ../frontend 重构前端里所有调 /api/v1 的地方，改成 /api/v2
+
+# CI / 脚本中无人值守运行（需确认的操作会被拒绝而非挂起）
+smithcode -y 跑一遍测试并总结失败原因
+```
+
+## 安全说明
+
+- API Key 仅从 `.env` 或环境变量加载，不会被提交到仓库
+- 所有需确认的操作在非交互环境（管道 / CI）下一律拒绝，不挂起、不崩溃
+- `-y` 跳过所有 `ask` 确认（含工作区外路径访问），但显式 `deny` 规则依然生效——仅在信任任务时使用
+- shell 命令 60 秒超时；LLM 请求 120 秒超时，限流 / 断网自动重试
+- 单次工具输出超长时自动头尾截断，防止撑爆上下文
 
 ## 开发
 
@@ -172,14 +161,7 @@ pytest                    # 运行测试（不依赖真实 API）
 ruff check src tests      # 代码检查
 ```
 
-## 安全说明
+## 文档
 
-- API Key 仅通过 `.env` 或环境变量加载，不会被提交到仓库
-- 所有文件操作限制在工作区内，访问工作区之外的路径会被拒绝
-- 保护路径：`.git` 目录只读，禁止写入与编辑
-- 非交互模式（管道 / CI / 脚本）：标准输入非终端时无法弹确认，所有 `ask` 一律**失败降级为拒绝**并回传模型，不会因无法询问而崩溃
-- shell 命令默认 60 秒超时（可通过 `config.py` 中的 `COMMAND_TIMEOUT` 调整）
-- LLM 请求默认 120 秒超时，瞬时错误自动重试 3 次（可通过 `config.py` 中的 `LLM_TIMEOUT`、`MAX_RETRIES` 调整）
-- 单次工具输出超过 `MAX_TOOL_OUTPUT`（默认 2 万字符，可在 `config.py` 调整）时自动截断为头尾各半，防止撑爆模型上下文
-- 权限规则三层叠加：内置默认规则 < `codeagent.json` 用户规则 < 会话内"总是允许"
-- 请谨慎使用 `-y` 参数：它跳过所有 `ask` 确认（含工作区外路径访问，按"仅本次"授权），但 `deny` 规则仍然生效
+- [架构说明](docs/architecture.md)：模块划分、安全边界设计、如何新增一个工具
+- [更新日志](CHANGELOG.md)

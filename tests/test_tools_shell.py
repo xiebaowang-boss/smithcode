@@ -1,5 +1,5 @@
 """命令执行工具测试。"""
-from codeagent.tools.shell import run_command
+from smithcode.tools.shell import run_command
 
 
 def test_run_command_captures_output():

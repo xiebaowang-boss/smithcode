@@ -1,8 +1,8 @@
 """上下文计量测试：token 估算、分桶报告与锚点/提醒逻辑，不依赖真实 API。"""
 
-from codeagent import config
-from codeagent.agent import Agent
-from codeagent.context import (
+from smithcode import config
+from smithcode.agent import Agent
+from smithcode.context import (
     ContextMeter,
     assemble,
     breakdown,
@@ -14,7 +14,7 @@ from codeagent.context import (
     report,
     validate_summary,
 )
-from codeagent.session import Session
+from smithcode.session import Session
 
 # ---------- 估算启发式 ----------
 
@@ -190,7 +190,7 @@ class CompactAwareLLM:
 def _over_threshold_agent(monkeypatch):
     monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 500)  # 阈值 400
     monkeypatch.setattr(config, "COMPACT_KEEP_TOKENS", 150)
-    monkeypatch.setattr("codeagent.agent.LLMClient", CompactAwareLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", CompactAwareLLM)
     session = Session()
     # 历史：system + 一轮千 token 的工具结果，越过阈值
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
@@ -222,7 +222,7 @@ def test_compact_aborts_when_summary_invalid_twice(monkeypatch, capsys):
 
     monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 500)
     monkeypatch.setattr(config, "COMPACT_KEEP_TOKENS", 150)
-    monkeypatch.setattr("codeagent.agent.LLMClient", BadSummaryLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", BadSummaryLLM)
     session = Session()
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
@@ -247,7 +247,7 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
 
     monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 5000)  # 不触发预检，纯溢出恢复
     monkeypatch.setattr(config, "COMPACT_KEEP_TOKENS", 150)
-    monkeypatch.setattr("codeagent.agent.LLMClient", OverflowOnceLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", OverflowOnceLLM)
     session = Session()
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
@@ -290,7 +290,7 @@ def test_agent_run_records_anchor(monkeypatch):
             )
             yield ("message", {"role": "assistant", "content": "好的"})
 
-    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
 
     agent.run("你好")

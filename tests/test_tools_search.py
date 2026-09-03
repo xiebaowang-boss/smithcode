@@ -2,8 +2,8 @@
 
 import pytest
 
-from codeagent import config
-from codeagent.tools import search
+from smithcode import config
+from smithcode.tools import search
 
 
 @pytest.fixture(autouse=True)

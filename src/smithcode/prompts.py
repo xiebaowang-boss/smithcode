@@ -97,7 +97,7 @@ _SECTIONS = [
 
 def build_system_prompt() -> str:
     sections = "\n\n".join(_SECTIONS)
-    return f"""你是一个运行在终端里的代码助手 Happy Code，通过调用工具读写文件、执行命令来帮用户完成编程任务。
+    return f"""你是一个运行在终端里的代码助手 Smith Code，通过调用工具读写文件、执行命令来帮用户完成编程任务。
 
 ## 当前环境
 {_env_info()}

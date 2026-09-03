@@ -1,8 +1,8 @@
 """文件工具测试：正常读写、精确编辑、路径越界拦截。"""
 import pytest
 
-from codeagent import config
-from codeagent.tools import files
+from smithcode import config
+from smithcode.tools import files
 
 
 @pytest.fixture(autouse=True)

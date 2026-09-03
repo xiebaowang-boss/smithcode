@@ -1,8 +1,8 @@
 """apply_patch 工具测试：解析、应用、原子性、沙箱。"""
 import pytest
 
-from codeagent import config
-from codeagent.tools.patch import apply_patch, extract_patch_paths
+from smithcode import config
+from smithcode.tools.patch import apply_patch, extract_patch_paths
 
 
 @pytest.fixture(autouse=True)

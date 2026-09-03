@@ -4,8 +4,8 @@ import sys
 
 import pytest
 
-from codeagent import config
-from codeagent.permission import (
+from smithcode import config
+from smithcode.permission import (
     ALLOW,
     ASK,
     DEFAULT_RULES,
@@ -19,7 +19,7 @@ from codeagent.permission import (
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
 
 
 def refuse_input(monkeypatch):
@@ -29,13 +29,13 @@ def refuse_input(monkeypatch):
 
 @pytest.fixture
 def make_perm(tmp_path, monkeypatch):
-    """工厂：可选地写入 codeagent.json，并把工作区指向临时目录。"""
+    """工厂：可选地写入 smithcode.json，并把工作区指向临时目录。"""
 
     def _make(permissions=None, raw=None):
         if raw is not None:
-            (tmp_path / "codeagent.json").write_text(raw, encoding="utf-8")
+            (tmp_path / "smithcode.json").write_text(raw, encoding="utf-8")
         elif permissions is not None:
-            (tmp_path / "codeagent.json").write_text(
+            (tmp_path / "smithcode.json").write_text(
                 json.dumps({"permissions": permissions}), encoding="utf-8"
             )
         monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
@@ -316,7 +316,7 @@ def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
 
 def test_non_interactive_ask_denied(make_perm, monkeypatch):
     """非交互 stdin 下 ask 操作直接拒绝，不调用 input、不因 EOFError 崩溃。"""
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
     refuse_input(monkeypatch)
     perm = make_perm()
 
@@ -325,7 +325,7 @@ def test_non_interactive_ask_denied(make_perm, monkeypatch):
 
 def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
     """非交互 stdin 下越界访问直接拒绝，不尝试询问。"""
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
     outside = tmp_path.parent / (tmp_path.name + "-out")

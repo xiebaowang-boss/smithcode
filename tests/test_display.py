@@ -4,22 +4,22 @@ import json
 
 import pytest
 
-from codeagent import config
-from codeagent.agent import MAX_SUMMARY_LEN, Agent
-from codeagent.session import Session
-from codeagent.tools import DESCRIBERS
+from smithcode import config
+from smithcode.agent import MAX_SUMMARY_LEN, Agent
+from smithcode.session import Session
+from smithcode.tools import DESCRIBERS
 
 
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("codeagent.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
 
 
 # ---------- 配置加载：tool_display 字段 ----------
 
 def _config_file(tmp_path, text) -> str:
-    path = tmp_path / "codeagent.json"
+    path = tmp_path / "smithcode.json"
     path.write_text(text, encoding="utf-8")
     return str(path)
 
@@ -97,7 +97,7 @@ def _run_tool(monkeypatch, tmp_path, name, args_dict, display=None) -> Agent:
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(args_dict)},
     }
-    monkeypatch.setattr("codeagent.agent.LLMClient", lambda: FakeLLM(tool_call))
+    monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM(tool_call))
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
     agent = Agent(session=Session())
