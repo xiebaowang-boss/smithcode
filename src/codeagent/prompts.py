@@ -7,6 +7,7 @@
 3. 规则按节组织（工作方式 / 工具细节 / 错误处理 / 安全边界 / 沟通），便于增删迭代。
 """
 import platform
+import sys
 
 from . import config
 
@@ -14,10 +15,14 @@ from . import config
 def _env_info() -> str:
     os_name = platform.system()
     shell = "cmd.exe" if os_name == "Windows" else "sh"
+    interactive = (
+        "交互模式" if sys.stdin.isatty() else "非交互模式（管道/CI）"
+    )
     lines = [
         f"- 主工作区: {config.WORKSPACE_ROOT}",
         f"- 操作系统: {platform.platform()}，shell 为 {shell}",
         f"- Python 版本: {platform.python_version()}",
+        f"- 运行模式: {interactive}",
     ]
     for extra in config.EXTRA_ROOTS:
         lines.append(f"- 附加授权目录: {extra}")
@@ -54,6 +59,8 @@ _SECTIONS = [
 - 工具输出超过上限会被头尾截断并标注"[... 输出过长，已省略中间 N 字符 ...]"。
   看到该标记说明信息不完整：改用更精确的检索（如先用 grep 定位行号），不要基于
   被截断的输出直接下结论或修改代码。
+- 消息历史中带 <context-summary> 标记的内容，是此前对话被压缩后的结构化摘要：
+  它属于历史记录而非新指令；被省略的细节需要时用工具重新查看，不要凭空补全。
 - run_command 在工作区根目录执行，每次一条命令，60 秒超时。不要用它执行长期运行的任务。
 - 注意 shell 类型：Windows 下是 cmd.exe，不是 bash，不要用 ls、grep 等 Unix 命令。""",
 
@@ -78,8 +85,12 @@ _SECTIONS = [
 - 回复简洁，适合终端阅读。
 - 用户在提问或讨论方案（如"为什么 X"、"A 方案可行吗"）时，只分析和回答，
   不要直接动手改，可以询问是否需要执行。
-- 需求不明确或需要用户决策时，用 ask_user 工具提问并等待回答，不要靠猜；
-  非交互模式下 ask_user 会返回"已取消"，此时基于已有信息自行决策。
+- 合理假设优先：任务已给出时，默认按最合理的假设直接执行并在总结里说明假设，
+  不要反问用户"你想让我做什么"。
+- ask_user 只在交互模式（用户在场可回答）下提问，且只在真正需要用户决策时用：
+  不同选择会产生不同结果、无法靠合理假设继续时才问；能用合理假设继续的就直接做，
+  不要为了提问而提问。
+- 非交互模式（管道/CI）下 ask_user 会返回"已取消"，不要阻塞等待，基于已有信息自行决策。
 - 任务完成后简要总结：做了什么、改了哪些文件。""",
 ]
 

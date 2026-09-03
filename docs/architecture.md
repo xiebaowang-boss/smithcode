@@ -51,7 +51,7 @@ CodeAgent 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 | `llm.py` | OpenAI 兼容接口封装（流式、自动重试） |
 | `prompts.py` | 系统提示词（行为规则） |
 | `session.py` | 消息历史的增删存取 |
-| `context.py` | 上下文计量：token 估算、`/context` 占用报告、压缩阈值提醒 |
+| `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission.py` | 敏感操作的用户确认 |
 | `config.py` | `.env` 与 `codeagent.json` 配置加载（权限规则、展示粒度） |
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe`） |

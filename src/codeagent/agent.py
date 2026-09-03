@@ -4,34 +4,27 @@ import json
 from pathlib import Path
 
 from . import config
-from .context import ContextMeter
+from .context import (
+    ContextMeter,
+    assemble,
+    build_summary_request,
+    is_context_overflow,
+    pick_tail,
+    total_tokens,
+    truncate_output,
+    validate_summary,
+)
 from .llm import LLMClient
 from .permission import Permission
 from .session import Session
 from .tools import DESCRIBERS, FUNCTIONS, PATHS_EXTRACTORS, SCHEMAS
-from .usage import UsageAccumulator
+from .usage import format_call
 
 # ANSI 转义：思考内容以灰色展示（90m 比 dim/2m 在 Windows 终端上兼容性好得多）
 DIM, RESET = "\033[90m", "\033[0m"
 
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
-
-
-def truncate_output(text: str, limit: int) -> str:
-    """把超长的工具输出截断为头尾各半，中间用省略标记代替。
-
-    报错信息常出现在输出末尾，保留尾部比只留头部更不容易丢关键信息。
-    """
-    if limit <= 0 or len(text) <= limit:
-        return text
-    half = limit // 2
-    omitted = len(text) - limit
-    return (
-        f"{text[:half]}\n\n"
-        f"[... 输出过长，已省略中间 {omitted} 字符 ...]\n\n"
-        f"{text[-half:]}"
-    )
 
 
 class Agent:
@@ -42,27 +35,21 @@ class Agent:
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
         self.display_mode = config.load_tool_display()  # 工具调用展示粒度：summary / detail
-        self.last_usage = UsageAccumulator()  # 最近一次 run 的用量合计，供 CLI 展示
 
     def run(self, user_input: str) -> str:
         self.session.add("user", user_input)
-        self.context.new_run()  # 临近压缩阈值的提醒每次任务最多一次
-        run_usage = UsageAccumulator()  # 本次任务所有 LLM 调用的用量
 
         for _ in range(self.max_iterations):
-            self.context.warn_once(
-                self.session.messages,
-                config.CONTEXT_TOKEN_BUDGET,
-                config.COMPACT_TRIGGER,
-            )
-            msg, usage = self._chat()
-            run_usage.add(usage)
+            self._compact_if_needed()
+            msg, usage = self._chat_with_recovery()
             self.session.usage.add(usage)
             self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
+            if isinstance(usage, dict):
+                # 每次交互一行：输入即该次请求的上下文，随任务增长可见轨迹
+                print(f"  [tokens] {format_call(usage)}")
             self.session.messages.append(msg)
 
             if not msg.get("tool_calls"):
-                self.last_usage = run_usage
                 return msg.get("content", "")
 
             for tc in msg["tool_calls"]:
@@ -71,8 +58,68 @@ class Agent:
                     {"role": "tool", "content": result, "tool_call_id": tc["id"]}
                 )
 
-        self.last_usage = run_usage
         return "达到最大迭代次数，任务中止。"
+
+    def _chat_with_recovery(self) -> tuple[dict, dict | None]:
+        """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
+
+        仅当错误文本命中溢出特征才走这条路，其他异常原样上抛。恢复后的
+        调用再溢出就直接抛给 REPL——每步只重试一次，不反复烧钱。
+        """
+        try:
+            return self._chat()
+        except Exception as e:  # noqa: BLE001
+            if not is_context_overflow(e):
+                raise
+        print("\n[context] 上下文溢出，压缩后重试…")
+        self.compact()
+        return self._chat()
+
+    def _compact_if_needed(self) -> None:
+        """每轮调用前的预检：估算越过阈值（预算 × COMPACT_TRIGGER）就先压缩。"""
+        budget = config.CONTEXT_TOKEN_BUDGET
+        if total_tokens(self.session.messages) > budget * config.COMPACT_TRIGGER:
+            self.compact()
+
+    def compact(self) -> bool:
+        """LLM 摘要压缩：中段历史换成结构化摘要，保留 system 与近期尾部。
+
+        返回是否实际压缩。失败（无中段可压、摘要两次不合格）一律保持消息
+        原样并返回 False——压缩只是手段，绝不因此中断任务。
+        """
+        messages = self.session.messages
+        tail_start = pick_tail(messages, config.COMPACT_KEEP_TOKENS)
+        old = messages[1:tail_start]
+        if not old:
+            return False
+
+        before = total_tokens(messages)
+        summary = None
+        for _ in range(2):  # 摘要缺必需标题时重试一次
+            text = self._complete(build_summary_request(old))
+            if validate_summary(text):
+                summary = text
+                break
+        if summary is None:
+            print("[context] 摘要未按模板生成，放弃本次压缩，原样继续")
+            return False
+
+        self.session.messages = assemble(
+            messages[0].get("content", ""), summary, messages[tail_start:]
+        )
+        self.context.compact_count += 1
+        print(f"\n[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens")
+        return True
+
+    def _complete(self, request: list[dict]) -> str:
+        """一次不带工具的补全，收集完整文本（摘要生成专用）。"""
+        parts = []
+        for kind, payload in self.llm.chat_stream(request, tools=None):
+            if kind == "content":
+                parts.append(payload)
+            elif kind == "message" and not parts:
+                parts.append(payload.get("content") or "")
+        return "".join(parts)
 
     def _chat(self) -> tuple[dict, dict | None]:
         """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀）。

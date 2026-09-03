@@ -157,7 +157,7 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
 # ---------- 用量统计：双口径累计与 /new 重置 ----------
 
 def test_run_accumulates_usage(monkeypatch):
-    """usage 事件应累计进会话双口径，并作为 last_usage 供 CLI 展示。"""
+    """usage 事件应累计进会话双口径；/new 只清会话口径。"""
 
     class UsageLLM(FakeLLM):
         def chat_stream(self, messages, tools=None):
@@ -174,7 +174,6 @@ def test_run_accumulates_usage(monkeypatch):
     agent.run("第一条")
     agent.run("第二条")
 
-    assert agent.last_usage.get("total_tokens") == 15  # last_usage 只含最后一轮
     assert agent.session.usage.current_session.get("total_tokens") == 30
     assert agent.session.usage.since_start.get("total_tokens") == 30
 
@@ -188,7 +187,36 @@ def test_run_without_usage_keeps_counters_clean(monkeypatch):
     agent = _make_agent(monkeypatch)
     agent.run("打个招呼")
     assert agent.session.usage.since_start.calls == 0
-    assert agent.last_usage.calls == 0
+
+
+def test_run_prints_per_call_usage(monkeypatch, capsys):
+    """每次 LLM 调用结束后打印一行单次用量（不聚合本轮），usage 缺失时不打印。"""
+
+    class UsageLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            self.calls += 1
+            yield (
+                "usage",
+                {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            )
+            yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
+
+    monkeypatch.setattr("codeagent.agent.LLMClient", UsageLLM)
+    agent = Agent(session=Session())
+
+    agent.run("第一次")
+    agent.run("第二次")
+
+    out = capsys.readouterr().out
+    assert out.count("[tokens]") == 2  # 每次调用各一行
+    assert "输入 10 / 输出 5 / 合计 15" in out
+
+
+def test_run_prints_no_token_line_without_usage(monkeypatch, capsys):
+    """usage 事件缺失时不打印 [tokens] 行。"""
+    agent = _make_agent(monkeypatch)
+    agent.run("打个招呼")
+    assert "[tokens]" not in capsys.readouterr().out
 
 
 # ---------- 路径预检：授权目录之外的访问确认 ----------

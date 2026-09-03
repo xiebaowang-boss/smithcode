@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import platform
 from contextlib import contextmanager
@@ -16,10 +17,33 @@ WORKSPACE_ROOT = os.getenv("CODEAGENT_ROOT", os.getcwd())
 MAX_ITERATIONS = 30
 COMMAND_TIMEOUT = 60
 MAX_TOOL_OUTPUT = 20_000  # 单次工具输出进入上下文的最大字符数，超出则头尾截断
-CONTEXT_TOKEN_BUDGET = int(
-    os.getenv("CODEAGENT_CONTEXT_BUDGET", "65536")
-)  # 上下文窗口预算（token 估算基准），/context 展示与压缩阈值的依据
-COMPACT_TRIGGER = 0.8  # 占预算的比例；越过即临近压缩（当前仅用于展示与提醒）
+
+
+def _env_number(name: str, default):
+    """读一个数值型环境变量；缺失用默认值，无效值打印警告并降级，不影响启动。
+
+    先按 float 统一解析（兼容 "1e5"、".85" 等写法），再转回默认值的类型——
+    配置要 int 还是 float 是配置项自己的语义，由默认值决定，与输入写法无关。
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+        if not math.isfinite(value):  # nan/inf 是合法 float 但不是合法配置
+            raise ValueError(raw)
+        return type(default)(value)
+    except ValueError:
+        print(f"[警告] 环境变量 {name}={raw!r} 不是有效数字，已用默认值 {default}")
+        return default
+
+
+# 上下文窗口预算与压缩阈值（token 估算基准），/context 展示与阈值提醒的依据
+CONTEXT_TOKEN_BUDGET = _env_number("CODEAGENT_CONTEXT_BUDGET", 65536)
+COMPACT_TRIGGER = _env_number("CODEAGENT_COMPACT_TRIGGER", 0.8)  # 占预算的比例
+COMPACT_KEEP_TOKENS = _env_number(
+    "CODEAGENT_COMPACT_KEEP_TOKENS", 15000
+)  # 压缩时尾部原样保留的 token 数
 MAX_RETRIES = 3  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
 LLM_TIMEOUT = 120  # 单次 LLM 请求超时（秒）
 
@@ -110,11 +134,9 @@ DEFAULT_TOOL_DISPLAY = "summary"
 def load_tool_display(path=None):
     """读取工作区 codeagent.json 的 tool_display 字段，决定工具调用的展示粒度。
 
-    缺失用 summary；非法值打印警告并降级，不中断程序。
+    缺失用 summary；非法值（含显式 null）打印警告并降级，不中断程序。
     """
-    value = _read_workspace_config(path).get("tool_display")
-    if value is None:
-        return DEFAULT_TOOL_DISPLAY
+    value = _read_workspace_config(path).get("tool_display", DEFAULT_TOOL_DISPLAY)
     if value in TOOL_DISPLAYS:
         return value
     print(

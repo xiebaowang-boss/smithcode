@@ -12,6 +12,7 @@ HELP = """命令:
   /save   保存会话记录
   /usage  显示 token 用量统计
   /context 显示上下文占用分布
+  /compact 手动压缩上下文
   /exit   退出"""
 
 
@@ -52,13 +53,12 @@ def build_parser():
 
 
 def _print_usage_hint(agent: Agent):
-    """每轮任务结束后的用量速览：本轮一行、会话累计一行，缓存命中内联在输入后。"""
-    run = agent.last_usage
-    if not run.calls:
-        return
+    """每轮任务结束后的用量速览：单次交互的用量已在执行中逐条打印，
+    这里只汇总"会话累计"一行（计费口径），不再聚合本轮。"""
     acc = agent.session.usage.current_session
-    print(f"\n[tokens] 本轮 {run.humanize()}")
-    print(f"         会话累计 {acc.humanize()}")
+    if not acc.calls:
+        return
+    print(f"\n[tokens] 会话累计 {acc.humanize()}")
 
 
 def repl(agent: Agent):
@@ -80,6 +80,7 @@ def repl(agent: Agent):
             agent.session.reset()
             agent.permission.session_rules.clear()
             config.SESSION_EXTRA_ROOTS.clear()
+            agent.context.compact_count = 0  # 压缩计数是会话口径，随 /new 清零
             print("已开启新会话。")
             continue
         if user_input == "/save":
@@ -96,8 +97,15 @@ def repl(agent: Agent):
                     config.CONTEXT_TOKEN_BUDGET,
                     config.COMPACT_TRIGGER,
                     agent.context.last_actual,
+                    agent.context.compact_count,
                 )
             )
+            continue
+        if user_input == "/compact":
+            if agent.compact():
+                print("已压缩上下文。")
+            else:
+                print("没有可压缩的上下文（历史太短或摘要未生成）。")
             continue
         if user_input == "/help":
             print(HELP)

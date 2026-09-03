@@ -57,6 +57,16 @@ def _read(usage: dict, path: tuple[str, ...]) -> int:
     return int(value)
 
 
+def format_call(usage: dict) -> str:
+    """格式化单次 LLM 调用的用量：输入(含缓存命中) / 输出 / 合计。
+
+    逐次交互展示用：输入即该次请求携带的完整上下文，观察其随任务的增长轨迹。
+    """
+    acc = UsageAccumulator()
+    acc.add(usage)
+    return acc.humanize()
+
+
 class UsageAccumulator:
     """单口径累计器：对每次调用的 usage 全量数值字段求和。"""
 

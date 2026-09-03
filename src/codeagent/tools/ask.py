@@ -17,12 +17,13 @@ _CANCELLED = "（非交互模式，无法向用户提问，已取消。请基于
 @register(
     {
         "name": "ask_user",
-        "description": "向用户提问并等待回答（需求不明确、需要用户决策时使用）。"
+        "description": "向用户提问并等待回答（最后手段：仅当已做过实际工作、"
+        "且确实需要用户决策才能继续时使用；任务刚开始还没动手时尽量先自己动手）。"
         "用户的回答会作为工具结果返回。非交互模式下无法提问，会提示已取消。",
         "parameters": {
             "type": "object",
             "properties": {
-                "question": {"type": "string", "description": "要问用户的问题，尽量具体"},
+                "question": {"type": "string", "description": "要问用户的问题，尽量具体，一句话说完"},
             },
             "required": ["question"],
         },

@@ -20,7 +20,8 @@ def _agent_with_usage(monkeypatch, usage):
     return agent
 
 
-def test_hint_shows_run_and_session_on_separate_lines(monkeypatch, capsys):
+def test_hint_shows_session_total_only(monkeypatch, capsys):
+    """速览只剩会话累计一行（计费口径）；单次交互用量已由 run 逐条打印。"""
     usage = {
         "prompt_tokens": 100,
         "completion_tokens": 10,
@@ -28,18 +29,19 @@ def test_hint_shows_run_and_session_on_separate_lines(monkeypatch, capsys):
         "prompt_tokens_details": {"cached_tokens": 80},
     }
     agent = _agent_with_usage(monkeypatch, usage)
+    capsys.readouterr()  # 丢弃 run() 里逐条打印的 [tokens] 行
 
     _print_usage_hint(agent)
 
     lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) == 2
-    assert lines[0] == "[tokens] 本轮 输入 100 (缓存 80) / 输出 10 / 合计 110"
-    assert lines[1] == "         会话累计 输入 100 (缓存 80) / 输出 10 / 合计 110"
+    assert len(lines) == 1
+    assert lines[0] == "[tokens] 会话累计 输入 100 (缓存 80) / 输出 10 / 合计 110"
 
 
 def test_hint_omits_cache_when_zero(monkeypatch, capsys):
     usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
     agent = _agent_with_usage(monkeypatch, usage)
+    capsys.readouterr()  # 丢弃 run() 里逐条打印的 [tokens] 行
 
     _print_usage_hint(agent)
 
