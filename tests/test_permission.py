@@ -1,5 +1,4 @@
 """权限系统测试：三级动作、通配符匹配、最后匹配优先、模式级记忆、配置加载。"""
-import json
 import sys
 
 import pytest
@@ -29,15 +28,23 @@ def refuse_input(monkeypatch):
 
 @pytest.fixture
 def make_perm(tmp_path, monkeypatch):
-    """工厂：可选地写入 smithcode.json，并把工作区指向临时目录。"""
+    """工厂：可选地写入全局 config.toml（经 SMITHCODE_HOME 隔离），并把工作区指向临时目录。"""
 
     def _make(permissions=None, raw=None):
+        home = tmp_path / "home"
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("SMITHCODE_HOME", str(home))
         if raw is not None:
-            (tmp_path / "smithcode.json").write_text(raw, encoding="utf-8")
+            (home / "config.toml").write_text(raw, encoding="utf-8")
         elif permissions is not None:
-            (tmp_path / "smithcode.json").write_text(
-                json.dumps({"permissions": permissions}), encoding="utf-8"
-            )
+            lines = ["[permissions]"]
+            for tool, value in permissions.items():
+                if isinstance(value, str):
+                    lines.append(f'{tool} = "{value}"')
+                else:
+                    pairs = ", ".join(f'"{pattern}" = "{action}"' for pattern, action in value.items())
+                    lines.append(f"{tool} = {{ {pairs} }}")
+            (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
         monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
         return Permission()
 
@@ -175,7 +182,7 @@ def test_missing_config_uses_defaults(make_perm, monkeypatch):
 
 def test_broken_json_degrades_gracefully(make_perm, monkeypatch, capsys):
     refuse_input(monkeypatch)
-    perm = make_perm(raw="{ not valid json")
+    perm = make_perm(raw="this is not valid toml")
     assert perm.user_rules == []
     assert "警告" in capsys.readouterr().out
 

@@ -5,6 +5,7 @@ from . import __version__, config, context
 from .agent import Agent
 from .session import Session
 from .utils.terminal import read_user_input, setup_console_encoding
+from .wizard import run_setup
 
 HELP = """命令:
   /help   显示帮助
@@ -19,7 +20,8 @@ HELP = """命令:
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="smithcode",
-        description="终端 AI 编程助手：让大模型调用工具帮你读写文件、执行命令。",
+        description="终端 AI 编程助手：让大模型调用工具帮你读写文件、执行命令。\n"
+        "首次使用先运行 `smithcode setup` 完成初始化。",
     )
     parser.add_argument(
         "task", nargs="*",
@@ -50,15 +52,6 @@ def build_parser():
         version=f"%(prog)s {__version__}",
     )
     return parser
-
-
-def _print_usage_hint(agent: Agent):
-    """每轮任务结束后的用量速览：单次交互的用量已在执行中逐条打印，
-    这里只汇总"会话累计"一行（计费口径），不再聚合本轮。"""
-    acc = agent.session.usage.current_session
-    if not acc.calls:
-        return
-    print(f"\n[tokens] 会话累计 {acc.humanize()}")
 
 
 def repl(agent: Agent):
@@ -113,7 +106,6 @@ def repl(agent: Agent):
 
         try:
             agent.run(user_input)  # 回复已在流式过程中实时打印
-            _print_usage_hint(agent)
         except Exception as e:  # noqa: BLE001
             print(f"\n[错误] {type(e).__name__}: {e}")
 
@@ -121,7 +113,6 @@ def repl(agent: Agent):
 def run_once(agent: Agent, task: str):
     try:
         agent.run(task)  # 回复已在流式过程中实时打印
-        _print_usage_hint(agent)
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         sys.exit(1)
@@ -131,6 +122,8 @@ def main(argv=None):
     setup_console_encoding()
 
     args = build_parser().parse_args(argv)
+    if args.task == ["setup"]:  # 仅当唯一位置参数恰好是 setup，避免 subparsers 破坏自由文本任务
+        sys.exit(run_setup())
     if args.workspace:
         config.set_workspace(args.workspace)
     for extra in args.add or []:
@@ -138,7 +131,11 @@ def main(argv=None):
     if args.model:
         config.MODEL = args.model
 
-    agent = Agent(Session(), max_iterations=args.max_iterations)
+    try:
+        agent = Agent(Session(), max_iterations=args.max_iterations)
+    except config.ConfigError as e:
+        print(e)  # 指引文案由 ConfigError 自带，打印后安静退出，不甩 traceback
+        sys.exit(1)
     if args.yes:
         agent.permission.approved_all = True
 

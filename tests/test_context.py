@@ -258,25 +258,6 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
     assert "上下文溢出" in capsys.readouterr().out
 
 
-# ---------- 配置的环境变量解析 ----------
-
-def test_env_number_parses_and_degrades(monkeypatch, capsys):
-    monkeypatch.setenv("X_NUM", "0.5")
-    assert config._env_number("X_NUM", 0.8) == 0.5
-
-    monkeypatch.setenv("X_NUM", "70000")
-    value = config._env_number("X_NUM", 65536)
-    assert value == 70000 and isinstance(value, int)  # int 默认值得到 int
-
-    for bad in ("abc", "nan", "inf"):  # 非数字与 nan/inf 一律降级默认并警告
-        monkeypatch.setenv("X_NUM", bad)
-        assert config._env_number("X_NUM", 0.8) == 0.8
-    assert capsys.readouterr().out.count("不是有效数字") == 3
-
-    monkeypatch.delenv("X_NUM")
-    assert config._env_number("X_NUM", 65536) == 65536  # 缺失用默认值
-
-
 # ---------- 与 Agent 循环的接线 ----------
 
 def test_agent_run_records_anchor(monkeypatch):

@@ -40,7 +40,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 
 模型输出以流式方式逐字显示；思考内容（如 DeepSeek-R1 类模型的 `reasoning_content`）以暗色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
 
-工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `smithcode.json` 的 `tool_display` 控制：`summary`（默认）到此为止，`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
+工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止，`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
 
 ## 模块职责
 
@@ -53,7 +53,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 | `session.py` | 消息历史的增删存取 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission.py` | 敏感操作的用户确认 |
-| `config.py` | `.env` 与 `smithcode.json` 配置加载（权限规则、展示粒度） |
+| `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
@@ -64,7 +64,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 ## 安全边界
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，用 `Path.is_relative_to` 确认解析后的真实路径位于工作区内（目录名共享前缀的兄弟路径不会被误判为放行）。
-- **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `smithcode.json` 用户规则 < 会话内"总是允许"（按模式记忆）。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
+- **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `~/.smithcode/config.toml` 用户规则 < 会话内"总是允许"（按模式记忆）。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
 - **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
@@ -76,7 +76,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 ### 权限求值细节
 
 1. 每个工具注册时通过 schema 的 `pattern_arg` 声明权限模式来源（如 `run_command` 用 `command` 参数、文件工具用 `path`），该键不会发送给 LLM。
-2. 求值顺序：`DEFAULT_RULES` → `smithcode.json` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。因此配置文件中宽泛规则写在前、精确规则写在后。
+2. 求值顺序：`DEFAULT_RULES` → `config.toml` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。因此配置文件中宽泛规则写在前、精确规则写在后。
 3. `deny` 不询问用户直接拒绝；`-y`（approved_all）跳过所有 `ask`（含越界访问确认），但显式声明的 `deny` 依然生效。
 4. **权限族（family）**：规则匹配同时看「工具名」与「family」。`apply_patch` 声明 `family="edit_file"`，因此自动继承 `edit_file` 全部规则（含 `.git` 保护路径），避免"换个工具绕过规则"；工具名精确规则排在 family 规则之后可单独收紧。
 5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次，全部放行才执行。
@@ -101,7 +101,7 @@ def search_code(pattern: str) -> str:
     ...
 ```
 
-若该工具属于敏感操作，可通过 schema 的 `pattern_arg` 声明权限模式来源，并在 `smithcode.json` 中为它配置规则：
+若该工具属于敏感操作，可通过 schema 的 `pattern_arg` 声明权限模式来源，并在 `~/.smithcode/config.toml` 中为它配置规则：
 
 ```python
 @register({

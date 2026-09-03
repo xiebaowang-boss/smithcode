@@ -6,9 +6,11 @@
 
 ### 新增
 
+- 配置体系重构：配置统一收敛到用户目录 `~/.smithcode/`（路径经 `Path.home()` 跨平台，`SMITHCODE_HOME` 环境变量可覆盖供测试隔离）。行为配置 `config.toml`（`[provider]` 模型/接口地址、`[context]` 预算与压缩阈值、`[limits]` 迭代轮数/超时/重试/输出截断、`[permissions]` 权限规则、`tool_display`）与凭据 `credentials.json`（仅 `key`，写入即 `0600`）分文件存放，前者不含秘密可安全分享。解析优先级「内置默认 < config.toml < 环境变量（仅 `SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数」，任何配置缺失回退内置默认值；文件损坏打印警告并整体降级，单个非法值警告后回退，不中断启动。原 `smithcode.json`、`.env` 机制与 `OPENAI_*` / `ROOT` / `CONTEXT_BUDGET` 等环境变量移除（`python-dotenv` 依赖移除，3.9/3.10 经 `tomli` 读 TOML）
+- `smithcode setup` 初始化向导：交互式采集接口地址 / 模型名 / API Key（`getpass` 不回显）/ 上下文预算（支持 `128k` 后缀写法），写入 `~/.smithcode/` 下两个配置文件；重跑幂等——提示符默认值取当前生效配置、回车即保留，已存在的 `[permissions]` 等用户手写段落与注释经 `tomlkit` 原样保留。缺 API Key 启动时的报错指引改为指向 `smithcode setup` 或 `SMITHCODE_KEY` 环境变量，以退出码 1 结束，不抛 OpenAI SDK 裸 traceback
 - 运行时上下文压缩（opencode 式 checkpoint）：估算越过阈值（预算 × `COMPACT_TRIGGER`）自动把中段历史替换为结构化摘要（目标/关键决策/已完成/阻碍/下一步/相关文件，缺必需标题自动重试一次，仍失败则放弃压缩原样继续），保留系统提示词与近期尾部（`COMPACT_KEEP_TOKENS` 默认 15000，尾部超长工具结果截断到 2000 字符）；摘要以 `<context-summary>` 标记注入。provider 返回上下文溢出错误时压缩后重试一次（每步至多一次）。新增 `/compact` 手动压缩命令、`/context` 显示压缩次数；压缩只改运行时上下文，`/save` 行为不变
-- 上下文计量：新增 context 模块与 `/context` 命令，按角色分桶（系统提示词 / 用户 / 助手 / 工具结果）展示当前上下文的 token 占用；估算以字符构成启发式计算，并用上次请求的真实 `prompt_tokens` 锚点校准偏差。任务中估算越过压缩阈值 90% 时提醒一次。新增配置 `CONTEXT_TOKEN_BUDGET` 与 `COMPACT_TRIGGER`，均可用环境变量 `CONTEXT_BUDGET` / `COMPACT_TRIGGER` 覆盖（无效值打印警告并降级默认），为后续压缩功能预留
-- 工具调用展示粒度可配置：`smithcode.json` 新增 `tool_display` 字段（`summary` / `detail`，默认 `summary`）。`summary` 模式下每个工具调用只打印一行「短名 + 目标」摘要（`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`），不再展示结果内容；`detail` 模式保留原有 `[Result]` 内容展示。失败信息（`错误: ...`、用户拒绝）无论何种粒度始终原样展示
+- 上下文计量：新增 context 模块与 `/context` 命令，按角色分桶（系统提示词 / 用户 / 助手 / 工具结果）展示当前上下文的 token 占用；估算以字符构成启发式计算，并用上次请求的真实 `prompt_tokens` 锚点校准偏差。任务中估算越过压缩阈值 90% 时提醒一次。新增配置 `[context] budget` 与 `compact_trigger`（无效值打印警告并降级默认），为后续压缩功能预留
+- 工具调用展示粒度可配置：配置新增顶层 `tool_display` 键（`summary` / `detail`，默认 `summary`）。`summary` 模式下每个工具调用只打印一行「短名 + 目标」摘要（`read src/agent.py`、`edit src/cli.py`、`glob **/*.py`、`command git push`、`patch a.txt b.txt`），不再展示结果内容；`detail` 模式保留原有 `[Result]` 内容展示。失败信息（`错误: ...`、用户拒绝）无论何种粒度始终原样展示
 - 工具注册表支持 `describe` 钩子：`(args) -> str` 生成终端短摘要，与 `pattern_arg` / `family` / `paths_from` 同为注册时可声明的可选扩展点，不会发送给 LLM；未声明的工具回退为原 `[Tool] 名字(参数)` 格式
 - 新工具 `apply_patch`：opencode 信封格式的批量多文件修改（Add / Update / Delete），逐文件解析后**原子落盘**（任一文件失败整体不生效）；声明 `family="edit_file"` 自动继承其权限规则与 `.git` 保护路径
 - 新工具 `ask_user`：Agent 任务中途向用户提问，回答作为工具结果回传；与 REPL 共用 `read_user_input`（多行粘贴合并），非交互 stdin 下 fail-closed 返回"已取消"
@@ -17,8 +19,8 @@
 
 ### 变更
 
-- 项目更名为 **SmithCode**：Python 包 `codeagent` → `smithcode`，CLI 命令、项目配置文件（`codeagent.json` → `smithcode.json`）同步更名
-- 环境变量去掉项目名前缀：`CODEAGENT_ROOT` / `CODEAGENT_CONTEXT_BUDGET` / `CODEAGENT_COMPACT_TRIGGER` / `CODEAGENT_COMPACT_KEEP_TOKENS` → `ROOT` / `CONTEXT_BUDGET` / `COMPACT_TRIGGER` / `COMPACT_KEEP_TOKENS`
+- 去掉每轮任务的 `[tokens]` 用量打印（单次交互行与结束时的会话累计速览），用量统计改由 `/usage` 命令按需查看
+- 项目更名为 **SmithCode**：Python 包 `codeagent` → `smithcode`，CLI 命令同步更名
 - 工具调用展示由 `[Tool] 名字(原始 JSON 参数)` 改为一行短摘要（超长截断到 80 字符显示）；回传给模型的结果（含 2 万字符截断）完全不变
 - `-y`（approved_all）覆盖工作区外路径访问确认（按"仅本次"静默放行），显式 `deny` 依然生效
 - 权限匹配大小写行为对齐 opencode v2：Windows 下大小写不敏感

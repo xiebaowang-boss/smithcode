@@ -18,34 +18,39 @@ def enable_prompting(monkeypatch):
 
 # ---------- 配置加载：tool_display 字段 ----------
 
-def _config_file(tmp_path, text) -> str:
-    path = tmp_path / "smithcode.json"
-    path.write_text(text, encoding="utf-8")
-    return str(path)
+def _write_home_config(monkeypatch, tmp_path, text):
+    """把内容写进隔离的 SMITHCODE_HOME 下的 config.toml。"""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
 
 
-def test_tool_display_missing_field_uses_summary(tmp_path):
-    assert config.load_tool_display(_config_file(tmp_path, '{"permissions": {}}')) == "summary"
+def test_tool_display_missing_field_uses_summary(monkeypatch, tmp_path):
+    _write_home_config(monkeypatch, tmp_path, '[permissions]\nread_file = "allow"\n')
+    assert config.load_tool_display() == "summary"
 
 
-def test_tool_display_missing_file_uses_summary(tmp_path):
-    assert config.load_tool_display(str(tmp_path / "nope.json")) == "summary"
+def test_tool_display_missing_file_uses_summary(monkeypatch, tmp_path):
+    monkeypatch.setenv("SMITHCODE_HOME", str(tmp_path))
+    assert config.load_tool_display() == "summary"
 
 
 @pytest.mark.parametrize("value", ["summary", "detail"])
-def test_tool_display_accepts_enum(tmp_path, value):
-    assert config.load_tool_display(_config_file(tmp_path, f'{{"tool_display": "{value}"}}')) == value
+def test_tool_display_accepts_enum(monkeypatch, tmp_path, value):
+    _write_home_config(monkeypatch, tmp_path, f'tool_display = "{value}"')
+    assert config.load_tool_display() == value
 
 
-def test_tool_display_invalid_value_degrades(tmp_path, capsys):
-    path = _config_file(tmp_path, '{"tool_display": "verbose"}')
-    assert config.load_tool_display(path) == "summary"
+def test_tool_display_invalid_value_degrades(monkeypatch, tmp_path, capsys):
+    _write_home_config(monkeypatch, tmp_path, 'tool_display = "verbose"')
+    assert config.load_tool_display() == "summary"
     assert "警告" in capsys.readouterr().out
 
 
-def test_tool_display_broken_json_degrades(tmp_path, capsys):
-    path = _config_file(tmp_path, "{ not valid json")
-    assert config.load_tool_display(path) == "summary"
+def test_tool_display_broken_toml_degrades(monkeypatch, tmp_path, capsys):
+    _write_home_config(monkeypatch, tmp_path, "this is not valid toml")
+    assert config.load_tool_display() == "summary"
     assert "警告" in capsys.readouterr().out
 
 

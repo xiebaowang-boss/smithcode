@@ -25,9 +25,10 @@ RETRYABLE_ERRORS = (
 
 class LLMClient:
     def __init__(self):
+        config.ensure_api_key()  # 凭证缺失时给出人话指引，别让 OpenAI SDK 抛裸异常
         self.client = OpenAI(
-            api_key=config.API_KEY,
-            base_url=config.API_BASE,
+            api_key=config.KEY,
+            base_url=config.URL,
             timeout=config.LLM_TIMEOUT,
         )
 

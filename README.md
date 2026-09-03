@@ -28,7 +28,7 @@
 
 ### 权限与安全
 
-- **三级权限规则**：`allow` / `ask` / `deny`，按工具与参数通配符匹配，通过工作区 `smithcode.json` 自定义
+- **三级权限规则**：`allow` / `ask` / `deny`，按工具与参数通配符匹配，通过 `~/.smithcode/config.toml` 自定义
 - **保护路径**：`.env` 禁止读写、`.git` 目录只读，防止密钥泄露与仓库破坏
 - **工作区沙箱**：文件操作默认限制在工作区内，越界访问需逐次确认
 - **非交互安全**：管道 / CI 环境下无法弹确认时，所有需确认的操作一律拒绝（fail-closed），不会崩溃
@@ -50,24 +50,32 @@
 pip install -e .
 ```
 
-### 2. 配置
+### 2. 初始化配置
 
-复制 `.env.example` 为 `.env`，填入密钥：
+运行向导，按提示填入接口地址、模型名、API Key 与上下文预算（直接回车保留默认/已有值）：
 
-```dotenv
-OPENAI_API_KEY=你的API密钥
-OPENAI_API_BASE=https://api.deepseek.com/v1
-OPENAI_MODEL=deepseek-chat
+```bash
+smithcode setup
 ```
 
-可选配置（同样写在 `.env`）：
+配置写入用户目录（所有平台同一位置）：
 
-| 变量 | 默认 | 说明 |
+| 文件 | 内容 |
+| ---- | ---- |
+| `~/.smithcode/config.toml` | 行为配置：模型、接口地址、上下文预算、权限规则等，可安全分享 |
+| `~/.smithcode/credentials.json` | 仅 API Key，只归本机 |
+
+也可以跳过向导，直接用环境变量（优先级高于文件）：`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`。
+
+主要配置项（写在 `~/.smithcode/config.toml`，均有内置默认值）：
+
+| 配置项 | 默认 | 说明 |
 | ---- | ---- | ---- |
-| `ROOT` | 当前目录 | 工作区根目录 |
-| `CONTEXT_BUDGET` | 65536 | 上下文预算（token），建议设为模型窗口大小 |
-| `COMPACT_TRIGGER` | 0.8 | 占预算的比例，越过即触发自动压缩 |
-| `COMPACT_KEEP_TOKENS` | 15000 | 压缩时尾部原样保留的 token 数 |
+| `[provider] model` | `deepseek-v4-flash` | 模型名 |
+| `[provider] url` | 服务商官方地址 | OpenAI 兼容接口地址 |
+| `[context] budget` | 65536 | 上下文预算（token），建议不超过模型窗口大小 |
+| `[context] compact_trigger` | 0.8 | 占预算的比例，越过即触发自动压缩 |
+| `[context] compact_keep_tokens` | 15000 | 压缩时尾部原样保留的 token 数 |
 
 ### 3. 运行
 
@@ -95,10 +103,10 @@ python -m smithcode              # 等价的另一种启动方式
 
 | 参数 | 说明 |
 | ---- | ---- |
-| `task` | 一次性任务描述；留空则进入交互模式 |
+| `task` | 一次性任务描述；留空则进入交互模式；`setup` 进入初始化向导 |
 | `-w, --workspace` | 指定工作区目录（默认当前目录） |
 | `--add DIR` | 追加授权目录（可重复传入），跨项目访问用 |
-| `-m, --model` | 指定模型名（覆盖 `.env` 配置） |
+| `-m, --model` | 指定模型名（覆盖配置文件与环境变量） |
 | `-y, --yes` | 自动批准所有确认（deny 规则依然生效），慎用 |
 | `--max-iterations N` | 单次任务最大迭代轮数（默认 30） |
 | `-V, --version` | 显示版本号 |
@@ -115,24 +123,21 @@ python -m smithcode              # 等价的另一种启动方式
 
 选 `a` 后该模式在本会话内静默放行，`/new` 或退出后清零。
 
-### 自定义权限规则（smithcode.json）
+### 自定义权限规则（~/.smithcode/config.toml）
 
-在工作区根目录创建 `smithcode.json`。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：
+在 `~/.smithcode/config.toml` 的 `[permissions]` 段配置（`smithcode setup` 首次生成时自带注释示例）。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：
 
-```json
-{
-  "permissions": {
-    "read_file": "allow",
-    "write_file": {"*": "ask", "*.env": "deny"},
-    "run_command": {
-      "*": "ask",
-      "git *": "allow",
-      "rm -rf*": "deny"
-    }
-  },
-  "tool_display": "summary"
-}
+```toml
+[permissions]
+read_file = "allow"
+write_file = { "*" = "ask", "*.env" = "deny" }
+run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
+
+# 工具调用的终端展示粒度：summary（默认）/ detail
+tool_display = "summary"
 ```
+
+配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。
 
 上例含义：文件读取放行；写文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
 
@@ -153,7 +158,7 @@ smithcode -y 跑一遍测试并总结失败原因
 
 ## 安全说明
 
-- API Key 仅从 `.env` 或环境变量加载，不会被提交到仓库
+- API Key 只存在两处：本机的 `~/.smithcode/credentials.json`，或环境变量 `SMITHCODE_KEY`；`config.toml` 不含秘密、可安全分享
 - 所有需确认的操作在非交互环境（管道 / CI）下一律拒绝，不挂起、不崩溃
 - `-y` 跳过所有 `ask` 确认（含工作区外路径访问），但显式 `deny` 规则依然生效——仅在信任任务时使用
 - shell 命令 60 秒超时；LLM 请求 120 秒超时，限流 / 断网自动重试

@@ -1,53 +1,25 @@
-"""CLI 测试：用量速览格式与多行输入合并。"""
+"""CLI 测试：多行输入合并与缺配置时的启动退出。"""
 
 import sys
 
-from smithcode.agent import Agent
-from smithcode.cli import _print_usage_hint
-from smithcode.session import Session
+import pytest
+
+from smithcode import config
+from smithcode.cli import main
 from smithcode.utils.terminal import read_user_input
 
+# ---------- 启动时缺配置：优雅退出而非裸 traceback ----------
 
-def _agent_with_usage(monkeypatch, usage):
-    class UsageLLM:
-        def chat_stream(self, messages, tools=None):
-            yield ("usage", usage)
-            yield ("message", {"role": "assistant", "content": "ok"})
+def test_main_exits_gracefully_on_config_error(monkeypatch, capsys):
+    """缺 API Key 时打印修复指引并以退出码 1 结束，不甩 SDK 异常栈。"""
+    def broken_agent(*args, **kwargs):
+        raise config.ConfigError("[启动失败] 缺少 API Key：没有找到任何配置")
 
-    monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
-    agent = Agent(session=Session())
-    agent.run("hi")
-    return agent
-
-
-def test_hint_shows_session_total_only(monkeypatch, capsys):
-    """速览只剩会话累计一行（计费口径）；单次交互用量已由 run 逐条打印。"""
-    usage = {
-        "prompt_tokens": 100,
-        "completion_tokens": 10,
-        "total_tokens": 110,
-        "prompt_tokens_details": {"cached_tokens": 80},
-    }
-    agent = _agent_with_usage(monkeypatch, usage)
-    capsys.readouterr()  # 丢弃 run() 里逐条打印的 [tokens] 行
-
-    _print_usage_hint(agent)
-
-    lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) == 1
-    assert lines[0] == "[tokens] 会话累计 输入 100 (缓存 80) / 输出 10 / 合计 110"
-
-
-def test_hint_omits_cache_when_zero(monkeypatch, capsys):
-    usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
-    agent = _agent_with_usage(monkeypatch, usage)
-    capsys.readouterr()  # 丢弃 run() 里逐条打印的 [tokens] 行
-
-    _print_usage_hint(agent)
-
-    out = capsys.readouterr().out
-    assert "输入 100 / 输出 10" in out
-    assert "(缓存" not in out
+    monkeypatch.setattr("smithcode.cli.Agent", broken_agent)
+    with pytest.raises(SystemExit) as excinfo:
+        main([])
+    assert excinfo.value.code == 1
+    assert "缺少 API Key" in capsys.readouterr().out
 
 
 # ---------- read_user_input：多行粘贴合并 ----------
