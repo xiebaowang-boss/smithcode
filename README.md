@@ -4,6 +4,12 @@
 
 你用自然语言描述任务，SmithCode 自主规划步骤、调用工具、根据结果继续推理，直到任务完成——全程流式输出，敏感操作逐个向你确认。
 
+> **Harbormaster:** Hold up there, you. It's a shilling to tie up your boat at the dock... and I shall need to know your name.
+>
+> **Jack Sparrow:** What do you say to three shillings and we forget the name?
+>
+> **Harbormaster:** *Welcome to Port Royal, Mr. Smith.*
+
 ## 功能特性
 
 ### 智能体
