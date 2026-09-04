@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.6.1] - 2026-09-04
+
 ### 修复
 
 - 修复 Linux 下中文退格错乱（删一字残留空格、需按两次、删到一半整行卡死）：加载 readline 按字符宽度擦除双宽中文（替代原 `IUTF8` termios 方案，readline 处理更完整）；同时关闭 bracketed paste，让 Linux/macOS 下多行粘贴能像 Windows 一样合并为同一条消息（`select` 探测内核队列）

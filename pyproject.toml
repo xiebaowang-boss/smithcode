@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smithcode"
-version = "0.6.0"
+version = "0.6.1"
 description = "终端 AI 编程助手"
 requires-python = ">=3.9"
 dependencies = [

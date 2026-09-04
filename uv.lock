@@ -615,7 +615,7 @@ wheels = [
 
 [[package]]
 name = "smithcode"
-version = "0.5.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "openai", version = "2.48.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
