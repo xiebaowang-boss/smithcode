@@ -5,6 +5,33 @@ import sys
 import time
 
 
+def enable_utf8_erase():
+    """Linux 下为终端设置 IUTF8，让内核按完整 UTF-8 字符擦除退格。
+
+    Python input() 未加载 readline 时，行编辑由内核（canonical 模式）完成，
+    默认按"字节"擦除：中文是 3 字节、2 列宽，退格一次只删掉半个字，残留
+    空格、需按两次、删到一半字节/列计数错位后整行卡死。IUTF8 让内核识别
+    多字节字符，退格一次删掉整个字。Windows / 非交互 stdin / 非 Linux
+    （无 IUTF8 标志）自动跳过。
+    """
+    if sys.platform == "win32" or not sys.stdin.isatty():
+        return
+    try:
+        import termios
+    except ImportError:  # pragma: no cover - 非 POSIX
+        return
+    if not hasattr(termios, "IUTF8"):
+        return
+    try:
+        attrs = termios.tcgetattr(sys.stdin.fileno())
+        if attrs[0] & termios.IUTF8:
+            return
+        attrs[0] |= termios.IUTF8
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+    except Exception:  # noqa: BLE001, S110 - 终端设置失败不应阻止启动
+        pass
+
+
 def setup_console_encoding():
     """把控制台与标准输出流切换到 UTF-8。
 
@@ -15,6 +42,7 @@ def setup_console_encoding():
         os.system("chcp 65001 > nul 2>&1")
         os.system("")  # 触发旧版控制台启用 ANSI 转义序列解析（Windows 10+）
     os.environ["PYTHONIOENCODING"] = "utf-8"
+    enable_utf8_erase()
 
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)

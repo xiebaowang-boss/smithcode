@@ -6,7 +6,7 @@ import pytest
 
 from smithcode import config
 from smithcode.cli import main
-from smithcode.utils.terminal import read_user_input
+from smithcode.utils.terminal import enable_utf8_erase, read_user_input
 
 # ---------- 启动时缺配置：优雅退出而非裸 traceback ----------
 
@@ -77,3 +77,37 @@ def test_read_user_input_skips_merge_for_piped_stdin(monkeypatch):
 
     assert read_user_input() == "一行"
     assert len(calls) == 1
+
+
+# ---------- enable_utf8_erase：Linux 下设置 IUTF8 修复中文退格 ----------
+
+def test_enable_utf8_erase_noop_on_windows(monkeypatch):
+    """Windows 下为 no-op，不尝试访问 termios。"""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+
+    assert enable_utf8_erase() is None
+
+
+def test_enable_utf8_erase_noop_for_piped_stdin(monkeypatch):
+    """非交互 stdin（管道/CI）为 no-op，避免对非终端 fd 调 tcgetattr。"""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", _NotTtyStdin())
+
+    assert enable_utf8_erase() is None
+
+
+def test_enable_utf8_erase_survives_missing_termios(monkeypatch):
+    """POSIX 交互终端但无 termios 模块时优雅跳过，不阻止启动。"""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "termios":
+            raise ImportError("no termios")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    assert enable_utf8_erase() is None
