@@ -1,12 +1,17 @@
 """CLI 测试：多行输入合并与缺配置时的启动退出。"""
 
+import os
 import sys
 
 import pytest
 
 from smithcode import config
 from smithcode.cli import main
-from smithcode.utils.terminal import enable_utf8_erase, read_user_input
+from smithcode.utils.terminal import (
+    enable_readline,
+    read_user_input,
+    stdin_has_pending,
+)
 
 # ---------- 启动时缺配置：优雅退出而非裸 traceback ----------
 
@@ -32,6 +37,19 @@ class _TtyStdin:
 class _NotTtyStdin:
     def isatty(self):
         return False
+
+
+class _SelectableTtyStdin:
+    """带真实 fd 的交互 stdin 桩：供 select() 探测排队数据。"""
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return self._fd
 
 
 def _fake_input(replies, calls):
@@ -79,35 +97,113 @@ def test_read_user_input_skips_merge_for_piped_stdin(monkeypatch):
     assert len(calls) == 1
 
 
-# ---------- enable_utf8_erase：Linux 下设置 IUTF8 修复中文退格 ----------
+# ---------- enable_readline：加载 readline 并关闭 bracketed paste ----------
 
-def test_enable_utf8_erase_noop_on_windows(monkeypatch):
-    """Windows 下为 no-op，不尝试访问 termios。"""
+def test_enable_readline_noop_on_windows(monkeypatch):
+    """Windows 下为 no-op，不尝试导入 readline。"""
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(sys, "stdin", _TtyStdin())
+    real_import = __import__
 
-    assert enable_utf8_erase() is None
+    def fail_import(name, *args, **kwargs):
+        if name == "readline":
+            raise AssertionError("win32 不应尝试导入 readline")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_import)
+
+    assert enable_readline() is None
 
 
-def test_enable_utf8_erase_noop_for_piped_stdin(monkeypatch):
-    """非交互 stdin（管道/CI）为 no-op，避免对非终端 fd 调 tcgetattr。"""
+def test_enable_readline_survives_missing_module(monkeypatch):
+    """无 readline 模块（裁剪构建）时优雅跳过，不阻止启动。"""
     monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(sys, "stdin", _NotTtyStdin())
-
-    assert enable_utf8_erase() is None
-
-
-def test_enable_utf8_erase_survives_missing_termios(monkeypatch):
-    """POSIX 交互终端但无 termios 模块时优雅跳过，不阻止启动。"""
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(sys, "stdin", _TtyStdin())
     real_import = __import__
 
     def fake_import(name, *args, **kwargs):
-        if name == "termios":
-            raise ImportError("no termios")
+        if name == "readline":
+            raise ImportError("no readline")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr("builtins.__import__", fake_import)
 
-    assert enable_utf8_erase() is None
+    assert enable_readline() is None
+
+
+def test_enable_readline_disables_bracketed_paste(monkeypatch):
+    """Linux 下导入 readline 并关闭 bracketed paste（保护多行合并的 select 探测）。"""
+    calls = []
+
+    class _FakeReadline:
+        @staticmethod
+        def parse_and_bind(binding):
+            calls.append(binding)
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "readline":
+            return _FakeReadline()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert enable_readline() is None
+    assert calls == ["set enable-bracketed-paste off"]
+
+
+def test_enable_readline_survives_bind_error(monkeypatch):
+    """parse_and_bind 抛错（如终端异常）时优雅跳过，不阻止启动。"""
+    class _BoomReadline:
+        @staticmethod
+        def parse_and_bind(binding):
+            raise ValueError("terminal not ready")
+
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "readline":
+            return _BoomReadline()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert enable_readline() is None
+
+
+# ---------- stdin_has_pending：Linux 下 select 探测排队输入 ----------
+
+def test_stdin_has_pending_detects_queued_input_on_posix(monkeypatch):
+    """POSIX 交互终端：fd 有排队数据时 select 能探测到。"""
+    r, w = os.pipe()
+    try:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(sys, "stdin", _SelectableTtyStdin(r))
+        os.write(w, b"x")
+
+        assert stdin_has_pending() is True
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+def test_stdin_has_pending_silent_when_empty_on_posix(monkeypatch):
+    """POSIX 交互终端：fd 无数据时不误报排队。"""
+    r, w = os.pipe()
+    try:
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(sys, "stdin", _SelectableTtyStdin(r))
+
+        assert stdin_has_pending() is False
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+def test_stdin_has_pending_false_for_piped_stdin(monkeypatch):
+    """非交互 stdin（管道）在 POSIX 下一律返回 False，不做探测。"""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", _NotTtyStdin())
+
+    assert stdin_has_pending() is False
