@@ -105,9 +105,9 @@ def _run_tool(monkeypatch, tmp_path, name, args_dict, display=None) -> Agent:
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM(tool_call))
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
-    agent = Agent(session=Session())
     if display:
-        agent.display_mode = display
+        monkeypatch.setattr(config, "load_tool_display", lambda: display)
+    agent = Agent(session=Session())
     agent.run("工具测试")
     return agent
 
@@ -138,7 +138,7 @@ def test_summary_mode_result_still_reaches_model(monkeypatch, tmp_path):
     agent = _run_tool(monkeypatch, tmp_path, "read_file", {"path": "hi.txt"})
 
     tool_msg = next(m for m in agent.session.messages if m["role"] == "tool")
-    assert tool_msg["content"] == "模型要读的内容"
+    assert "模型要读的内容" in tool_msg["content"]
 
 
 def test_error_shown_even_in_summary_mode(monkeypatch, tmp_path, capsys):

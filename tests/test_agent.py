@@ -5,7 +5,8 @@ import json
 import pytest
 
 from smithcode import config
-from smithcode.agent import Agent, truncate_output
+from smithcode.agent import Agent
+from smithcode.context import truncate_output
 from smithcode.session import Session
 from smithcode.tools import FUNCTIONS
 
@@ -66,6 +67,38 @@ def test_agent_loop_stops_at_max_iterations(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolCallLoopLLM)
     agent = Agent(session=Session(), max_iterations=2)
     assert agent.run("死循环") == "达到最大迭代次数，任务中止。"
+
+
+def test_run_stops_when_permission_denied(monkeypatch, tmp_path):
+    """权限被拒：任务立即终止，同批剩余 tool_calls 补占位结果（防悬空 tool_call_id）。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+
+    class TwoToolCallsLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield (
+                "message",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        _fake_tool_call("read_file", json.dumps({"path": "a.txt"})),
+                        _fake_tool_call("list_dir", "{}"),
+                    ],
+                },
+            )
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", TwoToolCallsLLM)
+    agent = Agent(session=Session())
+    agent.permission.user_rules = [("read_file", "*", "deny")]
+
+    result = agent.run("测试拒绝流程")
+    assert "权限" in result
+
+    tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
+    assert "拒绝" in tool_msgs[0]["content"]
+    assert "未执行" in tool_msgs[1]["content"]
 
 
 def test_truncate_output_short_text_unchanged():
@@ -151,7 +184,8 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
     assert usage is None  # 假 LLM 没发 usage 事件
 
     out = capsys.readouterr().out
-    assert "\x1b[90m[Thinking] 想一想\x1b[0m\n助手> 答案" in out
+    assert "[Thinking] 想一想" in out
+    assert "助手> 答案" in out
 
 
 # ---------- 用量统计：双口径累计与 /new 重置 ----------
@@ -213,7 +247,7 @@ def test_execute_outside_path_denied(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "n")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call) == "用户拒绝了此操作"
+    assert agent._execute(call)[0] == "用户拒绝了此操作"
     assert config.SESSION_EXTRA_ROOTS == []
 
 
@@ -224,7 +258,7 @@ def test_execute_outside_path_once_approval(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "y")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call) == "s"
+    assert "s" in agent._execute(call)[0]
     assert config.SESSION_EXTRA_ROOTS == []
 
 
@@ -239,10 +273,10 @@ def test_execute_outside_path_always_approval(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "a")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call) == "s"
+    assert "s" in agent._execute(call)[0]
     assert config.SESSION_EXTRA_ROOTS == [str(outside)]
 
-    assert agent._execute(call) == "s"
+    assert "s" in agent._execute(call)[0]
 
 
 def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
@@ -253,7 +287,7 @@ def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("不应弹出交互确认"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call) == "s"
+    assert "s" in agent._execute(call)[0]
     assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义
 
 
@@ -265,7 +299,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("非交互不应调用 input"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call) == "用户拒绝了此操作"
+    assert agent._execute(call)[0] == "用户拒绝了此操作"
 
 
 # ---------- apply_patch：多路径工具流程 ----------
@@ -283,7 +317,7 @@ def test_execute_apply_patch_creates_file(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "y")
 
     call = _fake_tool_call("apply_patch", json.dumps({"patch": "*** Add File: hi.txt\n+hi\n"}))
-    result = agent._execute(call)
+    result = agent._execute(call)[0]
     assert "已应用" in result
     assert (tmp_path / "hi.txt").read_text(encoding="utf-8") == "hi"
 
@@ -297,5 +331,5 @@ def test_execute_apply_patch_denied_for_git(monkeypatch, tmp_path):
         "apply_patch",
         json.dumps({"patch": "*** Add File: .git/hooks/pre-commit\n+echo x\n"}),
     )
-    assert agent._execute(call) == "用户拒绝了此操作"
+    assert agent._execute(call)[0] == "用户拒绝了此操作"
     assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()

@@ -116,6 +116,8 @@ def _resolve_number(section: str, key: str, default):
 KEY = os.getenv("SMITHCODE_KEY") or _credentials_key()
 MODEL = os.getenv("SMITHCODE_MODEL") or _file_str("provider", "model") or "deepseek-v4-flash"
 URL = os.getenv("SMITHCODE_URL") or _file_str("provider", "url")
+# 模型思考强度（reasoning_effort：low / medium / high 等，可选）；不配则不发该参数
+REASONING_EFFORT = _file_str("provider", "reasoning_effort")
 
 
 def ensure_api_key():
@@ -141,6 +143,7 @@ def ensure_api_key():
 
 MAX_ITERATIONS = _resolve_number("limits", "max_iterations", 30)
 COMMAND_TIMEOUT = _resolve_number("limits", "command_timeout", 60)
+COMMAND_TIMEOUT_MAX = _resolve_number("limits", "command_timeout_max", 300)  # run_command timeout 参数的上限
 MAX_TOOL_OUTPUT = _resolve_number("limits", "max_tool_output", 20_000)  # 单次工具输出进入上下文的最大字符数，超出则头尾截断
 
 # 上下文窗口预算与压缩阈值（token 估算基准），/context 展示与阈值提醒的依据

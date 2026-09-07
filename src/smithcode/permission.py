@@ -16,9 +16,9 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
-from . import config
+from . import config, renderer
 from .tools import PATTERN_ARGS, PATTERN_FAMILIES
-from .utils.terminal import confirmations_available, flush_pending_input
+from .utils.terminal import confirmations_available
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 
@@ -35,6 +35,7 @@ DEFAULT_RULES = [
     ("edit_file", "*.git/**", DENY),
     ("run_command", "*", ASK),
     ("ask_user", "*", ALLOW),  # 提问本身不再弹确认（确认一个"提问"是荒谬的）；可用 deny 禁止
+    ("todo_write", "*", ALLOW),  # 更新任务清单本身不弹确认（确认一个"追踪步骤"是荒谬的）；可用 deny 禁止
 ]
 
 ACTIONS = (ALLOW, ASK, DENY)
@@ -97,7 +98,7 @@ class Permission:
         if action == ALLOW:
             return True
         if action == DENY:
-            print(f"\n⛔ 已被权限规则拒绝: {tool_name}（模式 {pattern}）")
+            renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（模式 {pattern}）")
             return False
         return self._ask(tool_name, pattern)
 
@@ -111,7 +112,7 @@ class Permission:
             for pat in patterns
         ]
         if any(a == DENY for a in actions):
-            print(f"\n⛔ 已被权限规则拒绝: {tool_name}（目标含保护/受限路径）")
+            renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（目标含保护/受限路径）")
             return False
         if any(a == ASK for a in actions):
             if self.approved_all:
@@ -131,21 +132,18 @@ class Permission:
         if self.approved_all:
             return "once", root
         if not confirmations_available():
-            print(f"\n⛔ 非交互模式，无法确认越界访问，已拒绝: {raw_path}")
+            renderer.current().info(f"\n⛔ 非交互模式，无法确认越界访问，已拒绝: {raw_path}")
             return "deny", None
-        print("\n⚠️  Agent 请求访问授权目录之外的路径:")
-        print(f"   {raw_path}")
-        print(f"   解析为 {target}")
-        print(f"   将信任目录: {root}")
-        flush_pending_input()
-        while True:
-            answer = input(
-                "   允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: "
-            ).strip().lower()
-            if answer in ("y", "n", "a"):
-                break
-            shown = f"（收到: {answer[:40]!r}）" if answer else ""
-            print(f"   无效输入{shown}，请输入 y / a / n")
+        r = renderer.current()
+        r.info("\n⚠️  Agent 请求访问授权目录之外的路径:")
+        r.info(f"   {raw_path}")
+        r.info(f"   解析为 {target}")
+        r.info(f"   将信任目录: {root}")
+        answer = r.confirm_choice(
+            "   允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
+            "yan",
+            "y / a / n",
+        )
         if answer == "y":
             return "once", root
         if answer == "a":
@@ -183,19 +181,18 @@ class Permission:
 
     def _ask(self, tool_name: str, pattern: str) -> bool:
         if not confirmations_available():
-            print(f"\n⛔ 非交互模式，无法确认，已拒绝: {tool_name}（模式 {pattern}）")
+            renderer.current().info(
+                f"\n⛔ 非交互模式，无法确认，已拒绝: {tool_name}（模式 {pattern}）"
+            )
             return False
-        print(f"\n⚠️  Agent 请求执行: {tool_name}")
-        print(f"   模式: {pattern}")
-        flush_pending_input()  # 丢弃提前键入/粘贴的排队内容，防止被误当成回答
-        while True:
-            answer = input(
-                "   允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: "
-            ).strip().lower()
-            if answer in ("y", "n", "a"):
-                break
-            shown = f"（收到: {answer[:40]!r}）" if answer else ""
-            print(f"   无效输入{shown}，请输入 y / n / a")
+        r = renderer.current()
+        r.info(f"\n⚠️  Agent 请求执行: {tool_name}")
+        r.info(f"   模式: {pattern}")
+        answer = r.confirm_choice(
+            "   允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ",
+            "yna",
+            "y / n / a",
+        )
         if answer == "a":
             self.session_rules.append((tool_name, pattern, ALLOW))
             return True

@@ -7,6 +7,7 @@ PATTERN_ARGS: dict = {}
 PATTERN_FAMILIES: dict = {}
 PATHS_EXTRACTORS: dict = {}
 DESCRIBERS: dict = {}
+DISPLAY: dict = {}  # 终端展示形态：inline（一行式）/ block（可折叠结果块）
 
 
 def register(schema: dict):
@@ -20,6 +21,9 @@ def register(schema: dict):
     （如 apply_patch）做逐路径预检与权限聚合，同样不会发送给 LLM。
     可选的 schema["describe"] 是一个 (args)->str 函数，生成终端展示的一行短摘要
     （如 `read src/agent.py`），同样不会发送给 LLM。
+    可选的 schema["display"] 声明终端展示形态（opencode 式）：
+    "inline"（默认，一行摘要 + 计数）/ "block"（结果可折叠成块，按行截断），
+    同样不会发送给 LLM。
     """
 
     def decorator(func):
@@ -28,6 +32,7 @@ def register(schema: dict):
         PATTERN_FAMILIES[s["name"]] = s.pop("family", s["name"])
         PATHS_EXTRACTORS[s["name"]] = s.pop("paths_from", None)
         DESCRIBERS[s["name"]] = s.pop("describe", None)
+        DISPLAY[s["name"]] = s.pop("display", "inline")
         SCHEMAS.append(s)
         FUNCTIONS[s["name"]] = func
         return func

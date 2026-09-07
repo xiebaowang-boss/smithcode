@@ -120,6 +120,7 @@ def _apply_blocks_to_text(text: str, blocks: list[tuple[str, str]], path: str) -
         "name": "apply_patch",
         "family": "edit_file",
         "paths_from": extract_patch_paths,
+        "display": "block",
         "describe": _describe_patch,
         "description": "用 patch 信封批量应用多文件修改（Add/Update/Delete），原子落盘。"
         "权限与 edit_file 一致。小改动用 edit_file，多文件/大改动用本工具。",

@@ -11,7 +11,7 @@ from openai import (
     RateLimitError,
 )
 
-from . import config
+from . import config, renderer
 
 # 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
 # 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。
@@ -50,6 +50,8 @@ class LLMClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if config.REASONING_EFFORT:
+            kwargs["reasoning_effort"] = config.REASONING_EFFORT
         if tools:
             kwargs["tools"] = [
                 {"type": "function", "function": schema} for schema in tools
@@ -66,10 +68,9 @@ class LLMClient:
                 if attempt == config.MAX_RETRIES or emitted:
                     raise
                 wait = 2**attempt + random.random()
-                print(
+                renderer.current().info(
                     f"\n[LLM] 请求失败，{wait:.0f}s 后重试"
-                    f"（{attempt + 1}/{config.MAX_RETRIES}）...",
-                    flush=True,
+                    f"（{attempt + 1}/{config.MAX_RETRIES}）..."
                 )
                 time.sleep(wait)
 

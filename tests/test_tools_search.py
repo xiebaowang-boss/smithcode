@@ -31,6 +31,20 @@ def test_glob_skips_junk_dirs(workspace):
     assert "node_modules" not in out
 
 
+def test_glob_sorted_by_mtime_desc(workspace):
+    """glob 结果按修改时间新→旧排序。"""
+    import os
+
+    old = workspace / "old.txt"
+    new = workspace / "new.txt"
+    old.write_text("x", encoding="utf-8")
+    new.write_text("x", encoding="utf-8")
+    past = old.stat().st_mtime - 100
+    os.utime(old, (past, past))
+    out = search.glob("*.txt")
+    assert out.index("new.txt") < out.index("old.txt")
+
+
 def test_glob_outside_workspace_rejected(workspace):
     with pytest.raises(PermissionError):
         search.glob("**/*.py", "../elsewhere")
@@ -74,6 +88,43 @@ def test_grep_invalid_regex_returns_message(workspace):
 def test_grep_outside_workspace_rejected(workspace):
     with pytest.raises(PermissionError):
         search.grep("needle", "../elsewhere")
+
+
+# ---------- grep 增强参数 ----------
+
+def test_grep_ignore_case(workspace):
+    (workspace / "a.py").write_text("Needle\n", encoding="utf-8")
+    assert search.grep("needle") == "(无匹配)"
+    assert "a.py:1" in search.grep("needle", ignore_case=True)
+
+
+def test_grep_files_with_matches_mode(workspace):
+    (workspace / "a.py").write_text("hit\nhit\n", encoding="utf-8")
+    (workspace / "b.py").write_text("hit\n", encoding="utf-8")
+    out = search.grep("hit", output_mode="files_with_matches")
+    assert "a.py" in out and "b.py" in out
+    assert "a.py:1" not in out  # 不带行号与内容
+
+
+def test_grep_count_mode(workspace):
+    (workspace / "a.py").write_text("hit\nhit\nhit\n", encoding="utf-8")
+    (workspace / "b.py").write_text("nope\n", encoding="utf-8")
+    out = search.grep("hit", output_mode="count")
+    assert "a.py:3" in out
+    assert "b.py" not in out
+
+
+def test_grep_context_lines(workspace):
+    (workspace / "c.txt").write_text("one\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+    out = search.grep("three", path="c.txt", context=1)
+    assert "c.txt-2- two" in out      # 上下文行用 - 分隔
+    assert "c.txt:3: three" in out    # 匹配行用 : 分隔
+    assert "c.txt-4- four" in out
+    assert "five" not in out          # 窗口外不出现
+
+
+def test_grep_invalid_output_mode(workspace):
+    assert "output_mode" in search.grep("x", output_mode="bogus")
 
 
 # ---------- 多根授权（--add） ----------

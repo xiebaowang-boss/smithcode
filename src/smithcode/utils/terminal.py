@@ -1,46 +1,89 @@
-"""终端环境处理：统一控制台 UTF-8 输出，避免 Windows 下中文乱码。"""
-import contextlib
+"""终端环境处理：统一控制台 UTF-8 输出与交互输入。
+
+交互输入走 prompt_toolkit：多行粘贴自动合并为一条消息、历史记录、
+中文按显示宽度编辑，原生解决 input() 内核行编辑的字节宽度问题。
+Enter 发送消息，Ctrl+Enter 手动插入换行（长文本自动折行显示）。
+非交互 stdin（管道 / CI）一律退回普通 input()，行为与原先一致。
+"""
+from __future__ import annotations
+
 import io
 import os
 import sys
-import time
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.enums import DEFAULT_BUFFER
+from prompt_toolkit.filters import has_focus
+from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+
+from .. import config
+
+_SESSION: PromptSession | None = None
 
 
-def enable_readline():
-    """Linux/macOS 下加载 readline，让 input() 按字符宽度编辑。
+def _bindings() -> KeyBindings:
+    """自定义按键：Enter 发送（等同单行模式），Ctrl+Enter 插入换行。
 
-    内核 canonical 模式的行编辑按"字节/单列"处理退格回显，双宽中文字
-    （wcwidth=2）退格后会残留一列空格；readline 按 wcwidth 感知宽度，可
-    一次完整擦除。同时关闭 bracketed paste：开启时粘贴会整段被 readline
-    吞入内部缓冲，内核输入队列里不再有排队数据，select() 探测不到后续行，
-    多行合并失效。Windows 无 readline，跳过；导入失败时静默退回内核
-    canonical 模式。
+    Windows 下 Alt+Enter 会被终端拦截（全屏切换），因此换行改用 Ctrl+Enter
+    （终端把它作为独立键事件传入，不会与 Enter 混淆）；Alt+Enter 在多数
+    Linux 终端可直通，保留为备选。传入的绑定与 prompt_toolkit 默认键合并且
+    优先，编辑键（Ctrl+W、Ctrl+A/E、上下翻历史、Ctrl+C 中断等）保持默认。
     """
-    if sys.platform == "win32":
-        return
+    kb = KeyBindings()
+    focused = has_focus(DEFAULT_BUFFER)
+
+    @kb.add("enter", filter=focused)
+    def _accept(event):
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("c-j", filter=focused)  # Ctrl+Enter（\n），Windows 与多数 POSIX 终端可区分
+    @kb.add("escape", "enter", filter=focused)  # Alt+Enter，Linux 终端备选
+    def _newline(event):
+        event.current_buffer.insert_text("\n")
+
+    return kb
+
+
+def _history():
+    """输入历史：持久化到 smithcode_home/history；任何失败降级为进程内历史。"""
     try:
-        import readline  # 导入即接管 input() 行编辑；下方 parse_and_bind 也引用它
-    except ImportError:  # pragma: no cover - 裁剪构建/非标准平台无 readline
-        return
-    try:
-        # 旧版 readline（如 macOS 的 libedit）不认识该变量会向 stderr 报错，临时重定向掉
-        with contextlib.redirect_stderr(io.StringIO()):
-            readline.parse_and_bind("set enable-bracketed-paste off")
-    except Exception:  # noqa: BLE001, S110 - 尽力而为，失败不应阻止启动
-        pass
+        config.smithcode_home().mkdir(parents=True, exist_ok=True)
+        return FileHistory(str(config.smithcode_home() / "history"))
+    except OSError:
+        return InMemoryHistory()
+
+
+def _session() -> PromptSession:
+    """惰性创建全局 PromptSession，会话间复用同一份输入历史。"""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = PromptSession(
+            multiline=True,  # 支持缓冲区内换行；Enter 仍发送（见 _bindings）
+            key_bindings=_bindings(),
+            history=_history(),
+        )
+    return _SESSION
+
+
+def _read_line(prompt: str = "") -> str:
+    """读一行输入：交互走 prompt_toolkit，非交互退回普通 input()。"""
+    if confirmations_available():
+        return _session().prompt(prompt)
+    return input(prompt)
 
 
 def setup_console_encoding():
-    """把控制台与标准输出流切换到 UTF-8，并启用 readline 行编辑。
+    """把控制台与标准输出流切换到 UTF-8。
 
     Windows 控制台默认代码页可能不是 65001，且 Python 流编码跟随系统区域设置，
     因此两者都要处理；其他平台通常已是 UTF-8，重复设置无副作用。
+    输入层由 prompt_toolkit 接管后，不再需要 readline 与内核队列探测。
     """
     if sys.platform == "win32":
         os.system("chcp 65001 > nul 2>&1")
         os.system("")  # 触发旧版控制台启用 ANSI 转义序列解析（Windows 10+）
     os.environ["PYTHONIOENCODING"] = "utf-8"
-    enable_readline()
 
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
@@ -52,38 +95,11 @@ def setup_console_encoding():
                 pass
 
 
-def stdin_has_pending() -> bool:
-    """控制台输入缓冲区里是否已有排队内容（粘贴的后续行会先进入缓冲区）。
-
-    Windows 用 msvcrt.kbhit()；POSIX 交互终端用 select() 短超时探测 stdin：
-    内核 canonical 模式下粘贴的后续行会留在终端输入队列，select 能读到。
-    标准输入被重定向（管道、测试）时一律返回 False。
-    """
-    try:
-        if not sys.stdin.isatty():
-            return False
-    except (AttributeError, OSError):
-        return False
-    if sys.platform == "win32":
-        try:
-            import msvcrt
-
-            return bool(msvcrt.kbhit())
-        except Exception:  # noqa: BLE001
-            return False
-    try:
-        import select
-
-        return bool(select.select([sys.stdin], [], [], 0.0)[0])
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def flush_pending_input():
     """清空控制台输入缓冲区（尽力而为）。
 
     弹出交互确认前调用：提前键入或粘贴进缓冲区的内容会被就地丢弃，
-    而不是被随后的 input() 误当成确认回答——后者正是"权限确认莫名被拒"
+    而不是被随后的确认框误当成回答——后者正是"权限确认莫名被拒"
     的根源。POSIX 用 termios.tcflush 丢弃输入队列；Windows 用 msvcrt 逐个
     读走。标准输入被重定向时自动退化为空操作。
     """
@@ -120,22 +136,24 @@ def confirmations_available() -> bool:
 
 
 def read_user_input(prompt: str = "\n你> ") -> str:
-    """读一条用户输入（可指定提示符）；粘贴的后续行会合并进同一条消息。
+    """读一条用户输入（可指定提示符）。
 
-    input() 是按行读的，多行粘贴会被逐行消费成多条独立消息（还会在工具
-    确认时被误当成回答）。交互模式下首次回车后，只要控制台缓冲区仍有
-    排队内容就继续读取，直到出现短暂静默——手动输入的下一句话必然晚于
-    该静默窗口，不会被误并进来。Linux/macOS 依赖 readline 关闭 bracketed
-    paste 后内核队列保留的后续行（select 探测），Windows 用 msvcrt。非交互
-    stdin（管道）不做合并，行为不变。
+    交互模式走 prompt_toolkit：Enter 发送，Ctrl+Enter 手动换行，粘贴的多行
+    文本整体作为一条消息提交，支持历史记录与中文按宽度编辑；非交互 stdin
+    （管道 / CI）退回普通 input()，不做合并，行为不变。
     """
-    first = input(prompt)
-    if not sys.stdin.isatty():
-        return first
-    lines = [first]
+    return _read_line(prompt)
+
+
+def prompt_choice(prompt: str, valid: str, hint: str) -> str:
+    """循环读取单个选择键（如 y/n/a），直到输入合法。
+
+    交互走 prompt_toolkit，非交互退回普通 input()。hint 用于非法输入时的
+    提示文案（如 "y / n / a"）。返回规范化后的小写选择键。
+    """
     while True:
-        if not stdin_has_pending():
-            time.sleep(0.05)
-            if not stdin_has_pending():
-                return "\n".join(lines)
-        lines.append(input())
+        answer = _read_line(prompt).strip().lower()
+        if answer and answer in valid:  # 空串在 Python 里是任意字符串的子串，需先排除
+            return answer
+        shown = f"（收到: {answer[:40]!r}）" if answer else ""
+        print(f"   无效输入{shown}，请输入 {hint}")

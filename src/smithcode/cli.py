@@ -1,20 +1,27 @@
 import argparse
 import sys
 
-from . import __version__, config, context
+from . import __version__, config, context, plan
 from .agent import Agent
 from .session import Session
-from .utils.terminal import read_user_input, setup_console_encoding
+from .utils.terminal import (
+    confirmations_available,
+    read_user_input,
+    setup_console_encoding,
+)
 from .wizard import run_setup
 
 HELP = """命令:
   /help   显示帮助
   /new    开启新会话
+  /plan   显示当前任务计划（步骤清单）
   /save   保存会话记录
   /usage  显示 token 用量统计
   /context 显示上下文占用分布
   /compact 手动压缩上下文
-  /exit   退出"""
+  /exit   退出
+
+输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"""
 
 
 def build_parser():
@@ -74,7 +81,12 @@ def repl(agent: Agent):
             agent.permission.session_rules.clear()
             config.SESSION_EXTRA_ROOTS.clear()
             agent.context.compact_count = 0  # 压缩计数是会话口径，随 /new 清零
+            plan.reset()  # 步骤清单是会话口径，随 /new 清零
             print("已开启新会话。")
+            continue
+        if user_input == "/plan":
+            print(f"[计划] {plan.summary()}")
+            print(plan.render_current(color=True))
             continue
         if user_input == "/save":
             path = agent.session.save()
@@ -141,5 +153,9 @@ def main(argv=None):
 
     if args.task:
         run_once(agent, " ".join(args.task))
+    elif confirmations_available():  # 交互终端：全屏 TUI（Textual）
+        from .tui import run_tui
+
+        run_tui(agent)
     else:
-        repl(agent)
+        repl(agent)  # 非 tty（管道/CI）保持富行式 REPL

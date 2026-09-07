@@ -4,6 +4,29 @@
 
 ## [未发布]
 
+## [0.7.0] - 2026-09-07
+
+### 新增
+
+- 文件工具对齐成熟 agent（Claude Code / opencode）：
+  - `read_file` 返回**带行号**的内容（形如 `12  code`），新增 `offset` / `limit` 分段读取参数（默认一次最多 2000 行、单行截断 2000 字符，尾部附「显示第 X-Y 行，共 N 行」续读提示）；拒绝读取二进制文件、目录，文件不存在返回友好错误（替代裸异常）
+  - `write_file` **覆盖已存在文件前必须先 read_file**（会话级「已读文件」追踪，新会话由 `Agent` 初始化时重置；新建文件不受限），防止覆盖未查看的内容
+  - `edit_file` 编辑前同样强制先读；新增 `replace_all` 参数（重命名等全部替换场景）；多处匹配的报错改为列出各匹配行号并提示用 replace_all；新增 old_string 为空与「行号前缀勿复制」的防御性提示
+  - 系统提示词同步更新：read_file 行号输出与分段读取、edit_file 行号前缀注意事项、write_file 覆盖前先读（工具强制校验）
+- `run_command` 新增 `timeout` 参数：默认 60 秒不变，可延长（上限 300 秒，`[limits] command_timeout_max` 可配），超时报错提示延长方式；短摘要同步显示 `timeout=N`。系统提示词改为"跑测试/构建前按预估设置 timeout"
+- 系统提示词修正权限拒绝语义与实际行为不一致的矛盾：拒绝即终止任务（对齐 opencode 默认），删除"改用其他方式"的无效承诺
+- P1 检索与工具增强（对齐 Claude Code / opencode）：
+  - `grep` 新增 `output_mode`（content 默认 / files_with_matches 只列命中文件 / count 每文件匹配数）、`ignore_case` 忽略大小写、`context=N` 显示匹配上下文行（rg 风格：匹配行 `:` 分隔、上下文行 `-` 分隔、组间 `--`）
+  - `glob` 结果改为按修改时间新→旧排序（最近改动的文件排前面，定位相关代码更准）
+  - `list_dir` 文件带大小标注、跳过 `.git`/`.venv`/`node_modules` 等无关目录
+  - `todo_write` 的步骤项 `status` 改为必填（非法值仍降级 pending）
+- 新工具 `webfetch`：抓取网页转纯文本（标准库实现，无新依赖），仅放行 http/https（拒绝 file:// 等协议与重定向逃逸），默认最多返回 20000 字符（`max_chars` 可调，下限 500），HTTP 错误/网络失败返回友好错误；默认权限 `ask`（可在 `[permissions]` 配置 allow）
+
+- **全屏聊天 TUI**（Textual 实现，复刻 Claude Code 风格）：交互终端启动 `smithcode` 直接进入全屏界面——上半消息区（助手回复**无前缀纯文本流式**、**思考过程折叠块**：思考时只显示「▸ [思考] 思考中…（N 字符）」计数不刷屏，点击/Enter 展开看全文，与工具调用折叠块同款交互、**用户消息面板**：opencode 式——面板底色 `#141414` + 左侧角色色竖线 + 上下 1 行/左 2 格内边距，无「你>」前缀、**轮次元数据页脚**：每轮任务结束追加 opencode 式「▣ 模型 · 用时 Ns」（▣ 用主色、模型亮色、用时弱化、缩进 3 格））、输入框下方**同一行**：最左运行动画（执行时旋转符 +「运行中…」，结束隐藏）+ 最右状态信息（模型名 / 思考强度 `[provider] reasoning_effort`（可选，同时传给模型）/ 项目名 / git 分支（读取 `.git/HEAD`，无仓库自动省略））、右侧常驻侧边栏（上半为用量/上下文：会话 token 用量、上下文占用百分比、压缩次数；中间为当前任务计划清单，`todo_write` 实时刷新；底部版本号 + 当前工作区路径）、底部多行输入框（Enter 发送、Shift+Enter/Ctrl+J 换行），不带底部操作按钮提示。配色取自 opencode 默认主题源码（`opencode.json`：背景 `#0a0a0a` / 面板 `#141414` / 元素 `#1e1e1e` / 主色 `#fab283` / 弱化 `#808080`），各模块带与 opencode 一致的 padding（消息区左右 2 上下 1、输入框顶部 1、用户消息面板上下 1 左 2）。权限确认与 `ask_user` 改为弹窗（y/n/a 按键选择 / 输入框回答，Esc 拒绝）。`/exit` `/new` `/plan` `/save` `/usage` `/context` `/compact` `/help` 全部在 TUI 内可用。Agent 保持同步流式在后台线程运行，经 `Renderer` 接口桥接（`renderer.py`：CLI 用 `ConsoleRenderer` 保持原 print/input 行为，TUI 用 `TuiRenderer` 以线程安全的 `post_message` 投递 UI 更新 + ModalScreen 弹窗）。一次性任务、管道/CI 仍走控制台模式，一行不改。新增依赖 `textual`
+- 交互输入层改用 prompt_toolkit：粘贴多行自动合并为一条消息（原生粘贴检测，不再依赖内核队列探测）、输入历史持久化到 `~/.smithcode/history`、中文按显示宽度编辑（替代 readline hack，消除 Linux 下退格错乱）。Enter 发送消息，Ctrl+Enter 手动插入换行（支持多行编辑；Alt+Enter 在 Windows 下会被终端拦截用于全屏切换，故不用它）。新增依赖 `prompt_toolkit`，仅交互模式加载，非交互 stdin（管道/CI）仍退回普通 `input()`，行为不变
+- 任务拆分与分步骤执行（opencode 式 TodoWrite）：新工具 `todo_write` 让模型维护会话级步骤清单（状态 `pending` / `in_progress` / `completed` / `cancelled`，传全量最新清单而非增量、非法状态降级为 pending、单份上限 50 步）。多步任务动手前模型先列出完整计划，逐步执行并实时更新状态。计划在终端实时渲染（进行中加粗高亮、完成/取消置灰），不受 `tool_display` 粒度影响；回传给模型的工具结果保持明文清单，供后续轮次参考。系统提示词新增「任务拆分与分步骤执行」规则段：同一时刻仅一个 in_progress、真正完成（含验证）后才标 completed、计划不合理时调整清单并在 reason 说明而非无视、取消的步骤保留清单、单步简单任务不需要拆分
+- 新增 `/plan` 命令随时查看当前任务计划，`/new` 开启新会话时同步清空；`todo_write` 默认 `allow`（与 `ask_user` 一致，确认一个"追踪步骤"是荒谬的），可用 `deny` 规则禁用
+
 ## [0.6.1] - 2026-09-04
 
 ### 修复

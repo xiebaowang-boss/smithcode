@@ -42,6 +42,29 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 
 工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止，`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
 
+## 任务拆分与分步骤执行
+
+借鉴 opencode 的 TodoWrite：模型用 `todo_write` 工具维护一份会话级步骤清单，把复杂任务拆成可追踪、可展示的步骤逐步执行。清单不是独立于循环的新架构——仍是同一个 Agentic Loop，只是多了"先列计划、边做边更"的纪律：
+
+```
+多步任务到达
+   │
+   ▼
+todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pending）
+   │                         ▸ [计划] 共 N 步 实时渲染到终端
+   ▼
+逐步执行：开始某步 → todo_write(该步 in_progress) → 执行工具 → 验证
+   │                         ▸ 完成 → todo_write(该步 completed, 下一步 in_progress)
+   ▼
+计划不合理 → todo_write(调整清单 + reason)；用户改主意 → 标 cancelled 保留
+```
+
+- **状态机**：`pending`（未开始）/ `in_progress`（进行中，同一时刻仅一个）/ `completed`（已完成）/ `cancelled`（不再需要）。`todo_write` 传**全量最新清单**（非增量），每次整体替换；空内容忽略、非法状态降级为 `pending`，单份上限 50 步。
+- **状态归属**：清单存于 `plan.py` 的进程内单例（会话口径），`/new` 时 `reset()`；`/plan` 命令随时查看当前计划。
+- **展示**：`todo_write` 走 Agent 的专用执行路径 `_execute_todo`，计划无论 `tool_display` 粒度都完整渲染（in_progress 加粗、完成/取消置灰），不受 summary 模式"只留一行摘要"影响；回传给模型的工具结果保持明文清单，供后续轮次参考。
+- **权限**：`todo_write` 默认 `allow`（与 `ask_user` 一致），可用 `deny` 规则禁用。
+- **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、计划不合理时调整而非无视、单步简单任务不拆分。
+
 ## 模块职责
 
 | 模块 | 职责 |
@@ -51,6 +74,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 | `llm.py` | OpenAI 兼容接口封装（流式、自动重试） |
 | `prompts.py` | 系统提示词（行为规则） |
 | `session.py` | 消息历史的增删存取 |
+| `plan.py` | 任务拆分与分步骤执行：`todo_write` 维护的会话级步骤清单（状态机 + 渲染 + `/plan` 查看） |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission.py` | 敏感操作的用户确认 |
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
@@ -60,6 +84,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 | `tools/shell.py` | 命令执行，含超时保护 |
 | `tools/patch.py` | apply_patch 批量原子改文件 |
 | `tools/ask.py` | ask_user 任务中途向用户提问 |
+| `tools/todo.py` | todo_write 任务拆分与分步骤执行的状态机 |
 
 ## 安全边界
 

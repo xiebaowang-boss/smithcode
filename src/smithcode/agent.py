@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import config
+from . import config, renderer
 from .context import (
     ContextMeter,
     assemble,
@@ -16,24 +16,35 @@ from .context import (
 )
 from .llm import LLMClient
 from .permission import Permission
+from .plan import render_current, summary
 from .session import Session
-from .tools import DESCRIBERS, FUNCTIONS, PATHS_EXTRACTORS, SCHEMAS
-
-# ANSI 转义：思考内容以灰色展示（90m 比 dim/2m 在 Windows 终端上兼容性好得多）
-DIM, RESET = "\033[90m", "\033[0m"
+from .tools import (
+    DESCRIBERS,
+    DISPLAY,
+    FUNCTIONS,
+    PATHS_EXTRACTORS,
+    SCHEMAS,
+    reset_read_tracking,
+)
 
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
 
 
+# 权限被拒时的统一工具结果文本（回传模型 + 终端展示共用）
+DENIED_RESULT = "用户拒绝了此操作"
+# 权限被拒后为同条 assistant 消息中剩余 tool_calls 补的占位结果（防悬空 tool_call_id）
+SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
+
+
 class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None):
+        reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
         self.llm = LLMClient()
         self.session = session or Session()
         self.permission = Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
-        self.display_mode = config.load_tool_display()  # 工具调用展示粒度：summary / detail
 
     def run(self, user_input: str) -> str:
         self.session.add("user", user_input)
@@ -48,11 +59,20 @@ class Agent:
             if not msg.get("tool_calls"):
                 return msg.get("content", "")
 
-            for tc in msg["tool_calls"]:
-                result = self._execute(tc)
+            for i, tc in enumerate(msg["tool_calls"]):
+                result, denied = self._execute(tc)
                 self.session.messages.append(
                     {"role": "tool", "content": result, "tool_call_id": tc["id"]}
                 )
+                if denied:
+                    # 权限被拒：为同条消息中剩余 tool_calls 补占位结果（防悬空
+                    # tool_call_id 破坏下一轮请求），然后直接终止本轮任务。
+                    for pending in msg["tool_calls"][i + 1:]:
+                        self.session.messages.append(
+                            {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": pending["id"]}
+                        )
+                    renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
+                    return "任务已停止：权限请求被用户拒绝。"
 
         return "达到最大迭代次数，任务中止。"
 
@@ -67,7 +87,7 @@ class Agent:
         except Exception as e:
             if not is_context_overflow(e):
                 raise
-        print("\n[context] 上下文溢出，压缩后重试…")
+        renderer.current().info("\n[context] 上下文溢出，压缩后重试…")
         self.compact()
         return self._chat()
 
@@ -97,14 +117,16 @@ class Agent:
                 summary = text
                 break
         if summary is None:
-            print("[context] 摘要未按模板生成，放弃本次压缩，原样继续")
+            renderer.current().info("[context] 摘要未按模板生成，放弃本次压缩，原样继续")
             return False
 
         self.session.messages = assemble(
             messages[0].get("content", ""), summary, messages[tail_start:]
         )
         self.context.compact_count += 1
-        print(f"\n[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens")
+        renderer.current().info(
+            f"\n[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens"
+        )
         return True
 
     def _complete(self, request: list[dict]) -> str:
@@ -121,44 +143,42 @@ class Agent:
         """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀）。
 
         返回 (完整消息, 本次用量)；用量由 llm 层从流中提取，服务商
-        不提供时为 None。思考内容（reasoning_content，仅部分模型返回）
-        以灰色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
+        不提供时为 None。渲染交给 renderer（CLI 逐字打印 / TUI 进组件）。
+        思考内容（reasoning_content，仅部分模型返回）以灰色实时展示，
+        但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
         """
         msg = {}
         usage = None
-        mode = None  # 当前流式内容类型："reasoning" / "content"
+        r = renderer.current()
         for kind, payload in self.llm.chat_stream(self.session.messages, tools=SCHEMAS):
             if kind == "message":
                 msg = payload
             elif kind == "usage":
                 usage = payload
             else:
-                if kind != mode:
-                    if mode == "reasoning":  # 思考段结束，恢复正常样式
-                        print(RESET, end="", flush=True)
-                    print("\n助手> ", end="", flush=True)
-                    if kind == "reasoning":
-                        print(f"{DIM}[Thinking] ", end="", flush=True)
-                    mode = kind
-                print(payload, end="", flush=True)
-        if mode == "reasoning":  # 流在思考段中结束（如模型直接发起工具调用）
-            print(RESET, end="")
-        if mode is not None:
-            print()
+                r.stream(kind, payload)
+        r.stream_done()
         return msg, usage
 
-    def _execute(self, tc: dict) -> str:
+    def _execute(self, tc: dict) -> tuple[str, bool]:
+        """执行一个工具调用，返回 (结果文本, 是否权限被拒)。
+
+        权限被拒时由 run() 终止整个任务循环（拒绝即停，不与模型继续拉扯）。
+        """
         name = tc["function"]["name"]
         args_json = tc["function"]["arguments"]
 
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
-            print(f"  [Tool] {name}({args_json[:80]})")
-            return self._finish(f"错误: JSONDecodeError: {e}")
+            tool_id = renderer.current().tool_call(f"[Tool] {name}({args_json[:80]})")
+            return self._finish(f"错误: JSONDecodeError: {e}", tool_id), False
 
         line = self._describe(name, args)
-        print(f"  {line[:MAX_SUMMARY_LEN]}{'...' if len(line) > MAX_SUMMARY_LEN else ''}")
+        display = DISPLAY.get(name, "inline")
+        tool_id = renderer.current().tool_call(
+            line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display
+        )
 
         # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
         extractor = PATHS_EXTRACTORS.get(name)
@@ -166,12 +186,15 @@ class Agent:
             try:
                 paths = [str(p) for p in extractor(args)]
             except Exception as e:  # noqa: BLE001
-                return self._finish(f"错误: 无法解析目标路径: {type(e).__name__}: {e}")
+                return self._finish(f"错误: 无法解析目标路径: {type(e).__name__}: {e}", tool_id), False
             if paths:
-                return self._execute_with_paths(name, args, paths)
-        return self._execute_single(name, args)
+                return self._execute_with_paths(name, args, paths, tool_id)
+        if name == "todo_write":
+            return self._execute_todo(args, tool_id)
+        return self._execute_single(name, args, tool_id)
 
-    def _execute_with_paths(self, name: str, args: dict, paths: list[str]) -> str:
+    def _execute_with_paths(self, name: str, args: dict, paths: list[str],
+                            tool_id: int | None = None) -> tuple[str, bool]:
         """多路径工具：任一路径越界被拒则整体拒绝；聚合权限检查；整体原子执行。
 
         路径预检（根信任门）→ 聚合操作权限门 → 执行，两道关卡有序，与单路径工具一致。
@@ -180,12 +203,12 @@ class Agent:
         for raw in paths:
             pre = self._preflight_path(raw)
             if pre == "deny":
-                return self._finish("用户拒绝了此操作")
+                return self._finish(DENIED_RESULT, tool_id), True
             if isinstance(pre, Path):
                 widened.append(pre)
 
         if not self.permission.check_paths(name, paths):
-            return self._finish("用户拒绝了此操作")
+            return self._finish(DENIED_RESULT, tool_id), True
 
         try:
             with config.widen_roots(widened):
@@ -194,17 +217,19 @@ class Agent:
             # 工具执行的任何失败都只作为结果回传给模型，不中断循环
             result = f"错误: {type(e).__name__}: {e}"
 
-        return self._finish(result)
+        return self._finish(result, tool_id), False
 
-    def _execute_single(self, name: str, args: dict) -> str:
+    def _execute_single(self, name: str, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
         preflight = self._preflight_outside_path(args)
         if preflight == "deny":
-            return self._finish("用户拒绝了此操作")
+            return self._finish(DENIED_RESULT, tool_id), True
 
+        denied = False
         try:
             if not self.permission.check(name, args):
-                result = "用户拒绝了此操作"
+                result = DENIED_RESULT
+                denied = True
             elif isinstance(preflight, Path):
                 with config.widen_roots([preflight]):
                     result = str(FUNCTIONS[name](**args))
@@ -214,19 +239,28 @@ class Agent:
             # 工具执行的任何失败都只作为结果回传给模型，不中断循环
             result = f"错误: {type(e).__name__}: {e}"
 
-        return self._finish(result)
+        return self._finish(result, tool_id), denied
 
-    def _finish(self, result: str) -> str:
-        """回传前截断超长输出；终端展示按 display_mode 分支：summary 模式只有
-        执行前那行短摘要，detail 模式追加结果内容。失败信息（错误/用户拒绝）
-        无论何种模式都原样展示——失败的细节比格式化摘要更重要。"""
+    def _execute_todo(self, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
+        """todo_write 专用执行路径：计划无论 display_mode 都必须完整展示，
+        不走 tool_result 的粒度分支（summary 模式也不能只留一行摘要）。"""
+        if not self.permission.check("todo_write", args):
+            return self._finish(DENIED_RESULT, tool_id), True
+        try:
+            result = str(FUNCTIONS["todo_write"](**args))
+        except Exception as e:  # noqa: BLE001
+            result = f"错误: {type(e).__name__}: {e}"
+            renderer.current().tool_result(result, tool_id)
+            return result, False
+        renderer.current().plan(summary(), render_current(color=True))
+        return result, False
+
+    def _finish(self, result: str, tool_id: int | None = None) -> str:
+        """回传前截断超长输出；终端展示交给 renderer（summary 模式只有
+        执行前那行短摘要，detail 模式追加结果内容）。失败信息无论何种模式
+        都原样展示——失败的细节比格式化摘要更重要。"""
         result = truncate_output(result, config.MAX_TOOL_OUTPUT)
-        if result.startswith("错误:") or result == "用户拒绝了此操作":
-            print(f"  {result}\n")
-            return result
-        if self.display_mode == "detail":
-            display = result[:500] + ("..." if len(result) > 500 else "")
-            print(f"  [Result] {display}\n")
+        renderer.current().tool_result(result, tool_id)
         return result
 
     @staticmethod
