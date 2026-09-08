@@ -44,6 +44,11 @@ def credentials_path() -> Path:
     return smithcode_home() / "credentials.json"
 
 
+def models_cache_path() -> Path:
+    """远端 `/models` 拉取结果的磁盘缓存路径（按接口地址校验，见 models.ModelCache）。"""
+    return smithcode_home() / "models.json"
+
+
 WORKSPACE_ROOT = os.getcwd()
 
 
@@ -117,8 +122,10 @@ def _resolve_number(section: str, key: str, default):
 KEY = os.getenv("SMITHCODE_KEY") or _credentials_key()
 MODEL = os.getenv("SMITHCODE_MODEL") or _file_str("provider", "model") or "deepseek-v4-flash"
 URL = os.getenv("SMITHCODE_URL") or _file_str("provider", "url")
-# 模型思考强度（reasoning_effort：low / medium / high 等，可选）；不配则不发该参数
-REASONING_EFFORT = _file_str("provider", "reasoning_effort")
+# 模型思考强度（reasoning_effort）：内置默认 high，config.toml 的
+# [provider].reasoning_effort 可覆盖；候选档位见 models.DEFAULT_EFFORTS
+DEFAULT_EFFORT = "high"
+REASONING_EFFORT = _file_str("provider", "reasoning_effort") or DEFAULT_EFFORT
 
 # 当前对话会话 id：一次对话（单次任务或 /new 之后）内保持稳定，新会话轮换。
 # 供自定义请求头 [provider.headers] 中的 {$session} 占位符使用（如 OpenCode Go
@@ -156,6 +163,28 @@ def load_provider_headers() -> dict:
                 f" 不是有效字符串，已忽略"
             )
     return result
+
+
+def read_configured_models():
+    """读取 config.toml 的 [provider].models 列表；未配置或非法返回 None。
+
+    返回 None 表示"外部没有配置"（区别于空列表），由 ModelCatalog 决定后续
+    来源（磁盘缓存 / 远端 `/models`）。非列表或含非字符串项时打印警告并忽略。
+    """
+    section = _read_config_file().get("provider") or {}
+    raw = section.get("models")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        print(f"[警告] config.toml 的 provider.models = {raw!r} 不是字符串列表，已忽略")
+        return None
+    models = []
+    for item in raw:
+        if not isinstance(item, str):
+            print(f"[警告] config.toml 的 provider.models 含非字符串项 {item!r}，已忽略")
+        elif item.strip() and item not in models:
+            models.append(item)
+    return models or None
 
 
 def ensure_api_key():

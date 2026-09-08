@@ -25,6 +25,8 @@ _CONFIG_TEMPLATE = """\
 [provider]
 url = "{url}"
 model = "{model}"
+# 可选模型列表（/model 无参时弹出的候选）；留空则启动时自动拉取接口 /models
+# models = ["deepseek-v4-flash", "deepseek-v4-pro"]
 # 自定义请求头（可选）：随每个 LLM 请求发送，值支持 {{$session}} 占位符
 # （替换为当前会话 id，每次 /new 自动轮换）。OpenCode Go 会话路由示例：
 # [provider.headers]

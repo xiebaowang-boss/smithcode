@@ -204,3 +204,37 @@ def test_provider_headers_non_str_value_ignored(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SMITHCODE_HOME", str(home))
     assert config.load_provider_headers() == {"name": "ok"}
     assert "警告" in capsys.readouterr().out
+
+
+# ---------- provider.models（/model 候选的显式配置） ----------
+
+def test_read_configured_models_dedupes_in_order(tmp_path, monkeypatch):
+    home = _make_home(tmp_path, '[provider]\nmodels = ["a", "b", "a"]\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.read_configured_models() == ["a", "b"]
+
+
+def test_read_configured_models_absent_returns_none(tmp_path, monkeypatch):
+    """未配置返回 None（区别于空列表），由 ModelCatalog 决定后续来源。"""
+    monkeypatch.setenv("SMITHCODE_HOME", str(tmp_path))
+    assert config.read_configured_models() is None
+
+
+def test_read_configured_models_empty_list_returns_none(tmp_path, monkeypatch):
+    home = _make_home(tmp_path, '[provider]\nmodels = []\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.read_configured_models() is None
+
+
+def test_read_configured_models_wrong_type_warns(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, '[provider]\nmodels = "nope"\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.read_configured_models() is None
+    assert "警告" in capsys.readouterr().out
+
+
+def test_read_configured_models_skips_non_string_items(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, '[provider]\nmodels = ["a", 3]\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.read_configured_models() == ["a"]
+    assert "警告" in capsys.readouterr().out

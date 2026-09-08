@@ -90,3 +90,44 @@ def test_webfetch_rejects_non_http_redirect(monkeypatch):
         lambda req, timeout: FakeResp("<p>x</p>", final_url="ftp://evil/x"),
     )
     assert "重定向" in web.webfetch("https://example.com/x")
+
+
+def test_webfetch_batch_fetches_all_urls(monkeypatch):
+    def fake_urlopen(req, timeout):
+        return FakeResp(f"<p>内容-{req.full_url}</p>")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    out = web.webfetch(["https://a.example.com/", "https://b.example.com/"])
+    assert "内容-https://a.example.com/" in out
+    assert "内容-https://b.example.com/" in out
+    # 每个地址的结果有分隔头，可对应回原地址
+    assert "===== [1] https://a.example.com/ =====" in out
+    assert "===== [2] https://b.example.com/ =====" in out
+
+
+def test_webfetch_batch_keeps_single_url_result_plain(monkeypatch):
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout: FakeResp("<p>单页</p>"),
+    )
+def test_webfetch_batch_rejects_too_many_urls():
+    urls = [f"https://example.com/{i}" for i in range(web.MAX_URLS + 1)]
+    out = web.webfetch(urls)
+    assert "最多并行抓取" in out and "多次调用" in out
+
+
+def test_webfetch_batch_empty_list():
+    assert "url 列表为空" in web.webfetch([])
+
+
+def test_webfetch_batch_partial_failure(monkeypatch):
+    def fake_urlopen(req, timeout):
+        if "bad" in req.full_url:
+            raise urllib.error.URLError("getaddrinfo failed")
+        return FakeResp("<p>正常</p>")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    out = web.webfetch(["https://bad.invalid/", "https://good.example.com/"])
+    # 失败的地址不拖垮整批：正常结果与错误信息都在，且各归各的分隔段
+    assert "正常" in out
+    assert "抓取失败" in out

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from smithcode import commands, config, plan
 from smithcode.commands import base
 from smithcode.commands.base import CommandResult
+from smithcode.models import DEFAULT_EFFORTS
 
 
 class _StubAgent:
@@ -22,6 +23,7 @@ class _StubAgent:
         )
         self.permission = SimpleNamespace(session_rules=["旧规则"])
         self.context = SimpleNamespace(compact_count=0, last_actual=None)
+        self.models = SimpleNamespace(list=lambda: ["a", "b", "c"])
 
     def _reset(self):
         self.reset_called = True
@@ -39,7 +41,7 @@ def _run(text, **kwargs):
 
 def test_all_builtin_commands_registered():
     names = {cmd.name for cmd in commands.all_commands()}
-    assert {"exit", "new", "save", "compact", "help", "plan", "usage", "context"} <= names
+    assert {"exit", "new", "save", "compact", "help", "plan", "usage", "context", "model", "effort"} <= names
 
 
 def test_all_commands_sorted_and_deduped():
@@ -58,6 +60,60 @@ def test_register_with_alias_points_to_same_command():
     finally:
         base.COMMANDS.pop("faketest", None)
         base.COMMANDS.pop("ft", None)
+
+
+def test_register_immediate_flag():
+    """immediate 通过注册透传；默认 False。"""
+    base.register("immtest", "测试立即执行", immediate=True)(lambda ctx: CommandResult())
+    try:
+        assert base.get_command("immtest").immediate is True
+        assert base.get_command("help").immediate is False
+    finally:
+        base.COMMANDS.pop("immtest", None)
+
+
+def test_model_command_is_immediate():
+    assert base.get_command("model").immediate is True
+
+
+# ---------- /effort：思考强度切换（本地档位列表，交互同 /model） ----------
+
+def test_effort_builtin_default_is_high():
+    """内置默认档位为 high，且在候选列表中。"""
+    assert config.DEFAULT_EFFORT == "high"
+    assert config.DEFAULT_EFFORT in DEFAULT_EFFORTS
+
+
+def test_effort_switches_with_arg(monkeypatch):
+    monkeypatch.setattr(config, "REASONING_EFFORT", "low")
+    _, outcome = _run("/effort high")
+    assert config.REASONING_EFFORT == "high"
+    assert "思考强度已切换" in outcome.text
+    assert outcome.refresh_status
+
+
+def test_effort_without_arg_returns_select(monkeypatch):
+    monkeypatch.setattr(config, "REASONING_EFFORT", "medium")
+    _, outcome = _run("/effort")
+    assert outcome.select is not None
+    assert outcome.select.command == "effort"
+    values = [c.value for c in outcome.select.items]
+    assert values == list(DEFAULT_EFFORTS)
+    currents = [c.current for c in outcome.select.items]
+    assert currents[values.index("medium")] is True
+    assert currents.count(True) == 1
+
+
+def test_effort_default_current_when_unset(monkeypatch):
+    """REASONING_EFFORT 为空时按内置默认档位（config.DEFAULT_EFFORT）标记当前项。"""
+    monkeypatch.setattr(config, "REASONING_EFFORT", None)
+    _, outcome = _run("/effort")
+    values = [c.value for c in outcome.select.items]
+    assert outcome.select.items[values.index(config.DEFAULT_EFFORT)].current is True
+
+
+def test_effort_command_is_immediate():
+    assert base.get_command("effort").immediate is True
 
 
 # ---------- dispatch：分发、未知命令、参数校验、异常兜底 ----------
@@ -197,3 +253,33 @@ def test_help_text_alignment_covers_all_commands():
     for cmd in commands.all_commands():
         assert (cmd.usage or "/" + cmd.name) in text
         assert cmd.description in text
+
+
+# ---------- /model：带参直接切换，无参返回选择意图 ----------
+
+def test_model_switches_with_arg(monkeypatch):
+    monkeypatch.setattr(config, "MODEL", "old-model")
+    _, outcome = _run("/model new-model")
+    assert config.MODEL == "new-model"
+    assert "已切换模型" in outcome.text
+    assert outcome.refresh_status
+    assert outcome.select is None
+
+
+def test_model_without_arg_returns_select(monkeypatch):
+    monkeypatch.setattr(config, "MODEL", "b")
+    _, outcome = _run("/model")
+    assert outcome.select is not None
+    assert outcome.select.command == "model"
+    assert [c.value for c in outcome.select.items] == ["a", "b", "c"]
+    assert [c.current for c in outcome.select.items] == [False, True, False]
+
+
+def test_model_without_candidates_hints(monkeypatch):
+    monkeypatch.setattr(config, "MODEL", "only")
+    agent = _StubAgent()
+    agent.models = SimpleNamespace(list=lambda: ["only"])
+    outcome = commands.dispatch(agent, "/model")
+    assert outcome.select is None
+    assert "没有可切换的候选模型" in outcome.text
+

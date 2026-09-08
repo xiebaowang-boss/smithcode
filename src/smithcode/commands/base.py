@@ -12,6 +12,29 @@ KIND_BLOCK = "block"
 
 
 @dataclass
+class CommandChoice:
+    """选择器的一个候选项：label 展示、value 回传、current 标记当前值。"""
+
+    label: str
+    value: str
+    description: str = ""
+    current: bool = False
+
+
+@dataclass
+class CommandSelect:
+    """命令要求宿主弹出的选择意图：选中后按 `/<command> <value>` 重新分发。
+
+    command 是被调用的命令名（如 "model"），宿主不关心选项语义，只负责
+    展示并回填参数——命令处理器保持同步、纯函数。
+    """
+
+    title: str
+    command: str
+    items: list  # CommandChoice 列表
+
+
+@dataclass
 class CommandResult:
     """命令执行结果：宿主（REPL / TUI）据此渲染输出并做后续动作。"""
 
@@ -21,6 +44,7 @@ class CommandResult:
     exit: bool = False            # 要求退出（REPL 跳出循环 / TUI 结束应用）
     session_reset: bool = False   # 会话已重置（TUI 需清空计划侧栏）
     refresh_status: bool = False  # 会话状态可能变化（TUI 需刷新状态栏）
+    select: CommandSelect | None = None  # 非空时宿主弹出选择器
 
 
 @dataclass
@@ -41,24 +65,28 @@ class Command:
     usage: str | None = None      # 用法示例（含参数形态），缺省为 /<name>
     aliases: tuple = ()           # 别名，注册后同样指向本命令
     accepts_args: bool = False    # False 时携带参数直接回用法提示
+    immediate: bool = False       # TUI 菜单选中后立即执行（而非填入输入框）
 
 
 COMMANDS: dict = {}  # 命令名 / 别名 -> Command
 
 
 def register(name: str, description: str, usage: str | None = None,
-             aliases: tuple = (), accepts_args: bool = False):
+             aliases: tuple = (), accepts_args: bool = False,
+             immediate: bool = False):
     """把一个函数注册为斜杠命令。
 
     name 为命令名（不含斜杠）；description 进 /help 文案；
     usage 为含参数形态的用法示例（如 "/model [名称]"，缺省 /<name>）；
-    aliases 为可选别名；accepts_args 为 False 时携带参数会收到用法提示。
+    aliases 为可选别名；accepts_args 为 False 时携带参数会收到用法提示；
+    immediate 为 True 时 TUI 命令菜单选中即执行（不填入输入框）。
     """
 
     def decorator(func):
         cmd = Command(
             name=name, description=description, handler=func,
             usage=usage, aliases=tuple(aliases), accepts_args=accepts_args,
+            immediate=immediate,
         )
         COMMANDS[name] = cmd
         for alias in cmd.aliases:

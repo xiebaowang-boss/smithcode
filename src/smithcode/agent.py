@@ -15,6 +15,13 @@ from .context import (
     validate_summary,
 )
 from .llm import LLMClient
+from .models import (
+    CachedModelSource,
+    ConfiguredModelSource,
+    ModelCache,
+    ModelCatalog,
+    RemoteModelSource,
+)
 from .permission import Permission
 from .plan import render_current, summary
 from .session import Session
@@ -72,6 +79,18 @@ class Agent:
         self.permission = Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
+        # 候选模型目录：命令层只读 `agent.models.list()`，不关心来源与装载时机
+        cache = ModelCache()
+        self.models = ModelCatalog(
+            configured=ConfiguredModelSource(),
+            cached=CachedModelSource(cache),
+            remote=RemoteModelSource(self.llm, cache),
+            current_model=lambda: config.MODEL,
+        )
+
+    def start(self) -> None:
+        """启动期装载模型目录：外部配置优先；未配置则后台拉取远端 `/models`。"""
+        self.models.bootstrap()
 
     def run(self, user_input: str) -> str:
         self.session.ensure_system()  # 首次发请求前才把系统提示词放入历史（懒加载）

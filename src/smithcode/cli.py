@@ -68,12 +68,23 @@ def repl(agent: Agent):
                 break
             if outcome.text is not None:
                 print(outcome.text)
+            if outcome.select is not None:
+                _print_select(outcome.select)
             continue
 
         try:
             agent.run(user_input)  # 回复已在流式过程中实时打印
         except Exception as e:  # noqa: BLE001
             print(f"\n[错误] {type(e).__name__}: {e}")
+
+
+def _print_select(select):
+    """非交互 REPL 无法弹选择器：列出候选并提示改用带参形式（fail-closed）。"""
+    print(f"{select.title}:")
+    for index, choice in enumerate(select.items, 1):
+        mark = "（当前）" if choice.current else ""
+        print(f"  {index}. {choice.label}{mark}")
+    print(f"非交互模式无法弹出选择器，请用 /{select.command} <名称> 指定。")
 
 
 def run_once(agent: Agent, task: str):
@@ -104,6 +115,7 @@ def main(argv=None):
         sys.exit(1)
     if args.yes:
         agent.permission.approved_all = True
+    agent.start()  # 启动模型目录：外部未配置时后台拉取 /models（不阻塞启动）
 
     if args.task:
         run_once(agent, " ".join(args.task))

@@ -11,15 +11,19 @@ import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
 from smithcode.session import Session
-from smithcode.tui.app import (
+from smithcode.tui.app import SmithTUI
+from smithcode.tui.panels import SelectionScreen
+from smithcode.tui.render import format_duration, git_branch
+from smithcode.tui.renderer import TuiRenderer
+from smithcode.tui.widgets import (
+    MENU_VISIBLE_ITEMS,
     ChatInput,
     ChatView,
     CommandMenu,
+    CommandMenuItem,
     Sidebar,
-    SmithTUI,
     ThinkingBlock,
     ToolCall,
-    TuiRenderer,
 )
 from smithcode.utils.terminal import confirmations_available
 
@@ -575,8 +579,48 @@ def test_running_indicator_during_task(monkeypatch):
     _run(_run_case())
 
 
+def test_format_duration_levels():
+    """时长分级格式：各级到点才出现，不凑零、不进位显示。"""
+    assert format_duration(0.4) == "0s"
+    assert format_duration(42.7) == "42s"
+    assert format_duration(59.9) == "59s"
+    assert format_duration(60) == "1m 0s"
+    assert format_duration(330) == "5m 30s"
+    assert format_duration(3599) == "59m 59s"
+    assert format_duration(3600) == "1h 0m 0s"
+    assert format_duration(4350) == "1h 12m 30s"
+
+
+def test_running_indicator_width_stable_across_levels():
+    """动画文案宽度不随时长分级变化：这是 _spin 用 layout=False 免重排的前提。"""
+    from smithcode.tui.widgets import RunningIndicator
+
+    indicator = RunningIndicator()
+    widths = {len(indicator._spin_text(secs)) for secs in (0, 59, 60, 599, 3600, 3600 * 99)}
+    assert len(widths) == 1
+
+
+def test_running_indicator_first_show_has_width(monkeypatch):
+    """回归：首次显示即有宽度——start() 立即定宽渲染，否则 layout=False 让首轮零宽不可见。"""
+    no_prompting(monkeypatch)
+    from smithcode.tui.widgets import RunningIndicator
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            running = app.query_one("#running", RunningIndicator)
+            assert running.size.width == 0  # 空内容初始零宽
+            running.display = True
+            running.start()
+            await pilot.pause(0.2)
+            assert running.size.width > 0  # 首次显示即定宽可见
+            assert "Working" in str(running.render())
+
+    _run(_run_case())
+
+
 def test_turn_footer_after_task(monkeypatch):
-    """轮次结束在会话末尾追加 opencode 式「▣ 模型 · 用时」页脚。"""
+    """轮次结束在会话末尾追加 opencode 式「▣ 模型 · 思考强度 · 用时」页脚。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -593,7 +637,8 @@ def test_turn_footer_after_task(monkeypatch):
             footer = str(app.query_one("#chat").children[-1].content)
             assert footer.startswith("▣")
             assert config.MODEL in footer
-            assert "用时" in footer
+            assert (config.REASONING_EFFORT or config.DEFAULT_EFFORT) in footer
+            assert "用时" not in footer
 
     _run(_run_case())
 
@@ -636,8 +681,6 @@ def test_user_message_panel(monkeypatch):
 
 def test_git_branch_detection(tmp_path):
     """git 分支读取：常规仓库 / 无 .git / detached HEAD。"""
-    from smithcode.tui.app import git_branch
-
     repo = tmp_path / "repo"
     (repo / ".git" / "refs" / "heads").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
@@ -764,12 +807,83 @@ def test_command_menu_enter_accepts_without_sending(monkeypatch):
     _run(_run_case())
 
 
+def test_command_menu_immediate_command_executes(monkeypatch):
+    """immediate 命令（/model）在菜单选中后立即执行，不填入输入框。"""
+    no_prompting(monkeypatch)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "MODEL", "a")
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.models = SimpleNamespace(list=lambda: ["a", "b"])
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/model")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert inp.text == ""  # 未填入输入框
+            assert isinstance(app.screen, SelectionScreen)  # 直接弹选择框
+
+    _run(_run_case())
+
+
+def test_command_menu_effort_immediate_and_switch(monkeypatch):
+    """/effort immediate：菜单选中直接弹选择框，选定后切换思考强度。"""
+    no_prompting(monkeypatch)
+    monkeypatch.setattr(config, "REASONING_EFFORT", "low")
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/effort")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, SelectionScreen)
+            panel = app.screen.query_one("SelectionPanel")
+            # low 是当前项，↓ 移到下一档 high
+            start = panel._selected
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not isinstance(app.screen, SelectionScreen)
+            assert config.REASONING_EFFORT != "low"
+            assert panel._items[start].value == "low"
+
+    _run(_run_case())
+
+
+def test_command_menu_click_activates(monkeypatch):
+    """鼠标点击菜单项：普通命令填入输入框（与 Enter 接受同一入口）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/he")
+            await pilot.pause()
+            await pilot.click(app.query_one(CommandMenuItem))
+            await pilot.pause()
+            assert inp.text == "/help "
+            assert not app.query_one(CommandMenu).open
+
+    _run(_run_case())
+
+
 def test_command_menu_scroll_when_overflow(monkeypatch):
     """候选超过固定展示行数：高度封顶 + ↑↓ 到可视区外自动滚动。"""
     no_prompting(monkeypatch)
     from smithcode.commands import base
     from smithcode.commands.base import CommandResult
-    from smithcode.tui.app import MENU_VISIBLE_ITEMS
 
     extras = []
     for i in range(5):  # 8 内置 + 5 临时 = 13 > 8，触发滚动
@@ -822,5 +936,150 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
             await pilot.pause()
             assert not menu.open
             assert inp.text == "/"  # 输入内容保持不变
+
+    _run(_run_case())
+
+
+# ---------- 通用选择面板（居中弹窗） ----------
+
+def test_selection_panel_centered_selects_and_redispatch(monkeypatch):
+    """命令返回 select：弹出遮罩居中面板，选中后按 /命令 值 重新分发。"""
+    no_prompting(monkeypatch)
+    from smithcode.commands import base
+    from smithcode.commands.base import CommandChoice, CommandResult, CommandSelect
+
+    def handler(ctx):
+        if ctx.args:
+            return CommandResult(text=f"选中 {ctx.args[0]}")
+        return CommandResult(
+            select=CommandSelect(
+                title="测试选择",
+                command="picktest",
+                items=[
+                    CommandChoice("甲", "a", current=True),
+                    CommandChoice("乙", "b"),
+                ],
+            )
+        )
+
+    base.register("picktest", "测试选择", accepts_args=True)(handler)
+    try:
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            async with app.run_test() as pilot:
+                inp = app.query_one(ChatInput)
+                inp.focus()
+                inp.insert("/picktest")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, SelectionScreen)  # 弹窗已挂载
+                assert app.screen.query("SelectionPanel")
+                # 半透明背景：底层界面变暗而非全黑（a=0 透明 / a=1 不透明）
+                assert 0 < app.screen.styles.background.a < 1
+                await pilot.press("down")  # 当前项「甲」→「乙」
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert not isinstance(app.screen, SelectionScreen)  # 已关闭
+                assert "选中 b" in _chat_text(app)
+
+        _run(_run_case())
+    finally:
+        base.COMMANDS.pop("picktest", None)
+
+
+def test_selection_panel_escape_cancels(monkeypatch):
+    """Esc 取消：不产生副作用、遮罩关闭。"""
+    no_prompting(monkeypatch)
+    from smithcode.commands import base
+    from smithcode.commands.base import CommandChoice, CommandResult, CommandSelect
+
+    def handler(ctx):
+        if ctx.args:
+            return CommandResult(text=f"选中 {ctx.args[0]}")
+        return CommandResult(
+            select=CommandSelect(
+                title="测试选择",
+                command="pickcancel",
+                items=[CommandChoice("甲", "a", current=True)],
+            )
+        )
+
+    base.register("pickcancel", "测试取消", accepts_args=True)(handler)
+    try:
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            async with app.run_test() as pilot:
+                inp = app.query_one(ChatInput)
+                inp.focus()
+                inp.insert("/pickcancel")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, SelectionScreen)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(app.screen, SelectionScreen)
+                assert "选中" not in _chat_text(app)
+
+        _run(_run_case())
+    finally:
+        base.COMMANDS.pop("pickcancel", None)
+
+
+def test_model_command_picker_switches_model(monkeypatch):
+    """真实 /model 无参：弹窗选择后切换 config.MODEL 并刷新底栏。"""
+    no_prompting(monkeypatch)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "MODEL", "a")
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.models = SimpleNamespace(list=lambda: ["a", "b"])
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/model")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, SelectionScreen)
+            await pilot.press("down")  # 当前项 a → b
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert config.MODEL == "b"
+            assert not isinstance(app.screen, SelectionScreen)
+
+    _run(_run_case())
+
+
+def test_selection_panel_scrolls_to_selected(monkeypatch):
+    """选项超出可视区出现滚动条，↑↓ 移动时选中项自动滚进视野。"""
+    no_prompting(monkeypatch)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "MODEL", "model-00")
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.models = SimpleNamespace(
+            list=lambda: [f"model-{i:02d}" for i in range(40)]
+        )
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/model")
+            await pilot.press("enter")
+            await pilot.pause()
+            scroll = app.screen.query_one(".selection-scroll")
+            assert scroll.show_vertical_scrollbar  # 内容超出：出现滚动条
+            for _ in range(39):  # 移到最后一个（可视区之外）
+                await pilot.press("down")
+            await pilot.pause()
+            assert scroll.scroll_offset.y > 0  # 已自动滚到选中项
 
     _run(_run_case())

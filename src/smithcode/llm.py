@@ -45,6 +45,23 @@ class LLMClient:
             for name, value in self._custom_headers.items()
         }
 
+    def list_models(self):
+        """拉取服务商可用模型列表（OpenAI 兼容 `GET /models`）。
+
+        网络异常、接口不支持、返回为空一律返回 None——模型列表只是 `/model`
+        的候选，缺失不应影响对话本身。返回去重后的模型 id 列表。
+        """
+        try:
+            page = self.client.models.list()
+        except Exception:  # noqa: BLE001
+            return None
+        names = []
+        for item in page:
+            name = getattr(item, "id", None)
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+        return names or None
+
     def chat_stream(self, messages, tools=None):
         """发起流式对话请求，逐段 yield 模型输出。
 
