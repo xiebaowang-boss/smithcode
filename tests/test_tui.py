@@ -723,10 +723,17 @@ def test_command_menu_shows_on_slash_and_filters(monkeypatch):
             inp = app.query_one(ChatInput)
             menu = app.query_one(CommandMenu)
             inp.focus()
+            chat = app.query_one("#chat")
+            before = inp.region
             inp.insert("/")
             await pilot.pause()
             assert menu.open
             assert len(menu._candidates) >= 8  # 全量命令
+            assert (inp.region.x, inp.region.y, inp.region.width, inp.region.height) == (
+                before.x, before.y, before.width, before.height
+            )  # 悬浮层：输入框位置尺寸不变
+            assert menu.region.bottom <= inp.region.y  # 菜单锚在输入框正上方
+            assert menu.region.y < chat.region.bottom  # 且盖住聊天区底部
             inp.insert("he")
             await pilot.pause()
             assert [c.name for c in menu._candidates] == ["help"]  # 前缀过滤
@@ -755,6 +762,43 @@ def test_command_menu_enter_accepts_without_sending(monkeypatch):
             assert not app._busy  # 未提交任务
 
     _run(_run_case())
+
+
+def test_command_menu_scroll_when_overflow(monkeypatch):
+    """候选超过固定展示行数：高度封顶 + ↑↓ 到可视区外自动滚动。"""
+    no_prompting(monkeypatch)
+    from smithcode.commands import base
+    from smithcode.commands.base import CommandResult
+    from smithcode.tui.app import MENU_VISIBLE_ITEMS
+
+    extras = []
+    for i in range(5):  # 8 内置 + 5 临时 = 13 > 8，触发滚动
+        name = f"scrolltest{i}"
+        extras.append(name)
+        base.register(name, "测试滚动")(lambda ctx: CommandResult())
+    try:
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            async with app.run_test() as pilot:
+                inp = app.query_one(ChatInput)
+                menu = app.query_one(CommandMenu)
+                inp.focus()
+                inp.insert("/")
+                await pilot.pause()
+                assert len(menu._candidates) >= 13
+                assert menu.size.height == MENU_VISIBLE_ITEMS  # 高度封顶
+                menu.move(-1)  # ↑ 回绕到最后一项（可视区外）
+                await pilot.pause()
+                assert menu.scroll_offset.y > 0  # 自动滚动
+                menu.move(1)  # ↓ 回到第一项，滚回顶部
+                await pilot.pause()
+                assert menu.scroll_offset.y == 0
+
+        _run(_run_case())
+    finally:
+        for name in extras:
+            base.COMMANDS.pop(name, None)
 
 
 def test_command_menu_escape_closes_and_arrows_move(monkeypatch):

@@ -558,13 +558,40 @@ class Sidebar(Vertical):
 # ---------- 输入区 ----------
 
 
-class CommandMenu(Static):
+# 命令菜单固定展示的行数：候选超出即出现滚动条（与 CSS 里 #command-menu 的
+# max-height 保持一致）
+MENU_VISIBLE_ITEMS = 8
+
+
+class CommandMenuItem(Static):
+    """命令菜单里的一行（/命令名 + 中文描述）。"""
+
+    def __init__(self, cmd, selected: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.cmd = cmd
+        self.set_selected(selected)
+
+    def set_selected(self, selected: bool) -> None:
+        self.set_class(selected, "selected")
+        mark = "› " if selected else "  "
+        text = Text()
+        if selected:  # 选中项整行 accent 底色（对齐权限面板的 chip 高亮）
+            text.append(f"{mark}/{self.cmd.name}", style="bold black on #fab283")
+            text.append(f"  {self.cmd.description}", style="black on #fab283")
+        else:
+            text.append(f"{mark}/{self.cmd.name}", style="#a9b1d6")
+            text.append(f"  {self.cmd.description}", style="#565f89")
+        self.update(text)
+
+
+class CommandMenu(VerticalScroll):
     """输入框正上方的斜杠命令菜单（opencode 式）：输入 / 即弹出，
     实时前缀过滤，↑↓ 选择、Enter/Tab 补全、Esc 关闭。
-    候选统一来自 commands.complete_commands()，新命令自动进菜单。"""
+    候选统一来自 commands.complete_commands()，新命令自动进菜单。
+    高度按候选数自适应、封顶 MENU_VISIBLE_ITEMS 行，超出后滚动查看。"""
 
     def __init__(self, **kwargs):
-        super().__init__("", **kwargs)
+        super().__init__(**kwargs)
         self._candidates: list = []
         self._selected = 0
 
@@ -580,7 +607,12 @@ class CommandMenu(Static):
             self.hide_menu()
             return
         self.display = True
-        self._refresh()
+        self.remove_children()
+        self.mount_all(
+            CommandMenuItem(cmd, i == self._selected, classes="menu-item")
+            for i, cmd in enumerate(self._candidates)
+        )
+        self.scroll_to(y=0, animate=False)  # 列表重建后从顶部开始
 
     def hide_menu(self) -> None:
         self._candidates = []
@@ -590,26 +622,15 @@ class CommandMenu(Static):
         if not self._candidates:
             return
         self._selected = (self._selected + delta) % len(self._candidates)
-        self._refresh()
+        items = list(self.query(CommandMenuItem))
+        for i, item in enumerate(items):
+            item.set_selected(i == self._selected)
+        if items:
+            items[self._selected].scroll_visible(animate=False)  # 选中项滚进可视区
 
     def accept(self) -> str | None:
         """返回当前选中项的命令名（无候选时 None）。"""
         return self._candidates[self._selected].name if self._candidates else None
-
-    def _refresh(self) -> None:
-        """重绘菜单列表（注意：不可命名为 _render，那是 Textual Widget 的内部管线方法）。"""
-        text = Text()
-        for i, cmd in enumerate(self._candidates):
-            if i:
-                text.append("\n")
-            mark = "› " if i == self._selected else "  "
-            if i == self._selected:  # 选中项整行 accent 底色（对齐权限面板的 chip 高亮）
-                text.append(f"{mark}/{cmd.name}", style="bold black on #fab283")
-                text.append(f"  {cmd.description}", style="black on #fab283")
-            else:
-                text.append(f"{mark}/{cmd.name}", style="#a9b1d6")
-                text.append(f"  {cmd.description}", style="#565f89")
-        self.update(text)
 
 
 class ChatInput(TextArea):
@@ -1049,11 +1070,21 @@ class SmithTUI(App):
         border-left: solid #23d18b;
     }
     #command-menu {
+        /* 悬浮层：dock 到聊天列底部再上移 5 行（#bottom 2 + #input-wrap 3），
+           锚在输入框正上方、向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小 */
+        dock: bottom;
+        offset: 0 -5;
+        layer: command-menu;
+        margin: 0 2;
         height: auto;
-        max-height: 12;
+        max-height: 8;  /* 固定展示行数，与 MENU_VISIBLE_ITEMS 一致，超出滚动 */
         padding: 0 2;
         background: #1e1e1e;
         overflow: hidden auto;
+    }
+    #command-menu .menu-item {
+        width: 1fr;  /* 拉满整行，选中项的高亮底色才贯通 */
+        height: 1;
     }
     #input {
         height: 3;
@@ -1158,7 +1189,6 @@ class SmithTUI(App):
                 yield ChatView(id="chat")
                 # 输入框（左侧竖线）+ 底行（最左：权限模式·模型·思考·运行提示，最右：git/上下文）
                 with Vertical(id="input-wrap"):
-                    yield CommandMenu(id="command-menu")
                     yield ChatInput(id="input")
                 with Horizontal(id="bottom"):
                     yield Static(id="composer-mode")
@@ -1166,6 +1196,8 @@ class SmithTUI(App):
                     yield Static(id="composer-thinking")
                     yield RunningIndicator(id="running")
                     yield Static(id="status")
+                # 斜杠命令菜单：绝对定位悬浮层（锚在输入框正上方），不挤压聊天区布局
+                yield CommandMenu(id="command-menu")
             yield Sidebar(id="sidebar")
 
     def on_mount(self) -> None:
