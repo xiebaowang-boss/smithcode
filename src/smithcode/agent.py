@@ -23,6 +23,7 @@ from .tools import (
     DISPLAY,
     FUNCTIONS,
     PATHS_EXTRACTORS,
+    PREVIEWS,
     SCHEMAS,
     reset_read_tracking,
 )
@@ -30,11 +31,37 @@ from .tools import (
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
 
+# 变更预览（diff）最多展示的行数，超出截断
+MAX_PREVIEW_LINES = 40
+
+# 写/编辑类工具：调用详情默认展开（diff 是本次改动的关键信息，直接可见可收起）
+FILE_EXPAND_TOOLS = frozenset({"write_file", "edit_file"})
+
 
 # 权限被拒时的统一工具结果文本（回传模型 + 终端展示共用）
 DENIED_RESULT = "用户拒绝了此操作"
 # 权限被拒后为同条 assistant 消息中剩余 tool_calls 补的占位结果（防悬空 tool_call_id）
 SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
+
+
+def _diff_preview(name: str, args: dict) -> str:
+    """执行前生成工具的变更预览（diff）并按行截断。
+
+    必须在工具执行前调用——执行后文件已变更，diff 恒为空。生成失败只
+    影响展示，不影响执行。"""
+    preview = PREVIEWS.get(name)
+    if preview is None:
+        return ""
+    try:
+        detail = str(preview(args) or "")
+    except Exception:  # noqa: BLE001 预览失败不影响执行
+        return ""
+    lines = detail.splitlines()
+    if len(lines) > MAX_PREVIEW_LINES:
+        hidden = len(lines) - MAX_PREVIEW_LINES
+        lines = lines[:MAX_PREVIEW_LINES]
+        lines.append(f"……（diff 过长，省略 {hidden} 行）")
+    return "\n".join(lines)
 
 
 class Agent:
@@ -47,6 +74,7 @@ class Agent:
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
 
     def run(self, user_input: str) -> str:
+        self.session.ensure_system()  # 首次发请求前才把系统提示词放入历史（懒加载）
         self.session.add("user", user_input)
 
         for _ in range(self.max_iterations):
@@ -210,6 +238,9 @@ class Agent:
         if not self.permission.check_paths(name, paths):
             return self._finish(DENIED_RESULT, tool_id), True
 
+        snapshot = _diff_preview(name, args)  # 执行前快照（apply_patch 暂无 preview，为空串）
+        if snapshot:
+            renderer.current().tool_preview(tool_id, snapshot)
         try:
             with config.widen_roots(widened):
                 result = str(FUNCTIONS[name](**args))
@@ -217,9 +248,15 @@ class Agent:
             # 工具执行的任何失败都只作为结果回传给模型，不中断循环
             result = f"错误: {type(e).__name__}: {e}"
 
-        return self._finish(result, tool_id), False
+        return self._finish(result, tool_id, name), False
 
     def _execute_single(self, name: str, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
+        # 变更预览（diff）在路径预检 / 权限确认 / 执行之前推送到工具调用块：
+        # 审核时改动内容已经可见，权限框保持纯净
+        snapshot = _diff_preview(name, args)
+        if snapshot:
+            renderer.current().tool_preview(tool_id, snapshot)
+
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
         preflight = self._preflight_outside_path(args)
         if preflight == "deny":
@@ -239,7 +276,7 @@ class Agent:
             # 工具执行的任何失败都只作为结果回传给模型，不中断循环
             result = f"错误: {type(e).__name__}: {e}"
 
-        return self._finish(result, tool_id), denied
+        return self._finish(result, tool_id, name), denied
 
     def _execute_todo(self, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
         """todo_write 专用执行路径：计划无论 display_mode 都必须完整展示，
@@ -255,12 +292,17 @@ class Agent:
         renderer.current().plan(summary(), render_current(color=True))
         return result, False
 
-    def _finish(self, result: str, tool_id: int | None = None) -> str:
+    def _finish(self, result: str, tool_id: int | None = None,
+                name: str | None = None) -> str:
         """回传前截断超长输出；终端展示交给 renderer（summary 模式只有
         执行前那行短摘要，detail 模式追加结果内容）。失败信息无论何种模式
-        都原样展示——失败的细节比格式化摘要更重要。"""
+        都原样展示——失败的细节比格式化摘要更重要。
+
+        name 非空且属写/编辑类时，TUI 中调用详情默认展开（diff 已在
+        tool_preview 阶段推入工具块）。"""
         result = truncate_output(result, config.MAX_TOOL_OUTPUT)
-        renderer.current().tool_result(result, tool_id)
+        renderer.current().tool_result(result, tool_id,
+                                       expand=name in FILE_EXPAND_TOOLS)
         return result
 
     @staticmethod

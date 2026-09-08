@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from . import __version__, config, context, plan
+from . import __version__, commands, config
 from .agent import Agent
 from .session import Session
 from .utils.terminal import (
@@ -10,18 +10,6 @@ from .utils.terminal import (
     setup_console_encoding,
 )
 from .wizard import run_setup
-
-HELP = """命令:
-  /help   显示帮助
-  /new    开启新会话
-  /plan   显示当前任务计划（步骤清单）
-  /save   保存会话记录
-  /usage  显示 token 用量统计
-  /context 显示上下文占用分布
-  /compact 手动压缩上下文
-  /exit   退出
-
-输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"""
 
 
 def build_parser():
@@ -73,47 +61,13 @@ def repl(agent: Agent):
 
         if not user_input:
             continue
-        if user_input == "/exit":
-            print("再见!")
-            break
-        if user_input == "/new":
-            agent.session.reset()
-            agent.permission.session_rules.clear()
-            config.SESSION_EXTRA_ROOTS.clear()
-            agent.context.compact_count = 0  # 压缩计数是会话口径，随 /new 清零
-            plan.reset()  # 步骤清单是会话口径，随 /new 清零
-            print("已开启新会话。")
-            continue
-        if user_input == "/plan":
-            print(f"[计划] {plan.summary()}")
-            print(plan.render_current(color=True))
-            continue
-        if user_input == "/save":
-            path = agent.session.save()
-            print(f"会话已保存到 {path}")
-            continue
-        if user_input == "/usage":
-            print(agent.session.usage.summary())
-            continue
-        if user_input == "/context":
-            print(
-                context.report(
-                    agent.session.messages,
-                    config.CONTEXT_TOKEN_BUDGET,
-                    config.COMPACT_TRIGGER,
-                    agent.context.last_actual,
-                    agent.context.compact_count,
-                )
-            )
-            continue
-        if user_input == "/compact":
-            if agent.compact():
-                print("已压缩上下文。")
-            else:
-                print("没有可压缩的上下文（历史太短或摘要未生成）。")
-            continue
-        if user_input == "/help":
-            print(HELP)
+        if user_input.startswith("/"):
+            outcome = commands.dispatch(agent, user_input)
+            if outcome.exit:
+                print("再见!")
+                break
+            if outcome.text is not None:
+                print(outcome.text)
             continue
 
         try:

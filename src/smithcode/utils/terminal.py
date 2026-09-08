@@ -12,14 +12,32 @@ import os
 import sys
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.enums import DEFAULT_BUFFER
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 
-from .. import config
+from .. import commands, config
 
 _SESSION: PromptSession | None = None
+
+
+class SlashCompleter(Completer):
+    """斜杠命令补全：输入以 / 开头且光标仍在首个 token 内时给出命令候选，
+    描述显示在补全菜单右侧（opencode 式）。普通消息文本不触发。"""
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for cmd in commands.complete_commands(text[1:]):
+            yield Completion(
+                "/" + cmd.name,
+                start_position=-len(text),
+                display="/" + cmd.name,
+                display_meta=cmd.description,
+            )
 
 
 def _bindings() -> KeyBindings:
@@ -35,7 +53,15 @@ def _bindings() -> KeyBindings:
 
     @kb.add("enter", filter=focused)
     def _accept(event):
-        event.current_buffer.validate_and_handle()
+        buf = event.current_buffer
+        state = buf.complete_state
+        if state and state.current_completion:
+            # 补全菜单开着且选中了候选：Enter 先应用补全（补命令名 + 空格），不发送
+            buf.apply_completion(state.current_completion)
+            buf.complete_state = None
+            buf.insert_text(" ")
+            return
+        buf.validate_and_handle()
 
     @kb.add("c-j", filter=focused)  # Ctrl+Enter（\n），Windows 与多数 POSIX 终端可区分
     @kb.add("escape", "enter", filter=focused)  # Alt+Enter，Linux 终端备选
@@ -62,6 +88,8 @@ def _session() -> PromptSession:
             multiline=True,  # 支持缓冲区内换行；Enter 仍发送（见 _bindings）
             key_bindings=_bindings(),
             history=_history(),
+            completer=SlashCompleter(),
+            complete_while_typing=True,  # 敲 "/" 即时弹候选菜单
         )
     return _SESSION
 

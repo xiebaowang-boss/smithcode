@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
 from .. import config
@@ -37,6 +38,82 @@ def _is_binary(p: Path) -> bool:
             return b"\x00" in f.read(8192)
     except OSError:
         return False
+
+
+def _unified(old_text: str, new_text: str, path: str) -> str:
+    """两份文本的 unified diff（带 a/ b/ 前缀头，行尾不补换行符）。"""
+    diff = difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def _protected_path(p: Path) -> bool:
+    """预览不回显内容的保护路径：.env（密钥）与 .git 子树（config 里常含令牌）。"""
+    return p.name == ".env" or ".git" in p.parts
+
+
+def _read_preview_text(p: Path) -> str | None:
+    """预览用读取：文件不存在返回 None 之外的空串语义由调用方处理；任何读取失败返回 None。"""
+    try:
+        return p.read_text(encoding="utf-8")
+    except (PermissionError, OSError, UnicodeDecodeError):
+        return None
+
+
+def _preview_write(args: dict) -> str | None:
+    """write_file 的权限确认预览：现有内容 vs 新内容（新文件为全增行）。
+
+    任何读取失败（越界/二进制/编码异常）都返回 None，宁可没有预览也不影响
+    确认流程；保护路径（.env / .git）不展示内容，避免密钥回显终端。
+    """
+    path = args.get("path")
+    if not path:
+        return None
+    try:
+        p = _resolve(path)
+        if _protected_path(p):
+            return None
+        old = p.read_text(encoding="utf-8") if p.exists() else ""
+    except (PermissionError, OSError, UnicodeDecodeError):
+        return None
+    new = str(args.get("content", ""))
+    if old == new:
+        return None
+    return _unified(old, new, path)
+
+
+def _preview_edit(args: dict) -> str | None:
+    """edit_file 的权限确认预览：替换应用后的文件 vs 原文件。
+
+    与工具本体同样的匹配规则：old_string 找不到或多处匹配且未开 replace_all
+    时工具会报错——预览仍按"第一处替换"尽力展示，帮用户看清改动意图。
+    """
+    path = args.get("path")
+    old_string = args.get("old_string")
+    if not path or not old_string:
+        return None
+    try:
+        p = _resolve(path)
+        if not p.exists() or _protected_path(p):
+            return None
+        text = p.read_text(encoding="utf-8")
+    except (PermissionError, OSError, UnicodeDecodeError):
+        return None
+    if text.count(old_string) == 0:
+        return None
+    new_string = str(args.get("new_string", ""))
+    if args.get("replace_all"):
+        new_text = text.replace(old_string, new_string)
+    else:
+        new_text = text.replace(old_string, new_string, 1)
+    if new_text == text:
+        return None
+    return _unified(text, new_text, path)
 
 
 @register(
@@ -106,6 +183,7 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
         "pattern_arg": "path",
         "display": "block",
         "describe": lambda args: f"write {args.get('path', '?')}",
+        "preview": _preview_write,
         "description": "创建新文件或覆盖写入；覆盖已存在的文件前必须先用 read_file 读取（工具强制校验）。",
         "parameters": {
             "type": "object",
@@ -135,6 +213,7 @@ def write_file(path: str, content: str) -> str:
         "pattern_arg": "path",
         "display": "block",
         "describe": lambda args: f"edit {args.get('path', '?')}",
+        "preview": _preview_edit,
         "description": "精确替换文件中的一段文本。old_string 必须与文件内容逐字符完全一致"
         "（从 read_file 输出复制，不含行号前缀），且本会话须先 read_file 过该文件。"
         "默认要求唯一匹配（多带几行上下文保证唯一），replace_all=true 时替换全部匹配。",

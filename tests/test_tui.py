@@ -2,14 +2,19 @@
 import asyncio
 import json
 import threading
+from pathlib import Path
 
+import pytest
 from textual.widgets import Static
 
+import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.tui.app import (
     ChatInput,
+    ChatView,
+    CommandMenu,
     Sidebar,
     SmithTUI,
     ThinkingBlock,
@@ -17,6 +22,16 @@ from smithcode.tui.app import (
     TuiRenderer,
 )
 from smithcode.utils.terminal import confirmations_available
+
+
+@pytest.fixture(autouse=True)
+def restore_renderer():
+    """TuiRenderer.on_mount 会替换全局渲染后端，测试结束还原，避免污染同进程后续测试。"""
+    from smithcode import renderer
+
+    backup = renderer._current
+    yield
+    renderer_module.set_renderer(backup)
 
 
 def no_prompting(monkeypatch):
@@ -93,12 +108,12 @@ def test_choice_modal_resolves(monkeypatch):
                 "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
             )
             await pilot.pause()
-            assert app.query_one(ChatInput).display is False  # 输入框被替换
+            assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("y")
             await pilot.pause()
             assert result.get("value") == "y"
             assert evt.is_set()
-            assert app.query_one(ChatInput).display is True  # 面板关闭后恢复
+            assert app.query_one("#input-wrap").display is True  # 面板关闭后恢复
 
     _run(_run_case())
 
@@ -147,6 +162,31 @@ def test_permission_panel_arrow_keys_do_not_answer(monkeypatch):
     _run(_run_case())
 
 
+def test_tool_preview_shown_in_pending_block_before_approval(monkeypatch):
+    """审核前变更预览：diff 推送到 pending 工具调用块（而非权限框），就地展开可见。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            widget = ToolCall("write a.txt", pending=True, display="block")
+            app._tool_widgets[7] = widget
+            app.query_one(ChatView).add_widget(widget)
+            await pilot.pause()
+            body = widget.query_one(".tool-body")
+            assert body.display is False  # 无预览时 pending 不展示内容
+            app.ui_tool_preview(7, "--- a/a.txt\n+++ b/a.txt\n-old\n+new")
+            await pilot.pause()
+            plain = str(body.content)
+            assert "-old" in plain
+            assert "+new" in plain
+            # 未配对 id 的预览不崩溃、不挂载孤儿块
+            app.ui_tool_preview(None, "+x")
+            await pilot.pause()
+
+    _run(_run_case())
+
+
 def test_question_panel_resolves(monkeypatch):
     """无选项提问：输入框被提问面板替换，输入文本提交后恢复。"""
     no_prompting(monkeypatch)
@@ -157,13 +197,13 @@ def test_question_panel_resolves(monkeypatch):
             result, evt = {}, threading.Event()
             app.show_question_panel("要继续吗?", [], False, result, evt)
             await pilot.pause()
-            assert app.query_one(ChatInput).display is False  # 输入框被替换
+            assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("是")
             await pilot.press("enter")
             await pilot.pause()
             assert result.get("value") == "是"
             assert evt.is_set()
-            assert app.query_one(ChatInput).display is True  # 面板关闭后恢复
+            assert app.query_one("#input-wrap").display is True  # 面板关闭后恢复
 
     _run(_run_case())
 
@@ -191,7 +231,7 @@ class ToolLLM:
 
 
 def test_tui_tool_call_collapsible(monkeypatch, tmp_path):
-    """工具调用渲染为可折叠块：summary 模式默认收起，展开可见结果。"""
+    """工具调用渲染为可折叠块：read 结果默认收起（count 计数），展开可见内容。"""
     no_prompting(monkeypatch)
     (tmp_path / "hi.txt").write_text("文件内容", encoding="utf-8")
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
@@ -219,10 +259,32 @@ def test_tui_tool_call_collapsible(monkeypatch, tmp_path):
             block = app.query_one("#chat").query(ToolCall).first()
             assert "read hi.txt" in str(block.query_one(".tool-header").content)
             body = block.query_one(".tool-body")
-            assert body.display is False  # summary 模式默认收起
+            assert body.display is False  # 读取工具默认收起（整文件内容不上屏）
             block.action_toggle()
             assert body.display is True
             assert "文件内容" in str(body.content)
+
+    _run(_run_case())
+
+
+def test_tool_call_shows_diff_detail(monkeypatch):
+    """write/edit 的调用详情：diff（改动内容）在前，「已编辑」确认语在后。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            detail = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new"
+            block = ToolCall("edit a.txt", "已编辑 a.txt", expanded=True,
+                             display="block", detail=detail)
+            app.query_one(ChatView).add_widget(block)
+            await pilot.pause()
+            plain = str(block.query_one(".tool-body").content)
+            assert "-old" in plain
+            assert "+new" in plain
+            assert "已编辑 a.txt" in plain
+            assert "@@ -1 +1 @@" in plain
+            assert plain.find("+new") < plain.find("已编辑 a.txt")  # diff 在前
 
     _run(_run_case())
 
@@ -232,49 +294,199 @@ def test_tui_sidebar_shows_plan_section(monkeypatch):
     no_prompting(monkeypatch)
     from smithcode import plan as plan_mod
 
-    plan_mod.current().replace([{"content": "读文件", "status": "in_progress"}])
+    plan_mod.current().replace(
+        [{"title": "读文件", "status": "in_progress", "description": "详情内容"}]
+    )
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(140, 30)) as pilot:  # 够宽：侧边栏可见
             sidebar = app.query_one(Sidebar)
             assert sidebar.display is True  # 常驻可见
             assert f"v{__version__}" in str(sidebar.query_one(".sidebar-version").content)  # 底部版本号
-            # 版本号下方展示当前工作区路径
-            assert str(config.WORKSPACE_ROOT) in str(
-                sidebar.query_one(".sidebar-workspace").content
-            )
+            # 版本号下方：项目名 | 工作区路径（路径前补名字，截断时仍可辨认项目）
+            workspace = str(sidebar.query_one(".sidebar-workspace").content)
+            assert workspace.startswith(f"{Path(config.WORKSPACE_ROOT).name} | ")
+            assert str(config.WORKSPACE_ROOT) in workspace
             TuiRenderer(app).plan("共 1 步", plan_mod.render_current(color=True))
             await pilot.pause()
-            assert "读文件" in str(sidebar.query_one(".plan-body").content)
+            plan_body = str(sidebar.query_one(".plan-body").content)
+            assert "读文件" in plan_body
+            assert "详情内容" not in plan_body  # 侧边栏只展示标题
+
+    _run(_run_case())
+
+
+def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
+    """opencode 式：无任务或全部完成/取消时侧边栏任务区隐藏，有未完结步骤才展示。"""
+    no_prompting(monkeypatch)
+    from smithcode import plan as plan_mod
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 30)) as pilot:  # 够宽：侧边栏可见
+            sidebar = app.query_one(Sidebar)
+            section = sidebar.query_one("#sidebar-plan-section")
+            assert section.display is False  # 初始无任务：隐藏
+            # 隐藏计划区后 #sidebar-top（1fr 弹性占位）仍在，底部版本/路径不被顶到上方
+            assert sidebar.query_one("#sidebar-top").display is True
+
+            # 全部完成 → 仍隐藏
+            plan_mod.current().replace([{"title": "写代码", "status": "completed"}])
+            TuiRenderer(app).plan("共 1 步", plan_mod.render_current(color=True))
+            await pilot.pause()
+            assert section.display is False
+
+            # 出现 pending 步骤 → 展示
+            plan_mod.current().replace(
+                [{"title": "写代码", "status": "completed"}, {"title": "跑测试", "status": "in_progress"}]
+            )
+            TuiRenderer(app).plan("共 2 步", plan_mod.render_current(color=True))
+            await pilot.pause()
+            assert section.display is True
+            assert "跑测试" in str(sidebar.query_one(".plan-body").content)
+            assert "写代码" in str(sidebar.query_one(".plan-body").content)
+
+            # 全部取消 → 再次隐藏
+            plan_mod.current().replace(
+                [{"title": "写代码", "status": "cancelled"}, {"title": "跑测试", "status": "cancelled"}]
+            )
+            TuiRenderer(app).plan("共 2 步", plan_mod.render_current(color=True))
+            await pilot.pause()
+            assert section.display is False
+
+    _run(_run_case())
+
+
+def test_tui_sidebar_hidden_narrow(monkeypatch):
+    """窄窗口：宽度不足断点时不展示侧边栏。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(80, 24)) as pilot:  # 默认窄终端
+            assert app.query_one(Sidebar).display is False  # 自适应隐藏
+            await pilot.resize_terminal(140, 30)  # 拉宽后恢复显示
+            assert app.query_one(Sidebar).display is True
+            await pilot.resize_terminal(100, 30)  # 再缩窄重新隐藏
+            assert app.query_one(Sidebar).display is False
 
     _run(_run_case())
 
 
 def test_tui_sidebar_usage_section(monkeypatch):
-    """侧边栏上半展示会话用量与上下文占用。"""
+    """侧边栏上半：「用量」「上下文」两张卡片各自成块、内容就位。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
-        async with app.run_test():
-            text = str(app.query_one(Sidebar).query_one(".usage-body").content)
-            assert "上下文" in text
+        async with app.run_test() as pilot:
+            sidebar = app.query_one(Sidebar)
+            # 用量卡：无调用时标题仍为「用量」，正文灰色占位「尚无调用」
+            usage = str(sidebar.query_one(".usage-body").content)
+            assert "尚无调用" in usage
+            assert str(sidebar.query_one(".usage-card .section-title").content).strip() == "用量"
+            # 上下文卡：百分比跟在「上下文 · 」后，正文为当前用量/预算
+            context_title = str(sidebar.query_one(".context-card .section-title").content)
+            assert context_title.startswith("上下文 · ")
+            assert "%" in context_title
+            context = str(sidebar.query_one(".context-body").content)
+            assert "当前" in context and "预算" in context
+            # 有调用后：用量卡标题变为「用量 · 调用 N」，正文只剩输入/输出
+            app.agent.session.usage.add({"prompt_tokens": 1234, "completion_tokens": 567})
+            app.ui_status()
+            await pilot.pause()
+            assert str(sidebar.query_one(".usage-card .section-title").content) == "用量 · 调用 1"
+            usage = str(sidebar.query_one(".usage-body").content)
+            assert "1.2K" in usage and "输入" in usage and "输出" in usage
+            assert "调用" not in usage  # 调用次数已上移到标题
 
     _run(_run_case())
 
 
 def test_tui_status_bar(monkeypatch):
-    """底部状态栏展示模型 / 思考强度 / 项目名 / git 信息。"""
+    """模型与思考强度展示在输入框内底部状态行；底栏只剩上下文占用条 / git。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
-        async with app.run_test():
-            text = str(app.query_one("#status").content)
-            assert config.MODEL in text
-            assert "思考" in text
-            assert "项目" in text
+        async with app.run_test() as pilot:
+            # 模型/思考/运行提示都在最底行 #bottom，最左侧依次排列
+            bottom = app.query_one("#bottom")
+            mode_w = app.query_one("#composer-mode")
+            model_w = app.query_one("#composer-model")
+            think_w = app.query_one("#composer-thinking")
+            running = app.query_one("#running")
+            assert model_w.parent is bottom
+            assert think_w.parent is bottom
+            assert running.parent is bottom
+            assert mode_w.parent is bottom
+            # 权限模式在最前，其后 模型 · 思考 · 运行提示
+            assert bottom.children.index(mode_w) < bottom.children.index(model_w) < bottom.children.index(think_w) < bottom.children.index(running)
+            assert str(mode_w.content) == "Smith"  # 默认档展示名
+            assert config.MODEL in str(model_w.content)
+            assert not str(model_w.content).startswith("▣")  # 模型前无图标
+            assert "思考" not in str(think_w.content)  # 思考字样已去掉
+            assert str(think_w.content).startswith("· ")  # · 分隔符 + 强度值
+            mode, model, thinking = app._composer_status()
+            assert mode.style == "#808080"  # Smith 灰（默认档）
+            assert str(mode) == "Smith"
+            assert str(model) == f"· {config.MODEL}"  # 灰色 · 分隔符 + 模型名
+            assert str(thinking).startswith("· ")  # 灰色 · 分隔符 + 强度值
+            assert model.style == "#808080"  # 分隔符灰
+            assert any(s.style == "#7aa2f7" for s in model.spans)  # 模型蓝色（span）
+            assert any(s.style == "#e0af68" for s in thinking.spans)  # 思考黄色（span）
+            # 提问/权限面板替换输入框时，输入框隐藏
+            result, evt = {}, threading.Event()
+            app.show_permission_panel(
+                "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
+            )
+            await pilot.pause()
+            assert app.query_one("#input-wrap").display is False
+            await pilot.press("y")
+            await pilot.pause()
+            assert app.query_one("#input-wrap").display is True
+            # 底部状态栏：上下文占用条 + git 分支（不再含模型/思考强度/「上下文」「git」字样）
+            status = str(app.query_one("#status").content)
+            assert config.MODEL not in status
+            assert "思考" not in status
+            assert "项目" not in status
+            assert "上下文" not in status
+            assert "git" not in status
+            assert "%" in status
+            assert "█" in status or "░" in status  # 进度条字符（0% 或 100% 时可能只有一种）
+
+    _run(_run_case())
+
+
+def test_tui_cycle_permission_mode(monkeypatch):
+    """Shift+Tab 循环切换权限模式，底栏同步刷新；权限面板弹出期间不响应。"""
+    no_prompting(monkeypatch)
+    assert any(getattr(b, "key", None) == "shift+tab" for b in SmithTUI.BINDINGS)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            assert str(app.query_one("#composer-mode").content) == "Smith"
+            app.action_cycle_permission_mode()
+            await pilot.pause()
+            assert app.agent.permission.mode == "accept_edits"
+            assert str(app.query_one("#composer-mode").content) == "Accept Edits"
+            app.action_cycle_permission_mode()
+            await pilot.pause()
+            assert str(app.query_one("#composer-mode").content) == "Auto"
+            app.action_cycle_permission_mode()
+            await pilot.pause()
+            assert str(app.query_one("#composer-mode").content) == "Smith"
+            # 权限面板弹出（瞬时态）期间不响应切换
+            result, evt = {}, threading.Event()
+            app.show_permission_panel(
+                "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
+            )
+            await pilot.pause()
+            app.action_cycle_permission_mode()
+            await pilot.pause()
+            assert app.agent.permission.mode == "smith"
 
     _run(_run_case())
 
@@ -496,5 +708,75 @@ def test_question_choice_modal_custom_answer(monkeypatch):
             await pilot.pause()
             assert result.get("value") == "紫色"
             assert evt.is_set()
+
+    _run(_run_case())
+
+
+# ---------- 斜杠命令菜单：输入 / 弹出、实时过滤、按键仲裁 ----------
+
+def test_command_menu_shows_on_slash_and_filters(monkeypatch):
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            menu = app.query_one(CommandMenu)
+            inp.focus()
+            inp.insert("/")
+            await pilot.pause()
+            assert menu.open
+            assert len(menu._candidates) >= 8  # 全量命令
+            inp.insert("he")
+            await pilot.pause()
+            assert [c.name for c in menu._candidates] == ["help"]  # 前缀过滤
+            inp.text = "普通消息"
+            await pilot.pause()
+            assert not menu.open  # 非 / 前缀自动收起
+
+    _run(_run_case())
+
+
+def test_command_menu_enter_accepts_without_sending(monkeypatch):
+    """菜单开着时 Enter 只补全命令名（带尾随空格），不当作消息发送。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/he")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert inp.text == "/help "
+            assert not app.query_one(CommandMenu).open
+            assert not app._busy  # 未提交任务
+
+    _run(_run_case())
+
+
+def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            menu = app.query_one(CommandMenu)
+            inp.focus()
+            inp.insert("/")
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            assert menu.accept() == "usage"  # up 从首项回绕到最后一项
+            await pilot.press("down")
+            await pilot.pause()
+            assert menu.accept() == "compact"  # down 回到首项（回绕）
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not menu.open
+            assert inp.text == "/"  # 输入内容保持不变
 
     _run(_run_case())

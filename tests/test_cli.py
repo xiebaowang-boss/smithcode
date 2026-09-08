@@ -96,6 +96,34 @@ def test_prompt_choice_retries_on_invalid(monkeypatch, capsys):
     assert "无效输入" in capsys.readouterr().out
 
 
+# ---------- SlashCompleter：REPL 斜杠命令补全 ----------
+
+def _completions(text):
+    """以光标在末尾构造 Document，返回补全候选列表。"""
+    from prompt_toolkit.document import Document
+
+    from smithcode.utils.terminal import SlashCompleter
+
+    return list(SlashCompleter().get_completions(Document(text, len(text)), None))
+
+
+def test_slash_completer_filters_by_prefix():
+    comps = _completions("/he")
+    assert [c.text for c in comps] == ["/help"]
+    assert comps[0].display_meta  # 描述（中文）随候选一起给出
+
+
+def test_slash_completer_empty_prefix_lists_all_commands():
+    comps = _completions("/")
+    names = [c.text for c in comps]
+    assert {"/exit", "/help", "/new"} <= set(names)
+
+
+def test_slash_completer_ignores_plain_text_and_args():
+    assert _completions("你好") == []  # 普通消息不触发
+    assert _completions("/new x") == []  # 光标离开首 token 不再补命令名
+
+
 # ---------- 按键绑定：Enter 发送，Ctrl+Enter 插入换行 ----------
 
 def _prompt_with_keys(keys: bytes) -> str:

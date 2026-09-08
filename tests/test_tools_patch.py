@@ -1,4 +1,4 @@
-"""apply_patch 工具测试：解析、应用、原子性、沙箱。"""
+"""apply_patch 工具测试：解析、应用、原子性、沙箱、权限确认预览。"""
 import pytest
 
 from smithcode import config

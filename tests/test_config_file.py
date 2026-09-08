@@ -173,3 +173,34 @@ run_command = { "*" = "ask", "git status" = "allow" }
         ("run_command", "*", "ask"),
         ("run_command", "git status", "allow"),
     ]
+
+
+# ---------- provider.headers 自定义请求头 ----------
+
+def test_provider_headers_absent_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("SMITHCODE_HOME", str(tmp_path))
+    assert config.load_provider_headers() == {}
+
+
+def test_provider_headers_read_nested_table(tmp_path, monkeypatch):
+    """[provider.headers] 嵌套表原样返回，占位符不在此处求值。"""
+    home = _make_home(
+        tmp_path,
+        '[provider.headers]\n"x-opencode-session" = "{$session}"\n',
+    )
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_provider_headers() == {"x-opencode-session": "{$session}"}
+
+
+def test_provider_headers_wrong_type_warns(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, '[provider]\nheaders = "nope"\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_provider_headers() == {}
+    assert "警告" in capsys.readouterr().out
+
+
+def test_provider_headers_non_str_value_ignored(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, '[provider.headers]\ncount = 3\nname = "ok"\n')
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_provider_headers() == {"name": "ok"}
+    assert "警告" in capsys.readouterr().out

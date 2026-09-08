@@ -37,6 +37,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
 | `tui/` | Textual 全屏聊天界面（`app.py`），仅交互终端加载 |
+| `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
 | `agent.py` | Agent 循环编排（工具调用分发、todo 专用路径 `_execute_todo`） |
 | `llm.py` | OpenAI 兼容接口封装（流式、超时、指数退避重试） |
 | `prompts.py` | 系统提示词（Agent 的行为规则，改行为先看这里） |

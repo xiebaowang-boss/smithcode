@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import sys
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -118,6 +119,43 @@ MODEL = os.getenv("SMITHCODE_MODEL") or _file_str("provider", "model") or "deeps
 URL = os.getenv("SMITHCODE_URL") or _file_str("provider", "url")
 # 模型思考强度（reasoning_effort：low / medium / high 等，可选）；不配则不发该参数
 REASONING_EFFORT = _file_str("provider", "reasoning_effort")
+
+# 当前对话会话 id：一次对话（单次任务或 /new 之后）内保持稳定，新会话轮换。
+# 供自定义请求头 [provider.headers] 中的 {$session} 占位符使用（如 OpenCode Go
+# 要求每会话稳定的 x-opencode-session，用于路由与提示缓存）。
+SESSION_ID = uuid.uuid4().hex
+
+
+def new_session_id() -> str:
+    """开新会话时轮换会话 id：保证每个对话的 {$session} 值唯一且会话内稳定。"""
+    global SESSION_ID
+    SESSION_ID = uuid.uuid4().hex
+    return SESSION_ID
+
+
+def load_provider_headers() -> dict:
+    """读取 config.toml 的 [provider.headers] 段：随每个 LLM 请求发送的自定义请求头。
+
+    值须为字符串，原样发送；含 {$session} 占位符的值在每次请求时替换为当前
+    会话 id。整段非表、单个值非字符串时打印警告并忽略该项，不中断启动。
+    """
+    section = _read_config_file().get("provider") or {}
+    headers = section.get("headers")
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        print(f"[警告] config.toml 的 provider.headers = {headers!r} 不是配置表，已忽略")
+        return {}
+    result = {}
+    for name, value in headers.items():
+        if isinstance(value, str):
+            result[name] = value
+        else:
+            print(
+                f"[警告] config.toml 的 provider.headers.{name} = {value!r}"
+                f" 不是有效字符串，已忽略"
+            )
+    return result
 
 
 def ensure_api_key():

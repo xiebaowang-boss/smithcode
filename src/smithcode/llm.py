@@ -31,6 +31,19 @@ class LLMClient:
             base_url=config.URL,
             timeout=config.LLM_TIMEOUT,
         )
+        self._custom_headers = config.load_provider_headers()
+
+    def _resolved_headers(self) -> dict:
+        """把配置的自定义请求头解析为实际值：{$session} 占位符替换为当前会话 id。
+
+        每次请求现取现替换（而非构造时固化），保证 /new 轮换会话后仍发送新 id。
+        """
+        if not self._custom_headers:
+            return {}
+        return {
+            name: value.replace("{$session}", config.SESSION_ID)
+            for name, value in self._custom_headers.items()
+        }
 
     def chat_stream(self, messages, tools=None):
         """发起流式对话请求，逐段 yield 模型输出。
@@ -56,6 +69,9 @@ class LLMClient:
             kwargs["tools"] = [
                 {"type": "function", "function": schema} for schema in tools
             ]
+        headers = self._resolved_headers()
+        if headers:
+            kwargs["extra_headers"] = headers  # 自定义请求头，_open_stream 重连时随 kwargs 沿用
 
         for attempt in range(config.MAX_RETRIES + 1):
             emitted = False

@@ -11,7 +11,9 @@ from smithcode.permission import (
     DENY,
     Permission,
     evaluate,
+    has_command_substitution,
     infer_trust_root,
+    split_command,
 )
 
 
@@ -169,6 +171,68 @@ def test_unknown_action_degrades_to_ask(make_perm, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _: "n")
     perm = make_perm(permissions={"write_file": {"*.env": "block"}})
     assert perm.check("write_file", {"path": ".env"}) is False
+
+
+# ---------- run_command 复合命令拆分求值 ----------
+
+def test_split_command_segments():
+    assert split_command("git status && git log") == ["git status", "git log"]
+    assert split_command("a; b | c & d || e") == ["a", "b", "c", "d", "e"]
+    assert split_command("echo 'a && b'") == ["echo 'a && b'"]  # 引号内不切
+    assert split_command('echo "x | y"') == ['echo "x | y"']
+    assert split_command("git commit -m 'fix: a; b'") == ["git commit -m 'fix: a; b'"]
+    assert split_command('echo "he said \\"hi; ok\\" now"') == ['echo "he said \\"hi; ok\\" now"']
+    assert split_command("git add .;\n git commit") == ["git add .", "git commit"]  # 换行视同 ;
+    assert split_command("  ") == []  # 空段丢弃
+
+
+def test_has_command_substitution():
+    assert has_command_substitution("git log $(rm -rf /)") is True
+    assert has_command_substitution("echo `whoami`") is True
+    assert has_command_substitution('git commit -m "$(date)"') is True  # 双引号内仍算
+    assert has_command_substitution("echo '$(safe)'") is False  # 单引号内不展开
+    assert has_command_substitution("git status") is False
+    assert has_command_substitution("echo cost: $5") is False  # 非 $( 不算
+
+
+def test_compound_command_any_ask_prompts(make_perm, monkeypatch):
+    """放行 git status 后不能借 && 偷渡其他命令：任一段 ask 则整体询问。"""
+    perm = make_perm(permissions={"run_command": {"git status": "allow"}})
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "git status && rm -rf /"}) is False
+
+
+def test_compound_command_any_deny_blocks_even_approved_all(make_perm):
+    """任一段命中 deny 即拒绝，-y 也不放行。"""
+    perm = make_perm(permissions={"run_command": {"git *": "allow", "rm -rf*": "deny"}})
+    perm.approved_all = True
+    assert perm.check("run_command", {"command": "git status && rm -rf /"}) is False
+
+
+def test_compound_command_all_allow_passes(make_perm, monkeypatch):
+    """各段都有 allow 规则时整体放行，不弹确认。"""
+    refuse_input(monkeypatch)
+    perm = make_perm(permissions={"run_command": {"git *": "allow"}})
+    assert perm.check("run_command", {"command": "git status && git log -1"}) is True
+
+
+def test_pipe_segments_each_evaluated(make_perm, monkeypatch):
+    """管道两段分别求值：前段 allow、后段 ask → 整体询问。"""
+    perm = make_perm(permissions={"run_command": {"git log*": "allow", "grep *": "ask"}})
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "git log | grep TODO"}) is False
+    assert perm.check("run_command", {"command": "git log"}) is True
+
+
+def test_command_substitution_forces_ask(make_perm, monkeypatch):
+    """命令替换体无法静态求值（$() / 反引号），即使外层命令被 allow 也强制询问。"""
+    perm = make_perm(permissions={"run_command": {"git *": "allow"}})
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "git log $(rm -rf /)"}) is False
+    assert perm.check("run_command", {"command": "git commit -m \"$(date)\""}) is False
+    assert perm.check("run_command", {"command": "echo `git push`"}) is False
+    # 单引号内的 $( 不展开，不算替换
+    assert perm.check("run_command", {"command": "git commit -m '$(date)'"}) is True
 
 
 # ---------- 配置加载 ----------
@@ -395,6 +459,20 @@ def test_check_paths_any_ask_prompts(make_perm, monkeypatch):
     assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
 
 
+def test_check_paths_always_remembers_exact_patterns(make_perm, monkeypatch):
+    """聚合检查的"总是允许"按路径精确模式记忆：同路径再次调用放行，新路径仍走确认。"""
+    perm = make_perm()
+    answers = iter(["a"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
+    # "a" 选项已为 a.py / b.py 各记一条精确规则，不再弹确认
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("不应再次弹确认"))
+    assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
+    # 新路径不在记忆范围内，仍然需要确认（非交互 fail-closed 拒绝）
+    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    assert perm.check_paths("apply_patch", ["a.py", "c.py"]) is False
+
+
 def test_check_paths_approved_all_skips_ask(make_perm, monkeypatch):
     """-y（approved_all）跳过聚合检查中的 ask，但 deny 依然生效。"""
     refuse_input(monkeypatch)
@@ -402,3 +480,84 @@ def test_check_paths_approved_all_skips_ask(make_perm, monkeypatch):
     perm.approved_all = True
     assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
     assert perm.check_paths("apply_patch", ["a.py", ".git/config"]) is False
+
+
+# ---------- 会话级权限模式（smith / accept_edits / auto） ----------
+
+def test_mode_defaults_to_smith_and_still_prompts(make_perm, monkeypatch):
+    perm = make_perm()
+    assert perm.mode == "smith"
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("write_file", {"path": "a.txt"}) is False
+
+
+def test_accept_edits_allows_edit_family_without_asking(make_perm, monkeypatch):
+    """accept_edits：编辑族（edit_file / write_file / apply_patch 族）自动放行，不弹确认。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    perm.mode = "accept_edits"
+    assert perm.check("edit_file", {"path": "src/a.py", "old_string": "x", "new_string": "y"}) is True
+    assert perm.check("write_file", {"path": "src/a.py"}) is True
+    assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
+
+
+def test_accept_edits_still_asks_run_command(make_perm, monkeypatch):
+    """accept_edits 不放行命令执行，run_command 仍走确认。"""
+    perm = make_perm()
+    perm.mode = "accept_edits"
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "ls"}) is False
+
+
+def test_accept_edits_respects_deny(make_perm, monkeypatch):
+    """accept_edits 下 .git 保护路径依然拒绝。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    perm.mode = "accept_edits"
+    assert perm.check("write_file", {"path": ".git/config"}) is False
+
+
+def test_auto_mode_allows_all_ask_tools(make_perm, monkeypatch):
+    """auto：全部 ask 自动放行（含命令与多路径聚合），不弹确认。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    perm.mode = "auto"
+    assert perm.check("write_file", {"path": "a.txt"}) is True
+    assert perm.check("run_command", {"command": "anything"}) is True
+    assert perm.check_paths("apply_patch", ["a.py"]) is True
+
+
+def test_auto_mode_respects_deny(make_perm):
+    """auto 下 .git 保护路径依然拒绝。"""
+    perm = make_perm()
+    perm.mode = "auto"
+    assert perm.check("write_file", {"path": ".git/config"}) is False
+
+
+def test_approved_all_alias_maps_to_auto(make_perm, monkeypatch):
+    """-y 兼容：置 approved_all = True 等价切到 auto 档，读回亦一致。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    perm.approved_all = True
+    assert perm.mode == "auto"
+    assert perm.approved_all is True
+    assert perm.check("run_command", {"command": "ls"}) is True
+
+
+def test_cycle_mode_loops_through_three_modes(make_perm):
+    """Shift+Tab 循环：smith → accept_edits → auto → smith。"""
+    perm = make_perm()
+    assert perm.cycle_mode() == "accept_edits"
+    assert perm.cycle_mode() == "auto"
+    assert perm.cycle_mode() == "smith"
+    assert perm.cycle_mode() == "accept_edits"
+
+
+def test_cycle_mode_syncs_approved_all_alias(make_perm):
+    """切到 auto 时 approved_all 读值为 True，切回 smith 恢复 False。"""
+    perm = make_perm()
+    perm.cycle_mode()
+    perm.cycle_mode()
+    assert perm.approved_all is True
+    perm.cycle_mode()
+    assert perm.approved_all is False

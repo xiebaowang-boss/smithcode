@@ -13,6 +13,28 @@ from .utils.terminal import flush_pending_input, prompt_choice, read_user_input
 
 DIM = "\033[90m"  # 思考内容灰色（90m 比 dim/2m 在 Windows 终端上兼容性好）
 RESET = "\033[0m"
+GREEN = "\033[32m"  # diff 增行
+RED = "\033[31m"  # diff 删行
+CYAN = "\033[36m"  # diff 位置头（@@）
+
+
+def diff_line_kind(line: str) -> str | None:
+    """diff 行的语义分类：add 增 / del 删 / hunk 位置头 / head 文件头 / None 普通。
+    渲染后端按各自配色方案映射（REPL 用 ANSI，TUI 用主题色）。"""
+    if line.startswith(("+++", "---")):
+        return "head"
+    if line.startswith("+"):
+        return "add"
+    if line.startswith("-"):
+        return "del"
+    if line.startswith("@@"):
+        return "hunk"
+    return None
+
+
+def diff_line_style(line: str) -> str | None:
+    """diff 行的 ANSI 颜色（REPL 用）：+/++ 绿、-/-- 红、@@ 与文件头青。"""
+    return {"add": GREEN, "del": RED, "hunk": CYAN, "head": CYAN}.get(diff_line_kind(line))
 
 
 def _is_number_list(text: str) -> bool:
@@ -37,9 +59,15 @@ class Renderer:
         """工具调用的短摘要行：先于结果出现（pending 态），返回配对 id。
         display 为终端展示形态（inline / block），仅 TUI 使用。"""
 
-    def tool_result(self, result: str, tool_id: int | None = None) -> None:
+    def tool_preview(self, tool_id: int | None, detail: str) -> None:
+        """执行前推送变更预览（diff）到工具调用块：审核前就能看到改动。
+        REPL 直接打印；TUI 更新对应的 pending 工具块。默认无操作。"""
+
+    def tool_result(self, result: str, tool_id: int | None = None,
+                    expand: bool = False) -> None:
         """工具执行结果展示（按 tool_display 粒度决定是否展示内容）；
-        tool_id 非空时按 id 配对更新对应 pending 行。"""
+        tool_id 非空时按 id 配对更新对应 pending 行。
+        expand 标记写/编辑类工具：REPL 在执行后展示结果确认语，TUI 详情默认展开。"""
 
     def plan(self, summary: str, rendered: str) -> None:
         """任务步骤清单更新。"""
@@ -99,7 +127,14 @@ class ConsoleRenderer(Renderer):
         print(f"  {line}")
         return self._tool_seq
 
-    def tool_result(self, result: str, tool_id: int | None = None) -> None:
+    def tool_preview(self, tool_id: int | None, detail: str) -> None:
+        # 变更预览（diff）按行着色，先于权限确认 / 执行展示
+        for line in detail.splitlines():
+            color = diff_line_style(line)
+            print(f"{color}{line}{RESET}" if color else line, flush=True)
+
+    def tool_result(self, result: str, tool_id: int | None = None,
+                    expand: bool = False) -> None:
         # 失败信息无论何种模式都原样展示——失败的细节比格式化摘要更重要
         if result.startswith("错误:") or result == "用户拒绝了此操作":
             print(f"  {result}\n")
@@ -107,6 +142,10 @@ class ConsoleRenderer(Renderer):
         if config.load_tool_display() == "detail":
             display = result[:500] + ("..." if len(result) > 500 else "")
             print(f"  [Result] {display}\n")
+        elif expand:
+            # 写/编辑类工具的执行确认语（如「已编辑 c.txt」）在真正执行后展示；
+            # 变更预览（diff）已在 tool_preview 阶段（执行前）展示过
+            print(f"  {result}\n")
 
     def plan(self, summary: str, rendered: str) -> None:
         print(f"\n[计划] {summary}")

@@ -17,7 +17,7 @@ Update 的每个块按"上下文 + 删除行"组成的原文在文件中唯一�
 任一步失败则整体不落盘（原子性）。所有目标路径经 _resolve 沙箱校验。
 """
 from .base import register
-from .files import _resolve
+from .files import _protected_path, _resolve, _unified
 
 _HEADER_ADD = "*** Add File:"
 _HEADER_UPDATE = "*** Update File:"
@@ -72,6 +72,47 @@ def _describe_patch(args: dict) -> str:
     return " ".join(["patch", *paths]) if paths else "patch"
 
 
+def _preview_patch(args: dict) -> str | None:
+    """apply_patch 的权限确认预览：逐文件生成 unified diff 汇总。
+
+    Add → 全增行；Update → 与工具本体同一套块解析/匹配逻辑在内存中应用，
+    与原文求 diff（反映真实将发生的变更，含上下文行与 @@ 锚点）；Delete →
+    原文全删行。单个文件无法预览时标注跳过，不影响其余文件；保护路径
+    （.env / .git）与无法解析的 patch 整体不预览。
+    """
+    ops = _parse_patch(str(args.get("patch", "")))
+    if not ops:
+        return None
+    parts = []
+    for action, path, payload in ops:
+        try:
+            p = _resolve(path)
+        except Exception:  # noqa: BLE001 越界等无法预览，整体放弃（执行时工具会再校验）
+            return None
+        if _protected_path(p):
+            return None
+        try:
+            if action == "add":
+                parts.append(_unified("", "\n".join(payload), path))
+            elif action == "delete":
+                if p.exists():
+                    parts.append(_unified(p.read_text(encoding="utf-8"), "", path))
+            else:  # update
+                if not p.exists():
+                    parts.append(f"(无法预览 {path}: 文件不存在，执行时会报错)")
+                    continue
+                text = p.read_text(encoding="utf-8")
+                blocks = _parse_update_blocks(payload)
+                new_text = _apply_blocks_to_text(text, blocks, path)
+                if new_text.startswith("错误"):
+                    parts.append(f"(无法预览 {path}: {new_text})")
+                else:
+                    parts.append(_unified(text, new_text, path))
+        except Exception:  # noqa: BLE001 单文件预览失败不影响其余文件
+            parts.append(f"(无法预览 {path}: 读取失败)")
+    return "\n".join(parts) or None
+
+
 def _parse_update_blocks(payload: list[str]) -> list[tuple[str, str]]:
     """把 Update 段解析为 [(old_block, new_block)]，@@ 行作为块分隔符。"""
     blocks = []
@@ -122,6 +163,7 @@ def _apply_blocks_to_text(text: str, blocks: list[tuple[str, str]], path: str) -
         "paths_from": extract_patch_paths,
         "display": "block",
         "describe": _describe_patch,
+        "preview": _preview_patch,
         "description": "用 patch 信封批量应用多文件修改（Add/Update/Delete），原子落盘。"
         "权限与 edit_file 一致。小改动用 edit_file，多文件/大改动用本工具。",
         "parameters": {

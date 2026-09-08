@@ -125,6 +125,18 @@ python -m smithcode              # 等价的另一种启动方式
 
 选 `a` 后该模式在本会话内静默放行，`/new` 或退出后清零。
 
+### 权限模式（Shift+Tab 切换）
+
+TUI 中按 **Shift+Tab** 在三档权限模式间循环切换，输入框底行最左侧实时显示当前档位：
+
+| 模式 | 行为 |
+| ---- | ---- |
+| `Smith` | 默认，所有需确认的操作逐个询问 |
+| `Accept Edits` | 文件编辑 / 写入（含 `apply_patch`）自动放行，命令执行仍确认 |
+| `Auto` | 全部自动放行（等价 `-y`），`deny` 规则依然生效 |
+
+模式仅当前会话有效，`/new` 或退出后回到默认。
+
 ### 自定义权限规则（~/.smithcode/config.toml）
 
 在 `~/.smithcode/config.toml` 的 `[permissions]` 段配置（`smithcode setup` 首次生成时自带注释示例）。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：

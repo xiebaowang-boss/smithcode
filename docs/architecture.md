@@ -40,7 +40,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 
 模型输出以流式方式逐字显示；思考内容（如 DeepSeek-R1 类模型的 `reasoning_content`）以暗色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
 
-工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止，`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
+工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止（附带展示 write/edit 的变更预览 diff），`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。
 
 ## 任务拆分与分步骤执行
 
@@ -59,38 +59,40 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 计划不合理 → todo_write(调整清单 + reason)；用户改主意 → 标 cancelled 保留
 ```
 
-- **状态机**：`pending`（未开始）/ `in_progress`（进行中，同一时刻仅一个）/ `completed`（已完成）/ `cancelled`（不再需要）。`todo_write` 传**全量最新清单**（非增量），每次整体替换；空内容忽略、非法状态降级为 `pending`，单份上限 50 步。
+- **数据模型**：每项含服务端分配的稳定 `id` + `title`（标题，创建后不可变，侧边栏只显示它）+ `description`（可选详情，可改）+ `reason` + `status`（`pending` / `in_progress`（同一时刻仅一个）/ `completed` / `cancelled`）。`todo_write` 传**全量最新清单**（非增量），每次整体替换：带 `id` 的项按 id 匹配（标题不可变，其余字段可更新），无 `id` 时按标题匹配既有项，匹配不到视为新项并分配新 id；空标题忽略、非法状态降级为 `pending`，单份上限 50 步。
 - **状态归属**：清单存于 `plan.py` 的进程内单例（会话口径），`/new` 时 `reset()`；`/plan` 命令随时查看当前计划。
-- **展示**：`todo_write` 走 Agent 的专用执行路径 `_execute_todo`，计划无论 `tool_display` 粒度都完整渲染（in_progress 加粗、完成/取消置灰），不受 summary 模式"只留一行摘要"影响；回传给模型的工具结果保持明文清单，供后续轮次参考。
-- **权限**：`todo_write` 默认 `allow`（与 `ask_user` 一致），可用 `deny` 规则禁用。
-- **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、计划不合理时调整而非无视、单步简单任务不拆分。
+- **展示**：`todo_write` 走 Agent 的专用执行路径 `_execute_todo`，聊天 [计划] 块完整渲染（标题 + 描述 + reason，in_progress 加粗、完成/取消置灰），不受 `tool_display` 粒度影响；TUI 侧边栏用 `render_titles` 只展示标题；回传给模型的工具结果保持明文清单，供后续轮次参考。
+- **只读**：`todo_read` 随时拉取当前清单权威快照（含 id），支持 `status` 过滤与 `summary_only` 摘要；`todo_write` 与 `todo_read` 均默认 `allow`，可用 `deny` 规则禁用。
+- **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、更新时用 `todo_read` 取 id 并保留、标题不可变、计划不合理时调整而非无视、单步简单任务不拆分。
 
 ## 模块职责
 
 | 模块 | 职责 |
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
+| `commands/` | 斜杠命令框架：注册表（`@register` 装饰器）+ 统一 `dispatch()`，REPL 与 TUI 共用；`/help` 文案由注册表自动生成，新命令一个文件零改动接入 |
 | `agent.py` | Agent 循环编排 |
-| `llm.py` | OpenAI 兼容接口封装（流式、自动重试） |
+| `llm.py` | OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入） |
 | `prompts.py` | 系统提示词（行为规则） |
 | `session.py` | 消息历史的增删存取 |
-| `plan.py` | 任务拆分与分步骤执行：`todo_write` 维护的会话级步骤清单（状态机 + 渲染 + `/plan` 查看） |
+| `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission.py` | 敏感操作的用户确认 |
-| `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
-| `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe`） |
+| `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
+| `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
 | `tools/shell.py` | 命令执行，含超时保护 |
 | `tools/patch.py` | apply_patch 批量原子改文件 |
 | `tools/ask.py` | ask_user 任务中途向用户提问 |
-| `tools/todo.py` | todo_write 任务拆分与分步骤执行的状态机 |
+| `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 
 ## 安全边界
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，用 `Path.is_relative_to` 确认解析后的真实路径位于工作区内（目录名共享前缀的兄弟路径不会被误判为放行）。
 - **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `~/.smithcode/config.toml` 用户规则 < 会话内"总是允许"（按模式记忆）。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
 - **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
+- **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框保持纯净；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。`.env` 等禁读文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
 - **超时保护**：shell 命令默认 60 秒超时。
@@ -104,7 +106,9 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 2. 求值顺序：`DEFAULT_RULES` → `config.toml` 规则 → 会话内 `always` 规则，取**最后一条**匹配的规则。因此配置文件中宽泛规则写在前、精确规则写在后。
 3. `deny` 不询问用户直接拒绝；`-y`（approved_all）跳过所有 `ask`（含越界访问确认），但显式声明的 `deny` 依然生效。
 4. **权限族（family）**：规则匹配同时看「工具名」与「family」。`apply_patch` 声明 `family="edit_file"`，因此自动继承 `edit_file` 全部规则（含 `.git` 保护路径），避免"换个工具绕过规则"；工具名精确规则排在 family 规则之后可单独收紧。
-5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次，全部放行才执行。
+5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次（逐条列出待确认路径），全部放行才执行；会话内"总是允许"按每个待确认路径的精确模式逐条记忆，同路径后续调用直接放行、新路径仍走确认。
+6. **审核前展示变更**：工具的变更预览（如 `write_file` / `edit_file` 的 unified diff）在权限确认与执行**之前**推送到工具调用块（pending 态就地展开）——审核时改动内容已可见，权限申请框只负责 y/n/a 决策。
+7. **复合命令拆分求值**：`run_command` 的命令串按顶层操作符（`&&` / `||` / `;` / `|` / `&` / 换行）切分为子命令逐段匹配规则（引号内不切），聚合语义与多路径一致——任一段 `deny` → 拒绝，任一段 `ask` → 询问，全部放行才放行；含 `$()` 或反引号命令替换（双引号内仍算，单引号内不算）无法静态求值，强制 `ask`。防止"放行 A 后借 `&&` 偷渡 B"绕过规则。
 
 ## 如何新增一个工具
 
@@ -148,5 +152,7 @@ def search_code(pattern: str) -> str:
     ...
 })
 ```
+
+若该工具执行时值得让用户看清改动（如写文件、改文件），用 `preview` 声明 `(args) -> str | None` 的变更预览（如 unified diff，None 表示无可预览内容）。预览由 Agent 在**工具执行前**快照生成（执行后文件已变更，diff 恒为空），推送到工具调用块——pending 态就地展开，权限审核时改动已可见；生成失败只影响展示、不影响确认与执行：
 
 未声明 `pattern_arg` 的工具，其权限模式固定为 `*`；默认规则中未覆盖的新工具按 `ask` 处理。

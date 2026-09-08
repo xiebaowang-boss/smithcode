@@ -178,3 +178,59 @@ def test_outside_all_roots_still_rejected(workspace, monkeypatch):
 
     with pytest.raises(PermissionError):
         files.read_file(str(workspace.parent / "unrelated.txt"))
+
+# ---------- 权限确认的 diff 预览 ----------
+
+def test_preview_write_shows_unified_diff(workspace):
+    files.write_file("a.txt", "hello\n")
+    detail = files._preview_write({"path": "a.txt", "content": "hello world\n"})
+    assert "--- a/a.txt" in detail
+    assert "-hello" in detail
+    assert "+hello world" in detail
+
+
+def test_preview_write_new_file_all_additions(workspace):
+    detail = files._preview_write({"path": "new.txt", "content": "x\ny\n"})
+    assert detail.startswith("--- a/new.txt")
+    assert "+x" in detail
+    assert "+y" in detail
+
+
+def test_preview_write_identical_content_none(workspace):
+    files.write_file("same.txt", "abc\n")
+    assert files._preview_write({"path": "same.txt", "content": "abc\n"}) is None
+
+
+def test_preview_write_missing_args_none(workspace):
+    assert files._preview_write({}) is None
+
+
+def test_preview_write_outside_workspace_none(workspace):
+    assert files._preview_write({"path": "../outside.txt", "content": "x"}) is None
+
+
+def test_preview_write_env_file_hidden(workspace):
+    """禁读文件（.env）不生成预览，避免密钥回显终端。"""
+    (workspace / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    assert files._preview_write({"path": ".env", "content": "SECRET=2\n"}) is None
+
+
+def test_preview_edit_shows_replacement(workspace):
+    files.write_file("c.py", "x = 1\ny = 2\n")
+    detail = files._preview_edit({"path": "c.py", "old_string": "y = 2", "new_string": "y = 3"})
+    assert "-y = 2" in detail
+    assert "+y = 3" in detail
+
+
+def test_preview_edit_replace_all(workspace):
+    files.write_file("d.txt", "a\nb\na\n")
+    detail = files._preview_edit(
+        {"path": "d.txt", "old_string": "a", "new_string": "z", "replace_all": True}
+    )
+    assert detail.count("-a") == 2
+    assert detail.count("+z") == 2
+
+
+def test_preview_edit_not_found_none(workspace):
+    files.write_file("e.txt", "abc")
+    assert files._preview_edit({"path": "e.txt", "old_string": "zzz", "new_string": "q"}) is None

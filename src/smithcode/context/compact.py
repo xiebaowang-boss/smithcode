@@ -38,6 +38,7 @@ def pick_tail(messages: list[dict], keep_tokens: int) -> int:
         return 0
     sizes = [estimate_message(m) for m in messages]
     ends = starts[1:] + [len(messages)]
+    # 从最后一轮向前累积；chosen 初始即最后一轮的起点（兜底：尾部至少保留一轮）
     total = 0
     chosen = starts[-1]
     for idx in range(len(starts) - 1, -1, -1):

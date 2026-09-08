@@ -16,7 +16,7 @@ import tomlkit
 from . import config
 
 DEFAULT_URL = "https://api.deepseek.com/v1"
-DEFAULT_BUDGET = 65536
+DEFAULT_BUDGET = 256000
 
 _CONFIG_TEMPLATE = """\
 # SmithCode 配置（本文件不含秘密、可分享；API Key 在同级 credentials.json）
@@ -25,6 +25,10 @@ _CONFIG_TEMPLATE = """\
 [provider]
 url = "{url}"
 model = "{model}"
+# 自定义请求头（可选）：随每个 LLM 请求发送，值支持 {{$session}} 占位符
+# （替换为当前会话 id，每次 /new 自动轮换）。OpenCode Go 会话路由示例：
+# [provider.headers]
+# x-opencode-session = "{{$session}}"
 
 [context]
 budget = {budget}  # 上下文预算（token），建议不超过模型窗口大小
