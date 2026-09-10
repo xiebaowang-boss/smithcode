@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import subprocess
-
 from .. import config
+from ..process import run as run_process
 from .base import register
 
 
@@ -37,23 +36,15 @@ def _describe(args: dict) -> str:
 def run_command(command: str, timeout: int | None = None) -> str:
     seconds = min(max(1, int(timeout) if timeout else config.COMMAND_TIMEOUT),
                   config.COMMAND_TIMEOUT_MAX)
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=seconds,
-            cwd=config.WORKSPACE_ROOT,
-            errors="replace",
-            check=False,  # 退出码由下方返回给模型自行判断，不抛异常
-        )
-        output = result.stdout or ""
-        if result.stderr:
-            output += "\n[stderr]\n" + result.stderr
-        output += f"\n[exit code: {result.returncode}]"
-        return output.strip() or "(无输出)"
-    except subprocess.TimeoutExpired:
+    result = run_process(command, timeout=seconds, cwd=config.WORKSPACE_ROOT)
+    if result.status == "interrupted":
+        return "错误: 命令被用户中断，已终止进程"
+    if result.status == "timeout":
         return (f"错误: 命令超时 ({seconds}s)。"
                 f"耗时命令先用 timeout 参数延长（上限 {config.COMMAND_TIMEOUT_MAX}s），"
                 "或拆成更小的步骤")
+    output = result.stdout or ""
+    if result.stderr:
+        output += "\n[stderr]\n" + result.stderr
+    output += f"\n[exit code: {result.returncode}]"
+    return output.strip() or "(无输出)"

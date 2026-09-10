@@ -1,6 +1,5 @@
 """会话级命令：/new /save /compact /exit。"""
 
-from .. import config, plan
 from .base import CommandResult, register
 
 
@@ -12,16 +11,12 @@ def _exit(ctx):
 
 @register("new", "开启新会话")
 def _new(ctx):
-    agent = ctx.agent
-    agent.session.reset()
-    agent.permission.session_rules.clear()
-    config.SESSION_EXTRA_ROOTS.clear()
-    agent.context.compact_count = 0  # 压缩计数是会话口径，随 /new 清零
-    plan.reset()  # 步骤清单是会话口径，随 /new 清零
+    # 重置动作集中在 Agent.new_session（会话级状态一处清空）；命令层只负责反馈与标记
+    ctx.agent.new_session()
     return CommandResult(
-        text="已开启新会话。",
+        text="已开启新会话。",  # 仅 REPL 展示；TUI 以清空聊天区代替，不再追加文本
         style="yellow",
-        session_reset=True,   # TUI 清空计划侧栏
+        session_reset=True,   # TUI 清空聊天区与计划侧栏
         refresh_status=True,  # TUI 刷新状态栏
     )
 

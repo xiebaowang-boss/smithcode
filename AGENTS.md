@@ -39,6 +39,8 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `tui/` | Textual 全屏聊天界面（`app.py`），仅交互终端加载 |
 | `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
 | `agent.py` | Agent 循环编排（工具调用分发、todo 专用路径 `_execute_todo`） |
+| `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
+| `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
 | `llm.py` | OpenAI 兼容接口封装（流式、超时、指数退避重试） |
 | `prompts.py` | 系统提示词（Agent 的行为规则，改行为先看这里） |
 | `session.py` | 消息历史的增删存取 |

@@ -5,7 +5,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import config, renderer
+from . import config, plan, renderer
+from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
     assemble,
@@ -52,6 +53,10 @@ FILE_EXPAND_TOOLS = frozenset({"write_file", "edit_file"})
 DENIED_RESULT = "用户拒绝了此操作"
 # 权限被拒后为同条 assistant 消息中剩余 tool_calls 补的占位结果（防悬空 tool_call_id）
 SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
+
+# Esc 中断：终端提示行与占位结果文本（语义同上两条）
+INTERRUPTED_NOTE = "\n⏹ 已中断"
+INTERRUPTED_RESULT = "（未执行：用户中断了任务）"
 
 
 def _diff_preview(name: str, args: dict) -> str:
@@ -102,6 +107,7 @@ class Agent:
         self.session = session or Session()
         self.permission = Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
+        self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
         # 候选模型目录：命令层只读 `agent.models.list()`，不关心来源与装载时机
         cache = ModelCache()
@@ -116,31 +122,87 @@ class Agent:
         """启动期装载模型目录：外部配置优先；未配置则后台拉取远端 `/models`。"""
         self.models.bootstrap()
 
-    def run(self, user_input: str) -> str:
+    def new_session(self) -> None:
+        """开启新会话（/new 的实际动作）：集中重置全部会话口径状态。
+
+        覆盖：消息历史与会话 id、会话用量、权限会话规则、越界信任目录、
+        上下文快照（压缩计数与真实 token 锚点）、工具侧「已读文件」记录、
+        步骤清单。新增会话级状态时在对应模块加 reset 后在此补一行，
+        命令层（commands）不感知重置细节。
+        """
+        self.session.reset()
+        self.permission.new_session()
+        config.SESSION_EXTRA_ROOTS.clear()
+        self.context.new_session()
+        reset_read_tracking()
+        plan.reset()
+
+    def interrupt(self) -> None:
+        """请求中断当前任务（线程安全：TUI / REPL 主线程调用，Agent 在后台线程运行）。
+
+        取消是协作式的：LLM 流在下一块数据到达前截停，正在执行的工具让
+        其跑完，未执行的工具调用补占位结果——会话历史始终保持合法。
+        """
+        if self._token is not None:
+            self._token.cancel()
+
+    def run(self, user_input: str) -> RunResult:
+        """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限）。
+
+        每次调用激活一个新令牌并经 ContextVar 沿调用链传播（llm 流层、
+        工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消
+        状态影响。
+        """
         self.session.ensure_system()  # 首次发请求前才把系统提示词放入历史（懒加载）
         self.session.add("user", user_input)
+        token = CancellationToken()
+        self._token = token
+        reset_token = activate_token(token)
+        try:
+            return self._run_loop(token)
+        finally:
+            self._token = None
+            reset_token()
 
+    def _run_loop(self, token: CancellationToken) -> RunResult:
         for _ in range(self.max_iterations):
+            if token.cancelled:
+                renderer.current().info(INTERRUPTED_NOTE)
+                return RunResult("interrupted")
             self._compact_if_needed()
-            msg, usage = self._chat_with_recovery()
+            msg, usage, interrupted = self._chat_with_recovery()
             self.session.usage.add(usage)
             self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
             self.session.messages.append(msg)
 
+            if interrupted:
+                renderer.current().info(INTERRUPTED_NOTE)
+                return RunResult("interrupted", partial=True)
+
             if not msg.get("tool_calls"):
-                return msg.get("content", "")
+                return RunResult("ok", msg.get("content", ""))
+
+            if token.cancelled:
+                # 流刚好走完时才取消：这批 tool_calls 一个都未执行，补占位后停止
+                self._interrupt_batch([], msg.get("tool_calls", []))
+                renderer.current().info(INTERRUPTED_NOTE)
+                return RunResult("interrupted")
 
             stopped = self._execute_batch(msg["tool_calls"])
-            if stopped:
-                return stopped
+            if stopped == "denied":
+                return RunResult("denied", "任务已停止：权限请求被用户拒绝。")
+            if stopped == "interrupted":
+                renderer.current().info(INTERRUPTED_NOTE)
+                return RunResult("interrupted")
 
-        return "达到最大迭代次数，任务中止。"
+        return RunResult("max_iterations", "达到最大迭代次数，任务中止。")
 
-    def _chat_with_recovery(self) -> tuple[dict, dict | None]:
+    def _chat_with_recovery(self) -> tuple[dict, dict | None, bool]:
         """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
 
         仅当错误文本命中溢出特征才走这条路，其他异常原样上抛。恢复后的
         调用再溢出就直接抛给 REPL——每步只重试一次，不反复烧钱。
+        返回 (消息, 用量, 是否被中断)。
         """
         try:
             return self._chat()
@@ -172,6 +234,9 @@ class Agent:
         before = total_tokens(messages)
         summary = None
         for _ in range(2):  # 摘要缺必需标题时重试一次
+            token = current_token()
+            if token is not None and token.cancelled:
+                return False  # 已中断：不再发起摘要请求，静默放弃（中断提示由收尾路径给出）
             text = self._complete(build_summary_request(old))
             if validate_summary(text):
                 summary = text
@@ -199,16 +264,20 @@ class Agent:
                 parts.append(payload.get("content") or "")
         return "".join(parts)
 
-    def _chat(self) -> tuple[dict, dict | None]:
+    def _chat(self) -> tuple[dict, dict | None, bool]:
         """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀）。
 
-        返回 (完整消息, 本次用量)；用量由 llm 层从流中提取，服务商
+        返回 (消息, 用量, 是否被中断)。用量由 llm 层从流中提取，服务商
         不提供时为 None。渲染交给 renderer（CLI 逐字打印 / TUI 进组件）。
+        任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼
+        成部分 assistant 消息返回并标记 interrupted——残缺的工具调用不
+        回传（无法解析），完整正文得以保留。
         思考内容（reasoning_content，仅部分模型返回）以灰色实时展示，
         但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
         """
-        msg = {}
+        msg: dict = {}
         usage = None
+        parts: list[str] = []
         r = renderer.current()
         for kind, payload in self.llm.chat_stream(self.session.messages, tools=SCHEMAS):
             if kind == "message":
@@ -216,9 +285,15 @@ class Agent:
             elif kind == "usage":
                 usage = payload
             else:
+                if kind == "content":
+                    parts.append(payload)
                 r.stream(kind, payload)
         r.stream_done()
-        return msg, usage
+        token = current_token()
+        if token is not None and token.cancelled and not msg:
+            msg = {"role": "assistant", "content": "".join(parts)}
+            return msg, usage, True
+        return msg, usage, False
 
     def _preflight_safe(self, tc: dict) -> tuple[_ToolPlan, bool]:
         """预检的兜底包装：预检自身的意外异常转为该工具的错误结果，不外抛。
@@ -347,41 +422,52 @@ class Agent:
         第一阶段（主线程，串行，按接收顺序）：逐个预检——解析参数、渲染摘要、
         路径预检与权限确认；任一被拒即终止任务，为剩余 tool_calls 补占位结果
         （防悬空 tool_call_id 破坏下一轮请求），此时还没有任何工具被执行。
+        每个预检项之前检查取消令牌：任务被中断时已过预检的计划与剩余
+        tool_calls 一律补占位、不再继续弹确认框（中断 = 不再发起任何新工作）。
         第二阶段（并发）：按序分段——连续的可并行计划合并为一个波次扔进线程池，
         serial 计划在主线程单独执行、作为顺序屏障（保证串行工具看见之前所有
         副作用、后续工具又看见串行工具的改动）；结果一律按提交顺序收集，
-        模型看到的 tool 结果顺序与它请求的顺序严格一致。
+        模型看到的 tool 结果顺序与它请求的顺序严格一致。每个波次/串行项
+        之前检查取消令牌：任务被中断时未执行的计划补占位后停止，已提交
+        的波次让其自然跑完（线程不可强杀）并照常收集结果。
 
-        返回 None 表示正常完成；返回终止文本表示权限被拒。
+        返回 None 表示正常完成；"denied" 表示权限被拒；"interrupted" 表示用户中断。
         """
+        token = current_token()
         plans: list[_ToolPlan] = []
         for i, tc in enumerate(tool_calls):
+            if token is not None and token.cancelled:
+                return self._interrupt_batch(plans, tool_calls[i:])
             plan, denied = self._preflight_safe(tc)
+            if token is not None and token.cancelled:
+                # 预检（含权限确认）期间用户中断：优先按中断处理——当前项即使
+                # 刚答了 y/n 也不执行、不按 denied 收尾，整个批次补占位。
+                return self._interrupt_batch(plans, tool_calls[i:])
             if denied:
                 # 此前已过预检但尚未执行的计划：任务中止，一并补占位结果
                 # （防悬空 tool_call_id 破坏下一轮请求）
                 for done in plans:
-                    self.session.messages.append(
-                        {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": done.tc.get("id")}
-                    )
+                    self._placeholder(SKIPPED_RESULT, done.tc.get("id"))
                 self._collect(plan, plan.run())
                 for pending in tool_calls[i + 1:]:
-                    self.session.messages.append(
-                        {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": pending["id"]}
-                    )
+                    self._placeholder(SKIPPED_RESULT, pending["id"])
                 renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
-                return "任务已停止：权限请求被用户拒绝。"
+                return "denied"
             plans.append(plan)
 
         limit = max(1, int(config.MAX_TOOL_CONCURRENCY))
         if limit == 1 or len(plans) < 2 or all(p.serial for p in plans):
-            for p in plans:  # 纯串行路径：不启用线程，行为与逐个执行完全一致
+            for idx, p in enumerate(plans):  # 纯串行路径：不启用线程，行为与逐个执行完全一致
+                if token is not None and token.cancelled:
+                    return self._interrupt_batch(plans[idx:], [])
                 self._collect(p, p.run())
             return None
 
         with ThreadPoolExecutor(max_workers=limit) as pool:
             i = 0
             while i < len(plans):
+                if token is not None and token.cancelled:
+                    return self._interrupt_batch(plans[i:], [])
                 if plans[i].serial:
                     self._collect(plans[i], plans[i].run())
                     i += 1
@@ -395,6 +481,25 @@ class Agent:
                     self._collect(p, f.result())  # 按提交序收集，不按完成序
                 i = j
         return None
+
+    def _interrupt_batch(self, pending_plans: list[_ToolPlan],
+                         remaining_tcs: list[dict]) -> str:
+        """中断收尾：已预检未执行 / 尚未预检的 tool_calls 一律补占位结果。
+
+        会话不变量：每条 assistant 消息的每个 tool_call_id 都必须有配对
+        的 tool 结果，否则下一次请求会被服务商拒绝。返回 "interrupted"。
+        """
+        for p in pending_plans:
+            self._placeholder(INTERRUPTED_RESULT, p.tc.get("id"))
+        for tc in remaining_tcs:
+            self._placeholder(INTERRUPTED_RESULT, tc.get("id"))
+        return "interrupted"
+
+    def _placeholder(self, content: str, tool_call_id) -> None:
+        """为未执行的 tool_call 补占位结果（拒绝 / 中断的会话修复共用）。"""
+        self.session.messages.append(
+            {"role": "tool", "content": content, "tool_call_id": tool_call_id}
+        )
 
     def _collect(self, plan: _ToolPlan, result: str) -> str:
         """收集一个执行完的计划：截断、终端展示、按序追加进会话。

@@ -12,9 +12,9 @@ from smithcode import __version__, config
 from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
+from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import SelectionScreen
 from smithcode.tui.render import format_duration, git_branch, split_md_blocks
-from smithcode.tui.renderer import TuiRenderer
 from smithcode.tui.widgets import (
     MENU_VISIBLE_ITEMS,
     ChatInput,
@@ -148,7 +148,7 @@ def test_tui_mounts_and_welcomes(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             assert pilot.app is app
-            assert "Smith Code" in _chat_text(app) or "omen-alpha" in _chat_text(app)
+            assert f"v{__version__}" in _chat_text(app)
 
     _run(_run_case())
 
@@ -470,6 +470,59 @@ def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
             TuiRenderer(app).plan("共 2 步", plan_mod.render_current(color=True))
             await pilot.pause()
             assert section.display is False
+
+    _run(_run_case())
+
+
+def test_tui_new_clears_chat_area(monkeypatch):
+    """/new：聊天区彻底清空（含欢迎横幅），不追加任何提示文本；侧栏计划与会话一并重置。"""
+    no_prompting(monkeypatch)
+    from smithcode import plan as plan_mod
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            chat = app.query_one(ChatView)
+            chat.add_line("旧消息一")
+            chat.add_line("旧消息二")
+            plan_mod.current().replace([{"title": "旧步骤", "status": "pending"}])
+            await pilot.pause()
+            assert app.query_one("#chat").query(Static)  # 聊天区有内容
+
+            app.handle_command("/new")
+            await pilot.pause()
+
+            assert not app.query_one("#chat").query(Static)  # 聊天区清空
+            assert "已开启新会话" not in _chat_text(app)  # 不展示提示文本
+            assert agent.session.messages == []
+            assert not plan_mod.has_active()
+
+    _run(_run_case())
+
+
+def test_tui_new_blocked_while_busy(monkeypatch):
+    """对齐 opencode：任务运行中 /new 被拦截，只提示不执行（后台线程在写历史，中途重置会撕裂轮次）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.add("user", "旧消息")
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            app.query_one(ChatView).add_line("旧消息")
+            await pilot.pause()
+
+            app._busy = True  # 模拟后台任务运行中
+            app.handle_command("/new")
+            await pilot.pause()
+
+            assert "任务运行中" in _chat_text(app)  # 只显示拦截提示
+            assert agent.session.messages != []  # 会话未被重置
+            app._busy = False
+            app.handle_command("/new")
+            await pilot.pause()
+            assert "任务运行中" not in _chat_text(app)  # 空闲时正常重置
 
     _run(_run_case())
 

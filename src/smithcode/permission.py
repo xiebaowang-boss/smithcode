@@ -171,6 +171,12 @@ class Permission:
         self.user_rules = config.load_permissions()
         self.session_rules: list = []
 
+    def new_session(self) -> None:
+        """清空会话内"总是允许"积累的规则（/new 时调用）。
+
+        权限模式（Shift+Tab 切换的档位）是用户的手动选择，跨会话保留。"""
+        self.session_rules.clear()
+
     @property
     def approved_all(self) -> bool:
         """-y 兼容读写：置 True 等价切到 auto 档。旧引用点（cli -y）零改动。"""

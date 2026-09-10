@@ -212,6 +212,26 @@ def test_run_compacts_when_over_threshold(monkeypatch, capsys):
     assert "已压缩" in capsys.readouterr().out
 
 
+def test_compact_aborts_silently_when_cancelled(monkeypatch, capsys):
+    """任务已中断时不再发起摘要请求，静默放弃压缩（不打印失败噪音）。"""
+    from smithcode.cancel import CancellationToken, activate_token
+
+    agent = _over_threshold_agent(monkeypatch)
+    called = []
+    monkeypatch.setattr(agent, "_complete", lambda req: called.append(1) or "")
+
+    token = CancellationToken()
+    reset = activate_token(token)
+    token.cancel()
+    try:
+        assert agent.compact() is False
+    finally:
+        reset()
+
+    assert called == []  # 未发起任何摘要请求
+    assert "摘要未按模板生成" not in capsys.readouterr().out
+
+
 def test_compact_aborts_when_summary_invalid_twice(monkeypatch, capsys):
     class BadSummaryLLM(CompactAwareLLM):
         def chat_stream(self, messages, tools=None):
@@ -227,7 +247,7 @@ def test_compact_aborts_when_summary_invalid_twice(monkeypatch, capsys):
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
 
-    assert agent.run("继续") == "最终回复"  # 压缩失败不中断任务
+    assert agent.run("继续").text == "最终回复"  # 压缩失败不中断任务
 
     assert agent.context.compact_count == 0
     assert len(agent.session.messages) == 6  # 原 4 条 + 本轮 user + assistant，原样保留
@@ -252,7 +272,7 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
 
-    assert agent.run("继续") == "重试后回复"
+    assert agent.run("继续").text == "重试后回复"
 
     assert agent.context.compact_count == 1
     assert "上下文溢出" in capsys.readouterr().out

@@ -187,7 +187,7 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(agent.permission, "check", check)
 
     result = agent.run("拒绝")
-    assert "权限" in result
+    assert "权限" in result.text
     assert executed == []  # 第一个工具也未执行
 
     msgs = _tool_messages(agent)

@@ -100,6 +100,14 @@ class ContextMeter:
         self.last_actual: int | None = None
         self.compact_count = 0  # 本会话已执行的压缩次数（/context 展示，/new 清零）
 
+    def new_session(self) -> None:
+        """/new 时重置快照口径：压缩计数清零，上一会话的真实 token 锚点作废。
+
+        历史已清空，旧锚点再展示只会误导（/context 会拿旧会话的真实值
+        对比新会话的估算）。"""
+        self.last_actual = None
+        self.compact_count = 0
+
     def record(self, usage: dict | None) -> None:
         """每次 LLM 调用成功后记一笔真实 prompt_tokens；缺失时静默跳过。"""
         if isinstance(usage, dict) and usage.get("prompt_tokens"):

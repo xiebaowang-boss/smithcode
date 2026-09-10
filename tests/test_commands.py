@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from smithcode import commands, config, plan
+from smithcode import commands, config
 from smithcode.commands import base
 from smithcode.commands.base import CommandResult
 from smithcode.models import DEFAULT_EFFORTS
@@ -26,6 +26,9 @@ class _StubAgent:
         self.models = SimpleNamespace(list=lambda: ["a", "b", "c"])
 
     def _reset(self):
+        self.reset_called = True
+
+    def new_session(self):
         self.reset_called = True
 
     def compact(self):
@@ -188,22 +191,12 @@ def test_exit_requests_quit_without_text():
     assert outcome.text is None
 
 
-def test_new_resets_session_state():
-    config.SESSION_EXTRA_ROOTS.append("某个临时目录")
+def test_new_delegates_to_agent_and_sets_flags():
+    """/new 只委托 Agent.new_session（重置语义在 test_agent 验证），命令层管反馈与标记。"""
     agent, outcome = _run("/new")
     assert agent.reset_called
-    assert agent.permission.session_rules == []
-    assert config.SESSION_EXTRA_ROOTS == []
-    assert agent.context.compact_count == 0
-    assert "已开启新会话" in outcome.text
+    assert "已开启新会话" in outcome.text  # 仅 REPL 展示，TUI 不渲染该文本
     assert outcome.session_reset and outcome.refresh_status
-
-
-def test_new_resets_plan():
-    plan.current().replace([{"title": "步骤", "status": "pending"}])
-    assert plan.has_active()
-    _run("/new")
-    assert not plan.has_active()
 
 
 def test_save_reports_path():

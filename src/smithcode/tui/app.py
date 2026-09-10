@@ -9,7 +9,7 @@ Agent 在后台线程同步运行，TuiRenderer 用 post_message（线程安全�
 这里（cli 负责分流），仍用 ConsoleRenderer。
 
 本文件只负责「接线」：控件在 widgets.py、弹窗面板在 panels.py、线程桥在
-renderer.py、纯函数工具在 render.py。样式（CSS）集中在本文件的 SmithTUI.CSS。
+bridge.py、纯函数工具在 render.py。样式（CSS）集中在本文件的 SmithTUI.CSS。
 """
 from __future__ import annotations
 
@@ -21,9 +21,11 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from .. import commands, config, context, permission, plan, renderer, welcome
+from .bridge import TuiRenderer
 from .panels import (
     PermissionPanel,
     QuestionPanel,
@@ -32,7 +34,6 @@ from .panels import (
     SelectionScreen,
 )
 from .render import format_duration, git_branch, human_tokens
-from .renderer import TuiRenderer
 from .widgets import (
     ChatInput,
     ChatView,
@@ -187,6 +188,7 @@ class SmithTUI(App):
     BINDINGS: ClassVar = [
         Binding("ctrl+q", "quit", "退出"),
         Binding("shift+tab", "cycle_permission_mode", "权限模式", show=False),
+        Binding("escape", "interrupt", "中断", show=False),
     ]
     SIDEBAR_BREAKPOINT: ClassVar[int] = 120
     """终端宽度 >= 此值才显示侧边栏（46 列侧边栏 + 约 74 列聊天区）。"""
@@ -227,7 +229,7 @@ class SmithTUI(App):
         # 终端放得下就用完整版（Logo），太窄降级为单行紧凑版
         width = self.size.width
         self.query_one(ChatView).add_line_text(
-            welcome.banner(mode=self.agent.permission.mode, compact=width < welcome.LOGO_WIDTH + 12)
+            welcome.banner(compact=width < welcome.LOGO_WIDTH + 12)
         )
         self.ui_status()
 
@@ -281,6 +283,22 @@ class SmithTUI(App):
             return
         self.agent.permission.cycle_mode()
         self.ui_status()
+
+    def action_interrupt(self) -> None:
+        """Esc：任务运行中请求中断；空闲且无弹层时清空输入框（Claude Code 式）。
+
+        各弹层（权限 / 提问面板、选择弹窗、命令菜单）的 Esc 各有自己的
+        取消语义且焦点在内时按键先被其消费，一般走不到这里；此处守卫是
+        兜底（焦点不在弹层输入上时仍不干扰其语义）。
+        """
+        if self._busy:
+            self.agent.interrupt()
+            self.ui_line("（正在停止…）", "grey50")
+            return
+        if (self.query(PermissionPanel) or self.query(QuestionPanel)
+                or self.command_menu_open or isinstance(self.screen, ModalScreen)):
+            return
+        self.query_one(ChatInput).clear()
 
     def on_resize(self, event) -> None:
         """响应式侧边栏：窗口不够宽就隐藏，够宽再显示（与 App 内部重排并存）。"""
@@ -562,21 +580,41 @@ class SmithTUI(App):
 
     def handle_command(self, text: str) -> None:
         """斜杠命令统一走 commands.dispatch，按结果标记做 TUI 侧的收尾动作。"""
+        # 对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
+        # 中途重置会撕裂进行中的轮次（工具结果落入悬空的新会话），先行拦截
+        tokens = text.strip().split()
+        if self._busy and tokens and tokens[0].lower() == "/new":
+            self.ui_line("（任务运行中，不能开启新会话；请等待完成或先按 Esc 中断）", "yellow")
+            return
         outcome = commands.dispatch(self.agent, text)
         if outcome.exit:
             self.exit()
             return
-        if outcome.text is not None:
-            if outcome.kind == "block":
-                self.ui_block(outcome.text, outcome.style)
-            else:
-                self.ui_line(outcome.text, outcome.style)
-        if outcome.select is not None:
-            self.show_selection(outcome.select)
+        if outcome.session_reset:
+            # /new：清空聊天区本身就是全部反馈，不再追加提示文本（REPL 侧仍有文字）
+            self.reset_chat()
+        else:
+            if outcome.text is not None:
+                if outcome.kind == "block":
+                    self.ui_block(outcome.text, outcome.style)
+                else:
+                    self.ui_line(outcome.text, outcome.style)
+            if outcome.select is not None:
+                self.show_selection(outcome.select)
         if outcome.session_reset:
             self.query_one(Sidebar).update_plan("", has_active=False)
         if outcome.refresh_status:
             self.ui_status()
+
+    def reset_chat(self) -> None:
+        """开新会话：清空聊天区，屏幕回归空白起点。
+
+        连带清掉残留的瞬时渲染状态：工具块映射（widget 已随聊天区移除，
+        映射不清理会滞留旧引用）、思考块与轮次计时。"""
+        self.query_one(ChatView).remove_children()
+        self._tool_widgets.clear()
+        self._thinking_block = None
+        self._turn_start = None
 
 
 def run_tui(agent) -> None:

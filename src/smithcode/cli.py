@@ -1,5 +1,6 @@
 import argparse
 import sys
+import threading
 
 from . import __version__, commands, config
 from .agent import Agent
@@ -49,10 +50,41 @@ def build_parser():
     return parser
 
 
+def _run_agent_task(agent: Agent, text: str) -> None:
+    """后台线程执行一次任务：结果/错误在流式过程中实时打印。"""
+    try:
+        agent.run(text)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[错误] {type(e).__name__}: {e}")
+
+
+def _wait_for_task(agent: Agent, task: threading.Thread) -> None:
+    """等待后台任务结束，主线程专职做取消通道。
+
+    第一次 Ctrl+C：走与 TUI Esc 相同的协作式取消（流截停 + 会话修复），
+    继续等待任务收尾；第二次 Ctrl+C：不再等待、直接退出进程——正在执行的
+    工具最长可跑 300 秒，必须有明确的逃生通道（TUI 对应 Ctrl+Q）。
+
+    短轮询 join：Windows 下长阻塞 join 不能及时响应 Ctrl+C。
+    """
+    halted = False
+    while task.is_alive():
+        try:
+            task.join(0.2)
+        except KeyboardInterrupt:
+            if not halted:
+                halted = True
+                agent.interrupt()
+                print("\n（已中断，等待当前步骤收尾… 再按一次 Ctrl+C 退出）")
+            else:
+                print("\n再见!")
+                raise SystemExit(130)
+
+
 def repl(agent: Agent):
     from .welcome import welcome_text
 
-    print(welcome_text(agent.permission.mode, compact=True))
+    print(welcome_text(compact=True))
 
     while True:
         try:
@@ -74,10 +106,11 @@ def repl(agent: Agent):
                 _print_select(outcome.select)
             continue
 
-        try:
-            agent.run(user_input)  # 回复已在流式过程中实时打印
-        except Exception as e:  # noqa: BLE001
-            print(f"\n[错误] {type(e).__name__}: {e}")
+        # 任务放后台线程跑，主线程留作取消通道：Ctrl+C 时经 agent.interrupt()
+        # 走与 TUI Esc 相同的协作式取消（流截停 + 会话修复），而非整个进程退出
+        task = threading.Thread(target=_run_agent_task, args=(agent, user_input), daemon=True)
+        task.start()
+        _wait_for_task(agent, task)
 
 
 def _print_select(select):

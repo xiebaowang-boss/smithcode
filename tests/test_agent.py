@@ -44,7 +44,9 @@ def _make_agent(monkeypatch) -> Agent:
 
 def test_run_returns_final_content(monkeypatch):
     agent = _make_agent(monkeypatch)
-    assert agent.run("打个招呼") == "最终回复"
+    result = agent.run("打个招呼")
+    assert result.status == "ok"
+    assert result.text == "最终回复"
 
 
 def test_run_records_messages(monkeypatch):
@@ -66,7 +68,7 @@ def test_agent_loop_stops_at_max_iterations(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolCallLoopLLM)
     agent = Agent(session=Session(), max_iterations=2)
-    assert agent.run("死循环") == "达到最大迭代次数，任务中止。"
+    assert agent.run("死循环").text == "达到最大迭代次数，任务中止。"
 
 
 def test_run_stops_when_permission_denied(monkeypatch, tmp_path):
@@ -93,7 +95,8 @@ def test_run_stops_when_permission_denied(monkeypatch, tmp_path):
     agent.permission.user_rules = [("read_file", "*", "deny")]
 
     result = agent.run("测试拒绝流程")
-    assert "权限" in result
+    assert result.status == "denied"
+    assert "权限" in result.text
 
     tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
     assert len(tool_msgs) == 2
@@ -159,7 +162,7 @@ def test_reasoning_shown_but_not_persisted(monkeypatch, capsys):
     monkeypatch.setattr("smithcode.agent.LLMClient", ReasoningLLM)
     agent = Agent(session=Session())
 
-    assert agent.run("打个招呼") == "你好"
+    assert agent.run("打个招呼").text == "你好"
 
     out = capsys.readouterr().out
     assert "先想想" in out
@@ -179,13 +182,49 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
     monkeypatch.setattr("smithcode.agent.LLMClient", ThinkThenAnswerLLM)
     agent = Agent(session=Session())
 
-    msg, usage = agent._chat()
+    msg, usage, interrupted = agent._chat()
     assert msg == {"role": "assistant", "content": "答案"}
     assert usage is None  # 假 LLM 没发 usage 事件
+    assert interrupted is False
 
     out = capsys.readouterr().out
     assert "[Thinking] 想一想" in out
     assert "助手> 答案" in out
+
+
+# ---------- /new 重置：Agent.new_session 集中清空全部会话口径状态 ----------
+
+def test_new_session_resets_all_session_scope_state(monkeypatch, tmp_path):
+    """/new 的语义由 Agent.new_session 承担：会话级状态逐项清零，跨会话状态不动。
+
+    覆盖点含曾经的遗漏项（工具侧「已读文件」记录、上下文真实 token 锚点）
+    与既有各项：消息历史、会话用量、权限会话规则、越界信任目录、压缩计数、
+    步骤清单。会话 id 轮换与 since_start 用量存活一并验证。"""
+    from smithcode import plan
+    from smithcode.tools import files as files_mod
+
+    agent = _make_agent(monkeypatch)
+    agent.session.usage.add({"prompt_tokens": 10, "completion_tokens": 5})
+    agent.permission.session_rules.append(("run_command", "*", "allow"))
+    config.SESSION_EXTRA_ROOTS.append(str(tmp_path))
+    agent.context.compact_count = 3
+    agent.context.last_actual = 1234
+    files_mod.READ_FILES.add(str(tmp_path / "旧文件.py"))
+    plan.current().replace([{"title": "步骤", "status": "pending"}])
+
+    old_session_id = config.SESSION_ID
+    agent.new_session()
+
+    assert agent.session.messages == []
+    assert agent.session.usage.current_session.calls == 0
+    assert agent.session.usage.since_start.get("prompt_tokens") == 10  # 启动口径跨 /new 存活
+    assert agent.permission.session_rules == []
+    assert config.SESSION_EXTRA_ROOTS == []
+    assert agent.context.compact_count == 0
+    assert agent.context.last_actual is None  # 旧会话锚点对新会话无意义，作废
+    assert not files_mod.READ_FILES
+    assert not plan.has_active()
+    assert config.SESSION_ID != old_session_id  # 会话 id 随重置轮换
 
 
 # ---------- 用量统计：双口径累计与 /new 重置 ----------
@@ -338,3 +377,188 @@ def test_execute_apply_patch_denied_for_git(monkeypatch, tmp_path):
     )
     assert _run_call(agent, call) == "用户拒绝了此操作"
     assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()
+
+
+# ---------- Esc 中断：流式截停与工具批占位 ----------
+
+def test_interrupt_during_stream_keeps_partial_content(monkeypatch):
+    """流中取消：已收到的正文拼成部分消息入库，任务以 interrupted 结束。"""
+
+    class InterruptingLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield ("content", "部分")
+            agent.interrupt()  # 模拟用户按 Esc
+            yield ("content", "输出")
+            # 真实实现里流在此截停，不再产出 message
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
+    agent = Agent(session=Session())
+
+    result = agent.run("写首诗")
+    assert result.status == "interrupted"
+    assert result.partial is True
+    assert agent.session.messages[-1]["role"] == "assistant"
+    assert agent.session.messages[-1]["content"] == "部分输出"
+
+
+def test_interrupt_before_tool_batch_fills_placeholders(monkeypatch):
+    """流结束后才取消：这批 tool_calls 全部未执行，一律补占位（防悬空 tool_call_id）。"""
+
+    class StreamThenCancelLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield (
+                "message",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_fake_tool_call("list_dir", "{}"),
+                                   _fake_tool_call("list_dir", "{}")],
+                },
+            )
+            agent.interrupt()
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", StreamThenCancelLLM)
+    agent = Agent(session=Session())
+
+    result = agent.run("中断测试")
+    assert result.status == "interrupted"
+    tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
+    assert all("未执行" in m["content"] for m in tool_msgs)
+
+
+def test_interrupt_mid_batch_stops_remaining(monkeypatch):
+    """工具批执行中取消：已执行的正常入库，未执行的补占位、不再发起。"""
+    executed = []
+
+    def step_tool():
+        agent.interrupt()
+        executed.append(True)
+        return "第一步完成"
+
+    monkeypatch.setitem(FUNCTIONS, "step_tool", step_tool)
+    monkeypatch.setattr(config, "MAX_TOOL_CONCURRENCY", 1)  # 纯串行路径，结果确定
+
+    class ToolThenCancelLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield (
+                "message",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_fake_tool_call("step_tool", "{}"),
+                                   _fake_tool_call("list_dir", "{}")],
+                },
+            )
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", ToolThenCancelLLM)
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+
+    result = agent.run("中断批处理")
+    assert result.status == "interrupted"
+    assert executed == [True]  # list_dir 未再执行
+    tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
+    assert "第一步完成" in tool_msgs[0]["content"]
+    assert "未执行" in tool_msgs[1]["content"]
+
+
+def test_interrupt_during_preflight_skips_remaining(monkeypatch):
+    """预检阶段取消：剩余 tool_calls 不再预检、不再弹确认框，一律补占位。
+
+    已确认但未执行的第 1 个计划同样跳过——中断意味着不再发起任何新工作。
+    """
+    asked = []
+    executed = []
+
+    def step_tool():
+        executed.append(True)
+        return "第一步完成"
+
+    def check(name, args):
+        if not asked:
+            agent.interrupt()  # 模拟确认第 1 个工具时用户按 Esc
+        asked.append(name)
+        return True
+
+    monkeypatch.setitem(FUNCTIONS, "step_tool", step_tool)
+    monkeypatch.setattr(config, "MAX_TOOL_CONCURRENCY", 1)
+
+    class ToolThenCancelLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield (
+                "message",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_fake_tool_call("step_tool", "{}"),
+                                   _fake_tool_call("step_tool", "{}")],
+                },
+            )
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", ToolThenCancelLLM)
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", check)
+
+    result = agent.run("中断预检")
+    assert result.status == "interrupted"
+    assert asked == ["step_tool"]  # 第 2 个未再预检（确认框只弹过一次）
+    assert executed == []  # 已确认的也未执行
+    tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 2
+    assert all("未执行" in m["content"] for m in tool_msgs)
+
+
+def test_interrupt_during_confirmation_overrides_denied(monkeypatch):
+    """权限确认期间中断：即使随后答 n（本会 denied），也按 interrupted 收尾、不执行。"""
+    executed = []
+
+    def step_tool():
+        executed.append(True)
+        return "不应执行"
+
+    def check(name, args):
+        agent.interrupt()  # 确认框弹出期间用户按 Esc
+        return False       # 随后答 n——按中断语义优先，不转 denied
+
+    monkeypatch.setitem(FUNCTIONS, "step_tool", step_tool)
+
+    class OneToolLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield (
+                "message",
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [_fake_tool_call("step_tool", "{}")],
+                },
+            )
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", OneToolLLM)
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", check)
+
+    result = agent.run("确认中中断")
+    assert result.status == "interrupted"
+    assert executed == []
+    tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert "未执行" in tool_msgs[0]["content"]
+
+
+def test_session_reusable_after_interrupt(monkeypatch):
+    """中断后令牌已复位：同一会话继续追问正常工作，不受残留取消状态影响。"""
+
+    class InterruptingLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            yield ("content", "部分")
+            agent.interrupt()
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
+    agent = Agent(session=Session())
+    agent.run("第一条")
+
+    agent.llm = FakeLLM()  # 换回正常假 LLM（Agent 构造时已绑定实例，事后 patch 类不生效）
+    result = agent.run("继续")
+    assert result.status == "ok"
+    assert result.text == "最终回复"

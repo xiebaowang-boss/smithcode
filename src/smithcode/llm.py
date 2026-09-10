@@ -1,6 +1,7 @@
 """LLM 客户端封装：OpenAI 兼容接口，统一走流式，自带瞬时错误重试。"""
 import random
 import time
+from contextlib import closing
 
 from openai import (
     APIConnectionError,
@@ -12,6 +13,7 @@ from openai import (
 )
 
 from . import config, renderer
+from .cancel import current_token
 
 # 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
 # 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。
@@ -72,7 +74,9 @@ class LLMClient:
           ("usage", dict)      — 流中携带的 token 用量（服务商支持才发）
 
         瞬时错误按指数退避自动重试；失败前已输出过内容则不重试，
-        避免把已打印的文本重放一遍。
+        避免把已打印的文本重放一遍。任务被取消时（取消令牌已触发）流在
+        下一块数据到达前截停并关闭 HTTP 连接，不再产出 message/usage，
+        由 agent 侧拼装部分消息。
         """
         kwargs = {
             "model": config.MODEL,
@@ -108,34 +112,57 @@ class LLMClient:
                 time.sleep(wait)
 
     def _stream_once(self, kwargs):
-        """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息与用量。"""
+        """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息与用量。
+
+        取消即时生效：打开流后把 `stream.close` 登记为令牌监听——取消线程
+        直接关流，即使正阻塞在等待下一块数据（模型静默期 / 网络慢）也会
+        立即解除阻塞（读抛错或迭代结束），不必等下一块到达。关流引发的
+        读错误按取消处理（吞掉），非取消的真实异常照常上抛；任务被中断时
+        不产出 message/usage，由 agent 侧拼装部分消息。
+        """
         content_parts = []
         calls = {}  # 工具调用 index -> 累积中的 {"id", "name", "arguments"}
         latest_usage = None  # 有的服务商每个 chunk 都带 usage，始终记住最新一份
+        token = current_token()
+        if token is not None and token.cancelled:
+            return  # 已取消：连新请求都不发起（避免中断后仍白跑一次调用）
 
-        for chunk in self._open_stream(kwargs):
-            if getattr(chunk, "usage", None) is not None:
-                latest_usage = _usage_to_dict(chunk.usage)
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
+        with closing(self._open_stream(kwargs)) as stream:
+            if token is not None:
+                token.subscribe(stream.close)  # 取消线程直接关流，解除阻塞中的读
+            try:
+                for chunk in stream:
+                    if token is not None and token.cancelled:
+                        return
+                    if getattr(chunk, "usage", None) is not None:
+                        latest_usage = _usage_to_dict(chunk.usage)
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
 
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                yield ("reasoning", reasoning)
-            if delta.content:
-                content_parts.append(delta.content)
-                yield ("content", delta.content)
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        yield ("reasoning", reasoning)
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        yield ("content", delta.content)
 
-            for tc in delta.tool_calls or []:
-                idx = tc.index if tc.index is not None else 0
-                slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if tc.id:
-                    slot["id"] = tc.id
-                if tc.function and tc.function.name:
-                    slot["name"] = tc.function.name
-                if tc.function and tc.function.arguments:
-                    slot["arguments"] += tc.function.arguments
+                    for tc in delta.tool_calls or []:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["arguments"] += tc.function.arguments
+            except Exception:
+                if token is not None and token.cancelled:
+                    return  # 关流引发的读错误：本质是取消，非真实异常
+                raise
+
+        if token is not None and token.cancelled:
+            return  # 流恰好结束但已被取消：不产出 message/usage
 
         msg = {"role": "assistant", "content": "".join(content_parts)}
         if calls:

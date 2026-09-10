@@ -6,6 +6,14 @@
 
 ### 新增
 
+- **Esc 中断当前任务**（对齐 Claude Code / opencode 的 Esc 语义）：TUI 中任务运行时按 Esc 即时中断——LLM 流被取消令牌立即截停（打开流时把 `stream.close` 登记为令牌监听，取消线程直接关流，即使正阻塞在等待下一块数据也会即刻解除；已收到的正文以**部分消息**保留入库），工具批在**每个预检项**与波次边界截停（预检阶段中断时剩余确认框不再弹出、已确认未执行的同样跳过、确认期间中断优先于拒绝语义；正在执行的让其跑完、未执行的补占位结果，`tool_call_id` 永不悬空），会话历史始终合法、可直接继续追问；空闲时按 Esc 清空输入框。REPL 中 Ctrl+C 走同一协作式取消通道（任务移入后台线程，主线程专职取消；此前 Ctrl+C 会直接退出整个程序），第一次 Ctrl+C 触发中断、再按一次直接退出进程（长命令最长可能要等 300s，提供明确逃生通道，对应 TUI 的 Ctrl+Q）。配套机制：
+  - 新增 `cancel.py`：`CancellationToken`（幂等 cancel、线程安全查询、监听回调）+ `RunResult` 结构化结束状态（`ok / interrupted / denied / max_iterations`，`partial` 标记流中截停）——`Agent.run()` 返回值从字符串改为 `RunResult`，终止语义不再靠哨兵文本
+  - 取消令牌经 ContextVar 沿调用链隐式传播（`run()` 全程同线程，LLM 流层 / 工具调度层按需读取），`chat_stream` 接口零改动
+  - 中断与权限被拒共用同一会话修复路径（补占位结果收敛为 `_placeholder` / `_interrupt_batch`），`_execute_batch` 终止状态改为枚举（`denied` / `interrupted`）
+  - TUI 收尾（运行动画停止、轮次页脚、输入框聚焦）复用既有 `finally` 路径，中断后自动归位；权限 / 提问面板与选择弹窗的 Esc 取消语义不受影响
+  - **运行中的 shell 命令可被即时终止**：新增 `process.py` 作为外部命令执行的唯一出口——`run_command` 改走 `Popen` + 轮询，超时或被中断时终止整个进程树（Windows `taskkill /F /T`、POSIX 先 SIGTERM 宽限 2s 再 SIGKILL），不再等命令自然结束或撞 300s 超时；取消令牌由进程层自读（serial 工具运行在 run 线程），工具侧零接线，工具层只做结果文案映射
+  - **中断后不再发起新请求**：`compact` 的摘要重试循环与 `_stream_once` 打开流之前都先查令牌，中断时静默跳过压缩（不再白跑空请求、不再打印「摘要未按模板生成」噪音），溢出恢复重试也不会再发请求
+
 - **批量工具调用两阶段并发执行**（对齐 Claude Code 的分区 + 读写锁思路）：模型一次返回的多个 tool_calls 改为两阶段处理——第一阶段（主线程串行）按接收顺序逐个预检（解析参数、渲染摘要、路径预检、权限确认），任一被拒即终止任务，此时还没有任何工具被执行（比旧版"执行到一半被拒"更干净，且所有确认框仍逐个弹出、不会交错）；第二阶段按序分段执行——连续的可并行工具合并为一个波次扔进 `ThreadPoolExecutor`（`[limits].max_tool_concurrency` 上限，默认 5），有状态工具在主线程串行、作为顺序屏障（保证串行工具看见之前所有副作用、后续工具又看见它的改动），结果一律按提交顺序收集、回传给模型的顺序与请求顺序严格一致。配套机制：
   - 工具注册表新增 `serial=True` 声明（`tools/base.py` 的 `SERIAL` 注册表）：`run_command`（单会话 shell，cd/环境变量跨调用携带状态）、`todo_write`（会话级状态机 + 渲染）、`ask_user`（终端交互抢 stdin）、`write_file` / `edit_file` / `apply_patch`（写操作默认串行偏安全）已标注；未声明的只读工具（read_file / list_dir / glob / grep / webfetch / websearch / todo_read）默认可并行
   - "仅本次"越界放行（`widen_roots`）的调用强制串行——临时放行目录全局生效，并行窗口内其他线程会意外获得该目录访问权
@@ -31,6 +39,7 @@
 
 ### 变更
 
+- **`/new` 重置收敛与 TUI 清屏**：会话级状态的重置逻辑原先散落在命令层（`commands/session.py` 直接清 session / 权限规则 / 信任目录 / 压缩计数 / 计划清单），现集中为 `Agent.new_session()` 一处，并补齐两项漏网状态——工具侧「已读文件」记录（漏清会让新会话绕过 write/edit 前的已读校验）与上下文计量中的真实 token 锚点 `last_actual`（漏清会让 `/context` 用旧会话的真实值误导对比）。TUI 中执行 `/new` 现在会**彻底清空聊天区**（含欢迎横幅，连带清掉残留的工具块映射与思考块），且不再追加「已开启新会话。」提示文本——清空本身即反馈；REPL 仍打印该提示。**任务运行中 `/new` 会被拦截**（对齐 opencode 的 busy 拒绝）：只提示「请等待完成或先按 Esc 中断」，避免后台线程写历史时中途重置撕裂轮次。新增 `Agent.new_session` / `Permission.new_session` / `ContextMeter.new_session` 三个重置入口与对应测试
 - **修复运行计时动画首次显示不可见**：`RunningIndicator` 的 `width: auto` 空组件初始宽度为 0，而每次 tick 的更新走 `layout=False` 免重排——首次 `display=True` 不会触发布局，导致**第一轮任务的「Working…」计时全程渲染了却看不见**（第二次起 `display` 翻转强制重排才恢复）。修复为 `start()` 时立即渲染初始文案并触发一次布局定宽，组件状态初始化挪入 `__init__`；新增回归测试断言首次显示即有宽度
 - **时长显示统一为分级格式**：运行中动画与轮次页脚共用新的 `render.format_duration`——不足 1 分钟只显示秒（`42s`），不足 1 小时显示分+秒（`5m 30s`），再往上时+分+秒（`1h 12m 30s`），各级到点才出现；页脚此前超 1 小时也只显示分钟（如 `62m 5s`）。动画文案左对齐定宽，时长逐级变长不改变组件宽度，保持 `layout=False` 免重排的前提
 - **`tui/` 包结构化拆分**（纯代码搬移，行为零变化）：此前全部 TUI 布局与逻辑集中在 `tui/app.py`（约 1350 行），现按职责拆为四个文件——`app.py` 只留组装层（`SmithTUI` 布局接线、消息路由、命令分发与集中 CSS），`widgets.py` 收纳全部自包含控件（`ChatView` / `RunningIndicator` / `ThinkingBlock` / `ToolCall` / `Sidebar` / `CommandMenu` / `ChatInput` 与线程安全的 `UiAction` 消息），`renderer.py` 单独承载线程桥 `TuiRenderer`，`render.py` 收纳零 Textual 依赖的纯函数工具（`render_markdown` / `git_branch` / `human_tokens` / `format_duration`）；依赖方向单向（render → widgets → app，panels.py 沿用既有拆分），测试导入同步改为从各模块直连

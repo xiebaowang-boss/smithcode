@@ -16,6 +16,8 @@
 Update 的每个块按"上下文 + 删除行"组成的原文在文件中唯一匹配后替换（同 edit_file 语义）；
 任一步失败则整体不落盘（原子性）。所有目标路径经 _resolve 沙箱校验。
 """
+from __future__ import annotations
+
 from .base import register
 from .files import _protected_path, _resolve, _unified
 

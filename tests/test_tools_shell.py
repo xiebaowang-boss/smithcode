@@ -1,4 +1,5 @@
 """命令执行工具测试。"""
+from smithcode.process import ProcessResult
 from smithcode.tools.shell import run_command
 
 
@@ -17,16 +18,11 @@ def test_run_command_timeout_clamped(monkeypatch):
     """timeout 参数被夹在 [1, 上限] 区间，未传时用默认值。"""
     captured = {}
 
-    class FakeResult:
-        stdout = "ok"
-        stderr = ""
-        returncode = 0
-
     def fake_run(command, **kwargs):
         captured["timeout"] = kwargs["timeout"]
-        return FakeResult()
+        return ProcessResult(0, "ok", "", "ok")
 
-    monkeypatch.setattr("smithcode.tools.shell.subprocess.run", fake_run)
+    monkeypatch.setattr("smithcode.tools.shell.run_process", fake_run)
 
     run_command("echo hi", timeout=9999)
     assert captured["timeout"] == 300
@@ -43,3 +39,12 @@ def test_run_command_timeout_expired():
     output = run_command("ping -n 5 127.0.0.1 >nul", timeout=1)
     assert "超时" in output
     assert "300" in output
+
+
+def test_run_command_interrupted_message(monkeypatch):
+    """进程被中断时的结果文案（process 层 status=interrupted 的映射）。"""
+    monkeypatch.setattr(
+        "smithcode.tools.shell.run_process",
+        lambda command, **kwargs: ProcessResult(None, "", "", "interrupted"),
+    )
+    assert "中断" in run_command("sleep 999")

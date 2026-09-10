@@ -152,3 +152,54 @@ def test_ctrl_enter_inserts_newline_then_enter_submits():
 def test_enter_submits_single_line():
     """单行输入直接按 Enter 提交，行为与单行模式一致。"""
     assert _prompt_with_keys(b"hello\r") == "hello"
+
+
+# ---------- REPL 等待循环：Ctrl+C 中断与逃生通道 ----------
+
+def test_wait_for_task_waits_until_finished():
+    """任务正常结束（无 Ctrl+C）时安静返回，不抛异常。"""
+    from smithcode.cli import _wait_for_task
+
+    class FakeTask:
+        def __init__(self):
+            self.lives = 2
+
+        def is_alive(self):
+            self.lives -= 1
+            return self.lives > 0
+
+        def join(self, timeout=None):
+            pass
+
+    class FakeAgent:
+        def interrupt(self):
+            raise AssertionError("正常结束时不应触发中断")
+
+    _wait_for_task(FakeAgent(), FakeTask())
+
+
+def test_wait_for_task_second_interrupt_exits(capsys):
+    """第一次 Ctrl+C 触发协作式取消，第二次直接退出进程（逃生通道）。"""
+    from smithcode.cli import _wait_for_task
+
+    calls = []
+
+    class FakeAgent:
+        def interrupt(self):
+            calls.append(True)
+
+    class FakeTask:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            raise KeyboardInterrupt()
+
+    with pytest.raises(SystemExit) as excinfo:
+        _wait_for_task(FakeAgent(), FakeTask())
+
+    assert excinfo.value.code == 130
+    assert calls == [True]  # interrupt 只触发一次
+    out = capsys.readouterr().out
+    assert "再按一次 Ctrl+C 退出" in out
+    assert "再见" in out

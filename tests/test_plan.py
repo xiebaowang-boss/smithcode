@@ -232,7 +232,7 @@ def test_agent_executes_todo_write_and_renders(monkeypatch, capsys):
         ),
     )
     agent = Agent(session=Session())
-    assert agent.run("多步任务") == "完成"
+    assert agent.run("多步任务").text == "完成"
     out = capsys.readouterr().out
     assert "[计划]" in out
     assert "步骤一" in out

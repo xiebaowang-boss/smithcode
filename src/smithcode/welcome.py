@@ -1,4 +1,4 @@
-"""启动欢迎语：ASCII Logo + 会话信息行 + 随机问候 + 小贴士。
+"""启动欢迎语：ASCII Logo（附版本号）+ 随机问候 + 小贴士。
 
 供 TUI（Textual 界面）与 REPL（cli.repl）共用：TUI 用完整版（多行 Logo），
 REPL 用紧凑版（单行 Logo）。问候语池与小贴士池各随机抽一条，让每次启动
@@ -7,13 +7,11 @@ REPL 用紧凑版（单行 Logo）。问候语池与小贴士池各随机抽一�
 from __future__ import annotations
 
 import datetime
-import platform
 import random
 
 from rich.text import Text
 
-from . import __version__, config
-from .permission import MODE_LABELS, MODES
+from . import __version__
 
 # TUI 用的多行 Logo（块状字）。行宽 40 列，终端 ≥ 52 列才显示完整版，
 # 更窄时调用方降级为紧凑版；REPL 始终用紧凑版。
@@ -68,47 +66,30 @@ def _current_hour() -> int:
     return datetime.datetime.now().astimezone().hour  # 本地时区（避免 DTZ005）
 
 
-def _info_line(mode: str) -> Text:
-    """会话信息行：模型 · 权限模式 · 版本 · Python · git 分支（分支缺省省略）。"""
-    line = Text("  ", style="#808080")
-    line.append(config.MODEL, style="#7aa2f7")
-    line.append(" · ", style="#808080")
-    line.append(MODE_LABELS.get(mode, mode), style="#808080")
-    line.append(f" · v{__version__}", style="#808080")
-    line.append(f" · Python {platform.python_version()}", style="#808080")
-    from .tui.render import git_branch
-
-    branch = git_branch(config.WORKSPACE_ROOT)
-    if branch:
-        line.append(" · ", style="#808080")
-        line.append(branch, style="#808080")
-    return line
-
-
 def _pick(rng: random.Random, seq: list[str]) -> str:
     return rng.choice(seq)
 
 
-def banner(mode: str | None = None, compact: bool = False,
-           rng: random.Random | None = None) -> Text:
+def banner(compact: bool = False, rng: random.Random | None = None) -> Text:
     """欢迎语（Text 对象，内嵌配色）。
 
-    mode：权限模式键（如 agent.permission.mode），缺省用默认模式；
     compact：紧凑版（单行 Logo，REPL 用）；TUI 用完整版（compact=False）。
     rng：随机源，测试可注入固定种子。
     """
     rng = rng or random.Random()
     parts: list[Text] = []
 
+    logo = Text()
     if compact:
-        logo = Text()
         logo.append(f"  {COMPACT}", style="bold #23d18b")
         logo.append(f"  v{__version__}", style="#808080")
     else:
-        logo = Text(LOGO, style="#23d18b")
+        # 版本号紧跟在 Logo 最后一行后面
+        version = f"v{__version__}"
+        logo.append(LOGO.rstrip("\n"), style="#23d18b")
+        logo.append("  ", style="#808080")
+        logo.append(version, style="#808080")
     parts.append(logo)
-
-    parts.append(_info_line(mode or MODES[0]))
 
     greet = Text("  ")
     greet.append(greet_by_hour(_current_hour()), style="#e0af68")
@@ -129,8 +110,7 @@ def banner(mode: str | None = None, compact: bool = False,
     return result
 
 
-def welcome_text(mode: str | None = None, compact: bool = False,
-                 seed: int | None = None) -> str:
+def welcome_text(compact: bool = False, seed: int | None = None) -> str:
     """纯文本版：去掉配色，便于测试与日志。"""
     rng = random.Random(seed)
-    return str(banner(mode=mode, compact=compact, rng=rng))
+    return str(banner(compact=compact, rng=rng))
