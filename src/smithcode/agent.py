@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import config, renderer
@@ -32,6 +34,7 @@ from .tools import (
     PATHS_EXTRACTORS,
     PREVIEWS,
     SCHEMAS,
+    SERIAL,
     reset_read_tracking,
 )
 
@@ -71,6 +74,27 @@ def _diff_preview(name: str, args: dict) -> str:
     return "\n".join(lines)
 
 
+class _ToolPlan:
+    """单个工具调用的执行计划：预检阶段（主线程）的产物。
+
+    run 闭包封装全部执行细节（临时放行 widen、异常转结果文本），预检时
+    权限与路径检查已完成，执行阶段可直接在主线程或线程池 worker 中调用。
+    被拒的计划 run() 返回 DENIED_RESULT；display_result=False 的计划
+    （todo_write）由 run() 自行渲染，收集时跳过 tool_result 展示与截断。
+    """
+
+    __slots__ = ("display_result", "name", "run", "serial", "tc", "tool_id")
+
+    def __init__(self, tc: dict, name: str, tool_id: int | None, run, serial: bool = False,
+                 display_result: bool = True):
+        self.tc = tc
+        self.name = name
+        self.tool_id = tool_id
+        self.run = run
+        self.serial = serial
+        self.display_result = display_result
+
+
 class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None):
         reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
@@ -106,20 +130,9 @@ class Agent:
             if not msg.get("tool_calls"):
                 return msg.get("content", "")
 
-            for i, tc in enumerate(msg["tool_calls"]):
-                result, denied = self._execute(tc)
-                self.session.messages.append(
-                    {"role": "tool", "content": result, "tool_call_id": tc["id"]}
-                )
-                if denied:
-                    # 权限被拒：为同条消息中剩余 tool_calls 补占位结果（防悬空
-                    # tool_call_id 破坏下一轮请求），然后直接终止本轮任务。
-                    for pending in msg["tool_calls"][i + 1:]:
-                        self.session.messages.append(
-                            {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": pending["id"]}
-                        )
-                    renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
-                    return "任务已停止：权限请求被用户拒绝。"
+            stopped = self._execute_batch(msg["tool_calls"])
+            if stopped:
+                return stopped
 
         return "达到最大迭代次数，任务中止。"
 
@@ -207,10 +220,27 @@ class Agent:
         r.stream_done()
         return msg, usage
 
-    def _execute(self, tc: dict) -> tuple[str, bool]:
-        """执行一个工具调用，返回 (结果文本, 是否权限被拒)。
+    def _preflight_safe(self, tc: dict) -> tuple[_ToolPlan, bool]:
+        """预检的兜底包装：预检自身的意外异常转为该工具的错误结果，不外抛。
 
-        权限被拒时由 run() 终止整个任务循环（拒绝即停，不与模型继续拉扯）。
+        旧实现里权限确认与执行同处一个 try 块，交互层异常（如终端不可用）
+        只体现为该工具的错误结果、循环继续；这里保持同样的容错边界。
+        """
+        try:
+            return self._preflight(tc)
+        except Exception as e:  # noqa: BLE001
+            name = tc["function"]["name"]
+            text = f"错误: {type(e).__name__}: {e}"
+            return _ToolPlan(tc, name, None, lambda: text), False
+
+    def _preflight(self, tc: dict) -> tuple[_ToolPlan, bool]:
+        """预检一个工具调用：解析参数、渲染摘要、路径预检与权限检查。
+
+        全部在主线程按接收顺序进行——交互确认与权限规则的会话级写入
+        不容并发。返回 (计划, 是否权限被拒)；被拒时计划的 run() 返回
+        DENIED_RESULT，由 _execute_batch 终止任务。解析失败、路径解析
+        失败等错误不视为被拒，同样封装成计划（run() 直接返回错误文本），
+        保证结果收集路径统一。
         """
         name = tc["function"]["name"]
         args_json = tc["function"]["arguments"]
@@ -218,14 +248,16 @@ class Agent:
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
+            text = f"错误: JSONDecodeError: {e}"
             tool_id = renderer.current().tool_call(f"[Tool] {name}({args_json[:80]})")
-            return self._finish(f"错误: JSONDecodeError: {e}", tool_id), False
+            return _ToolPlan(tc, name, tool_id, lambda: text), False
 
         line = self._describe(name, args)
         display = DISPLAY.get(name, "inline")
         tool_id = renderer.current().tool_call(
             line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display
         )
+        denied_plan = _ToolPlan(tc, name, tool_id, lambda: DENIED_RESULT)
 
         # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
         extractor = PATHS_EXTRACTORS.get(name)
@@ -233,45 +265,47 @@ class Agent:
             try:
                 paths = [str(p) for p in extractor(args)]
             except Exception as e:  # noqa: BLE001
-                return self._finish(f"错误: 无法解析目标路径: {type(e).__name__}: {e}", tool_id), False
-            if paths:
-                return self._execute_with_paths(name, args, paths, tool_id)
+                text = f"错误: 无法解析目标路径: {type(e).__name__}: {e}"
+                return _ToolPlan(tc, name, tool_id, lambda: text), False
+
+            widened = []
+            for raw in paths:
+                pre = self._preflight_path(raw)
+                if pre == "deny":
+                    return denied_plan, True
+                if isinstance(pre, Path):
+                    widened.append(pre)
+            if not self.permission.check_paths(name, paths):
+                return denied_plan, True
+
+            snapshot = _diff_preview(name, args)  # 执行前快照（apply_patch 暂无 preview，为空串）
+            if snapshot:
+                renderer.current().tool_preview(tool_id, snapshot)
+
+            # "仅本次"越界放行经 widen_roots 全局生效，并行窗口内其他线程会
+            # 意外获得该目录的访问权——带临时放行目录的计划强制串行
+            return _ToolPlan(tc, name, tool_id,
+                             self._make_runner(name, args, widened), serial=bool(widened)), False
+
         if name == "todo_write":
-            return self._execute_todo(args, tool_id)
-        return self._execute_single(name, args, tool_id)
+            if not self.permission.check(name, args):
+                return denied_plan, True
 
-    def _execute_with_paths(self, name: str, args: dict, paths: list[str],
-                            tool_id: int | None = None) -> tuple[str, bool]:
-        """多路径工具：任一路径越界被拒则整体拒绝；聚合权限检查；整体原子执行。
+            def run_todo() -> str:
+                try:
+                    result = str(FUNCTIONS[name](**args))
+                except Exception as e:  # noqa: BLE001
+                    result = f"错误: {type(e).__name__}: {e}"
+                    renderer.current().tool_result(result, tool_id)
+                    return result
+                renderer.current().plan(summary(), render_current(color=True))
+                return result
 
-        路径预检（根信任门）→ 聚合操作权限门 → 执行，两道关卡有序，与单路径工具一致。
-        """
-        widened = []
-        for raw in paths:
-            pre = self._preflight_path(raw)
-            if pre == "deny":
-                return self._finish(DENIED_RESULT, tool_id), True
-            if isinstance(pre, Path):
-                widened.append(pre)
+            # todo_write 改写会话级状态机并渲染计划，必须独占主线程
+            return _ToolPlan(tc, name, tool_id, run_todo, serial=True, display_result=False), False
 
-        if not self.permission.check_paths(name, paths):
-            return self._finish(DENIED_RESULT, tool_id), True
-
-        snapshot = _diff_preview(name, args)  # 执行前快照（apply_patch 暂无 preview，为空串）
-        if snapshot:
-            renderer.current().tool_preview(tool_id, snapshot)
-        try:
-            with config.widen_roots(widened):
-                result = str(FUNCTIONS[name](**args))
-        except Exception as e:  # noqa: BLE001
-            # 工具执行的任何失败都只作为结果回传给模型，不中断循环
-            result = f"错误: {type(e).__name__}: {e}"
-
-        return self._finish(result, tool_id, name), False
-
-    def _execute_single(self, name: str, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
-        # 变更预览（diff）在路径预检 / 权限确认 / 执行之前推送到工具调用块：
-        # 审核时改动内容已经可见，权限框保持纯净
+        # 单路径/无路径工具：变更预览（diff）在路径预检 / 权限确认 / 执行之前
+        # 推送到工具调用块：审核时改动内容已经可见，权限框保持纯净
         snapshot = _diff_preview(name, args)
         if snapshot:
             renderer.current().tool_preview(tool_id, snapshot)
@@ -279,37 +313,101 @@ class Agent:
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
         preflight = self._preflight_outside_path(args)
         if preflight == "deny":
-            return self._finish(DENIED_RESULT, tool_id), True
+            return denied_plan, True
+        if not self.permission.check(name, args):
+            return denied_plan, True
 
-        denied = False
-        try:
-            if not self.permission.check(name, args):
-                result = DENIED_RESULT
-                denied = True
-            elif isinstance(preflight, Path):
-                with config.widen_roots([preflight]):
-                    result = str(FUNCTIONS[name](**args))
-            else:
-                result = str(FUNCTIONS[name](**args))
-        except Exception as e:  # noqa: BLE001
-            # 工具执行的任何失败都只作为结果回传给模型，不中断循环
-            result = f"错误: {type(e).__name__}: {e}"
+        # 注册为 serial 的工具（shell / 写文件 / 交互确认等）与需要临时放行的
+        # 调用在主线程串行执行，其余进并发波次
+        widen = [preflight] if isinstance(preflight, Path) else []
+        return _ToolPlan(tc, name, tool_id,
+                         self._make_runner(name, args, widen),
+                         serial=bool(SERIAL.get(name)) or bool(widen)), False
 
-        return self._finish(result, tool_id, name), denied
+    @staticmethod
+    def _make_runner(name: str, args: dict, widen: list[Path]) -> Callable[[], str]:
+        """生成工具执行闭包：临时放行（widen）+ 调用 + 异常转结果文本。
 
-    def _execute_todo(self, args: dict, tool_id: int | None = None) -> tuple[str, bool]:
-        """todo_write 专用执行路径：计划无论 display_mode 都必须完整展示，
-        不走 tool_result 的粒度分支（summary 模式也不能只留一行摘要）。"""
-        if not self.permission.check("todo_write", args):
-            return self._finish(DENIED_RESULT, tool_id), True
-        try:
-            result = str(FUNCTIONS["todo_write"](**args))
-        except Exception as e:  # noqa: BLE001
-            result = f"错误: {type(e).__name__}: {e}"
-            renderer.current().tool_result(result, tool_id)
-            return result, False
-        renderer.current().plan(summary(), render_current(color=True))
-        return result, False
+        闭包在预检完成后于主线程或线程池 worker 中调用；工具执行的任何
+        失败都只作为结果回传给模型，不中断循环。widen 为空时 widen_roots
+        直接放行，等价无放行调用。
+        """
+        def run() -> str:
+            try:
+                with config.widen_roots(widen):
+                    return str(FUNCTIONS[name](**args))
+            except Exception as e:  # noqa: BLE001
+                return f"错误: {type(e).__name__}: {e}"
+
+        return run
+
+    def _execute_batch(self, tool_calls: list[dict]) -> str | None:
+        """执行同一条 assistant 消息里的全部工具调用（两阶段：预检串行、执行并发）。
+
+        第一阶段（主线程，串行，按接收顺序）：逐个预检——解析参数、渲染摘要、
+        路径预检与权限确认；任一被拒即终止任务，为剩余 tool_calls 补占位结果
+        （防悬空 tool_call_id 破坏下一轮请求），此时还没有任何工具被执行。
+        第二阶段（并发）：按序分段——连续的可并行计划合并为一个波次扔进线程池，
+        serial 计划在主线程单独执行、作为顺序屏障（保证串行工具看见之前所有
+        副作用、后续工具又看见串行工具的改动）；结果一律按提交顺序收集，
+        模型看到的 tool 结果顺序与它请求的顺序严格一致。
+
+        返回 None 表示正常完成；返回终止文本表示权限被拒。
+        """
+        plans: list[_ToolPlan] = []
+        for i, tc in enumerate(tool_calls):
+            plan, denied = self._preflight_safe(tc)
+            if denied:
+                # 此前已过预检但尚未执行的计划：任务中止，一并补占位结果
+                # （防悬空 tool_call_id 破坏下一轮请求）
+                for done in plans:
+                    self.session.messages.append(
+                        {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": done.tc.get("id")}
+                    )
+                self._collect(plan, plan.run())
+                for pending in tool_calls[i + 1:]:
+                    self.session.messages.append(
+                        {"role": "tool", "content": SKIPPED_RESULT, "tool_call_id": pending["id"]}
+                    )
+                renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
+                return "任务已停止：权限请求被用户拒绝。"
+            plans.append(plan)
+
+        limit = max(1, int(config.MAX_TOOL_CONCURRENCY))
+        if limit == 1 or len(plans) < 2 or all(p.serial for p in plans):
+            for p in plans:  # 纯串行路径：不启用线程，行为与逐个执行完全一致
+                self._collect(p, p.run())
+            return None
+
+        with ThreadPoolExecutor(max_workers=limit) as pool:
+            i = 0
+            while i < len(plans):
+                if plans[i].serial:
+                    self._collect(plans[i], plans[i].run())
+                    i += 1
+                    continue
+                j = i
+                while j < len(plans) and not plans[j].serial:
+                    j += 1
+                wave = plans[i:j]
+                futures = [pool.submit(p.run) for p in wave]  # 按序提交
+                for p, f in zip(wave, futures):
+                    self._collect(p, f.result())  # 按提交序收集，不按完成序
+                i = j
+        return None
+
+    def _collect(self, plan: _ToolPlan, result: str) -> str:
+        """收集一个执行完的计划：截断、终端展示、按序追加进会话。
+
+        只在主线程调用（渲染不进 worker）；todo_write 的计划展示已由 run()
+        自行渲染，display_result=False 时跳过 tool_result 展示与截断。
+        """
+        if plan.display_result:
+            result = self._finish(result, plan.tool_id, plan.name)
+        self.session.messages.append(
+            {"role": "tool", "content": result, "tool_call_id": plan.tc.get("id")}
+        )
+        return result
 
     def _finish(self, result: str, tool_id: int | None = None,
                 name: str | None = None) -> str:

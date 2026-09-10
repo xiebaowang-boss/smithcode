@@ -71,7 +71,8 @@ def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
 
     agent = Agent(session=Session())
     call = {"function": {"name": "ask_user", "arguments": json.dumps({"question": "确认？"})}}
-    assert agent._execute(call)[0] == "继续"
+    agent._execute_batch([call])
+    assert agent.session.messages[-1]["content"] == "继续"
 
 
 # ---------- 选项提问（opencode 式） ----------

@@ -9,6 +9,7 @@ PATHS_EXTRACTORS: dict = {}
 DESCRIBERS: dict = {}
 PREVIEWS: dict = {}  # (args)->str|None：ask 确认前生成的变更预览（如 unified diff）
 DISPLAY: dict = {}  # 终端展示形态：inline（一行式）/ block（可折叠结果块）
+SERIAL: dict = {}  # 是否禁止并行：True 的工具批量执行时在主线程串行运行
 
 
 def register(schema: dict):
@@ -28,6 +29,9 @@ def register(schema: dict):
     可选的 schema["display"] 声明终端展示形态（opencode 式）：
     "inline"（默认，一行摘要 + 计数）/ "block"（结果可折叠成块，按行截断），
     同样不会发送给 LLM。
+    可选的 schema["serial"] 声明该工具禁止并行（默认 False）：批量执行时
+    可并行工具进线程池，serial=True 的工具在主线程串行运行、作为顺序屏障
+    （单会话 shell、交互确认、写文件等有跨调用状态或线程不安全的工具必须声明）。
     """
 
     def decorator(func):
@@ -38,6 +42,7 @@ def register(schema: dict):
         DESCRIBERS[s["name"]] = s.pop("describe", None)
         PREVIEWS[s["name"]] = s.pop("preview", None)
         DISPLAY[s["name"]] = s.pop("display", "inline")
+        SERIAL[s["name"]] = bool(s.pop("serial", False))
         SCHEMAS.append(s)
         FUNCTIONS[s["name"]] = func
         return func

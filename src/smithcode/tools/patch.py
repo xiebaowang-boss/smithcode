@@ -162,6 +162,7 @@ def _apply_blocks_to_text(text: str, blocks: list[tuple[str, str]], path: str) -
         "family": "edit_file",
         "paths_from": extract_patch_paths,
         "display": "block",
+        "serial": True,
         "describe": _describe_patch,
         "preview": _preview_patch,
         "description": "用 patch 信封批量应用多文件修改（Add/Update/Delete），原子落盘。"

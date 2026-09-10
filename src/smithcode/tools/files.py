@@ -182,6 +182,7 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
         "name": "write_file",
         "pattern_arg": "path",
         "display": "block",
+        "serial": True,
         "describe": lambda args: f"write {args.get('path', '?')}",
         "preview": _preview_write,
         "description": "创建新文件或覆盖写入；覆盖已存在的文件前必须先用 read_file 读取（工具强制校验）。",
@@ -212,6 +213,7 @@ def write_file(path: str, content: str) -> str:
         "name": "edit_file",
         "pattern_arg": "path",
         "display": "block",
+        "serial": True,
         "describe": lambda args: f"edit {args.get('path', '?')}",
         "preview": _preview_edit,
         "description": "精确替换文件中的一段文本。old_string 必须与文件内容逐字符完全一致"

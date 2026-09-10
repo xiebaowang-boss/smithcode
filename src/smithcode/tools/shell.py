@@ -17,6 +17,7 @@ def _describe(args: dict) -> str:
         "name": "run_command",
         "pattern_arg": "command",
         "display": "block",
+        "serial": True,
         "describe": _describe,
         "description": "在工作区根目录执行一条 shell 命令并返回输出。"
         "默认 60 秒超时，跑测试、构建等耗时命令前用 timeout 参数延长（上限 300 秒）。",

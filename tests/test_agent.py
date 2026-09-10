@@ -240,6 +240,12 @@ def _outside_agent(monkeypatch, tmp_path):
     return Agent(session=Session())
 
 
+def _run_call(agent: Agent, call: dict) -> str:
+    """跑单个工具调用并返回其结果文本（批量路径的单调用用法，结果在最后一条 tool 消息）。"""
+    agent._execute_batch([call])
+    return agent.session.messages[-1]["content"]
+
+
 def test_execute_outside_path_denied(monkeypatch, tmp_path):
     """越界路径被用户拒绝时，工具不执行，返回统一的拒绝结果。"""
     _outside, arg = _outside_file(tmp_path)
@@ -247,7 +253,7 @@ def test_execute_outside_path_denied(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "n")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call)[0] == "用户拒绝了此操作"
+    assert _run_call(agent, call) == "用户拒绝了此操作"
     assert config.SESSION_EXTRA_ROOTS == []
 
 
@@ -258,7 +264,7 @@ def test_execute_outside_path_once_approval(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "y")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert "s" in agent._execute(call)[0]
+    assert "s" in _run_call(agent, call)
     assert config.SESSION_EXTRA_ROOTS == []
 
 
@@ -273,10 +279,10 @@ def test_execute_outside_path_always_approval(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "a")
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert "s" in agent._execute(call)[0]
+    assert "s" in _run_call(agent, call)
     assert config.SESSION_EXTRA_ROOTS == [str(outside)]
 
-    assert "s" in agent._execute(call)[0]
+    assert "s" in _run_call(agent, call)
 
 
 def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
@@ -287,7 +293,7 @@ def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("不应弹出交互确认"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert "s" in agent._execute(call)[0]
+    assert "s" in _run_call(agent, call)
     assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义
 
 
@@ -299,7 +305,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("非交互不应调用 input"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
-    assert agent._execute(call)[0] == "用户拒绝了此操作"
+    assert _run_call(agent, call) == "用户拒绝了此操作"
 
 
 # ---------- apply_patch：多路径工具流程 ----------
@@ -317,8 +323,7 @@ def test_execute_apply_patch_creates_file(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", lambda _: "y")
 
     call = _fake_tool_call("apply_patch", json.dumps({"patch": "*** Add File: hi.txt\n+hi\n"}))
-    result = agent._execute(call)[0]
-    assert "已应用" in result
+    assert "已应用" in _run_call(agent, call)
     assert (tmp_path / "hi.txt").read_text(encoding="utf-8") == "hi"
 
 
@@ -331,5 +336,5 @@ def test_execute_apply_patch_denied_for_git(monkeypatch, tmp_path):
         "apply_patch",
         json.dumps({"patch": "*** Add File: .git/hooks/pre-commit\n+echo x\n"}),
     )
-    assert agent._execute(call)[0] == "用户拒绝了此操作"
+    assert _run_call(agent, call) == "用户拒绝了此操作"
     assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()

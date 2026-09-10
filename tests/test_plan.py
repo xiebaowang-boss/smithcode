@@ -251,7 +251,8 @@ def test_agent_todo_write_denied_by_user_rule(monkeypatch, tmp_path):
             "arguments": json.dumps({"todos": [{"title": "x", "status": "pending"}]}),
         }
     }
-    assert agent._execute(call)[0] == "用户拒绝了此操作"
+    agent._execute_batch([call])
+    assert agent.session.messages[-1]["content"] == "用户拒绝了此操作"
     assert plan.current().items == []
 
 

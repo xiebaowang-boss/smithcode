@@ -34,7 +34,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 1. `cli.py` 接收用户输入，交给 `Agent.run()`。
 2. `Agent` 把消息列表（含系统提示词）发给 LLM。
 3. 模型要么返回纯文本（任务完成，循环结束），要么返回工具调用。
-4. 工具调用先经 `Permission` 确认（读文件/列目录免确认），再由 `tools/` 执行。
+4. 工具调用先经 `Permission` 确认（读文件/列目录免确认），再由 `tools/` 执行；同一批调用**两阶段执行**——预检（解析参数、渲染摘要、路径预检、权限确认）全部在主线程按接收顺序串行完成，之后可并行的只读调用进线程池并发执行（`MAX_TOOL_CONCURRENCY` 上限），声明 `serial` 的有状态工具（shell / 写文件 / 交互确认）在主线程串行、作为顺序屏障；结果一律按提交顺序回传。
 5. 执行结果以 `role: tool` 消息回传给模型，进入下一轮循环。
 6. 循环超过 `MAX_ITERATIONS` 次则强制终止，防止失控。
 
@@ -61,7 +61,7 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 
 - **数据模型**：每项含服务端分配的稳定 `id` + `title`（标题，创建后不可变，侧边栏只显示它）+ `description`（可选详情，可改）+ `reason` + `status`（`pending` / `in_progress`（同一时刻仅一个）/ `completed` / `cancelled`）。`todo_write` 传**全量最新清单**（非增量），每次整体替换：带 `id` 的项按 id 匹配（标题不可变，其余字段可更新），无 `id` 时按标题匹配既有项，匹配不到视为新项并分配新 id；空标题忽略、非法状态降级为 `pending`，单份上限 50 步。
 - **状态归属**：清单存于 `plan.py` 的进程内单例（会话口径），`/new` 时 `reset()`；`/plan` 命令随时查看当前计划。
-- **展示**：`todo_write` 走 Agent 的专用执行路径 `_execute_todo`，聊天 [计划] 块完整渲染（标题 + 描述 + reason，in_progress 加粗、完成/取消置灰），不受 `tool_display` 粒度影响；TUI 侧边栏用 `render_titles` 只展示标题；回传给模型的工具结果保持明文清单，供后续轮次参考。
+- **展示**：`todo_write` 的计划无论 display_mode 都完整渲染聊天 [计划] 块（标题 + 描述 + reason，in_progress 加粗、完成/取消置灰），不走 `tool_result` 的粒度分支；TUI 侧边栏用 `render_titles` 只展示标题；回传给模型的工具结果保持明文清单，供后续轮次参考。
 - **只读**：`todo_read` 随时拉取当前清单权威快照（含 id），支持 `status` 过滤与 `summary_only` 摘要；`todo_write` 与 `todo_read` 均默认 `allow`，可用 `deny` 规则禁用。
 - **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、更新时用 `todo_read` 取 id 并保留、标题不可变、计划不合理时调整而非无视、单步简单任务不拆分。
 
@@ -80,7 +80,7 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission.py` | 敏感操作的用户确认 |
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
-| `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview`） |
+| `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
 | `tools/shell.py` | 命令执行，含超时保护 |
@@ -156,5 +156,7 @@ def search_code(pattern: str) -> str:
 ```
 
 若该工具执行时值得让用户看清改动（如写文件、改文件），用 `preview` 声明 `(args) -> str | None` 的变更预览（如 unified diff，None 表示无可预览内容）。预览由 Agent 在**工具执行前**快照生成（执行后文件已变更，diff 恒为空），推送到工具调用块——pending 态就地展开，权限审核时改动已可见；生成失败只影响展示、不影响确认与执行：
+
+若该工具有跨调用状态或线程不安全（单会话 shell、交互确认、写文件、会话级状态机），用 `serial=True` 声明禁止并行：批量执行时该工具在主线程串行运行、作为顺序屏障，其余只读工具进线程池并发。
 
 未声明 `pattern_arg` 的工具，其权限模式固定为 `*`；默认规则中未覆盖的新工具按 `ask` 处理。
