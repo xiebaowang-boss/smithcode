@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import sys
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -220,6 +221,11 @@ COMPACT_KEEP_TOKENS = _resolve_number("context", "compact_keep_tokens", 15000)  
 MAX_RETRIES = _resolve_number("limits", "max_retries", 3)  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
 LLM_TIMEOUT = _resolve_number("limits", "llm_timeout", 120)  # 单次 LLM 请求超时（秒）
 
+# 一轮内多个工具调用的并发执行上限（线程池 max_workers）。
+# 模型一次返回的多个调用中，可并行的部分最多同时跑这么多，其余排队；
+# 权限需确认/被拒的调用不走并发池，决策与展示均在主线程完成。
+MAX_TOOL_CONCURRENCY = max(1, _resolve_number("limits", "max_tool_concurrency", 5))
+
 # 操作系统信息
 OS_INFO = platform.platform()
 PYTHON_VERSION = platform.python_version()
@@ -232,6 +238,9 @@ EXTRA_ROOTS: list[str] = []
 SESSION_EXTRA_ROOTS: list[str] = []
 # 仅单次工具调用期间临时放行的目录（由 widen_roots 维护，正常情况下为空）
 _WIDENED_ROOTS: list[str] = []
+# _WIDENED_ROOTS 的增删锁：工具并发执行时多个线程同时进出 widen_roots，
+# 列表 extend/del 不是原子操作，无锁会竞态导致放行目录被误删
+_WIDENED_ROOTS_LOCK = threading.Lock()
 
 
 def add_workspace(path):
@@ -256,11 +265,13 @@ def widen_roots(roots):
     if not added:
         yield
         return
-    _WIDENED_ROOTS.extend(added)
+    with _WIDENED_ROOTS_LOCK:
+        _WIDENED_ROOTS.extend(added)
     try:
         yield
     finally:
-        del _WIDENED_ROOTS[-len(added):]
+        with _WIDENED_ROOTS_LOCK:
+            del _WIDENED_ROOTS[-len(added):]
 
 
 def load_permissions():

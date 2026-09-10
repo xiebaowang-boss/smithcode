@@ -50,7 +50,9 @@ def build_parser():
 
 
 def repl(agent: Agent):
-    print("SmithCode 已启动 (输入 /help 查看命令)")
+    from .welcome import welcome_text
+
+    print(welcome_text(agent.permission.mode, compact=True))
 
     while True:
         try:

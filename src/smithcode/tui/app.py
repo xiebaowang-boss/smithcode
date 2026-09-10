@@ -23,7 +23,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
-from .. import commands, config, context, permission, plan, renderer
+from .. import commands, config, context, permission, plan, renderer, welcome
 from .panels import (
     PermissionPanel,
     QuestionPanel,
@@ -54,12 +54,14 @@ class SmithTUI(App):
         height: 1fr;
         padding: 1 2 1 2;
         background: #0a0a0a;
-        scrollbar-gutter: stable;
+        /* Claude Code 式：不画滚动条（滚动功能不受影响）。
+           注意不能配 scrollbar-gutter: stable——两者同用会让 virtual_size 塌缩、滚动失效 */
+        scrollbar-size-vertical: 0;
     }
     #sidebar {
         height: 100%;
         width: 46;
-        padding: 1 2 0 2;
+        padding: 1 2 1 2;
         background: #141414;
     }
     #input-wrap {
@@ -126,7 +128,7 @@ class SmithTUI(App):
     ThinkingBlock { height: auto; padding-left: 3; margin-top: 1; margin-bottom: 1; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
-    .assistant-stream { padding-left: 3; }
+    .assistant-stream { padding-left: 3; margin-top: 1; }
 
     .user-msg {
         background: #141414;
@@ -222,7 +224,11 @@ class SmithTUI(App):
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
-        self.ui_line("SmithCode TUI（Enter 发送，Shift+Enter 换行，/help 查看命令）", "bold")
+        # 终端放得下就用完整版（Logo），太窄降级为单行紧凑版
+        width = self.size.width
+        self.query_one(ChatView).add_line_text(
+            welcome.banner(mode=self.agent.permission.mode, compact=width < welcome.LOGO_WIDTH + 12)
+        )
         self.ui_status()
 
     # ----- 斜杠命令菜单 -----
@@ -439,35 +445,33 @@ class SmithTUI(App):
         return bar
 
     def _sidebar_usage(self) -> tuple[Text, Text]:
-        """「用量」卡：(标题, 正文)。标题 = 用量 · 调用 N；正文 = 输入/输出（缓存命中另起一行）。"""
+        """「用量」卡：(标题, 正文)。标题 = Usage（有调用时附 · Calls N）；正文 = In/Out（缓存命中另起一行）。"""
         usage = self.agent.session.usage.current_session
-        title = Text("用量", style="#808080")
-        body = Text()
+        title = Text("Usage", style="#808080")
         if usage.calls:
-            title.append(" · 调用 ", style="#808080")
+            title.append(" · Calls ", style="#808080")
             title.append(str(usage.calls), style="#eeeeee")
-            body.append("输入 ", style="#808080")
-            body.append(human_tokens(usage.get("prompt_tokens")), style="#eeeeee")
-            body.append(" · 输出 ", style="#808080")
-            body.append(human_tokens(usage.get("completion_tokens")), style="#eeeeee")
-            cache = usage.cache_hit()
-            if cache:
-                body.append("\n缓存命中 ", style="#808080")
-                body.append(human_tokens(cache), style="#eeeeee")
-        else:
-            body.append("尚无调用", style="#808080")
+        body = Text()
+        body.append("In ", style="#808080")
+        body.append(human_tokens(usage.get("prompt_tokens")), style="#eeeeee")
+        body.append(" · Out ", style="#808080")
+        body.append(human_tokens(usage.get("completion_tokens")), style="#eeeeee")
+        cache = usage.cache_hit()
+        if cache:
+            body.append("\nCache ", style="#808080")
+            body.append(human_tokens(cache), style="#eeeeee")
         return title, body
 
     def _sidebar_context(self) -> tuple[Text, Text]:
-        """「上下文」卡：(标题, 正文)。标题 = 上下文 · 占用百分比；正文 = 当前用量/预算。"""
+        """「上下文」卡：(标题, 正文)。标题 = Context · 占用百分比；正文 = 当前用量/预算。"""
         est, budget, pct = self._context_stats()
-        title = Text("上下文 · ", style="#808080")
+        title = Text("Context · ", style="#808080")
         title.append(f"{pct}%", style=self._context_color(pct))
         body = Text()
-        body.append("当前 ", style="#808080")
-        body.append(f"{human_tokens(est)} / 预算 {human_tokens(budget)}", style="#eeeeee")
+        body.append("Used ", style="#808080")
+        body.append(f"{human_tokens(est)} / Budget {human_tokens(budget)}", style="#eeeeee")
         if self.agent.context.compact_count:
-            body.append(f" · 已压缩 {self.agent.context.compact_count}", style="#808080")
+            body.append(f" · Compacted {self.agent.context.compact_count}", style="#808080")
         return title, body
 
     def _composer_status(self) -> tuple[Text, Text, Text]:
