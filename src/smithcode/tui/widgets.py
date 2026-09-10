@@ -16,7 +16,7 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 
 from .. import __version__, config, renderer
-from .render import format_duration, render_markdown
+from .render import format_duration, render_markdown, split_md_blocks
 
 # ---------- 线程安全的 UI 操作投递 ----------
 
@@ -42,8 +42,11 @@ class ChatView(VerticalScroll):
         super().__init__(*args, **kwargs)
         self._kind: str | None = None
         self._text: Text | None = None
-        self._raw = ""  # 正文段落纯文本累积，流结束后转 markdown 渲染
+        self._raw = ""  # 正文段落纯文本累积，按块增量转 markdown 渲染
         self._block: Static | None = None
+        self._prefix: Text | None = None  # 已渲染完结块的缓存（与 _done_blocks 对齐）
+        self._done_blocks: list[str] = []  # 已渲染完结块的原文，内容对齐防计数漂移
+        self._last_render = 0.0  # 上次渲染时刻（尾部块重渲染节流用）
 
     def add_line(self, text: str, style: str | None = None) -> None:
         self._mk(Text.from_ansi(text, style=style))
@@ -53,7 +56,9 @@ class ChatView(VerticalScroll):
         self._mk(text)
 
     def add_user(self, text: str) -> None:
-        """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。"""
+        """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
+
+        提交自己的消息视为回到最新位置：无条件滚到底（不受锚定约束）。"""
         block = Static(Text(text), classes="user-msg")
         block.can_focus = False
         self.mount(block)
@@ -65,6 +70,7 @@ class ChatView(VerticalScroll):
 
     def add_turn_footer(self, model: str, effort: str, elapsed: str) -> None:
         """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时（▣ 用强调色，缩进 3 格）。"""
+        at_bottom = self._at_bottom()
         text = Text()
         text.append("▣ ", style="#fab283")
         text.append(model, style="#eeeeee")
@@ -72,17 +78,21 @@ class ChatView(VerticalScroll):
         block = Static(text, classes="turn-footer")
         block.can_focus = False
         self.mount(block)
-        self.scroll_end(animate=False)
+        self._follow(at_bottom)
 
     def add_widget(self, widget) -> None:
         """挂载任意消息组件（如可折叠的工具调用块）。"""
+        at_bottom = self._at_bottom()
         self.mount(widget)
-        self.scroll_end(animate=False)
+        self._follow(at_bottom)
 
     def begin_stream(self, kind: str) -> None:
         self._kind = kind
         self._text = Text()
         self._raw = ""
+        self._prefix = None
+        self._done_blocks = []
+        self._last_render = 0.0
         if kind == "reasoning":
             self._text.append("[Thinking] ", style="grey50")
         # 助手正文统一缩进 3（opencode 式：用户块 2 / 助手流 3，层次差产生交叉感）
@@ -94,30 +104,89 @@ class ChatView(VerticalScroll):
             self.begin_stream(kind)
         if kind == "content":
             self._raw += chunk
-        self._text.append(chunk, style="grey50" if kind == "reasoning" else None)
+            self._refresh_markdown()
+            return
+        at_bottom = self._at_bottom()
+        self._text.append(chunk, style="grey50")
         self._block.update(self._text)
-        self.scroll_end(animate=False)
+        self._follow(at_bottom)
+
+    def _refresh_markdown(self) -> None:
+        """按块增量渲染（Claude Code / opencode 式）：已完结块渲染一次缓存
+        复用，尾部未完结块整块重渲染并节流（16ms ≈ 一帧）。
+
+        完结块对齐按**内容**而非数量：流式 chunk 可能把"  "前导空格先送来
+        被误判成空行（块提前完结），下个 chunk 又让它缩回未完结——数量对齐
+        会漏渲后续块（内容丢失），逐块内容比对则能自动发现并重建前缀。
+        """
+        done, tail = split_md_blocks(self._raw)
+        # 与已渲染前缀逐块比对：找公共前缀长度；不同即从该块起重建
+        common = 0
+        for a, b in zip(self._done_blocks, done):
+            if a != b:
+                break
+            common += 1
+        if common < len(done) or common < len(self._done_blocks):
+            self._done_blocks = done[:common]
+            piece = render_markdown("\n\n".join(done[common:]), self._block.size.width or 80)
+            if common == 0:
+                self._prefix = piece
+            else:
+                self._prefix = render_markdown(
+                    "\n\n".join(done[:common]), self._block.size.width or 80
+                )
+                self._prefix.append("\n\n")
+                self._prefix.append_text(piece)
+            self._last_render = 0.0  # 块完结不受节流约束
+        if self._last_render and time.monotonic() - self._last_render < 0.016:
+            return
+        self._last_render = time.monotonic()
+        at_bottom = self._at_bottom()
+        self._text = Text()
+        if self._prefix is not None:
+            self._text.append_text(self._prefix)
+            if tail:
+                self._text.append("\n\n")
+        self._text.append_text(render_markdown(tail, self._block.size.width or 80))
+        self._block.update(self._text)
+        self._follow(at_bottom)
 
     def end_stream(self) -> None:
-        """流结束：正文段落原地转 markdown 渲染（流式中仍是纯文本，稳定不闪）。
+        """流结束：走与流式期间相同的按块增量渲染路径，最后只剩尾部块的
+        一次定型，与中途渲染视觉连续（不再有"文本突然变漂亮"的整段跳变）。
 
         经 rich Console 渲染为带样式的 Text（而不是直接塞 Markdown 渲染对象），
         Static 内容仍是文本——窄终端换行交给 Textual 处理，测试也能直接读文本。
         """
         if self._kind == "content" and self._block is not None and self._raw.strip():
-            width = self._block.size.width or 80
-            self._block.update(render_markdown(self._raw, width))
+            self._last_render = 0.0  # 结束时绕过节流，确保最终态立即定型
+            self._refresh_markdown()
         self._kind = None
         self._text = None
         self._raw = ""
+        self._prefix = None
+        self._done_blocks = []
         self._block = None
 
     def _mk(self, renderable, classes: str | None = None) -> Static:
+        at_bottom = self._at_bottom()
         block = Static(renderable, classes=classes)
         block.can_focus = False
         self.mount(block)
-        self.scroll_end(animate=False)
+        self._follow(at_bottom)
         return block
+
+    # ----- 底部锚定跟随 -----
+
+    def _at_bottom(self) -> bool:
+        """当前是否贴在底部（留 1 行容差）。必须在挂载/更新内容**之前**取值——
+        新内容一进来 virtual_size 就涨，贴底判断会被误判成"用户已翻走"。"""
+        return self.scroll_offset.y >= self.max_scroll_y - 1
+
+    def _follow(self, at_bottom: bool) -> None:
+        """底部锚定跟随：用户贴底时才滚到底；翻看历史时保持位置不打断。"""
+        if at_bottom:
+            self.scroll_end(animate=False)
 
 
 # ---------- 运行中动画 ----------
@@ -442,17 +511,15 @@ class Sidebar(Vertical):
     Sidebar .side-card {
         width: 100%;
         height: auto;
-        background: #1b1b1b;
-        padding: 1 1;
         margin-bottom: 1;
     }
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._usage_title = Static("用量", classes="section-title")
+        self._usage_title = Static("Usage", classes="section-title")
         self._usage = Static("", classes="usage-body")
-        self._context_title = Static("上下文", classes="section-title")
+        self._context_title = Static("Context", classes="section-title")
         self._context_body = Static("", classes="context-body")
         self._plan = Static("（暂无任务计划）", classes="plan-body")
 

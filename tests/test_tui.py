@@ -13,7 +13,7 @@ from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.panels import SelectionScreen
-from smithcode.tui.render import format_duration, git_branch
+from smithcode.tui.render import format_duration, git_branch, split_md_blocks
 from smithcode.tui.renderer import TuiRenderer
 from smithcode.tui.widgets import (
     MENU_VISIBLE_ITEMS,
@@ -66,14 +66,89 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+# ---------- split_md_blocks：流式按块增量渲染的切分器 ----------
+
+def test_split_md_blocks_paragraphs():
+    done, tail = split_md_blocks("第一段\n还在写")
+    assert done == []  # 尾部块未完结（流式可能继续追加）
+    assert tail == "第一段\n还在写"
+    done, tail = split_md_blocks("第一段\n\n第二段完成\n")
+    assert done == ["第一段"]
+    assert tail == "第二段完成"  # 空行后的块视为未完结
+
+
+def test_split_md_blocks_closed_fence_is_done():
+    md = "前言\n\n```python\nprint(1)\n```\n\n后续"
+    done, tail = split_md_blocks(md)
+    assert done == ["前言", "```python\nprint(1)\n```"]
+    assert tail == "后续"
+
+
+def test_split_md_blocks_open_fence_stays_tail():
+    """未闭合围栏整体留在尾部，围栏内空行不切分。"""
+    md = "前言\n\n```py\n代码\n\n还是代码"
+    done, tail = split_md_blocks(md)
+    assert done == ["前言"]
+    assert tail == "```py\n代码\n\n还是代码"
+
+
+def test_split_md_blocks_empty():
+    assert split_md_blocks("") == ([], "")
+    assert split_md_blocks("\n\n") == ([], "")
+
+
+def test_tui_stream_nested_list_no_content_loss(monkeypatch):
+    """回归：列表前导空格单独成 chunk 时曾被误判为空行（块"完结"后缩回），
+    数量对齐漏渲后续块导致整段列表丢失；现为内容对齐，任何分块粒度无缺失。"""
+    no_prompting(monkeypatch)
+
+    md = ("这是介绍。\n\n**核心内容**：\n\n"
+          "- **是什么**：终端 AI 编程助手。\n"
+          "- **主要能力**：\n"
+          "  - 多轮工具循环\n"
+          "  - 权限确认与沙箱\n"
+          "- **怎么用**：直接说需求\n\n"
+          "想深入了解可以告诉我。")
+
+    class ChunkLLM:
+        def __init__(self, size):
+            self.size = size
+
+        def chat_stream(self, messages, tools=None):
+            full = ("message", {"role": "assistant", "content": md})
+            for i in range(0, len(md), self.size):
+                yield ("content", md[i:i + self.size])
+            yield full
+
+    async def _run_case():
+        monkeypatch.setattr("smithcode.agent.LLMClient", lambda: ChunkLLM(3))
+        app = SmithTUI(Agent(session=Session()))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("分块")
+            await pilot.press("enter")
+            for _ in range(200):
+                if not app._busy:
+                    break
+                await pilot.pause(0.02)
+            text = _chat_text(app)
+            # 列表内嵌套项与最后条目必须完整上屏（此前会整体丢失）
+            for key in ("是什么", "主要能力", "多轮工具循环", "权限确认与沙箱", "怎么用", "深入了解"):
+                assert key in text, f"丢失内容: {key}"
+
+    _run(_run_case())
+
+
 def test_tui_mounts_and_welcomes(monkeypatch):
+    """TUI 挂载欢迎语（headless）。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             assert pilot.app is app
-            assert "SmithCode TUI" in _chat_text(app)
+            assert "Smith Code" in _chat_text(app) or "omen-alpha" in _chat_text(app)
 
     _run(_run_case())
 
@@ -96,6 +171,43 @@ def test_tui_streams_assistant_reply(monkeypatch):
             assert "说句话" in text  # 用户消息以面板形式回显
             assert "你好，世界" in text  # 助手正文无"助手>"前缀
             assert "助手>" not in text
+
+    _run(_run_case())
+
+
+class MdLLM:
+    """带 markdown 结构的假模型：段落 + 完结代码块，验证流式期间即渲染。"""
+
+    def chat_stream(self, messages, tools=None):
+        yield ("content", "第一段说明\n\n```py\n")
+        yield ("content", "print(1)\n```\n\n第二段")
+        yield ("message", {"role": "assistant",
+                           "content": "第一段说明\n\n```py\nprint(1)\n```\n\n第二段"})
+
+
+def test_tui_stream_renders_markdown_incrementally(monkeypatch):
+    """流式期间（未等 end_stream）完结块就已渲染定型：代码块行带样式缩进。"""
+    no_prompting(monkeypatch)
+    monkeypatch.setattr("smithcode.agent.LLMClient", lambda: MdLLM())
+
+    async def _run_case():
+        app = SmithTUI(Agent(session=Session()))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("md")
+            await pilot.press("enter")
+            for _ in range(200):
+                if not app._busy:
+                    break
+                await pilot.pause(0.02)
+            text = _chat_text(app)
+            assert "第一段说明" in text
+            assert "print(1)" in text
+            assert "第二段" in text
+            # 代码块经 rich 渲染后有缩进（非流式纯文本顶格），证明走了渲染路径
+            stream_blocks = app.query_one("#chat").query(".assistant-stream")
+            assert any("print(1)" in str(b.content) for b in stream_blocks)
 
     _run(_run_case())
 
@@ -386,24 +498,25 @@ def test_tui_sidebar_usage_section(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             sidebar = app.query_one(Sidebar)
-            # 用量卡：无调用时标题仍为「用量」，正文灰色占位「尚无调用」
+            # 用量卡：无调用时标题为「Usage」，正文直接展示各项值（不再显示占位语）
             usage = str(sidebar.query_one(".usage-body").content)
-            assert "尚无调用" in usage
-            assert str(sidebar.query_one(".usage-card .section-title").content).strip() == "用量"
-            # 上下文卡：百分比跟在「上下文 · 」后，正文为当前用量/预算
+            assert "In" in usage and "Out" in usage
+            assert "尚无调用" not in usage
+            assert str(sidebar.query_one(".usage-card .section-title").content).strip() == "Usage"
+            # 上下文卡：百分比跟在「Context · 」后，正文为当前用量/预算
             context_title = str(sidebar.query_one(".context-card .section-title").content)
-            assert context_title.startswith("上下文 · ")
+            assert context_title.startswith("Context · ")
             assert "%" in context_title
             context = str(sidebar.query_one(".context-body").content)
-            assert "当前" in context and "预算" in context
-            # 有调用后：用量卡标题变为「用量 · 调用 N」，正文只剩输入/输出
+            assert "Used" in context and "Budget" in context
+            # 有调用后：用量卡标题变为「Usage · Calls N」，正文只剩 In/Out
             app.agent.session.usage.add({"prompt_tokens": 1234, "completion_tokens": 567})
             app.ui_status()
             await pilot.pause()
-            assert str(sidebar.query_one(".usage-card .section-title").content) == "用量 · 调用 1"
+            assert str(sidebar.query_one(".usage-card .section-title").content) == "Usage · Calls 1"
             usage = str(sidebar.query_one(".usage-body").content)
-            assert "1.2K" in usage and "输入" in usage and "输出" in usage
-            assert "调用" not in usage  # 调用次数已上移到标题
+            assert "1.2K" in usage and "In" in usage and "Out" in usage
+            assert "Calls" not in usage  # 调用次数已上移到标题
 
     _run(_run_case())
 

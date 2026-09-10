@@ -28,6 +28,37 @@ def render_markdown(text: str, width: int) -> Text:
     return result
 
 
+def split_md_blocks(text: str):
+    """把 markdown 文本切成（已完结块列表, 尾部未完结块）。
+
+    按「块级边界」切分：段落以空行分隔；``` 围栏以开/闭状态机处理（围栏内
+    的空行不切分，未闭合前整体留在尾部）。列表项之间不切（rich 对列表整体
+    渲染更准确）。已完结块渲染一次即可缓存复用，尾部块在流式期间整块重渲染
+    ——这是流式 markdown 丝滑的关键（Claude Code / opencode 式按块增量）。
+    """
+    lines = text.rstrip("\n").split("\n")  # 末尾换行不代表块完结（流式常见）
+    done: list[str] = []
+    fence = False  # 是否处于 ``` 围栏内
+    start = 0  # 当前块起始行
+
+    def emit(end: int) -> None:
+        block = "\n".join(lines[start:end]).strip("\n")
+        if block.strip():
+            done.append(block)
+
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            if fence:  # 围栏闭合：整块完结（含围栏本身）
+                emit(i + 1)
+                start = i + 1
+            fence = not fence
+        elif not fence and not line.strip():  # 空行 = 块边界
+            emit(i)
+            start = i + 1
+    tail = "\n".join(lines[start:]).strip("\n")
+    return done, tail
+
+
 def git_branch(workspace: str) -> str | None:
     """当前工作区的 git 分支名；非 git 仓库或读取失败返回 None。
 
