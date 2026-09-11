@@ -10,7 +10,7 @@ from textual.widgets import Static
 import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
-from smithcode.session import Session
+from smithcode.llm.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import SelectionScreen
@@ -40,7 +40,7 @@ def restore_renderer():
 
 def no_prompting(monkeypatch):
     """headless 环境里 stdin 非 TTY，权限确认会 fail-closed，正好不用真弹窗。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     monkeypatch.setattr(config, "WORKSPACE_ROOT", __file__)
 
 
@@ -405,6 +405,41 @@ def test_tool_call_shows_diff_detail(monkeypatch):
     _run(_run_case())
 
 
+def test_tool_call_summary_markup_not_parsed(monkeypatch):
+    """回归：工具摘要含 Textual markup 样式（如 URL 被包成 [link=https://...]）
+    时不得当标签解析——否则 Static 在布局/退出时抛 MarkupError 直接崩掉 TUI。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            summary = "fetch [link=https://raw.githubusercontent.com/x/y]"
+            block = ToolCall(summary)
+            app.query_one(ChatView).add_widget(block)
+            await pilot.pause()
+            header = str(block.query_one(".tool-header").content)
+            assert summary in header  # 原样展示，未被当作标签吞掉 / 报错
+
+    _run(_run_case())
+
+
+def test_question_panel_question_markup_not_parsed(monkeypatch):
+    """回归：模型提问文本含 markup 样式时，提问面板标题原样展示不崩溃。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            question = "访问 [link=https://raw.githubusercontent.com/x] 吗？"
+            app.show_question_panel(question, [], False, result, evt)
+            await pilot.pause()
+            title = str(app.query_one(".ask-title").content)
+            assert question in title
+
+    _run(_run_case())
+
+
 def test_tui_sidebar_shows_plan_section(monkeypatch):
     """侧边栏常驻；计划更新渲染到下半部分。"""
     no_prompting(monkeypatch)
@@ -475,7 +510,7 @@ def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
 
 
 def test_tui_new_clears_chat_area(monkeypatch):
-    """/new：聊天区彻底清空（含欢迎横幅），不追加任何提示文本；侧栏计划与会话一并重置。"""
+    """/new：清空旧消息并重新渲染欢迎横幅，不追加任何提示文本；侧栏计划与会话一并重置。"""
     no_prompting(monkeypatch)
     from smithcode import plan as plan_mod
 
@@ -493,8 +528,10 @@ def test_tui_new_clears_chat_area(monkeypatch):
             app.handle_command("/new")
             await pilot.pause()
 
-            assert not app.query_one("#chat").query(Static)  # 聊天区清空
-            assert "已开启新会话" not in _chat_text(app)  # 不展示提示文本
+            text = _chat_text(app)
+            assert "旧消息一" not in text and "旧消息二" not in text  # 旧消息清空
+            assert f"v{__version__}" in text  # 欢迎横幅随新会话重新渲染
+            assert "已开启新会话" not in text  # 不展示提示文本
             assert agent.session.messages == []
             assert not plan_mod.has_active()
 

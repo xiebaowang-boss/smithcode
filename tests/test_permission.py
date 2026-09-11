@@ -20,7 +20,7 @@ from smithcode.permission import (
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: True)
 
 
 def refuse_input(monkeypatch):
@@ -118,15 +118,16 @@ def test_ask_approved_once_does_not_remember(make_perm, monkeypatch):
 # ---------- check：模式级"总是允许" ----------
 
 def test_always_remembers_pattern_not_tool(make_perm, monkeypatch):
+    # 用非安全命令（npm 不在只读安全集内），否则会走安全免确认而不弹框
     answers = iter(["a", "n"])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
     perm = make_perm()
 
-    assert perm.check("run_command", {"command": "git status"}) is True
+    assert perm.check("run_command", {"command": "npm test"}) is True
     # 相同模式不再询问
-    assert perm.check("run_command", {"command": "git status"}) is True
+    assert perm.check("run_command", {"command": "npm test"}) is True
     # 其他模式仍会询问（第二次答案为 n）
-    assert perm.check("run_command", {"command": "rm -rf /"}) is False
+    assert perm.check("run_command", {"command": "npm run build"}) is False
 
 
 # ---------- check：deny 与 -y ----------
@@ -387,7 +388,7 @@ def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
 
 def test_non_interactive_ask_denied(make_perm, monkeypatch):
     """非交互 stdin 下 ask 操作直接拒绝，不调用 input、不因 EOFError 崩溃。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     refuse_input(monkeypatch)
     perm = make_perm()
 
@@ -396,7 +397,7 @@ def test_non_interactive_ask_denied(make_perm, monkeypatch):
 
 def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
     """非交互 stdin 下越界访问直接拒绝，不尝试询问。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
     outside = tmp_path.parent / (tmp_path.name + "-out")
@@ -469,7 +470,7 @@ def test_check_paths_always_remembers_exact_patterns(make_perm, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("不应再次弹确认"))
     assert perm.check_paths("apply_patch", ["a.py", "b.py"]) is True
     # 新路径不在记忆范围内，仍然需要确认（非交互 fail-closed 拒绝）
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     assert perm.check_paths("apply_patch", ["a.py", "c.py"]) is False
 
 
@@ -561,3 +562,142 @@ def test_cycle_mode_syncs_approved_all_alias(make_perm):
     assert perm.approved_all is True
     perm.cycle_mode()
     assert perm.approved_all is False
+
+
+# ---------- 安全只读命令免确认（shell_policy 集成） ----------
+
+def test_safe_command_skips_prompt(make_perm, monkeypatch):
+    """内置默认 ask 下，安全只读命令不弹确认（含安全命令组成的复合命令）。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "git status"}) is True
+    assert perm.check("run_command", {"command": "git status && git diff"}) is True
+
+
+def test_unsafe_command_still_prompts(make_perm, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "rm -rf /"}) is False
+
+
+def test_user_broad_ask_disables_safe_set(make_perm, monkeypatch):
+    """宽泛 ask 等于整体关闭安全集（显式规则优先于内置默认）。"""
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm(permissions={"run_command": "ask"})
+    assert perm.check("run_command", {"command": "git status"}) is False
+
+
+def test_user_specific_ask_keeps_safe_set_for_others(make_perm, monkeypatch):
+    """精确 ask 仅收紧该命令，其余安全命令仍免确认。"""
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm(permissions={"run_command": {"git push *": "ask"}})
+    assert perm.check("run_command", {"command": "git status"}) is True
+    assert perm.check("run_command", {"command": "git push origin"}) is False
+
+
+def test_user_deny_beats_safe_set(make_perm, monkeypatch):
+    refuse_input(monkeypatch)
+    perm = make_perm(permissions={"run_command": {"git status": "deny"}})
+    assert perm.check("run_command", {"command": "git status"}) is False
+
+
+def test_cd_with_git_prompts(make_perm, monkeypatch):
+    """cd 改变目录 + git 同现：即使两段各自安全也整体询问。"""
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "cd sub && git status"}) is False
+
+
+def test_cd_noop_with_git_allowed(make_perm, monkeypatch):
+    """cd .（no-op）不触发守卫，安全命令整体放行。"""
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "cd . && git status"}) is True
+
+
+def test_substitution_forces_prompt(make_perm, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "git status && echo $(rm -rf /)"}) is False
+
+
+def test_unknown_action_degrades_to_ask_for_command(make_perm, monkeypatch):
+    """非法动作名在命令路径同样降级为 ask（不静默放行）。"""
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    perm = make_perm(permissions={"run_command": {"git status": "block"}})
+    assert perm.check("run_command", {"command": "git status"}) is False
+
+
+# ---------- "总是允许"前缀记忆 ----------
+
+def test_always_remembers_command_prefix(make_perm, monkeypatch):
+    """批准 python -m pytest 后，同族命令（文件/参数变化）免确认。"""
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "python -m pytest tests/a.py"}) is True
+    assert ("run_command", ("python", "-m", "pytest"), "allow") in perm.session_rules
+
+    refuse_input(monkeypatch)  # 后续不应再弹确认
+    assert perm.check("run_command", {"command": "python -m pytest tests/b.py"}) is True
+    assert perm.check("run_command", {"command": "python -m pytest -k foo"}) is True
+    assert perm.check("run_command", {"command": "CI=1 python -m pytest"}) is True
+
+
+def test_prefix_memory_does_not_overreach(make_perm, monkeypatch):
+    """前缀只覆盖 pytest 族：别的模块 / 内联代码仍询问。"""
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    perm = make_perm()
+    perm.check("run_command", {"command": "python -m pytest tests/a.py"})
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "python -m http.server"}) is False
+    assert perm.check("run_command", {"command": "python -c 'print(1)'"}) is False
+    assert perm.check("run_command", {"command": "python other.py"}) is False
+
+
+def test_python_inline_code_memory_is_exact(make_perm, monkeypatch):
+    """python -c 无法推导前缀 → 精确记忆，换代码仍询问。"""
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "python -c 'print(1)'"}) is True
+    assert ("run_command", "python -c 'print(1)'", "allow") in perm.session_rules
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "python -c 'print(2)'"}) is False
+
+
+def test_unknown_command_memory_is_exact(make_perm, monkeypatch):
+    """未登记命令不做首 token 放宽，只精确记忆整段。"""
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "mytool build --fast"}) is True
+    assert ("run_command", "mytool build --fast", "allow") in perm.session_rules
+
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert perm.check("run_command", {"command": "mytool build --slow"}) is False
+
+
+def test_compound_remembers_per_segment(make_perm, monkeypatch):
+    """复合命令逐段记忆前缀，后续各段分别命中。"""
+    monkeypatch.setattr("builtins.input", lambda _: "a")
+    perm = make_perm()
+    assert perm.check(
+        "run_command", {"command": "pytest -k a && git commit -m x"}
+    ) is True
+    keys = [rule[1] for rule in perm.session_rules]
+    assert ("pytest",) in keys
+    assert ("git", "commit") in keys
+
+    refuse_input(monkeypatch)
+    assert perm.check(
+        "run_command", {"command": "pytest -k b && git commit --amend"}
+    ) is True
+
+
+def test_cd_git_guard_does_not_offer_always(make_perm, monkeypatch):
+    """cd 改目录 + git 的组合守卫不提供"总是允许"（选项无 a，非法输入后按 n 拒绝）。"""
+    answers = iter(["a", "n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    perm = make_perm()
+    assert perm.check("run_command", {"command": "cd sub && git status"}) is False
+    assert perm.session_rules == []

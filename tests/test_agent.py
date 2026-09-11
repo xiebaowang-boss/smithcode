@@ -6,15 +6,15 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import Agent
-from smithcode.context import truncate_output
-from smithcode.session import Session
+from smithcode.llm.context import truncate_output
+from smithcode.llm.session import Session
 from smithcode.tools import FUNCTIONS
 
 
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: True)
 
 
 def _fake_tool_call(name="list_dir", args="{}"):
@@ -340,7 +340,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
     """非交互 stdin 下越界访问直接拒绝，不调用 input、不因 EOFError 崩溃。"""
     _outside, arg = _outside_file(tmp_path)
     agent = _outside_agent(monkeypatch, tmp_path)
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: False)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     monkeypatch.setattr("builtins.input", lambda _: pytest.fail("非交互不应调用 input"))
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))

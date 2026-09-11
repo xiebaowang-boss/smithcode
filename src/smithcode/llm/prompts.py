@@ -9,7 +9,7 @@
 import platform
 import sys
 
-from . import config
+from .. import config
 
 
 def _env_info() -> str:
@@ -61,10 +61,11 @@ _SECTIONS = [
 
     """\
 ## 工具使用细节
-- read_file 返回带行号的内容（如 `12  code`）。大文件用 offset/limit 分段读取，
-  看到范围提示就用 offset 续读，不要一次读入整份超长文件。
+- read_file 返回带行号的内容（如 `12│code`，`│` 是行号与正文的分隔符、不属于文件内容）。
+  大文件用 offset/limit 分段读取，看到范围提示就用 offset 续读，不要一次读入整份超长文件。
 - edit_file 的 old_string 必须与文件内容逐字符完全一致——从 read_file 输出复制
-  代码部分，不要包含行号前缀。默认要求唯一匹配：多带几行上下文保证唯一性，
+  代码部分，不要包含「行号│」前缀（尤其别把分隔符当成正文缩进）。默认要求唯一匹配：
+  多带几行上下文保证唯一性，
   只包含要改的行和少量相邻行；重命名等需要全部替换的场景用 replace_all=true；
   大改动拆成多次小的编辑。
 - apply_patch 用 patch 信封批量改文件，权限与 edit_file 一致：`*** Begin Patch` 开头，

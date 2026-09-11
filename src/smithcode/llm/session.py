@@ -2,7 +2,7 @@ import json
 import time
 from pathlib import Path
 
-from . import config
+from .. import config
 from .prompts import build_system_prompt
 from .usage import UsageTracker
 

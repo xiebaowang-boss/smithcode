@@ -14,14 +14,14 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import Agent
-from smithcode.session import Session
+from smithcode.llm.session import Session
 from smithcode.tools import FUNCTIONS, SERIAL
 
 
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: True)
 
 
 def _tc(name, args="{}", call_id="1"):

@@ -6,8 +6,8 @@
 
 SmithCode 是一个终端 AI 编程助手（mini coding agent）：用户用自然语言描述任务，Agent 自主规划步骤、调用工具、根据结果继续推理，直到任务完成。核心是 **Agentic Loop**——模型要么返回纯文本（任务完成），要么返回工具调用，经权限确认后执行、结果回传，循环直至结束。
 
-- 语言：纯 Python，**>= 3.9**（无类型标注依赖、不用 3.10+ 语法糖）
-- 布局：src 布局，包在 `src/smithcode/`，测试在 `tests/`，一一对应（如 `test_agent.py` 测 `agent.py`）
+- 语言：纯 Python，**>= 3.9**（不引入额外类型依赖，仅用标准库 typing；不用 3.10+ 语法糖）
+- 布局：src 布局，包在 `src/smithcode/`，测试在 `tests/`，大体对应（如 `test_agent.py` 测 `agent.py`；集成类测试如 `test_display.py` / `test_agent_parallel.py` 不一一对端）
 - 接口：任何 OpenAI 兼容接口均可接入；LLM 请求带流式输出与自动重试
 - 跨平台：Windows / Linux / macOS 都要正常工作
 
@@ -36,18 +36,18 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | 模块 | 职责 |
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
-| `tui/` | Textual 全屏聊天界面（`app.py`），仅交互终端加载 |
+| `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线 + 集中 CSS）、`widgets.py` 自包含控件、`panels.py` 弹窗面板、`bridge.py` 线程桥（`TuiRenderer`）、`render.py` 纯函数工具 |
 | `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
-| `agent.py` | Agent 循环编排（工具调用分发、todo 专用路径 `_execute_todo`） |
+| `agent.py` | Agent 循环编排（工具调用两阶段调度、todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`） |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
-| `llm.py` | OpenAI 兼容接口封装（流式、超时、指数退避重试） |
-| `prompts.py` | 系统提示词（Agent 的行为规则，改行为先看这里） |
-| `session.py` | 消息历史的增删存取 |
+| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
+| `llm/` | LLM 交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`session.py` 消息历史、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）、`context/` 上下文计量与压缩（`meter` / `compact` / `prompts`）；`__init__.py` 汇总公共 API |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
-| `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
-| `permission.py` | 敏感操作的用户确认，规则引擎 |
+| `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
+| `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
+| `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
 | `tools/*.py` | 各工具实现（files / search / shell / patch / web / ask / todo） |
 
@@ -58,6 +58,8 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，解析后的真实路径必须在授权目录内；绕过沙箱的"捷径"一律不加
 - **保护路径**：`.env` 禁止读写，`.git` 只读（内置 deny 规则）
 - **权限规则**：工具通过 schema 的 `pattern_arg` 声明权限模式来源；权限语义与既有工具一致时用 `family` 继承（如 `apply_patch` 继承 `edit_file`）；多路径工具用 `paths_from` 逐路径求值聚合
+- **安全命令免确认**：内置只读命令集（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在内置默认 `ask` 下自动放行，且**仅在无任何用户/会话规则命中时生效**——用户可用精确 `ask`/`deny` 收紧，宽泛 `ask` 即整体关闭。开发工具链仅放行版本查询/只读枚举/静态检查（`python --version`、`pip list`、`ruff check`），**真正运行代码的用法（`pytest`、`python x.py`、`npm run`、`uv run`、`cargo test`）不放行**。判定为纯函数 `permission/shell_policy.is_safe_command`，拿不准（解析失败、inline 环境变量前缀、路径限定 argv[0]、重定向、命令替换、危险标志、未加引号 glob）一律回退确认
+- **命令前缀记忆**：`run_command` 的"总是允许"记 argv 前缀（`permission/shell_policy.derive_prefix`），不记整串；匹配用 `command_key` token 前缀比较，文件/参数变化仍命中。拿不准（未登记命令、标志截断、`python -c`、`bash -c`、含危险标志）一律退回精确记忆；`BANNED_PREFIXES` 兜底；`cd`+`git` 守卫不提供"总是允许"
 - **非交互 fail-closed**：管道 / CI 下无法弹确认时，所有 `ask` 一律拒绝而非挂起；改动确认流程时保持此语义
 - **输出截断**：工具返回超过 `MAX_TOOL_OUTPUT`（默认 2 万字符）时保留头尾省略中间，防止撑爆上下文
 
@@ -79,7 +81,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 
 ### 兼容性红线
 
-- Python 3.9 兼容：不用 `match` 语句、不用 `X | Y` 类型联合写法、不用仅 3.10+ 的标准库特性
+- Python 3.9 兼容：不用 `match` 语句、不用仅 3.10+ 的标准库特性。**注解**里可用 `X | Y` 联合写法——凡用到它的模块都带 `from __future__ import annotations`（延迟求值，3.9 不会报错）；但**运行期即时求值**处禁用（如 `isinstance(x, int | str)`、模块级类型别名求值），那些地方改用 `typing.Union`
 - TOML 读取走 `tomli`（3.11+ 才有内置 `tomllib`），写走 `tomlkit`（保留用户注释）
 - 交互层依赖（prompt_toolkit / textual）仅交互模式加载，非交互 stdin 退回普通 `input()`，保证管道 / CI 可用
 

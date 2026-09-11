@@ -24,7 +24,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .. import commands, config, context, permission, plan, renderer, welcome
+from .. import commands, config, permission, plan, renderer, welcome
+from ..llm import context
 from .bridge import TuiRenderer
 from .panels import (
     PermissionPanel,
@@ -226,12 +227,17 @@ class SmithTUI(App):
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
-        # 终端放得下就用完整版（Logo），太窄降级为单行紧凑版
+        self._show_welcome()
+        self.ui_status()
+
+    def _show_welcome(self) -> None:
+        """在聊天区渲染欢迎横幅（启动与 /new 后复用）。
+
+        终端放得下就用完整版（Logo），太窄降级为单行紧凑版。"""
         width = self.size.width
         self.query_one(ChatView).add_line_text(
             welcome.banner(compact=width < welcome.LOGO_WIDTH + 12)
         )
-        self.ui_status()
 
     # ----- 斜杠命令菜单 -----
 
@@ -607,7 +613,7 @@ class SmithTUI(App):
             self.ui_status()
 
     def reset_chat(self) -> None:
-        """开新会话：清空聊天区，屏幕回归空白起点。
+        """开新会话：清空聊天区并重新渲染欢迎横幅，屏幕回归会话起点。
 
         连带清掉残留的瞬时渲染状态：工具块映射（widget 已随聊天区移除，
         映射不清理会滞留旧引用）、思考块与轮次计时。"""
@@ -615,6 +621,7 @@ class SmithTUI(App):
         self._tool_widgets.clear()
         self._thinking_block = None
         self._turn_start = None
+        self._show_welcome()
 
 
 def run_tui(agent) -> None:

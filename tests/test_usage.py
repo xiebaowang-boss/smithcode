@@ -1,6 +1,6 @@
 """用量统计测试：全量字段容错累计、双口径重置与展示。"""
 
-from smithcode.usage import UsageAccumulator, UsageTracker
+from smithcode.llm.usage import UsageAccumulator, UsageTracker
 
 
 def _usage(**detail_overrides):

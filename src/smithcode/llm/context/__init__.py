@@ -5,7 +5,7 @@ meter：token 估算、分桶报告、真实锚点（"当前装了多少"的快�
 compact：opencode 式 checkpoint 压缩的纯逻辑（切尾、摘要请求、组装、溢出识别）；
 prompts：压缩专用提示词。
 
-公共 API 在此汇总，外部统一 `from smithcode.context import ...`，
+公共 API 在此汇总，外部统一 `from smithcode.llm.context import ...`，
 包内文件如何拆分是对外不可见的实现细节。
 """
 

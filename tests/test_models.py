@@ -3,7 +3,7 @@
 import threading
 
 from smithcode import config
-from smithcode.models import (
+from smithcode.llm.models import (
     CachedModelSource,
     ModelCache,
     ModelCatalog,

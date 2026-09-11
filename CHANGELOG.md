@@ -6,6 +6,12 @@
 
 ### 新增
 
+- **"总是允许"改为命令前缀记忆**：`run_command` 选"总是允许"时不再记整条命令字符串（此前 `pytest tests/a.py` 换成 `tests/b.py` 就失效），而是记 **argv 前缀**——`shell_policy.derive_prefix` 先把命令归一化成稳定 key（剥 inline 环境变量前缀与 `env`/`command` 包装器；解释器保留 `-m 模块` / 脚本名；其余取从头连续的非标志 token），再按命令规范表切出前缀：`python -m pytest tests/a.py` → `("python","-m","pytest")`、`git commit -m x` → `("git","commit")`、`npm run test --watch` → `("npm","run","test")`。匹配时对段重新计算 `command_key` 做 token 前缀比较，因此文件/参数变化（`tests/b.py`、`-k foo`、`CI=1` 前缀）都能命中；前缀只覆盖该命令族，`python -m http.server` 不会被 `python -m pytest` 的记忆放行。**拿不准即精确**：未登记命令（不做首 token 放宽，避免 opencode 的 `rtk *` 类问题）、标志截断 arity（`git --no-pager log`）、inline 解释器（`python -c`）、shell（`bash -c`）、含危险标志（`ruff check --fix`）一律退回整段精确记忆；`BANNED_PREFIXES`（`uv run` / 裸 `python` / 裸 `npm run` 等）作为最后安全网。复合命令逐段各自记忆；`cd` 改变目录 + `git` 组合守卫场景不提供"总是允许"（只给 y/n）。确认框会显示 `总是允许将记住: python -m pytest *`。用户 `config.toml` 的字符串规则仍按通配匹配，行为不变
+- **权限相关代码收拢为 `permission/` 包，命令策略合并为 `shell_policy.py`**：原 `permission.py` 与 `shell_policy.py` 移入 `permission/` 包（`engine.py` / `shell_policy.py`），`__init__.py` 汇总公共 API（外部 `from smithcode.permission import ...` 不变）；命令策略把散落的 per-command 判定（`POSIX_SAFE` / `WINDOWS_SAFE` / `_HANDLERS` / `UNSAFE_FLAGS` / `GLOB_RISK` / `GIT_READONLY`）统一成一张命令规范表 `COMMANDS`（每个命令一行，声明 `safe` / `platforms` / `arity` / `sub_arity` / `mode_flags` / `inline_flags` / `script` / `unsafe_flags` / `glob_risk`），安全只读判定与前缀推导共用同一套 tokenizer/守卫/规范，新增命令只改表。`permission/engine.py` 命令路径改为基础 `(动作, 待确认段, 是否可记忆)` 三元组，`_ask` 按段生成记忆候选
+- **LLM 交互代码收拢为 `llm/` 包**：`llm.py` / `models.py` / `session.py` / `usage.py` / `prompts.py` / `context/` 移入 `llm/`（分别变成 `client.py` / `models.py` / `session.py` / `usage.py` / `prompts.py` / `context/`），`__init__.py` 汇总公共 API（外部 `from smithcode.llm import LLMClient / Session / ...`）。`agent.py`（编排层）与 `renderer` / `cancel` / `config` 等共享基础设施仍留在顶层
+
+- **安全只读命令免确认**（对齐 Claude Code 的内置只读命令集）：`run_command` 在内置默认 `ask` 下，对一批只读命令（`ls` / `cat` / `head` / `grep` / `git status` 等，POSIX 与 cmd.exe 各一套安全集）自动放行，减少确认疲劳。安全层插在「内置默认规则」与「用户规则」之间——**任何用户/会话规则命中都优先**，因此可用精确 `ask`（如 `git push *`）在保留安全集的同时收紧个别命令，也可用宽泛 `ask` 整体关闭。判定为独立纯函数模块 `shell_policy`（`is_safe_command` 按顶层段逐段求值，复用既有命令拆分），拿不准即回退 `ask`：解析失败、inline 环境变量前缀（`CI=true git commit`）、路径限定的 argv[0]（`./sed`、`/usr/bin/ls`）、写文件/读文件重定向（仅放行 `/dev/null`、`NUL`、`2>&1`）、命令替换（`$()`/反引号）、危险标志（`find -delete` / `sort -o` / `date -s` / `git -c` 等）、对有写/exec 能力命令的未加引号 glob（`find *` 类绕过）、网络工具（`curl`/`wget`）以及 `env` / `awk` / `uniq` / `docker` / `sed`（脚本 `w`/`e` 可写文件/执行）一律不纳入。开发工具链只放行**版本查询 / 只读枚举 / 静态检查**（`python --version`、`pip list` / `show` / `freeze`、`npm ls`、`uv pip list`、`poetry show`、`ruff check` 等，并屏蔽 `--outdated`/`-i`/`--fix` 等网络与写入标志）；**真正运行代码的用法一律不放行**（`pytest`、`python x.py`、`node -e`、`npm run`、`uv run`、`cargo test` 等）——没有 OS 沙箱时默认放行任意执行等于放弃安全边界；`cd` 目标须落在授权目录内，同一复合命令里 `cd` 改变目录与 `git` 同时出现时整体降级为询问（git 会执行新目录 hooks）
+
 - **Esc 中断当前任务**（对齐 Claude Code / opencode 的 Esc 语义）：TUI 中任务运行时按 Esc 即时中断——LLM 流被取消令牌立即截停（打开流时把 `stream.close` 登记为令牌监听，取消线程直接关流，即使正阻塞在等待下一块数据也会即刻解除；已收到的正文以**部分消息**保留入库），工具批在**每个预检项**与波次边界截停（预检阶段中断时剩余确认框不再弹出、已确认未执行的同样跳过、确认期间中断优先于拒绝语义；正在执行的让其跑完、未执行的补占位结果，`tool_call_id` 永不悬空），会话历史始终合法、可直接继续追问；空闲时按 Esc 清空输入框。REPL 中 Ctrl+C 走同一协作式取消通道（任务移入后台线程，主线程专职取消；此前 Ctrl+C 会直接退出整个程序），第一次 Ctrl+C 触发中断、再按一次直接退出进程（长命令最长可能要等 300s，提供明确逃生通道，对应 TUI 的 Ctrl+Q）。配套机制：
   - 新增 `cancel.py`：`CancellationToken`（幂等 cancel、线程安全查询、监听回调）+ `RunResult` 结构化结束状态（`ok / interrupted / denied / max_iterations`，`partial` 标记流中截停）——`Agent.run()` 返回值从字符串改为 `RunResult`，终止语义不再靠哨兵文本
   - 取消令牌经 ContextVar 沿调用链隐式传播（`run()` 全程同线程，LLM 流层 / 工具调度层按需读取），`chat_stream` 接口零改动
@@ -58,6 +64,12 @@
 - TUI 修复侧边栏与聊天区分界处的**锯齿/残影**：聊天区 `#chat` 与侧边栏计划区 `#sidebar-plan` 改为 `scrollbar-gutter: stable` 预留固定滚动条槽道，覆盖式滚动条不再反复出现/消失并盖住紧贴分界线的列（部分终端如 PyCharm 内嵌终端对 overlay 滚动条重绘清不干净导致毛边）
 - TUI 修复侧边栏**无任务时底部信息被顶到上方**：计划区隐藏（`display:none`）后 Sidebar 内不再有弹性占位，版本号与工作区路径随卡片从顶部堆起。现将用量/上下文卡片与计划区整体包进常驻的 `#sidebar-top`（`height: 1fr`）弹性容器，无论计划区是否展示，底部版本号 / `项目名 | 路径` 始终钉在侧边栏底部
 - TUI 修复运行期间**输入框左侧竖线底部抖动**：三处 100ms 动画（运行提示 / 工具行转轮 / 思考转轮）此前每次 `Static.update()` 都触发全屏布局重排（Textual 默认 `layout=True`），输入框 `border-left` 底格紧贴动画所在底行，缝两侧被分批清空重绘导致抖动。现转轮类更新改为 `layout=False`（内容尺寸不变时跳过重排，只做 cell 级 diff 重绘），运行提示的耗时文案改为分段定宽格式（`59s` / `5.3m` / `1.2h`，右对齐恒 5 列），任意时长下文案宽度恒定、全程零重排
+
+### 修复
+
+- **TUI 因工具摘要/提问文本含方括号而被 Textual markup 解析崩溃**：`Static` 默认按 console markup 解析字符串，当模型给的自由文本含 `[link=https://...]` 一类方括号结构（如 webfetch 的 `fetch <url>` 摘要）时，Textual 抛 `MarkupError` 直接崩掉整个界面（且异常常在退出排布时才暴露）。现把展示动态文本的控件统一禁用 markup：工具调用块头部、思考块头部、运行动画、权限/提问/选择面板标题与提示（正文本就是 rich `Text`，不受影响）——原样展示方括号，不再当样式标签解析
+- **TUI 执行 `/new` 后欢迎横幅（Logo）不再消失**：`reset_chat` 清空聊天区后漏了重新渲染欢迎语，导致新会话屏幕只剩空白、启动时的 Logo 不见了。现将欢迎横幅渲染抽为 `SmithTUI._show_welcome`，`on_mount` 与 `reset_chat` 共用——`/new` 后聊天区回归会话起点、Logo 与问候语重新出现
+- **read_file 行号分隔符由两个空格改为 `│`，消除 old_string 复制的隐性陷阱**：此前输出形如 `12  code`，行号与正文间的两个空格是**排版分隔符、不属于文件内容**，却极易被当成正文的缩进一并复制进 `old_string`（列首的行 + 长行场景尤甚，如 CHANGELOG 的列表项），导致 `text.count(old_string) == 0` 报「old_string 未找到」而反复踩坑。现改为醒目非空白分隔符 `12│code`，并同步 read_file / edit_file 的工具描述、系统提示词示例与报错文案（`（注意不要把「行号│」前缀复制进去）`），测试断言一并更新
 
 ## [0.7.0] - 2026-09-07
 

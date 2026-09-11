@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from smithcode import commands, config
 from smithcode.commands import base
 from smithcode.commands.base import CommandResult
-from smithcode.models import DEFAULT_EFFORTS
+from smithcode.llm.models import DEFAULT_EFFORTS
 
 
 class _StubAgent:

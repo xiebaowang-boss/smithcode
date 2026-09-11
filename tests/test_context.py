@@ -2,7 +2,7 @@
 
 from smithcode import config
 from smithcode.agent import Agent
-from smithcode.context import (
+from smithcode.llm.context import (
     ContextMeter,
     assemble,
     breakdown,
@@ -14,7 +14,7 @@ from smithcode.context import (
     report,
     validate_summary,
 )
-from smithcode.session import Session
+from smithcode.llm.session import Session
 
 # ---------- 估算启发式 ----------
 

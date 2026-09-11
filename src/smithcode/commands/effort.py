@@ -6,7 +6,7 @@
 """
 
 from .. import config
-from ..models import DEFAULT_EFFORTS
+from ..llm.models import DEFAULT_EFFORTS
 from .base import CommandChoice, CommandResult, CommandSelect, register
 
 

@@ -6,14 +6,14 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import MAX_SUMMARY_LEN, Agent
-from smithcode.session import Session
+from smithcode.llm.session import Session
 from smithcode.tools import DESCRIBERS
 
 
 @pytest.fixture(autouse=True)
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
-    monkeypatch.setattr("smithcode.permission.confirmations_available", lambda: True)
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: True)
 
 
 # ---------- 配置加载：tool_display 字段 ----------

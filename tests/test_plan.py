@@ -5,7 +5,7 @@ import pytest
 
 from smithcode import config, plan
 from smithcode.agent import Agent
-from smithcode.session import Session
+from smithcode.llm.session import Session
 from smithcode.tools.todo import todo_read, todo_write
 
 
@@ -181,7 +181,7 @@ def test_todo_read_describe_works():
 
 def test_system_prompt_instructs_todo_write():
     """系统提示词应包含任务拆分与分步骤执行规则。"""
-    from smithcode.prompts import build_system_prompt
+    from smithcode.llm.prompts import build_system_prompt
 
     assert "todo_write" in build_system_prompt()
     assert "in_progress" in build_system_prompt()

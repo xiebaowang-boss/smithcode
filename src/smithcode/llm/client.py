@@ -12,8 +12,8 @@ from openai import (
     RateLimitError,
 )
 
-from . import config, renderer
-from .cancel import current_token
+from .. import config, renderer
+from ..cancel import current_token
 
 # 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
 # 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。

@@ -20,9 +20,10 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
-from . import config, renderer
-from .tools import PATTERN_ARGS, PATTERN_FAMILIES
-from .utils.terminal import confirmations_available
+from .. import config, renderer
+from ..tools import PATTERN_ARGS, PATTERN_FAMILIES
+from ..utils.terminal import confirmations_available
+from . import shell_policy
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 
@@ -69,6 +70,33 @@ def infer_trust_root(target: Path) -> Path:
     return target.parent
 
 
+def _rule_pattern_matches(rule_pattern, pattern: str) -> bool:
+    """规则模式匹配：元组视为命令 argv 前缀（"总是允许"记忆），字符串走通配。"""
+    if isinstance(rule_pattern, tuple):
+        key = shell_policy.command_key(pattern)
+        return key is not None and key[:len(rule_pattern)] == rule_pattern
+    return fnmatch.fnmatch(pattern, rule_pattern)
+
+
+def evaluate_with_source(permission, pattern: str, *rulesets) -> tuple:
+    """同 evaluate，但额外返回命中规则所在 ruleset 的下标（无匹配为 None）。
+
+    供安全命令层判断「控制规则是否来自用户/会话」：只有内置默认规则判定为
+    ask 时才轮到安全只读命令集免确认，用户/会话规则命中一律优先。
+    """
+    keys = (permission,) if isinstance(permission, str) else tuple(permission)
+    matched = None
+    source = None
+    for index, ruleset in enumerate(rulesets):
+        for rule in ruleset:
+            if any(fnmatch.fnmatch(k, rule[0]) for k in keys) and _rule_pattern_matches(rule[1], pattern):
+                matched = rule
+                source = index
+    if matched is None:
+        return (keys[0], pattern, ASK), None
+    return matched, source
+
+
 def evaluate(permission, pattern: str, *rulesets) -> tuple:
     """求值一条权限请求：返回最后一条匹配的规则，无匹配则默认 ask。
 
@@ -77,15 +105,7 @@ def evaluate(permission, pattern: str, *rulesets) -> tuple:
     大小写行为与 opencode v2 对齐：Windows 下大小写不敏感（fnmatch.fnmatch 经
     os.path.normcase 归一化），其他平台保持大小写敏感。
     """
-    keys = (permission,) if isinstance(permission, str) else tuple(permission)
-    matched = [
-        rule
-        for ruleset in rulesets
-        for rule in ruleset
-        if any(fnmatch.fnmatch(k, rule[0]) for k in keys)
-        and fnmatch.fnmatch(pattern, rule[1])
-    ]
-    return matched[-1] if matched else (keys[0], pattern, ASK)
+    return evaluate_with_source(permission, pattern, *rulesets)[0]
 
 
 # 顶层 shell 操作符：在此切分复合命令（引号内不切）
@@ -165,6 +185,16 @@ def has_command_substitution(command: str) -> bool:
     return False
 
 
+def _cd_with_git(segments: list) -> bool:
+    """复合命令中同时出现「改变目录的 cd」与 git 时为 True。
+
+    git 会在新目录执行 hooks，`cd other && git ...` 不能因两段各自安全而整体放行。
+    """
+    has_cd = any(shell_policy.is_dir_change(seg) for seg in segments)
+    has_git = any(shell_policy.is_git_command(seg) for seg in segments)
+    return has_cd and has_git
+
+
 class Permission:
     def __init__(self):
         self.mode = "smith"
@@ -201,9 +231,10 @@ class Permission:
         pattern = self._pattern(tool_name, args or {})
         if PATTERN_ARGS.get(tool_name) == "command":
             # 复合命令拆分求值：放行 A 不能借 && 偷渡 B
-            action = self._eval_command(self._keys(tool_name), pattern)
+            action, asked, remember = self._eval_command(self._keys(tool_name), pattern)
         else:
             action = evaluate(self._keys(tool_name), pattern, DEFAULT_RULES, self.user_rules, self.session_rules)[2]
+            asked, remember = [pattern], True
 
         # deny 任何模式都拒绝；ask 交给模式分派（smith 确认 / accept_edits 编辑族放行 / auto 全放行）
         if action == ALLOW:
@@ -211,22 +242,40 @@ class Permission:
         if action == DENY:
             renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（模式 {pattern}）")
             return False
-        return self._dispatch_ask(tool_name, [pattern])
+        return self._dispatch_ask(tool_name, asked, remember)
 
-    def _eval_command(self, keys: tuple, command: str) -> str:
+    def _eval_segment(self, keys: tuple, segment: str) -> str:
+        """单段命令求值：用户/会话规则优先，命中即按其裁决（可收紧为 ask/deny，
+        也可放宽为 allow）；仅当没有任何用户/会话规则命中、且内置默认判定为
+        ask 时，才轮到内置安全只读命令集免确认。任何未知动作一律降级为 ask。"""
+        rule, source = evaluate_with_source(keys, segment, self.user_rules, self.session_rules)
+        if source is not None:
+            action = rule[2]
+        else:
+            action = evaluate(keys, segment, DEFAULT_RULES)[2]
+            if action == ASK and shell_policy.is_safe_command(segment):
+                return ALLOW
+        return action if action in ACTIONS else ASK
+
+    def _eval_command(self, keys: tuple, command: str) -> tuple:
         """复合命令求值：按顶层操作符拆段逐段匹配规则。
 
         聚合语义与多路径一致——任一段 deny → 拒绝；任一段 ask，或存在无法
-        静态求值的命令替换（$() / 反引号）→ 询问；全部放行才放行。"""
-        actions = [
-            evaluate(keys, seg, DEFAULT_RULES, self.user_rules, self.session_rules)[2]
-            for seg in split_command(command)
-        ]
+        静态求值的命令替换（$() / 反引号）→ 询问；全部放行才放行。
+        返回 (聚合动作, 待确认段列表, 是否允许"总是允许"记忆)。安全只读命令集
+        在内置默认 ask 下免确认；但同一复合命令里若既有改变目录的 cd 又有 git
+        （git 会在新目录执行 hooks），整体降级为询问且不允许前缀记忆（记忆无法
+        解除该组合守卫）。"""
+        segments = split_command(command)
+        actions = [self._eval_segment(keys, seg) for seg in segments]
         if any(a == DENY for a in actions):
-            return DENY
-        if has_command_substitution(command) or any(a == ASK for a in actions):
-            return ASK
-        return ALLOW
+            return DENY, [], True
+        asks = [seg for seg, a in zip(segments, actions) if a == ASK]
+        if has_command_substitution(command) or asks:
+            return ASK, asks or list(segments), True
+        if any(a == ALLOW for a in actions) and _cd_with_git(segments):
+            return ASK, list(segments), False
+        return ALLOW, [], True
 
     def check_paths(self, tool_name: str, paths: list[str]) -> bool:
         """多路径工具（如 apply_patch）的聚合检查：任一路径 deny → 拒绝；任一 ask → 询问；
@@ -310,22 +359,51 @@ class Permission:
                 return p.relative_to(root).as_posix()
         return raw
 
-    def _dispatch_ask(self, tool_name: str, patterns: list[str]) -> bool:
+    def _dispatch_ask(self, tool_name: str, patterns: list[str],
+                      remember: bool = True) -> bool:
         """按当前权限模式分派 ask 请求。
 
         auto：全部自动放行（原 -y 语义）。accept_edits：编辑族（edit_file /
         write_file，apply_patch 经 family 继承）自动放行，其余仍确认。
-        smith：逐个确认。deny 永远到不了这里（check 已拦截）。"""
+        smith：逐个确认。deny 永远到不了这里（check 已拦截）。
+        remember=False 时不提供"总是允许"（如 cd+git 组合守卫）。"""
         if self.approved_all:
             return True
         if self.mode == "accept_edits" and PATTERN_FAMILIES.get(tool_name) in EDIT_FAMILIES:
             return True
-        return self._ask(tool_name, patterns)
+        return self._ask(tool_name, patterns, remember)
 
-    def _ask(self, tool_name: str, patterns: list[str]) -> bool:
-        """交互确认；patterns 为本次待确认的模式列表（单路径一个，多路径聚合去重）。
-        选"总是允许"时按模式逐条记入会话规则，保证记忆的模式能被后续调用命中。
-        变更预览（diff）不在这里展示——它由 Agent 在确认前推送到工具调用块，
+    def _remember_proposals(self, tool_name: str, patterns: list) -> list:
+        """生成"总是允许"的记忆候选：[(展示文本, 规则键), ...]，按键去重。
+
+        命令工具逐段推导 argv 前缀（如 `("python","-m","pytest")`），推导不出则
+        退回精确串；其余工具按模式串记忆。"""
+        proposals = []
+        for pat in patterns:
+            if PATTERN_ARGS.get(tool_name) != "command":
+                proposals.append((pat, pat))
+                continue
+            for segment in split_command(pat):
+                prefix = shell_policy.derive_prefix(segment)
+                if prefix is None:
+                    proposals.append((segment, segment))
+                else:
+                    proposals.append((" ".join(prefix) + " *", prefix))
+        seen = set()
+        unique = []
+        for display, key in proposals:
+            if key not in seen:
+                seen.add(key)
+                unique.append((display, key))
+        return unique
+
+    def _ask(self, tool_name: str, patterns: list[str],
+             remember: bool = True) -> bool:
+        """交互确认；patterns 为本次待确认的模式列表（命令工具为待确认的段）。
+
+        选"总是允许"时按候选逐条记入会话规则：命令工具记 argv 前缀（或精确串），
+        其余工具记模式串，保证记忆能被后续调用命中。remember=False 时只提供
+        y/n。变更预览（diff）不在这里展示——它由 Agent 在确认前推送到工具调用块，
         与权限框解耦。"""
         if not confirmations_available():
             renderer.current().info(
@@ -336,13 +414,19 @@ class Permission:
         r.info(f"\n⚠️  Agent 请求执行: {tool_name}")
         for pat in patterns:
             r.info(f"   模式: {pat}")
+        proposals = self._remember_proposals(tool_name, patterns) if remember else []
+        if proposals:
+            shown = "、".join(display for display, _ in proposals)
+            r.info(f"   总是允许将记住: {shown}")
+        options = "yna" if proposals else "yn"
+        hint = "y / n / a" if proposals else "y / n"
         answer = r.confirm_choice(
-            "   允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ",
-            "yna",
-            "y / n / a",
+            "   允许? [y]本次 / [n]拒绝 / [a]总是允许: ",
+            options,
+            hint,
         )
         if answer == "a":
-            for pat in patterns:
-                self.session_rules.append((tool_name, pat, ALLOW))
+            for _, key in proposals:
+                self.session_rules.append((tool_name, key, ALLOW))
             return True
         return answer == "y"
