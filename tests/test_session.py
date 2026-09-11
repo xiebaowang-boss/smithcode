@@ -3,7 +3,7 @@
 import uuid
 
 from smithcode import config
-from smithcode.llm.session import Session
+from smithcode.session import Session
 
 
 def test_construction_rotates_session_id():

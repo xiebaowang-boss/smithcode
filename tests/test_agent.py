@@ -6,8 +6,8 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import Agent
-from smithcode.llm.context import truncate_output
-from smithcode.llm.session import Session
+from smithcode.context import truncate_output
+from smithcode.session import Session
 from smithcode.tools import FUNCTIONS
 
 

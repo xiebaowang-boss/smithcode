@@ -24,8 +24,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .. import commands, config, permission, plan, renderer, welcome
-from ..llm import context
+from .. import commands, config, context, permission, plan, renderer, welcome
 from .bridge import TuiRenderer
 from .panels import (
     PermissionPanel,

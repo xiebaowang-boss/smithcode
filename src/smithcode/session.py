@@ -2,9 +2,9 @@ import json
 import time
 from pathlib import Path
 
-from .. import config
-from .prompts import build_system_prompt
-from .usage import UsageTracker
+from . import config
+from .llm.prompts import build_system_prompt
+from .llm.usage import UsageTracker
 
 
 class Session:

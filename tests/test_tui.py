@@ -10,7 +10,7 @@ from textual.widgets import Static
 import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
-from smithcode.llm.session import Session
+from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import SelectionScreen

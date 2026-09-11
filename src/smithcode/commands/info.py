@@ -1,7 +1,6 @@
 """信息查询命令：/help /plan /usage /context。"""
 
-from .. import config, plan
-from ..llm.context import report
+from .. import config, context, plan
 from .base import CommandResult, help_text, register
 
 
@@ -33,7 +32,7 @@ def _usage(ctx):
 def _context(ctx):
     agent = ctx.agent
     return CommandResult(
-        text=report(
+        text=context.report(
             agent.session.messages,
             config.CONTEXT_TOKEN_BUDGET,
             config.COMPACT_TRIGGER,

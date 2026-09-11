@@ -42,8 +42,10 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
 | `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
-| `llm/` | LLM 交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`session.py` 消息历史、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）、`context/` 上下文计量与压缩（`meter` / `compact` / `prompts`）；`__init__.py` 汇总公共 API |
+| `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
+| `session.py` | 消息历史的增删存取（系统提示词装配、会话保存/恢复） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
+| `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |

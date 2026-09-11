@@ -6,7 +6,7 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import MAX_SUMMARY_LEN, Agent
-from smithcode.llm.session import Session
+from smithcode.session import Session
 from smithcode.tools import DESCRIBERS
 
 

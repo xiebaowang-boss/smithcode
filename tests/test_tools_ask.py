@@ -62,7 +62,7 @@ def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
     import json
 
     from smithcode.agent import Agent
-    from smithcode.llm.session import Session
+    from smithcode.session import Session
 
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr("smithcode.agent.LLMClient", type("DummyLLM", (), {}))

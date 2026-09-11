@@ -5,7 +5,7 @@ import pytest
 
 from smithcode import config, plan
 from smithcode.agent import Agent
-from smithcode.llm.session import Session
+from smithcode.session import Session
 from smithcode.tools.todo import todo_read, todo_write
 
 

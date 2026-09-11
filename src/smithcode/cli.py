@@ -4,7 +4,7 @@ import threading
 
 from . import __version__, commands, config
 from .agent import Agent
-from .llm import Session
+from .session import Session
 from .utils.terminal import (
     confirmations_available,
     read_user_input,

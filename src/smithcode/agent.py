@@ -7,8 +7,7 @@ from pathlib import Path
 
 from . import config, plan, renderer
 from .cancel import CancellationToken, RunResult, activate_token, current_token
-from .llm import LLMClient, Session
-from .llm.context import (
+from .context import (
     ContextMeter,
     assemble,
     build_summary_request,
@@ -18,6 +17,7 @@ from .llm.context import (
     truncate_output,
     validate_summary,
 )
+from .llm import LLMClient
 from .llm.models import (
     CachedModelSource,
     ConfiguredModelSource,
@@ -27,6 +27,7 @@ from .llm.models import (
 )
 from .permission import Permission
 from .plan import render_current, summary
+from .session import Session
 from .tools import (
     DESCRIBERS,
     DISPLAY,

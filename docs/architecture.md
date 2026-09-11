@@ -99,8 +99,10 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `agent.py` | Agent 循环编排；`new_session()` 集中承担 `/new` 的全部会话级重置（消息历史、会话用量、权限会话规则、信任目录、上下文快照、已读记录、步骤清单） |
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
-| `llm/` | LLM 交互子系统：`client.py` OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`session.py` 消息历史与系统提示词装配、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）、`context/` 上下文计量与运行时压缩包（`meter` / `compact` / `prompts`）；`__init__.py` 汇总公共 API |
+| `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
+| `session.py` | 消息历史的增删存取与系统提示词装配 |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
+| `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
