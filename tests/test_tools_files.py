@@ -1,4 +1,6 @@
 """文件工具测试：正常读写、精确编辑、路径越界拦截。"""
+import re
+
 import pytest
 
 from smithcode import config
@@ -107,7 +109,8 @@ def test_write_overwrite_requires_read_first(workspace):
 def test_list_dir(workspace):
     files.write_file("e.txt", "")
     listing = files.list_dir()
-    assert "[文件] e.txt" in listing
+    assert "e.txt" in listing
+    assert "[文件]" not in listing and "[目录]" not in listing  # 不再用类型前缀
 
 
 def test_list_dir_shows_size_and_skips_junk(workspace):
@@ -117,7 +120,32 @@ def test_list_dir_shows_size_and_skips_junk(workspace):
     files.write_file("s.txt", "abc")
     out = files.list_dir()
     assert ".venv" not in out
-    assert "[文件] s.txt (3 B)" in out
+    assert "s.txt" in out
+    assert "3 B" in out
+
+
+def test_list_dir_dirs_first_then_files_aligned(workspace):
+    """目录在前（以 / 结尾），文件在后，名称/大小/修改时间三列对齐。"""
+    (workspace / "sub").mkdir()
+    files.write_file("a.txt", "x")
+    files.write_file("longer_name.txt", "xx")
+    lines = files.list_dir().splitlines()
+    assert lines[0].startswith("sub/")
+    file_lines = lines[1:]
+    assert len(file_lines) == 2
+    assert all("B" in line for line in file_lines)
+    assert len(file_lines[0]) == len(file_lines[1])  # 三列对齐后两行等长
+    # 每行都以本地时间 YYYY-MM-DD HH:MM 收尾
+    assert all(re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", line) for line in lines)
+
+
+def test_list_dir_aligns_cjk_names_by_display_width(workspace):
+    """中文文件名按终端显示宽度（全角 2 列）对齐，不因字符数少而错位。"""
+    files.write_file("中文.txt", "x")
+    files.write_file("abcdef.txt", "x")
+    lines = files.list_dir().splitlines()
+    assert len(lines) == 2
+    assert files._display_width(lines[0]) == files._display_width(lines[1])
 
 
 def test_path_outside_workspace_rejected(workspace):

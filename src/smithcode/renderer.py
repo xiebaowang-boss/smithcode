@@ -55,9 +55,10 @@ class Renderer:
     def stream_done(self) -> None:
         """一段流式输出结束。"""
 
-    def tool_call(self, line: str, display: str = "inline") -> int:
+    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
         """工具调用的短摘要行：先于结果出现（pending 态），返回配对 id。
-        display 为终端展示形态（inline / block），仅 TUI 使用。"""
+        display 为终端展示形态（inline / block），仅 TUI 使用。
+        name 为工具名，供 TUI 判定是否归入「已探索」上下文汇总块。"""
 
     def tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前推送变更预览（diff）到工具调用块：审核前就能看到改动。
@@ -122,7 +123,7 @@ class ConsoleRenderer(Renderer):
             print()
         self.mode = None
 
-    def tool_call(self, line: str, display: str = "inline") -> int:
+    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
         self._tool_seq += 1
         print(f"  {line}")
         return self._tool_seq

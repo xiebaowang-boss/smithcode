@@ -194,3 +194,117 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
     assert [m["content"] for m in msgs] == ["（未执行：权限请求被拒绝，任务已中止）",
                                             "用户拒绝了此操作"]
     assert [m["tool_call_id"] for m in msgs] == ["1", "2"]
+
+
+# ---------- 展示分组的隐式契约 ----------
+
+def test_tool_start_events_precede_ordered_results(monkeypatch):
+    """TUI 的「已探索」分组依赖：同批 tool_calls 的 tool_call（start）全部
+    先于结果到达，且结果按请求顺序到达（不按完成顺序）。"""
+    calls = [_tc("fake_tool", call_id=str(i)) for i in (1, 2, 3)]
+    monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
+    agent = _make_agent(monkeypatch, calls)
+
+    events = []
+
+    class CapRenderer:
+        def __init__(self):
+            self.seq = 0
+
+        def tool_call(self, line, display="inline", name=""):
+            self.seq += 1
+            events.append(("start", self.seq))
+            return self.seq
+
+        def tool_result(self, result, tool_id=None, expand=False):
+            events.append(("result", tool_id))
+
+        def stream(self, kind, chunk):
+            pass
+
+        def stream_done(self):
+            pass
+
+        def info(self, text):
+            pass
+
+    monkeypatch.setattr("smithcode.renderer._current", CapRenderer())
+    agent.run("契约")
+
+    kinds = [kind for kind, _ in events]
+    last_start = max(i for i, kind in enumerate(kinds) if kind == "start")
+    first_result = min(i for i, kind in enumerate(kinds) if kind == "result")
+    assert last_start < first_result  # 全部 start 先于任何 result
+    assert [arg for kind, arg in events if kind == "start"] == [1, 2, 3]
+    assert [arg for kind, arg in events if kind == "result"] == [1, 2, 3]  # 按请求顺序
+
+
+class _CapRenderer:
+    """记录 (tool_id, result) 的假渲染后端，验证 pending 工具块被收尾。"""
+
+    def __init__(self):
+        self.seq = 0
+        self.results = []
+
+    def tool_call(self, line, display="inline", name=""):
+        self.seq += 1
+        return self.seq
+
+    def tool_result(self, result, tool_id=None, expand=False):
+        self.results.append((tool_id, result))
+
+    def stream(self, kind, chunk):
+        pass
+
+    def stream_done(self):
+        pass
+
+    def info(self, text):
+        pass
+
+
+def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
+    """权限被拒：此前已预检未执行的计划也要补 tool_result，否则 TUI 工具块停在 pending。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    calls = [_tc("fake_tool", call_id="1"), _tc("fake_tool", call_id="2")]
+    monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
+    monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
+    agent = Agent(session=Session())
+
+    seen = []
+    monkeypatch.setattr(
+        agent.permission, "check",
+        lambda name, args: seen.append(name) or len(seen) == 1,  # 第二次拒绝
+    )
+    cap = _CapRenderer()
+    monkeypatch.setattr("smithcode.renderer._current", cap)
+
+    agent.run("拒绝")
+
+    # 计划 1（tool_id=1）被跳过 → SKIPPED；计划 2（tool_id=2）被拒 → DENIED
+    assert cap.results[0] == (1, "（未执行：权限请求被拒绝，任务已中止）")
+    assert cap.results[1][0] == 2 and cap.results[1][1] == "用户拒绝了此操作"
+
+
+def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
+    """中断：已预检未执行的计划补 tool_result 收尾 pending 工具块。"""
+    monkeypatch.setattr(config, "MAX_TOOL_CONCURRENCY", 1)  # 纯串行，顺序确定
+    calls = [_tc("step_tool", call_id="1"), _tc("fake_tool", call_id="2")]
+    monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
+
+    def step_tool():
+        agent.interrupt()
+        return "第一步完成"
+
+    monkeypatch.setitem(FUNCTIONS, "step_tool", step_tool)
+    monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+    cap = _CapRenderer()
+    monkeypatch.setattr("smithcode.renderer._current", cap)
+
+    agent.run("中断")
+
+    # 计划 1 正常完成；计划 2 被中断 → INTERRUPTED（收尾其 pending 块）
+    assert cap.results[0] == (1, "第一步完成")
+    assert cap.results[1] == (2, "（未执行：用户中断了任务）")

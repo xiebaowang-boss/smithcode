@@ -14,13 +14,20 @@ from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import SelectionScreen
-from smithcode.tui.render import format_duration, git_branch, split_md_blocks
+from smithcode.tui.render import (
+    context_category,
+    context_summary,
+    format_duration,
+    git_branch,
+    split_md_blocks,
+)
 from smithcode.tui.widgets import (
     MENU_VISIBLE_ITEMS,
     ChatInput,
     ChatView,
     CommandMenu,
     CommandMenuItem,
+    ContextGroup,
     Sidebar,
     ThinkingBlock,
     ToolCall,
@@ -1368,6 +1375,122 @@ def test_model_command_picker_switches_model(monkeypatch):
             await pilot.pause()
             assert config.MODEL == "b"
             assert not isinstance(app.screen, SelectionScreen)
+
+    _run(_run_case())
+
+
+# ---------- 上下文收集汇总（「已探索」分组） ----------
+
+
+def test_context_category_mapping():
+    assert context_category("read_file") == "read"
+    assert context_category("list_dir") == "read"  # 列目录归入「读取」
+    assert context_category("glob") == "search"
+    assert context_category("grep") == "search"
+    assert context_category("write_file") is None
+    assert context_category("run_command") is None
+
+
+def test_context_summary_only_nonzero_categories():
+    assert context_summary({"read": 3, "search": 0}) == "3 次读取"
+    assert context_summary({"read": 2, "search": 1}) == "2 次读取，1 次搜索"
+    assert context_summary({"read": 0, "search": 0}) == ""
+
+
+def _start_tools(app, specs):
+    for tool_id, summary, name in specs:
+        app.ui_tool_start(tool_id, summary, "inline", name)
+
+
+def test_context_tools_grouped_with_counts(monkeypatch):
+    """连续的读取/搜索工具汇总为一个「已探索」块，头行按类计数（ls 计入读取）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "grep foo", "grep"),
+                (3, "ls src", "list_dir"),
+                (4, "glob **/*.py", "glob"),
+            ])
+            for tool_id in (1, 2, 3, 4):
+                app.ui_tool_result(tool_id, "结果", False, False)
+            await pilot.pause()
+            groups = app.query(ContextGroup)
+            assert len(groups) == 1
+            header = str(groups.first().query_one(".group-header").content)
+            assert "已探索" in header
+            assert "2 次读取" in header  # read_file + list_dir
+            assert "2 次搜索" in header  # grep + glob
+            assert "列目录" not in header
+            assert len(groups.first().query(ToolCall)) == 4
+
+    _run(_run_case())
+
+
+def test_non_context_tool_breaks_group(monkeypatch):
+    """非上下文工具（如命令执行）把上下文组切断：前后各自成组。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "command ls", "run_command"),
+                (3, "read b.py", "read_file"),
+            ])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 2
+            top_tools = [w for w in app.query_one(ChatView).children if isinstance(w, ToolCall)]
+            assert len(top_tools) == 1  # run_command 独立成块，不归组
+            assert "command ls" in str(top_tools[0].query_one(".tool-header").content)
+
+    _run(_run_case())
+
+
+def test_context_group_expand_shows_children(monkeypatch):
+    """汇总块默认收起，展开后可见逐条明细。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "read b.py", "read_file"),
+            ])
+            app.ui_tool_result(1, "内容A", False, False)
+            app.ui_tool_result(2, "内容B", False, False)
+            await pilot.pause()
+            group = app.query(ContextGroup).first()
+            body = group.query_one(".group-body")
+            assert body.display is False
+            group.action_toggle()
+            await pilot.pause()
+            assert body.display is True
+            assert len(group.query(ToolCall)) == 2
+            # 展开后按内容自适应，不得因 Vertical 默认 1fr 而撑满可用高度
+            assert group.size.height <= 8
+
+    _run(_run_case())
+
+
+def test_stream_breaks_context_group(monkeypatch):
+    """助手正文（可见输出）出现时上下文组封口，之后的工具另起一组。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            app.ui_tool_result(1, "内容", False, False)
+            app.ui_stream("content", "下面解释")
+            _start_tools(app, [(2, "read b.py", "read_file")])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 2
 
     _run(_run_case())
 

@@ -109,3 +109,29 @@ def format_duration(secs: float) -> str:
         return f"{minutes}m {seconds}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m {seconds}s"
+
+
+# 上下文收集类工具 → 汇总类别（opencode 式「已探索」）：读取 / 搜索。
+# `list_dir` 归入「读取」（同属浏览项目结构）；不在表内的工具不参与分组
+# （写文件、命令执行等有副作用，必须逐条可见）。
+CONTEXT_TOOLS = {
+    "read_file": "read",
+    "list_dir": "read",
+    "glob": "search",
+    "grep": "search",
+}
+
+_CONTEXT_LABELS = {"read": "读取", "search": "搜索"}
+_CONTEXT_ORDER = ("read", "search")
+
+
+def context_category(name: str) -> str | None:
+    """工具名 → 上下文类别（read / search / list）；非上下文工具返回 None。"""
+    return CONTEXT_TOOLS.get(name)
+
+
+def context_summary(counts: dict) -> str:
+    """把各类别计数渲染成中文汇总（只列非零项），如「3 次读取，2 次搜索」。"""
+    return "，".join(
+        f"{counts[key]} 次{_CONTEXT_LABELS[key]}" for key in _CONTEXT_ORDER if counts.get(key)
+    )

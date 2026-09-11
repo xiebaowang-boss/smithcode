@@ -46,10 +46,12 @@ class TuiRenderer(renderer.Renderer):
         else:
             self._post("stream_done")
 
-    def tool_call(self, line: str, display: str = "inline") -> int:
-        """opencode 式 pending 行：摘要先上屏转轮，结果到了原地更新。"""
+    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
+        """opencode 式 pending 行：摘要先上屏转轮，结果到了原地更新。
+
+        name 供 TUI 判定是否归入「已探索」上下文汇总块（读取/搜索/列目录）。"""
         self._tool_seq += 1
-        self._post("tool_start", self._tool_seq, line, display)
+        self._post("tool_start", self._tool_seq, line, display, name)
         return self._tool_seq
 
     def tool_preview(self, tool_id: int | None, detail: str) -> None:

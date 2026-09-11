@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import difflib
+import time
+import unicodedata
 from pathlib import Path
 
 from .. import config
@@ -286,7 +288,9 @@ def _match_linenos(text: str, needle: str) -> list[int]:
     {
         "name": "list_dir",
         "describe": lambda args: f"ls {args.get('path', '.')}",
-        "description": "列出目录内容（文件带大小标注，自动跳过 .git/.venv/node_modules 等无关目录）",
+        "description": "列出目录内容，每行三列「名称  大小  修改时间」：目录在前、以 / 结尾、"
+        "大小列留空；文件在后，大小按 B/KB/MB/GB 显示；修改时间为本地时间 YYYY-MM-DD HH:MM。"
+        "自动跳过 .git/.venv/node_modules 等无关目录。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -297,18 +301,47 @@ def _match_linenos(text: str, needle: str) -> list[int]:
 )
 def list_dir(path: str = ".") -> str:
     p = _resolve(path)
-    entries = []
-    for item in sorted(p.iterdir()):
+    rows: list[tuple[bool, str, str, str]] = []  # (是否目录, 显示名, 大小, 修改时间)
+    for item in sorted(p.iterdir(), key=lambda entry: entry.name.lower()):
         if item.name in SKIP_DIRS:
             continue
-        if item.is_dir():
-            entries.append(f"[目录] {item.name}/")
-            continue
+        is_dir = item.is_dir()
+        size, mtime = "", ""
         try:
-            entries.append(f"[文件] {item.name} ({_fmt_size(item.stat().st_size)})")
+            st = item.stat()
+            mtime = _fmt_mtime(st.st_mtime)
+            if not is_dir:
+                size = _fmt_size(st.st_size)
         except OSError:
-            entries.append(f"[文件] {item.name}")
-    return "\n".join(entries) or "(空目录)"
+            pass  # 坏链接 / 权限不足：仍列出名称，大小与时间留空
+        rows.append((is_dir, f"{item.name}/" if is_dir else item.name, size, mtime))
+    if not rows:
+        return "(空目录)"
+    rows.sort(key=lambda row: not row[0])  # 目录在前（稳定排序，组内保持名称序）
+    name_w = max(_display_width(row[1]) for row in rows)
+    size_w = max((_display_width(row[2]) for row in rows), default=0)
+    lines = []
+    for _, name, size, mtime in rows:
+        pad_name = " " * (name_w - _display_width(name))
+        pad_size = " " * (size_w - _display_width(size))
+        line = f"{name}{pad_name}  {pad_size}{size}"
+        if mtime:
+            line += f"  {mtime}"
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def _display_width(text: str) -> int:
+    """终端显示宽度：CJK 全角字符按 2 列计（文件名对齐用，避免中文名错位）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _fmt_mtime(ts: float) -> str:
+    """修改时间的本地展示（YYYY-MM-DD HH:MM）；异常时间戳返回空串。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except (OSError, ValueError, OverflowError):
+        return ""
 
 
 def _fmt_size(n: float) -> str:

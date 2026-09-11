@@ -16,7 +16,13 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 
 from .. import __version__, config, renderer
-from .render import format_duration, render_markdown, split_md_blocks
+from .render import (
+    context_category,
+    context_summary,
+    format_duration,
+    render_markdown,
+    split_md_blocks,
+)
 
 # ---------- 线程安全的 UI 操作投递 ----------
 
@@ -47,6 +53,8 @@ class ChatView(VerticalScroll):
         self._prefix: Text | None = None  # 已渲染完结块的缓存（与 _done_blocks 对齐）
         self._done_blocks: list[str] = []  # 已渲染完结块的原文，内容对齐防计数漂移
         self._last_render = 0.0  # 上次渲染时刻（尾部块重渲染节流用）
+        self._context_group: ContextGroup | None = None  # 当前进行中的「已探索」组
+        self._context_groups: dict[int, ContextGroup] = {}  # 未出结果的上下文工具 → 所属组
 
     def add_line(self, text: str, style: str | None = None) -> None:
         self._mk(Text.from_ansi(text, style=style))
@@ -59,6 +67,7 @@ class ChatView(VerticalScroll):
         """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
 
         提交自己的消息视为回到最新位置：无条件滚到底（不受锚定约束）。"""
+        self._finalize_context()
         block = Static(Text(text), classes="user-msg")
         block.can_focus = False
         self.mount(block)
@@ -70,6 +79,7 @@ class ChatView(VerticalScroll):
 
     def add_turn_footer(self, model: str, effort: str, elapsed: str) -> None:
         """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时（▣ 用强调色，缩进 3 格）。"""
+        self._finalize_context()
         at_bottom = self._at_bottom()
         text = Text()
         text.append("▣ ", style="#fab283")
@@ -82,9 +92,44 @@ class ChatView(VerticalScroll):
 
     def add_widget(self, widget) -> None:
         """挂载任意消息组件（如可折叠的工具调用块）。"""
+        self._finalize_context()
         at_bottom = self._at_bottom()
         self.mount(widget)
         self._follow(at_bottom)
+
+    def place_tool(self, tool_id: int, name: str, widget) -> None:
+        """放置一个工具控件：上下文类工具归入当前「已探索」组，其余独立成块。
+
+        组只吸收**连续**的上下文工具——遇到非上下文工具、正文/思考流、回合
+        结束时封口（_finalize_context）；封口后新的上下文工具另起一组。"""
+        at_bottom = self._at_bottom()
+        if context_category(name) is None:
+            self._finalize_context()
+            self.mount(widget)
+        else:
+            if self._context_group is None:
+                self._context_group = ContextGroup(classes="context-group")
+                self.mount(self._context_group)
+            self._context_group.add_tool(tool_id, name, widget)
+            self._context_groups[tool_id] = self._context_group
+        self._follow(at_bottom)
+
+    def mark_tool_done(self, tool_id: int) -> None:
+        """上下文工具出结果：更新所属组的计数与进行中状态。"""
+        group = self._context_groups.pop(tool_id, None)
+        if group is not None:
+            group.mark_done(tool_id)
+
+    def reset_context(self) -> None:
+        """清空分组引用（会话重置 / 聊天区清空时调用）。"""
+        self._finalize_context()
+        self._context_groups.clear()
+
+    def _finalize_context(self) -> None:
+        """封口当前「已探索」组（幂等）；后续上下文工具将另起一组。"""
+        if self._context_group is not None:
+            self._context_group.finalize()
+            self._context_group = None
 
     def begin_stream(self, kind: str) -> None:
         self._kind = kind
@@ -169,6 +214,7 @@ class ChatView(VerticalScroll):
         self._block = None
 
     def _mk(self, renderable, classes: str | None = None) -> Static:
+        self._finalize_context()
         at_bottom = self._at_bottom()
         block = Static(renderable, classes=classes)
         block.can_focus = False
@@ -485,6 +531,119 @@ class ToolCall(Vertical):
         body.update(self._body_content())
         body.display = self._expanded
         body.refresh()
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.action_toggle()
+
+
+# ---------- 上下文收集汇总块 ----------
+
+
+class ContextGroup(Vertical):
+    """连续的读取 / 搜索 / 列目录工具汇总块（opencode 式「已探索」）。
+
+    头行汇总各类计数：进行中 `⠋ ⚙ 正在探索 · 3 次读取，2 次搜索`，完成后
+    `▸ ⚙ 已探索 · …`；逐条明细是隐藏的子 ToolCall，展开可见。分组边界由
+    ChatView 控制（遇到非上下文工具、正文/思考流、回合结束时封口）。
+    """
+
+    can_focus = True
+    BINDINGS: ClassVar = [
+        Binding("enter", "toggle", "展开/收起"),
+        Binding("space", "toggle", "展开/收起"),
+    ]
+    SPINNER: ClassVar = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._expanded = False
+        self._items: list[tuple[str, ToolCall]] = []  # (工具名, 子控件)
+        self._pending: set[int] = set()  # 未出结果的 tool_id
+        self._pending_children: list[ToolCall] = []  # compose 前挂载缓冲
+        self._finalized = False
+        self._spin_frame = 0
+        self._spin_timer = None
+        self._header: Static | None = None
+        self._body: Vertical | None = None
+
+    def compose(self):
+        self._header = Static(self._header_text(), classes="group-header", markup=False)
+        self._body = Vertical(classes="group-body")
+        self._body.display = self._expanded
+        yield self._header
+        yield self._body
+
+    def on_mount(self) -> None:
+        for child in self._pending_children:
+            self._body.mount(child)
+        self._pending_children = []
+        self._sync_spinner()
+
+    def add_tool(self, tool_id: int, name: str, widget: ToolCall) -> None:
+        """纳入一个上下文工具；compose 前到达的子控件先缓冲，挂载后补挂。"""
+        self._items.append((name, widget))
+        self._pending.add(tool_id)
+        if self._body is not None:
+            self._body.mount(widget)
+        else:
+            self._pending_children.append(widget)
+        self._sync_spinner()
+        self._refresh_header()
+
+    def mark_done(self, tool_id: int) -> None:
+        """某个子工具出结果：更新计数与进行中状态。"""
+        self._pending.discard(tool_id)
+        self._sync_spinner()
+        self._refresh_header()
+
+    def finalize(self) -> None:
+        """封口：不再接收新工具，停掉转轮（幂等）。"""
+        self._finalized = True
+        if self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+        self._refresh_header()
+
+    def _counts(self) -> dict:
+        counts = {"read": 0, "search": 0}
+        for name, _ in self._items:
+            category = context_category(name)
+            if category:
+                counts[category] += 1
+        return counts
+
+    def _header_text(self) -> str:
+        arrow = "▾" if self._expanded else "▸"
+        summary = context_summary(self._counts())
+        if self._pending and not self._finalized:
+            return f"{arrow} {self.SPINNER[self._spin_frame]} ⚙ 正在探索 · {summary}"
+        return f"{arrow} ⚙ 已探索 · {summary}"
+
+    def _sync_spinner(self) -> None:
+        running = self._pending and not self._finalized
+        if running and self._spin_timer is None and self._header is not None:
+            self._spin_timer = self.set_interval(0.1, self._spin)
+        elif not running and self._spin_timer is not None:
+            self._spin_timer.stop()
+            self._spin_timer = None
+
+    def _spin(self) -> None:
+        self._spin_frame = (self._spin_frame + 1) % len(self.SPINNER)
+        if self._header is not None:
+            self._header.update(self._header_text(), layout=False)
+
+    def _refresh_header(self) -> None:
+        if self._header is not None:
+            self._header.update(self._header_text())
+
+    def action_toggle(self) -> None:
+        self._expanded = not self._expanded
+        if self._header is not None:
+            self._header.update(self._header_text())
+        if self._body is not None:
+            self._body.display = self._expanded
+            self._body.refresh()
 
     def on_click(self, event) -> None:
         event.stop()

@@ -410,13 +410,13 @@ class Agent:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
             text = f"错误: JSONDecodeError: {e}"
-            tool_id = renderer.current().tool_call(f"[Tool] {name}({args_json[:80]})")
+            tool_id = renderer.current().tool_call(f"[Tool] {name}({args_json[:80]})", name=name)
             return _ToolPlan(tc, name, tool_id, lambda: text), False
 
         line = self._describe(name, args)
         display = DISPLAY.get(name, "inline")
         tool_id = renderer.current().tool_call(
-            line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display
+            line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display, name
         )
         denied_plan = _ToolPlan(tc, name, tool_id, lambda: DENIED_RESULT)
 
@@ -531,9 +531,9 @@ class Agent:
                 return self._interrupt_batch(plans, tool_calls[i:])
             if denied:
                 # 此前已过预检但尚未执行的计划：任务中止，一并补占位结果
-                # （防悬空 tool_call_id 破坏下一轮请求）
+                # （防悬空 tool_call_id 破坏下一轮请求；同步收尾已上屏的工具块）
                 for done in plans:
-                    self._placeholder(SKIPPED_RESULT, done.tc.get("id"))
+                    self._placeholder(SKIPPED_RESULT, done.tc.get("id"), done.tool_id)
                 self._collect(plan, plan.run())
                 for pending in tool_calls[i + 1:]:
                     self._placeholder(SKIPPED_RESULT, pending["id"])
@@ -576,16 +576,21 @@ class Agent:
         的 tool 结果，否则下一次请求会被服务商拒绝。返回 "interrupted"。
         """
         for p in pending_plans:
-            self._placeholder(INTERRUPTED_RESULT, p.tc.get("id"))
+            self._placeholder(INTERRUPTED_RESULT, p.tc.get("id"), p.tool_id)
         for tc in remaining_tcs:
             self._placeholder(INTERRUPTED_RESULT, tc.get("id"))
         return "interrupted"
 
-    def _placeholder(self, content: str, tool_call_id) -> None:
-        """为未执行的 tool_call 补占位结果（拒绝 / 中断的会话修复共用）。"""
+    def _placeholder(self, content: str, tool_call_id, tool_id: int | None = None) -> None:
+        """为未执行的 tool_call 补占位结果（拒绝 / 中断的会话修复共用）。
+
+        tool_id 非空时同步更新渲染后端对应的 pending 工具块（已预检的计划
+        已上屏转轮，跳过执行后必须收尾，否则 TUI 停在 pending 态）。"""
         self.session.messages.append(
             {"role": "tool", "content": content, "tool_call_id": tool_call_id}
         )
+        if tool_id is not None:
+            renderer.current().tool_result(content, tool_id)
 
     def _collect(self, plan: _ToolPlan, result: str) -> str:
         """收集一个执行完的计划：截断、终端展示、按序追加进会话。

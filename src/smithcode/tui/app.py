@@ -135,6 +135,11 @@ class SmithTUI(App):
     ToolCall .tool-header.tool-error { color: #f7768e; }
     ToolCall .tool-body { color: #808080; margin-left: 2; }
     ToolCall .tool-body.tool-error { color: #f7768e; }
+    ContextGroup { height: auto; padding-left: 3; }
+    ContextGroup .group-header { color: #808080; }
+    /* Vertical 默认 height: 1fr，会让展开的汇总块撑满可用高度；明细区须按内容自适应 */
+    ContextGroup .group-body { height: auto; margin-left: 2; }
+    ContextGroup ToolCall { padding-left: 0; }
     ThinkingBlock { height: auto; padding-left: 3; margin-top: 1; margin-bottom: 1; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
@@ -348,11 +353,12 @@ class SmithTUI(App):
     def ui_stream_done(self) -> None:
         self.query_one(ChatView).end_stream()
 
-    def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline") -> None:
-        """pending 工具行：转轮摘要先上屏，结果到达后原地更新（opencode 式）。"""
+    def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
+                      name: str = "") -> None:
+        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。"""
         widget = ToolCall(summary, pending=True, display=display)
         self._tool_widgets[tool_id] = widget
-        self.query_one(ChatView).add_widget(widget)
+        self.query_one(ChatView).place_tool(tool_id, name, widget)
 
     def ui_tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：更新对应 pending 工具块，审核时改动已可见。"""
@@ -365,6 +371,7 @@ class SmithTUI(App):
         widget = self._tool_widgets.pop(tool_id, None) if tool_id is not None else None
         if widget is not None:
             widget.set_result(result, expanded=expanded, is_error=is_error)
+            self.query_one(ChatView).mark_tool_done(tool_id)
         else:  # 无配对（理论上不发生）：退化为独立块，不丢结果
             self.query_one(ChatView).add_widget(
                 ToolCall("[Tool]", result, expanded=expanded, is_error=is_error)
@@ -650,7 +657,9 @@ class SmithTUI(App):
 
         连带清掉残留的瞬时渲染状态：工具块映射（widget 已随聊天区移除，
         映射不清理会滞留旧引用）、思考块与轮次计时。"""
-        self.query_one(ChatView).remove_children()
+        chat = self.query_one(ChatView)
+        chat.reset_context()
+        chat.remove_children()
         self._tool_widgets.clear()
         self._thinking_block = None
         self._turn_start = None

@@ -6,6 +6,7 @@
 
 ### 新增
 
+- **TUI「已探索」上下文汇总**（对齐 opencode）：TUI 中连续的读取 / 搜索工具（`read_file` / `list_dir` 计入读取，`glob` / `grep` 计入搜索）不再逐条平铺，而是汇总成一个可折叠块——头行进行中显示 `⠋ ⚙ 正在探索 · 3 次读取，2 次搜索`，完成后 `▸ ⚙ 已探索 · …`（只列非零类别），展开可见逐条明细；遇到非上下文工具、助手正文/思考流或回合结束时封口，之后的上下文工具另起一组。分组只影响 TUI 展示，`ConsoleRenderer` 与回传给模型的内容完全不变。实现：`Renderer.tool_call` 新增可选 `name` 参数（Agent 预检传入工具名，不靠解析摘要猜工具），TUI 侧新增 `ContextGroup` 控件与 `ChatView.place_tool` / `mark_tool_done` 分组生命周期，分类与中文汇总为 `tui/render.py` 纯函数（`CONTEXT_TOOLS` / `context_category` / `context_summary`）
 - **技能（Agent Skills）**：兼容 agentskills.io 开放格式（`SKILL.md`：YAML frontmatter 的 `name` + `description`，正文写指令，可选 `scripts/`、`references/` 等资源），采用渐进式披露——启动只把技能名与描述装进系统提示词（约 100 token/技能，带字符预算三级降级），命中任务后由模型调用 `use_skill` 加载完整指令，资源文件按需读取：
   - 新增 `skills/` 子系统：`frontmatter.py` 自研宽容解析器（支持引号、`|`/`>` 块标量、`description` 内冒号，不引入 PyYAML；缺 `description` 才跳过，`name` 不符目录名等只告警）；`registry.py` 扫描发现（项目 `.agents/skills/` + 用户 `~/.smithcode/skills/` + `[skills].paths`，递归深度 4、跳过 `.git`/`node_modules`、同名"附加 > 项目 > 用户"先命中生效并记诊断）；`state.py` 会话级激活集合；`render.py` 目录段与已激活段渲染
   - 项目级技能来自可能不可信的仓库，默认 `[skills].project = "ask"` 首次发现时确认（`[a]` 落盘 `~/.smithcode/skills_trust.json` 始终信任、`[y]` 仅本会话、`[n]` 跳过；非交互 fail-closed 跳过）；`[skills].enabled` 总开关、`[skills].disabled` 通配禁用（整条从目录与工具 enum 隐藏，仅 `/skills` 诊断可见）、frontmatter `disable-model-invocation: true` 仅允许手动加载；`allowed-tools` 不产生任何授权效果
@@ -57,6 +58,7 @@
 
 ### 变更
 
+- **`list_dir` 输出规范化**：每行三列「名称  大小  修改时间」——目录在前（以 `/` 结尾、大小列留空），文件在后并标注大小，末尾附本地时间 `YYYY-MM-DD HH:MM`；去掉了每行重复的 `[文件]` / `[目录]` 前缀，与 `glob` 的「相对路径 + 目录带 `/`」约定一致，更省 token 也更好扫读。文件名按终端显示宽度对齐（中文全角按 2 列计），中文名不再错位。工具 schema 描述与系统提示词同步说明各列含义，让模型理解返回信息
 - **`/new` 重置收敛与 TUI 清屏**：会话级状态的重置逻辑原先散落在命令层（`commands/session.py` 直接清 session / 权限规则 / 信任目录 / 压缩计数 / 计划清单），现集中为 `Agent.new_session()` 一处，并补齐两项漏网状态——工具侧「已读文件」记录（漏清会让新会话绕过 write/edit 前的已读校验）与上下文计量中的真实 token 锚点 `last_actual`（漏清会让 `/context` 用旧会话的真实值误导对比）。TUI 中执行 `/new` 现在会**彻底清空聊天区**（含欢迎横幅，连带清掉残留的工具块映射与思考块），且不再追加「已开启新会话。」提示文本——清空本身即反馈；REPL 仍打印该提示。**任务运行中 `/new` 会被拦截**（对齐 opencode 的 busy 拒绝）：只提示「请等待完成或先按 Esc 中断」，避免后台线程写历史时中途重置撕裂轮次。新增 `Agent.new_session` / `Permission.new_session` / `ContextMeter.new_session` 三个重置入口与对应测试
 - **修复运行计时动画首次显示不可见**：`RunningIndicator` 的 `width: auto` 空组件初始宽度为 0，而每次 tick 的更新走 `layout=False` 免重排——首次 `display=True` 不会触发布局，导致**第一轮任务的「Working…」计时全程渲染了却看不见**（第二次起 `display` 翻转强制重排才恢复）。修复为 `start()` 时立即渲染初始文案并触发一次布局定宽，组件状态初始化挪入 `__init__`；新增回归测试断言首次显示即有宽度
 - **时长显示统一为分级格式**：运行中动画与轮次页脚共用新的 `render.format_duration`——不足 1 分钟只显示秒（`42s`），不足 1 小时显示分+秒（`5m 30s`），再往上时+分+秒（`1h 12m 30s`），各级到点才出现；页脚此前超 1 小时也只显示分钟（如 `62m 5s`）。动画文案左对齐定宽，时长逐级变长不改变组件宽度，保持 `layout=False` 免重排的前提
@@ -79,6 +81,8 @@
 
 ### 修复
 
+- **权限被拒 / 中断时，已预检未执行的 TUI 工具块停在 pending 转轮**：这类计划此前只补了会话占位结果（防悬空 `tool_call_id`），没有更新渲染后端，TUI 对应的工具行——以及「已探索」汇总组里的子项——会一直转轮。现 `_placeholder` 增加可选的渲染器配对 id，拒绝路径与 `_interrupt_batch` 对**已预检**的计划补一次 `tool_result` 收尾；尚未预检的剩余 `tool_calls` 没有控件、行为不变，回传模型的消息序列完全不变（REPL 的 summary 模式输出也不受影响）
+- **TUI「已探索」汇总块展开时撑满可用高度**：明细容器 `.group-body` 是 `Vertical`，而 Textual 容器默认 `height: 1fr`，展开即吃掉整块高度。现显式改为 `height: auto` 按内容自适应，并加回归测试断言展开后高度与明细行数相当
 - **TUI 因工具摘要/提问文本含方括号而被 Textual markup 解析崩溃**：`Static` 默认按 console markup 解析字符串，当模型给的自由文本含 `[link=https://...]` 一类方括号结构（如 webfetch 的 `fetch <url>` 摘要）时，Textual 抛 `MarkupError` 直接崩掉整个界面（且异常常在退出排布时才暴露）。现把展示动态文本的控件统一禁用 markup：工具调用块头部、思考块头部、运行动画、权限/提问/选择面板标题与提示（正文本就是 rich `Text`，不受影响）——原样展示方括号，不再当样式标签解析
 - **TUI 执行 `/new` 后欢迎横幅（Logo）不再消失**：`reset_chat` 清空聊天区后漏了重新渲染欢迎语，导致新会话屏幕只剩空白、启动时的 Logo 不见了。现将欢迎横幅渲染抽为 `SmithTUI._show_welcome`，`on_mount` 与 `reset_chat` 共用——`/new` 后聊天区回归会话起点、Logo 与问候语重新出现
 - **read_file 行号分隔符由两个空格改为 `│`，消除 old_string 复制的隐性陷阱**：此前输出形如 `12  code`，行号与正文间的两个空格是**排版分隔符、不属于文件内容**，却极易被当成正文的缩进一并复制进 `old_string`（列首的行 + 长行场景尤甚，如 CHANGELOG 的列表项），导致 `text.count(old_string) == 0` 报「old_string 未找到」而反复踩坑。现改为醒目非空白分隔符 `12│code`，并同步 read_file / edit_file 的工具描述、系统提示词示例与报错文案（`（注意不要把「行号│」前缀复制进去）`），测试断言一并更新
