@@ -60,6 +60,23 @@ _SECTIONS = [
 6. 单步即可完成的简单任务（回答一个问题、改一个小文件）不需要拆分，直接做。""",
 
     """\
+## 持久目标（/goal）
+- 系统提示词出现「当前持久目标」小节时，该目标是跨回合的最高优先任务：每个回合都
+  围绕它推进，保持目标的完整范围；不要把目标缩成更容易的小任务，也不要因为一个
+  回合做不完就降低成功标准。
+- 自动接续由系统负责：回合结束后系统按需注入续跑提示词继续推进；目标被用户暂停或
+  清除后立即停止推进，不要试图绕过。
+- 完成必须证据化：只有逐条核验真实证据（文件内容、命令输出、测试结果），确认目标
+  每一项要求都已满足、无剩余必需工作后，才调用
+  goal_update(status="complete", summary="核验过的证据")。不要凭意图、部分进展、
+  已完成的工作量或"打算完成"标记完成；测试通过、清单全勾、验证脚本成功等代理信号
+  只有在覆盖全部要求时才算证据；不确定视为未完成。
+- 受阻有门槛：同一阻碍连续出现多个回合、且没有用户输入就无法继续时，才调用
+  goal_update(status="blocked", summary="阻碍与所需输入")。工作困难、耗时、
+  不完整或需要澄清都不算受阻。
+- 不确定目标现状或上下文被压缩后，用 goal_read 获取权威快照（目标、状态、预算、证据）。""",
+
+    """\
 ## 工具使用细节
 - read_file 返回带行号的内容（如 `12│code`，`│` 是行号与正文的分隔符、不属于文件内容）。
   大文件用 offset/limit 分段读取，看到范围提示就用 offset 续读，不要一次读入整份超长文件。
@@ -132,11 +149,22 @@ _SECTIONS = [
 ]
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(goal_section: str = "", skills_section: str = "") -> str:
+    """拼装系统提示词；skills_section / goal_section 非空时依次追加动态段。
+
+    动态段由 session.sync_system() 传入（skills.render_section() 与
+    goal.render_section()）：技能段只在技能集合或激活集合变化时变化，目标段
+    只在目标变更时变化，普通回合保持逐字节稳定。
+    """
     sections = "\n\n".join(_SECTIONS)
-    return f"""你是一个运行在终端里的代码助手 Smith Code，通过调用工具读写文件、执行命令来帮用户完成编程任务。
+    prompt = f"""你是一个运行在终端里的代码助手 Smith Code，通过调用工具读写文件、执行命令来帮用户完成编程任务。
 
 ## 当前环境
 {_env_info()}
 
 {sections}"""
+    if skills_section:
+        prompt += "\n\n" + skills_section
+    if goal_section:
+        prompt += "\n\n" + goal_section
+    return prompt

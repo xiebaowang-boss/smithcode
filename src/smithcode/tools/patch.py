@@ -201,7 +201,7 @@ def apply_patch(patch: str) -> str:
     # 阶段一：全部在内存中准备，任一失败即整体放弃（原子性）
     prepared = []
     for action, path, payload in ops:
-        p = _resolve(path)  # 越界直接抛 PermissionError
+        p = _resolve(path, write=True)  # 越界直接抛 PermissionError
         if action == "add":
             if p.exists():
                 return f"错误: {path} 已存在，请改用 Update File"

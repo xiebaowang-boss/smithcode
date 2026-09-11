@@ -38,20 +38,22 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
 | `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线 + 集中 CSS）、`widgets.py` 自包含控件、`panels.py` 弹窗面板、`bridge.py` 线程桥（`TuiRenderer`）、`render.py` 纯函数工具 |
 | `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
-| `agent.py` | Agent 循环编排（工具调用两阶段调度、todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`） |
+| `agent.py` | Agent 循环编排（工具调用两阶段调度、todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`）；`run_with_goal()` 是 `/goal` 的续跑驱动器 |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
 | `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
 | `session.py` | 消息历史的增删存取（系统提示词装配、会话保存/恢复） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
+| `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
+| `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/skills-architecture.md`）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
-| `tools/*.py` | 各工具实现（files / search / shell / patch / web / ask / todo） |
+| `tools/*.py` | 各工具实现（files / search / shell / patch / web / ask / todo / goal / skills） |
 
 ## 关键约定
 
@@ -59,6 +61,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，解析后的真实路径必须在授权目录内；绕过沙箱的"捷径"一律不加
 - **保护路径**：`.env` 禁止读写，`.git` 只读（内置 deny 规则）
+- **技能目录只读**：技能根目录经 `config.read_roots()` 对读工具放行（免越界确认），写工具/`apply_patch` 只认授权目录（`_resolve(write=True)`）；技能 frontmatter 的 `allowed-tools` 不产生授权效果
 - **权限规则**：工具通过 schema 的 `pattern_arg` 声明权限模式来源；权限语义与既有工具一致时用 `family` 继承（如 `apply_patch` 继承 `edit_file`）；多路径工具用 `paths_from` 逐路径求值聚合
 - **安全命令免确认**：内置只读命令集（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在内置默认 `ask` 下自动放行，且**仅在无任何用户/会话规则命中时生效**——用户可用精确 `ask`/`deny` 收紧，宽泛 `ask` 即整体关闭。开发工具链仅放行版本查询/只读枚举/静态检查（`python --version`、`pip list`、`ruff check`），**真正运行代码的用法（`pytest`、`python x.py`、`npm run`、`uv run`、`cargo test`）不放行**。判定为纯函数 `permission/shell_policy.is_safe_command`，拿不准（解析失败、inline 环境变量前缀、路径限定 argv[0]、重定向、命令替换、危险标志、未加引号 glob）一律回退确认
 - **命令前缀记忆**：`run_command` 的"总是允许"记 argv 前缀（`permission/shell_policy.derive_prefix`），不记整串；匹配用 `command_key` token 前缀比较，文件/参数变化仍命中。拿不准（未登记命令、标志截断、`python -c`、`bash -c`、含危险标志）一律退回精确记忆；`BANNED_PREFIXES` 兜底；`cd`+`git` 守卫不提供"总是允许"

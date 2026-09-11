@@ -24,7 +24,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .. import commands, config, context, permission, plan, renderer, welcome
+from .. import commands, config, context, goal, permission, plan, renderer, welcome
 from .bridge import TuiRenderer
 from .panels import (
     PermissionPanel,
@@ -44,6 +44,15 @@ from .widgets import (
     ToolCall,
     UiAction,
 )
+
+# 侧边栏目标卡片标题的着色：进行中橙、暂停黄、完成绿、受阻/预算红
+_GOAL_STATUS_COLORS = {
+    "active": "#fab283",
+    "paused": "#e0af68",
+    "complete": "#23d18b",
+    "blocked": "#f7768e",
+    "budget_limited": "#f7768e",
+}
 
 
 class SmithTUI(App):
@@ -105,7 +114,7 @@ class SmithTUI(App):
         padding: 0 0 1 0;
         background: transparent;
     }
-    #composer-mode, #composer-model, #composer-thinking {
+    #composer-mode, #composer-model, #composer-thinking, #composer-goal {
         width: auto;
         padding: 0 0 0 2;
     }
@@ -215,6 +224,7 @@ class SmithTUI(App):
                     yield Static(id="composer-mode")
                     yield Static(id="composer-model")
                     yield Static(id="composer-thinking")
+                    yield Static(id="composer-goal")
                     yield RunningIndicator(id="running")
                     yield Static(id="status")
                 # 斜杠命令菜单：绝对定位悬浮层（锚在输入框正上方），不挤压聊天区布局
@@ -439,11 +449,23 @@ class SmithTUI(App):
     def ui_status(self) -> None:
         usage_title, usage_body = self._sidebar_usage()
         ctx_title, ctx_body = self._sidebar_context()
-        self.query_one(Sidebar).update_usage(usage_title, usage_body, ctx_title, ctx_body)
+        sidebar = self.query_one(Sidebar)
+        sidebar.update_usage(usage_title, usage_body, ctx_title, ctx_body)
+        snapshot = goal.sidebar()  # 侧边栏目标卡片（计划区上方）；无目标整块隐藏
+        if snapshot is None:
+            sidebar.update_goal(None)
+        else:
+            title, body = snapshot
+            color = _GOAL_STATUS_COLORS.get(goal.current().status, "#808080")
+            sidebar.update_goal((Text(title, style=color), body))
         mode, model, thinking = self._composer_status()
         self.query_one("#composer-mode").update(mode)
         self.query_one("#composer-model").update(model)
         self.query_one("#composer-thinking").update(thinking)
+        marker = goal.marker()  # 「◎ 目标 3/50」；无目标时隐藏该段
+        goal_status = self.query_one("#composer-goal")
+        goal_status.update(marker)
+        goal_status.display = bool(marker)
         self.query_one("#status").update(self._status_text())
 
     def _context_stats(self) -> tuple[int, int, int]:
@@ -551,7 +573,7 @@ class SmithTUI(App):
 
     def _run_task(self, text: str) -> None:
         try:
-            self.agent.run(text)
+            self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
         except Exception as e:  # noqa: BLE001
             self.post_message(UiAction("line", f"[错误] {type(e).__name__}: {e}", "red"))
         finally:
@@ -610,6 +632,18 @@ class SmithTUI(App):
             self.query_one(Sidebar).update_plan("", has_active=False)
         if outcome.refresh_status:
             self.ui_status()
+        if outcome.start_task is not None:
+            # /goal 设定/恢复后立即开跑；任务运行中则只提示——正在跑的续跑循环
+            # 会在当前轮结束后读到新目标状态并自动接续
+            if self._busy:
+                if outcome.echo_input:  # 技能手动激活：不排队，提示用户等待/中断
+                    self.ui_line("（上一条任务还在运行，请等待完成或先按 Esc 中断）", "yellow")
+                else:
+                    self.ui_line("（目标已记录，当前任务结束后自动接续）", "grey50")
+            else:
+                if outcome.echo_input:  # 技能手动激活带任务：用户输入原文整体回显
+                    self.query_one(ChatView).add_user(text)
+                self.start_task(outcome.start_task)
 
     def reset_chat(self) -> None:
         """开新会话：清空聊天区并重新渲染欢迎横幅，屏幕回归会话起点。

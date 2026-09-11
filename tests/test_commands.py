@@ -2,10 +2,30 @@
 
 from types import SimpleNamespace
 
-from smithcode import commands, config
+import pytest
+
+from smithcode import commands, config, goal
 from smithcode.commands import base
 from smithcode.commands.base import CommandResult
 from smithcode.llm.models import DEFAULT_EFFORTS
+
+
+@pytest.fixture(autouse=True)
+def _fresh_goal():
+    """命令用例共享全局目标单例，前后清空防止跨用例污染。"""
+    goal.reset()
+    yield
+    goal.reset()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_skills():
+    """技能是进程级单例：命令用例前后清空，防止补全/兜底读到其他用例的技能。"""
+    from smithcode import skills
+
+    skills.clear()
+    yield
+    skills.clear()
 
 
 class _StubAgent:
@@ -44,7 +64,7 @@ def _run(text, **kwargs):
 
 def test_all_builtin_commands_registered():
     names = {cmd.name for cmd in commands.all_commands()}
-    assert {"exit", "new", "save", "compact", "help", "plan", "usage", "context", "model", "effort"} <= names
+    assert {"exit", "new", "save", "compact", "help", "plan", "usage", "context", "model", "effort", "goal"} <= names
 
 
 def test_all_commands_sorted_and_deduped():
@@ -275,4 +295,78 @@ def test_model_without_candidates_hints(monkeypatch):
     outcome = commands.dispatch(agent, "/model")
     assert outcome.select is None
     assert "没有可切换的候选模型" in outcome.text
+
+
+# ---------- /goal：持久目标设定、状态与生命周期 ----------
+
+def test_goal_without_arg_shows_hint():
+    _, outcome = _run("/goal")
+    assert outcome.kind == "block"
+    assert "当前没有持久目标" in outcome.text
+
+
+def test_goal_sets_objective_and_start_task():
+    _, outcome = _run("/goal 修复所有失败的测试")
+    assert "已设定目标" in outcome.text
+    assert goal.is_active()
+    assert goal.current().objective == "修复所有失败的测试"
+    assert outcome.start_task and "修复所有失败的测试" in outcome.start_task
+    assert outcome.refresh_status
+
+
+def test_goal_status_block():
+    goal.set("目标 X", max_turns=5)
+    _, outcome = _run("/goal")
+    assert outcome.kind == "block"
+    assert "目标 X" in outcome.text
+    assert "进行中" in outcome.text
+
+
+def test_goal_pause_resume_clear():
+    _run("/goal 目标")
+    _, paused = _run("/goal pause")
+    assert not goal.is_active() and "已暂停" in paused.text and paused.refresh_status
+
+    _, resumed = _run("/goal resume")
+    assert goal.is_active() and resumed.start_task and resumed.refresh_status
+
+    _, cleared = _run("/goal clear")
+    assert not goal.is_set() and "已清除" in cleared.text
+    assert cleared.refresh_status
+
+
+def test_goal_resume_without_goal():
+    _, outcome = _run("/goal resume")
+    assert "没有持久目标" in outcome.text
+
+
+def test_goal_resume_while_active_kicks_continuation():
+    """active 目标（如中断后循环已停）再 resume 也接续一轮，而不是死胡同提示。"""
+    _run("/goal 目标")
+    _, outcome = _run("/goal resume")
+    assert goal.is_active()
+    assert outcome.start_task
+
+
+def test_goal_budget_validation_and_set():
+    _run("/goal 目标")
+    _, bad = _run("/goal budget abc")
+    assert "用法" in bad.text
+    _, good = _run("/goal budget 5")
+    assert goal.current().max_turns == 5
+    assert "5" in good.text
+
+
+def test_goal_objective_starting_with_verb_is_not_subcommand():
+    """/goal clear the failures 是目标描述而非清除命令（子命令只在单 token 时识别）。"""
+    _, outcome = _run("/goal clear the failing tests")
+    assert goal.is_active()
+    assert goal.current().objective == "clear the failing tests"
+    assert outcome.start_task
+
+
+def test_goal_rejects_overlong_objective():
+    _, outcome = _run("/goal " + "长" * (goal.MAX_OBJECTIVE_LEN + 1))
+    assert "过长" in outcome.text
+    assert not goal.is_set()
 

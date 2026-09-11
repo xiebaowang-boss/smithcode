@@ -5,7 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import config, plan, renderer
+from . import config, goal, plan, renderer, skills
 from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
@@ -34,10 +34,12 @@ from .tools import (
     FUNCTIONS,
     PATHS_EXTRACTORS,
     PREVIEWS,
-    SCHEMAS,
+    READ_ONLY_TOOLS,
     SERIAL,
     reset_read_tracking,
+    visible_schemas,
 )
+from .tools.skills import sync_schema
 
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
@@ -119,16 +121,27 @@ class Agent:
         )
 
     def start(self) -> None:
-        """启动期装载模型目录：外部配置优先；未配置则后台拉取远端 `/models`。"""
+        """启动期装载模型目录与技能目录：模型未配置时后台拉取 `/models`。
+
+        技能发现可能弹出项目级信任确认（渲染后端此时为 ConsoleRenderer，
+        TUI 尚未接管，交互行为一致）。
+        """
         self.models.bootstrap()
+        self.refresh_skills()
+
+    def refresh_skills(self) -> list:
+        """重新发现技能并同步 use_skill 工具 schema（启动与 /skills refresh 共用）。"""
+        diagnostics = skills.refresh()
+        sync_schema()
+        return diagnostics
 
     def new_session(self) -> None:
         """开启新会话（/new 的实际动作）：集中重置全部会话口径状态。
 
         覆盖：消息历史与会话 id、会话用量、权限会话规则、越界信任目录、
         上下文快照（压缩计数与真实 token 锚点）、工具侧「已读文件」记录、
-        步骤清单。新增会话级状态时在对应模块加 reset 后在此补一行，
-        命令层（commands）不感知重置细节。
+        步骤清单、持久目标、技能激活集合。新增会话级状态时在对应模块加
+        reset 后在此补一行，命令层（commands）不感知重置细节。
         """
         self.session.reset()
         self.permission.new_session()
@@ -136,6 +149,8 @@ class Agent:
         self.context.new_session()
         reset_read_tracking()
         plan.reset()
+        goal.reset()
+        skills.reset()
 
     def interrupt(self) -> None:
         """请求中断当前任务（线程安全：TUI / REPL 主线程调用，Agent 在后台线程运行）。
@@ -153,7 +168,7 @@ class Agent:
         工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消
         状态影响。
         """
-        self.session.ensure_system()  # 首次发请求前才把系统提示词放入历史（懒加载）
+        self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
         self.session.add("user", user_input)
         token = CancellationToken()
         self._token = token
@@ -164,11 +179,74 @@ class Agent:
             self._token = None
             reset_token()
 
+    def run_with_goal(self, user_input: str) -> RunResult:
+        """执行一次任务，并在持久目标激活时自动续跑直到目标结束或触发刹车。
+
+        /goal 的唯一续跑驱动器（REPL / TUI / 一次性任务共用）：无目标时与
+        run() 完全等价。目标 active 时，每轮结束后按下述规则决定是否注入
+        续跑提示词开启下一回合：
+
+        - 上一轮正常结束且执行过工具（推进动作）→ 继续；
+        - 续跑轮没有任何工具调用 → 暂停目标，防止空转；
+        - 被中断 → 保留 active，停止循环（用户主动叫停）；
+        - 被拒 / 迭代上限 → 暂停目标（继续只会重复失败）；
+        - 回合数达到预算 → 标记预算用尽并注入收尾提示词跑最后一轮。
+        """
+        goal_turn = goal.is_active()
+        if goal_turn:
+            goal.begin_turn()
+        result = self.run(user_input)
+        self._note_goal_run(result)
+        while goal.is_active():
+            if result.status != "ok":
+                if result.status in ("denied", "max_iterations") and goal.pause(
+                    "上一次任务未正常结束，已暂停自动推进"
+                ):
+                    renderer.current().info("\n[目标] 已暂停自动推进（/goal resume 可继续）")
+                break
+            if not result.tools_used:
+                if goal.pause("本轮没有产生工具调用，已暂停自动推进以防空转"):
+                    renderer.current().info(
+                        "\n[目标] 已暂停：本轮没有产生工具调用（/goal resume 可继续）"
+                    )
+                break
+            current = goal.current()
+            if current is None:  # 目标在本轮结束时被清除
+                break
+            if current.turns >= current.max_turns:
+                goal.budget_limited()
+                renderer.current().info(
+                    f"\n[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
+                )
+                result = self.run(current.wrapup_prompt())
+                self._note_goal_run(result)
+                break
+            goal.begin_turn()
+            marker = goal.current()
+            if marker is None:  # 目标在本轮结束时被清除
+                break
+            renderer.current().info(
+                f"\n[目标] 继续推进 · 第 {marker.turns}/{marker.max_turns} 回合"
+            )
+            result = self.run(marker.continuation_prompt())
+            self._note_goal_run(result)
+        return result
+
+    def _note_goal_run(self, result: RunResult) -> None:
+        """把一轮结果同步给目标状态机：推进动作重置阻碍连击、累计 token 用量。"""
+        goal.note_run(
+            result.tools_used,
+            self.session.usage.current_session.get("total_tokens"),
+        )
+
     def _run_loop(self, token: CancellationToken) -> RunResult:
+        tools_used: list = []  # 本任务执行过的工具名（去重保序），供 /goal 续跑裁决
         for _ in range(self.max_iterations):
             if token.cancelled:
                 renderer.current().info(INTERRUPTED_NOTE)
                 return RunResult("interrupted")
+            # 每轮同步系统提示词：本轮加载的技能正文下一轮生效（内容不变时不重建）
+            self.session.sync_system()
             self._compact_if_needed()
             msg, usage, interrupted = self._chat_with_recovery()
             self.session.usage.add(usage)
@@ -177,25 +255,33 @@ class Agent:
 
             if interrupted:
                 renderer.current().info(INTERRUPTED_NOTE)
-                return RunResult("interrupted", partial=True)
+                return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
 
             if not msg.get("tool_calls"):
-                return RunResult("ok", msg.get("content", ""))
+                return RunResult("ok", msg.get("content", ""), tools_used=tuple(tools_used))
 
             if token.cancelled:
                 # 流刚好走完时才取消：这批 tool_calls 一个都未执行，补占位后停止
                 self._interrupt_batch([], msg.get("tool_calls", []))
                 renderer.current().info(INTERRUPTED_NOTE)
-                return RunResult("interrupted")
+                return RunResult("interrupted", tools_used=tuple(tools_used))
 
+            for tc in msg["tool_calls"]:
+                name = tc.get("function", {}).get("name", "")
+                if name and name not in tools_used:
+                    tools_used.append(name)
             stopped = self._execute_batch(msg["tool_calls"])
             if stopped == "denied":
-                return RunResult("denied", "任务已停止：权限请求被用户拒绝。")
+                return RunResult(
+                    "denied", "任务已停止：权限请求被用户拒绝。", tools_used=tuple(tools_used)
+                )
             if stopped == "interrupted":
                 renderer.current().info(INTERRUPTED_NOTE)
-                return RunResult("interrupted")
+                return RunResult("interrupted", tools_used=tuple(tools_used))
 
-        return RunResult("max_iterations", "达到最大迭代次数，任务中止。")
+        return RunResult(
+            "max_iterations", "达到最大迭代次数，任务中止。", tools_used=tuple(tools_used)
+        )
 
     def _chat_with_recovery(self) -> tuple[dict, dict | None, bool]:
         """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
@@ -279,7 +365,7 @@ class Agent:
         usage = None
         parts: list[str] = []
         r = renderer.current()
-        for kind, payload in self.llm.chat_stream(self.session.messages, tools=SCHEMAS):
+        for kind, payload in self.llm.chat_stream(self.session.messages, tools=visible_schemas()):
             if kind == "message":
                 msg = payload
             elif kind == "usage":
@@ -386,7 +472,7 @@ class Agent:
             renderer.current().tool_preview(tool_id, snapshot)
 
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
-        preflight = self._preflight_outside_path(args)
+        preflight = self._preflight_outside_path(args, read_only=name in READ_ONLY_TOOLS)
         if preflight == "deny":
             return denied_plan, True
         if not self.permission.check(name, args):
@@ -535,22 +621,26 @@ class Agent:
             return describe(args)
         return f"[Tool] {name}({json.dumps(args, ensure_ascii=False)[:80]})"
 
-    def _preflight_path(self, raw: str) -> Path | str | None:
+    def _preflight_path(self, raw: str, read_only: bool = False) -> Path | str | None:
         """检查单个路径是否落在授权目录之外；之外时先交互确认。
 
         返回 "deny"（用户拒绝本次访问）、Path（"仅本次"，执行时需临时放行该信任根）、
         None（路径在授权范围内，或用户已选"本会话总是"——信任根已入库）。
+        只读工具（READ_ONLY_TOOLS）的目标落在技能目录只读白名单内时直接放行，
+        避免读技能引用文件反复弹越界确认；写路径不受影响。
         与工具内部的越界检查互为备份：预检管交互体验，工具侧管强制执行。
         """
         target = (Path(config.WORKSPACE_ROOT) / str(raw)).resolve()
         if any(target.is_relative_to(r) for r in config.allowed_roots()):
+            return None
+        if read_only and any(target.is_relative_to(r) for r in config.skill_roots()):
             return None
         action, root = self.permission.ask_outside_access(str(raw), target)
         if action == "deny":
             return "deny"
         return root if action == "once" else None
 
-    def _preflight_outside_path(self, args: dict) -> Path | str | None:
+    def _preflight_outside_path(self, args: dict, read_only: bool = False) -> Path | str | None:
         """单路径工具（path 参数）的越界预检入口。"""
         raw = args.get("path")
-        return self._preflight_path(raw) if raw else None
+        return self._preflight_path(raw, read_only=read_only) if raw else None

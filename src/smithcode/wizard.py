@@ -50,6 +50,14 @@ budget = {budget}  # 上下文预算（token），建议不超过模型窗口大
 # write_file = {{ "*" = "ask" }}
 # run_command = {{ "*" = "ask", "git status" = "allow", "rm -rf*" = "deny" }}
 
+[skills]
+# 技能（Agent Skills）：项目 .agents/skills/<名称>/SKILL.md 与用户 ~/.smithcode/skills/<名称>/SKILL.md
+# enabled = true            # 总开关
+# project = "ask"           # 项目技能信任策略：ask（首次确认）/ on / off
+# paths = []                # 额外技能目录（最高优先级）
+# disabled = ["internal-*"] # 按名称通配禁用（整条隐藏）
+# max_catalog_chars = 8000  # 技能目录注入系统提示词的字符预算
+
 # 工具调用的终端展示粒度：summary（默认）/ detail
 # tool_display = "summary"
 """

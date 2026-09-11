@@ -10,6 +10,10 @@ DESCRIBERS: dict = {}
 PREVIEWS: dict = {}  # (args)->str|None：ask 确认前生成的变更预览（如 unified diff）
 DISPLAY: dict = {}  # 终端展示形态：inline（一行式）/ block（可折叠结果块）
 SERIAL: dict = {}  # 是否禁止并行：True 的工具批量执行时在主线程串行运行
+HIDDEN: set = set()  # 不发送给 LLM 的工具（保留注册，如无可用技能时的 use_skill）
+
+# 只读文件类工具：目标落在技能目录只读白名单内时免越界确认（agent._preflight_path）
+READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep"})
 
 
 def register(schema: dict):
@@ -48,3 +52,16 @@ def register(schema: dict):
         return func
 
     return decorator
+
+
+def set_hidden(name: str, hidden: bool = True) -> None:
+    """隐藏/恢复一个已注册工具（不发送给 LLM，注册与执行能力保留）。"""
+    if hidden:
+        HIDDEN.add(name)
+    else:
+        HIDDEN.discard(name)
+
+
+def visible_schemas() -> list:
+    """发给 LLM 的工具 schema（过滤掉被隐藏的工具）。"""
+    return [s for s in SCHEMAS if s["name"] not in HIDDEN]

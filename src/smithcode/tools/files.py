@@ -27,10 +27,15 @@ def _remember(path: Path) -> None:
     READ_FILES.add(str(path))
 
 
-def _resolve(path: str) -> Path:
-    # 相对路径锚定主工作区；解析结果（含绝对路径、.. 逃逸后）落在任一授权目录内即放行
+def _resolve(path: str, write: bool = False) -> Path:
+    """解析工具路径并做沙箱校验。
+
+    读工具用读根（授权目录 + 技能目录只读白名单）；写工具必须显式
+    write=True，只认授权目录——技能目录不可被静默改写。
+    """
     p = (Path(config.WORKSPACE_ROOT) / path).resolve()
-    for root in config.allowed_roots():
+    roots = config.allowed_roots() if write else config.read_roots()
+    for root in roots:
         if p.is_relative_to(root):
             return p
     raise PermissionError(f"路径越界: {path}")
@@ -202,7 +207,7 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
     }
 )
 def write_file(path: str, content: str) -> str:
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     if p.exists() and str(p) not in READ_FILES:
         return (
             f"错误: {path} 已存在且本会话未读取过，先 read_file 查看现有内容后再覆盖"
@@ -241,7 +246,7 @@ def write_file(path: str, content: str) -> str:
 )
 def edit_file(path: str, old_string: str, new_string: str,
               replace_all: bool = False) -> str:
-    p = _resolve(path)
+    p = _resolve(path, write=True)
     if not p.exists():
         return f"错误: 文件不存在: {path}"
     if str(p) not in READ_FILES:

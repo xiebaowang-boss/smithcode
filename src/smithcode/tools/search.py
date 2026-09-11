@@ -26,12 +26,13 @@ OUTPUT_MODES = ("content", "files_with_matches", "count")
 
 
 def _roots(path: str) -> tuple:
-    """解析搜索起始路径，返回 (命中的授权根, 起始路径)。越界直接拒绝。
+    """解析搜索起始路径，返回 (命中的根, 起始路径)。越界直接拒绝。
 
-    相对路径锚定主工作区；结果落在任一授权目录内即放行，展示路径相对该根。
+    相对路径锚定主工作区；结果落在任一读根（授权目录 + 技能目录只读白名单）
+    内即放行，展示路径相对该根。
     """
     base = (Path(config.WORKSPACE_ROOT) / path).resolve()
-    for root in config.allowed_roots():
+    for root in config.read_roots():
         if base.is_relative_to(root):
             return root, base
     raise PermissionError(f"路径越界: {path}")

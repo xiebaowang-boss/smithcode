@@ -38,6 +38,16 @@ def restore_renderer():
     renderer_module.set_renderer(backup)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_goal():
+    """持久目标是全局单例，逐用例清空防止跨测试污染。"""
+    from smithcode import goal
+
+    goal.reset()
+    yield
+    goal.reset()
+
+
 def no_prompting(monkeypatch):
     """headless 环境里 stdin 非 TTY，权限确认会 fail-closed，正好不用真弹窗。"""
     monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
@@ -664,6 +674,109 @@ def test_tui_status_bar(monkeypatch):
             assert "█" in status or "░" in status  # 进度条字符（0% 或 100% 时可能只有一种）
 
     _run(_run_case())
+
+
+def test_tui_goal_indicator(monkeypatch):
+    """持久目标在底栏展示指示、在侧边栏计划区上方展示卡片；无目标均隐藏。"""
+    no_prompting(monkeypatch)
+    from smithcode import goal as goal_mod
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            indicator = app.query_one("#composer-goal")
+            section = app.query_one("#sidebar-goal-section")
+            assert indicator.display is False  # 无目标隐藏
+            assert section.display is False
+
+            goal_mod.set("迁移模块", max_turns=5)
+            app.ui_status()
+            await pilot.pause()
+            assert indicator.display is True
+            assert str(indicator.content) == "◎ 目标 0/5"
+            # 侧边栏目标卡片：位于计划区上方，标题带进度、正文含目标与明细
+            assert section.display is True
+            top = app.query_one("#sidebar-top")
+            plan_section = app.query_one("#sidebar-plan-section")
+            assert top.children.index(section) < top.children.index(plan_section)
+            assert str(section.query_one(".section-title").content) == "目标 · 0/5"
+            body = str(app.query_one(".goal-body").content)
+            assert "迁移模块" in body and "进行中" in body
+
+            goal_mod.pause("用户暂停")
+            app.ui_status()
+            await pilot.pause()
+            assert "已暂停" in str(indicator.content)
+            assert str(section.query_one(".section-title").content) == "目标 · 已暂停"
+
+            goal_mod.clear()
+            app.ui_status()
+            await pilot.pause()
+            assert indicator.display is False
+            assert section.display is False
+
+    _run(_run_case())
+
+
+def test_tui_goal_command_starts_task(monkeypatch):
+    """/goal 设定目标后向宿主返回 start_task，宿主立即开跑并刷新指示。"""
+    no_prompting(monkeypatch)
+    from smithcode import goal as goal_mod
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        started: list = []
+        app.start_task = lambda text: started.append(text)  # 捕获宿主动作，不起真实线程
+        async with app.run_test() as pilot:
+            app.handle_command("/goal 修复所有 lint 问题")
+            await pilot.pause()
+
+            assert goal_mod.is_active()
+            assert started and "修复所有 lint 问题" in started[0]
+            assert "已设定目标" in _chat_text(app)
+            assert "目标" in str(app.query_one("#composer-goal").content)
+
+    _run(_run_case())
+
+
+def test_tui_skill_command_echoes_task_silently(monkeypatch, tmp_path):
+    """技能手动激活保持静默；带任务时任务原文回显为用户消息后开跑。"""
+    no_prompting(monkeypatch)
+    from smithcode import skills
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (home / "config.toml").write_text('[skills]\nproject = "on"\n', encoding="utf-8")
+    skill_dir = workspace / ".agents" / "skills" / "proj"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: 测试技能\n---\n正文\n", encoding="utf-8"
+    )
+    skills.clear()
+    try:
+        skills.refresh()
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            started: list = []
+            app.start_task = lambda text: started.append(text)  # 捕获宿主动作，不起真实线程
+            async with app.run_test() as pilot:
+                app.handle_command("/skill proj 帮我处理报告")
+                await pilot.pause()
+
+                chat = _chat_text(app)
+                assert "/skill proj 帮我处理报告" in chat  # 完整输入原文回显（含技能指令）
+                assert "已加载技能" not in chat  # 激活不打印提示
+                assert started == ["帮我处理报告"]
+                assert skills.active_names() == ["proj"]
+
+        _run(_run_case())
+    finally:
+        skills.clear()
 
 
 def test_tui_cycle_permission_mode(monkeypatch):

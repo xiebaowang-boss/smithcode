@@ -501,6 +501,7 @@ class Sidebar(Vertical):
     DEFAULT_CSS = """
     Sidebar .section-title { color: #808080; text-style: bold; }
     Sidebar #sidebar-top { height: 1fr; }
+    Sidebar #sidebar-goal-section { height: auto; display: none; margin-bottom: 1; }
     Sidebar #sidebar-plan-section { height: 1fr; display: none; }
     Sidebar #sidebar-plan { height: 1fr; scrollbar-gutter: stable; }
     Sidebar .sidebar-version { color: #808080; height: 1; }
@@ -523,6 +524,8 @@ class Sidebar(Vertical):
         self._usage = Static("", classes="usage-body")
         self._context_title = Static("Context", classes="section-title")
         self._context_body = Static("", classes="context-body")
+        self._goal_title = Static("目标", classes="section-title")
+        self._goal = Static("", classes="goal-body")
         self._plan = Static("（暂无任务计划）", classes="plan-body")
 
     def compose(self):
@@ -536,6 +539,10 @@ class Sidebar(Vertical):
             with Vertical(classes="side-card context-card"):
                 yield self._context_title
                 yield self._context_body
+            # 目标区：持久目标（/goal）存在时展示，位于计划区上方；无目标整块隐藏
+            with Vertical(id="sidebar-goal-section"):
+                yield self._goal_title
+                yield self._goal
             # 任务区：仅在有未完结步骤（pending / in_progress）时展示，opencode 式——
             # 无任务或全部完成 / 取消时整块隐藏（CSS 默认 display:none，update_plan 切换）
             with Vertical(id="sidebar-plan-section"):
@@ -565,6 +572,17 @@ class Sidebar(Vertical):
         section.display = has_active
         if has_active:
             self._plan.update(Text.from_ansi(rendered))
+
+    def update_goal(self, snapshot) -> None:
+        """更新目标区：snapshot 为 (标题 Text, 正文) 或 None（无目标则整块隐藏）。"""
+        section = self.query_one("#sidebar-goal-section")
+        if snapshot is None:
+            section.display = False
+            return
+        title, body = snapshot
+        self._goal_title.update(title)
+        self._goal.update(body)
+        section.display = True
 
 
 # ---------- 输入区 ----------

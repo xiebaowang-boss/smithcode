@@ -53,7 +53,7 @@ def build_parser():
 def _run_agent_task(agent: Agent, text: str) -> None:
     """后台线程执行一次任务：结果/错误在流式过程中实时打印。"""
     try:
-        agent.run(text)
+        agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
 
@@ -104,6 +104,13 @@ def repl(agent: Agent):
                 print(outcome.text)
             if outcome.select is not None:
                 _print_select(outcome.select)
+            if outcome.start_task is not None:
+                # /goal 设定/恢复后立即开跑，走与普通任务相同的后台线程 + 取消通道
+                task = threading.Thread(
+                    target=_run_agent_task, args=(agent, outcome.start_task), daemon=True
+                )
+                task.start()
+                _wait_for_task(agent, task)
             continue
 
         # 任务放后台线程跑，主线程留作取消通道：Ctrl+C 时经 agent.interrupt()
@@ -124,7 +131,7 @@ def _print_select(select):
 
 def run_once(agent: Agent, task: str):
     try:
-        agent.run(task)  # 回复已在流式过程中实时打印
+        agent.run_with_goal(task)  # 回复已在流式过程中实时打印
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         sys.exit(1)

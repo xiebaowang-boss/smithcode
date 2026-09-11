@@ -40,6 +40,7 @@ GREETS = [
 
 TIPS = [
     "输入 /help 查看全部命令",
+    "输入 /goal <目标> 设定持久目标，Agent 会自动推进直到完成",
     "Shift+Tab 循环切换权限模式（Smith → Accept Edits → Auto）",
     "输入 / 唤出命令菜单，↑↓ 选择后回车执行",
     "Ctrl+O 切换计划侧边栏显示",

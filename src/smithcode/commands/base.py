@@ -45,6 +45,8 @@ class CommandResult:
     session_reset: bool = False   # 会话已重置（TUI 需清空计划侧栏）
     refresh_status: bool = False  # 会话状态可能变化（TUI 需刷新状态栏）
     select: CommandSelect | None = None  # 非空时宿主弹出选择器
+    start_task: str | None = None  # 非空时宿主立即以此文本发起一次任务（如 /goal 开跑）
+    echo_input: bool = False      # 与 start_task 搭配：宿主先把用户输入原文回显为消息
 
 
 @dataclass
@@ -113,15 +115,45 @@ def all_commands() -> list:
 
 
 def complete_commands(prefix: str) -> list:
-    """按前缀过滤命令，供输入补全菜单用（REPL 与 TUI 共用同一份数据）。
+    """按前缀过滤命令与技能，供输入补全菜单用（REPL 与 TUI 共用同一份数据）。
 
     prefix 为 "/" 后已敲出的字符（可为空串 = 全部命令）；别名不进菜单。
+    排序：功能命令按名称在前，技能条目按名称在后；同名技能不重复出现
+    （仍可用 /skill 加载）；技能未装载时不并入（补全路径不做磁盘扫描/信任确认）。
     """
-    return [cmd for cmd in all_commands() if cmd.name.startswith(prefix)]
+    registered = [cmd for cmd in all_commands() if cmd.name.startswith(prefix)]
+    taken = {cmd.name for cmd in registered}
+    skills = sorted(_skill_commands(prefix, taken), key=lambda cmd: cmd.name)
+    return registered + skills
+
+
+def _skill_commands(prefix: str, taken: set) -> list:
+    """技能补全条目：选中后填入 `/技能名 `（immediate=False），可继续补任务。"""
+    from .. import skills  # 延迟导入：commands -> utils.terminal -> commands 存在导入环
+
+    if not skills.is_loaded():
+        return []
+    out = []
+    for skill in skills.all_skills():
+        if skill.disabled or skill.name in taken or not skill.name.startswith(prefix):
+            continue
+        out.append(
+            Command(
+                name=skill.name,
+                description=f"技能 · {skill.description}",
+                handler=None,
+                usage=f"/{skill.name} [任务]",
+                accepts_args=True,
+            )
+        )
+    return out
 
 
 # /help 尾部的输入操作提示（REPL 与 TUI 通用）
-HELP_FOOTER = "输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"
+HELP_FOOTER = (
+    "技能: /skills 打开选择框，/<技能名> [任务] 直达，/skill <名称> [任务] 直接加载。\n"
+    "输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"
+)
 
 
 def help_text() -> str:

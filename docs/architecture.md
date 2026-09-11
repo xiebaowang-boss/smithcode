@@ -31,7 +31,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 打印给用户，结束
 ```
 
-1. `cli.py` 接收用户输入，交给 `Agent.run()`。
+1. `cli.py` 接收用户输入，交给 `Agent.run_with_goal()`（无目标时即 `Agent.run()`；/goal 的续跑裁决见后文）。
 2. `Agent` 把消息列表（含系统提示词）发给 LLM。
 3. 模型要么返回纯文本（任务完成，循环结束），要么返回工具调用。
 4. 工具调用先经 `Permission` 确认（读文件/列目录免确认），再由 `tools/` 执行；同一批调用**两阶段执行**——预检（解析参数、渲染摘要、路径预检、权限确认）全部在主线程按接收顺序串行完成，之后可并行的只读调用进线程池并发执行（`MAX_TOOL_CONCURRENCY` 上限），声明 `serial` 的有状态工具（shell / 写文件 / 交互确认）在主线程串行、作为顺序屏障；结果一律按提交顺序回传。
@@ -75,6 +75,60 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 - **只读**：`todo_read` 随时拉取当前清单权威快照（含 id），支持 `status` 过滤与 `summary_only` 摘要；`todo_write` 与 `todo_read` 均默认 `allow`，可用 `deny` 规则禁用。
 - **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、更新时用 `todo_read` 取 id 并保留、标题不可变、计划不合理时调整而非无视、单步简单任务不拆分。
 
+## 持久目标（/goal）
+
+借鉴 Codex CLI 的 /goal（Ralph loop 的产品化）：用户用 `/goal <目标>` 声明一个跨回合存活的使命，Agent 在每轮任务结束后自动接续推进，直到模型逐条核验真实证据后声明完成、用户暂停/清除，或回合预算用尽。续跑仍复用同一个 Agentic Loop——不是新的循环，而是"回合结束后是否再开一轮"的裁决与提示词注入：
+
+```
+/goal <目标> ──► goal.py（会话单例：状态机 + 提示词）
+                   │  CommandResult.start_task
+                   ▼
+宿主 ──► Agent.run_with_goal()          ← REPL / TUI / 一次性任务共用
+           │  run(text) → RunResult(tools_used…)
+           │  goal active 且正常结束且用过工具？
+           │    ├─ 是 → run(continuation_prompt()) ──► 循环
+           │    ├─ 续跑零工具调用 → pause（防空转）
+           │    ├─ interrupted → 保留 active、停止循环
+           │    ├─ denied / max_iterations → pause
+           │    └─ 回合达预算 → budget_limited + wrapup_prompt 收尾轮
+           └─ 否 → 返回
+```
+
+- **状态归属**：`goal.py` 进程内单例（会话口径，`/new` 时 `reset()`）；字段含目标、状态（`active / paused / complete / blocked / budget_limited`）、回合数/预算、token 差值、证据。`goal_update` / `goal_read` 是模型侧入口（默认 `allow`，可 deny）；`/goal` 命令是用户侧入口（设定并立即开跑、查看、pause/resume/clear/budget）。
+- **完成审计**：目标不自动宣告成功。续跑提示词要求模型"重述目标 → 逐条建立要求→证据清单 → 检查真实证据 → 代理信号只在覆盖全部要求时才算数 → 不确定即未完成"，只有证据完备才调用 `goal_update(status="complete", summary=...)`；测试通过、清单全勾、工作量本身都不足以标记完成。系统提示词的「持久目标」规则节与提示词文案两处同步维护。
+- **阻碍审计**：`blocked` 需同一阻碍连续出现 3 个回合（中途有推进动作即重置连击）；工作困难/耗时/不完整不算受阻，防止模型用"受阻"逃避目标。
+- **预算刹车**：`[limits].goal_max_turns`（默认 50，`/goal budget N` 可改）限制自动推进回合数；用尽后标记 `budget_limited` 并注入收尾提示词（总结进展/剩余/下一步，不得新开实质工作）后停止。中断保留目标（用户主动叫停）；权限被拒/迭代上限暂停目标（继续只会重复失败）。
+- **双通道注入**：`session.sync_system()` 把 `goal.render_section()` 追加进系统提示词 `messages[0]`——只含稳定信息（状态/目标/证据），普通回合逐字节不变以保护提示缓存，压缩时 `messages[0]` 保留所以目标不丢；回合数/token 等易变信息放在每轮的续跑提示词（user 消息）里。
+- **展示**：TUI 底栏常显 `◎ 目标 3/50`（暂停/完成/受阻换图标），侧边栏在计划区上方展示目标卡片（标题带进度/状态、目标文本、token/用时、证据），续跑、暂停、预算收尾经渲染层输出；`/goal` 查看完整状态（回合、用时、token、证据）。
+
+## 技能（Skills）
+
+借鉴 opencode / Claude Code 的 Agent Skills：技能是磁盘上的文件夹（`SKILL.md` 元数据 + 指令正文，可选 `scripts/`、`references/` 等资源），启动时只把 name + description 装进系统提示词，命中任务后再加载完整指令——渐进式披露让挂很多技能时上下文仍近乎恒定：
+
+```
+技能根目录（项目 .agents/skills / 用户 ~/.smithcode/skills / [skills].paths）
+   │  启动
+   ▼
+skills.refresh() ──► frontmatter 宽容解析 ──► 优先级去重（附加 > 项目 > 用户）
+   │                        │
+   │                        └─ 项目级信任门控（ask/on/off + skills_trust.json）
+   ▼
+Session.sync_system() ──► messages[0]「可用技能」目录（name + 描述，字符预算降级）
+   │
+   ▼
+模型 ──► use_skill(name) ──► 激活集合 ──► 下一轮 messages[0]「已激活技能」正文 + 资源清单
+   │
+   ▼
+第 3 层：引用文件用 read_file（技能目录只读免确认），脚本用 run_command（照常权限）
+```
+
+- **扫描与优先级**：项目级只扫 `<工作区>/.agents/skills/`，用户级只扫 `~/.smithcode/skills/`，外加 `[skills].paths`；同名"先命中者生效"（附加 > 项目 > 用户），被遮蔽/跳过者进 `/skills` 诊断；单根限深度 4、2000 目录。
+- **信任门控**：项目级技能随仓库分发、可能不可信，默认 `[skills].project="ask"` 交互确认（`[a]` 落盘 `~/.smithcode/skills_trust.json`、`[y]` 仅本会话、`[n]` 跳过）；非交互模式 fail-closed 跳过。
+- **披露与激活**：目录段与已激活正文都注入 `messages[0]`（同 goal 段机制，压缩天然保留、普通回合逐字节稳定）；`use_skill` 工具（`serial`、enum 约束技能名、默认 `allow`）只标记激活，正文由下一轮 `sync_system()` 注入；无可用技能时工具与目录一起隐藏。
+- **用户侧**：`/skills` 无参数直接弹出技能选择框（TUI 选择弹窗，选中即加载），`/skills list` 查看来源分组/状态/诊断、`/skills refresh` 重扫磁盘（新装技能无需重启）；`/skill <名称> [任务]` 直接加载（激活成功保持静默、不打印提示），带任务时用户输入原文（含技能指令）整体回显为消息后开跑；技能名并入 `/` 输入补全（功能命令在前、技能按名称在后，同名技能不重复），`/技能名 [任务]` 直达与 `/skill` 等价；`disable-model-invocation: true` 的技能只允许手动加载。
+- **安全边界**：技能根目录登记为**只读白名单**（`config.read_roots()`），读引用文件免越界确认、不弹权限框；写操作只认授权目录（`_resolve(write=True)`）；frontmatter 的 `allowed-tools` 不产生任何授权效果。
+- **会话与压缩**：`/new` 时 `skills.reset()` 清空激活集合（发现结果保留）；正文在 `messages[0]` 所以压缩不丢；`/context` 的 system 桶如实计量技能成本。
+
 ## 会话与 /new
 
 `/new` 命令开启新会话：所有会话口径状态的重置集中在 `Agent.new_session()`（`agent.py`），命令层只负责反馈与标记，不感知重置细节。覆盖项：
@@ -85,6 +139,8 @@ todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pendi
 - `context.new_session()`：压缩计数清零、上一会话的真实 token 锚点作废（旧锚点对新会话的估算对比无意义）
 - `reset_read_tracking()`：清空工具侧「已读文件」记录（新会话中未读过的文件重新受 write/edit 前置校验约束）
 - `plan.reset()`：清空步骤清单
+- `goal.reset()`：清空持久目标（`/new` 即 `/clear` 语义，目标不跨会话保留）
+- `skills.reset()`：清空技能激活集合（技能目录与项目信任决定保留，省一次磁盘扫描）
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
@@ -96,12 +152,14 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
 | `commands/` | 斜杠命令框架：注册表（`@register` 装饰器）+ 统一 `dispatch()`，REPL 与 TUI 共用；命令元数据（`accepts_args` / `immediate` / `aliases`）驱动两端行为；`/help` 文案由注册表自动生成，新命令一个文件零改动接入 |
-| `agent.py` | Agent 循环编排；`new_session()` 集中承担 `/new` 的全部会话级重置（消息历史、会话用量、权限会话规则、信任目录、上下文快照、已读记录、步骤清单） |
+| `agent.py` | Agent 循环编排；`run_with_goal()` 是 `/goal` 唯一的续跑驱动器（无目标等价 `run()`）；`new_session()` 集中承担 `/new` 的全部会话级重置（消息历史、会话用量、权限会话规则、信任目录、上下文快照、已读记录、步骤清单、持久目标） |
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
 | `session.py` | 消息历史的增删存取与系统提示词装配 |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
+| `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
+| `skills/` | 技能子系统（`skills-architecture.md` 的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级激活集合、`render.py` 目录段与已激活段渲染（字符预算降级）；`/new` 时重置激活集合 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
@@ -112,6 +170,8 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `tools/patch.py` | apply_patch 批量原子改文件 |
 | `tools/ask.py` | ask_user 任务中途向用户提问 |
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
+| `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
+| `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
 | `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
 
 ## 安全边界
@@ -119,6 +179,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，用 `Path.is_relative_to` 确认解析后的真实路径位于工作区内（目录名共享前缀的兄弟路径不会被误判为放行）。
 - **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `~/.smithcode/config.toml` 用户规则 < 会话内"总是允许"（命令记 argv 前缀，其余工具按模式串）。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
 - **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
+- **技能目录只读**：`skills.refresh()` 把技能根目录写入只读白名单（`config.read_roots()`），读工具（read_file / list_dir / glob / grep）访问技能引用文件免越界确认；写工具与 `apply_patch` 仍只认授权目录（`_resolve(write=True)`），技能文件不可被静默改写。
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框保持纯净；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。`.env` 等禁读文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。

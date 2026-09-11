@@ -235,3 +235,25 @@ def test_preview_edit_replace_all(workspace):
 def test_preview_edit_not_found_none(workspace):
     files.write_file("e.txt", "abc")
     assert files._preview_edit({"path": "e.txt", "old_string": "zzz", "new_string": "q"}) is None
+
+
+# ---------- 技能目录只读白名单 ----------
+
+def test_skill_read_root_readable_but_not_writable(workspace, tmp_path, monkeypatch):
+    """技能目录在授权目录之外时：读放行（免越界确认），写仍被沙箱拒绝。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(ws))
+    skills_root = tmp_path / "ext-skills"
+    skill_dir = skills_root / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "reference.md").write_text("参考资料", encoding="utf-8")
+    config.set_skill_roots([skills_root])
+    try:
+        assert "参考资料" in files.read_file(str(skill_dir / "reference.md"))
+        with pytest.raises(PermissionError):
+            files.write_file(str(skill_dir / "new.md"), "x")
+        with pytest.raises(PermissionError):
+            files.edit_file(str(skill_dir / "reference.md"), "参考", "x")
+    finally:
+        config.set_skill_roots([])

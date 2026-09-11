@@ -49,6 +49,9 @@ DEFAULT_RULES = [
     ("ask_user", "*", ALLOW),  # 提问本身不再弹确认（确认一个"提问"是荒谬的）；可用 deny 禁止
     ("todo_write", "*", ALLOW),  # 更新任务清单本身不弹确认（确认一个"追踪步骤"是荒谬的）；可用 deny 禁止
     ("todo_read", "*", ALLOW),  # 只读任务清单，无副作用；同 todo_write 默认放行
+    ("goal_update", "*", ALLOW),  # 更新持久目标状态本身不弹确认（确认一个"目标声明"是荒谬的）；可用 deny 禁止
+    ("goal_read", "*", ALLOW),  # 只读持久目标快照，无副作用；同 goal_update 默认放行
+    ("use_skill", "*", ALLOW),  # 加载技能指令本身不弹确认（项目级信任门控已在发现阶段完成）；可按技能名 deny
 ]
 
 ACTIONS = (ALLOW, ASK, DENY)

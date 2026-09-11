@@ -204,7 +204,9 @@ def test_run_compacts_when_over_threshold(monkeypatch, capsys):
 
     msgs = agent.session.messages
     assert agent.context.compact_count == 1
-    assert msgs[0] == {"role": "system", "content": "SYS"}
+    # run() 发请求前同步系统提示词（含当前持久目标段），压缩保留 messages[0]
+    assert msgs[0]["role"] == "system"
+    assert "Smith Code" in msgs[0]["content"]
     assert msgs[1]["content"].startswith("<context-summary>")
     assert "## 目标" in msgs[1]["content"]
     # 尾部只剩本轮（user + 最终回复），旧的千 token 工具结果已不在上下文里

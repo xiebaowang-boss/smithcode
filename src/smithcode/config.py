@@ -14,6 +14,7 @@ import sys
 import threading
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -48,6 +49,11 @@ def credentials_path() -> Path:
 def models_cache_path() -> Path:
     """远端 `/models` 拉取结果的磁盘缓存路径（按接口地址校验，见 models.ModelCache）。"""
     return smithcode_home() / "models.json"
+
+
+def skills_trust_path() -> Path:
+    """项目级技能信任库：记录用户"始终信任"的项目（技能子系统专用，非 config.toml）。"""
+    return smithcode_home() / "skills_trust.json"
 
 
 WORKSPACE_ROOT = os.getcwd()
@@ -221,6 +227,10 @@ COMPACT_KEEP_TOKENS = _resolve_number("context", "compact_keep_tokens", 15000)  
 MAX_RETRIES = _resolve_number("limits", "max_retries", 3)  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
 LLM_TIMEOUT = _resolve_number("limits", "llm_timeout", 120)  # 单次 LLM 请求超时（秒）
 
+# /goal 持久目标的默认回合预算：目标存续期间最多自动推进的回合数，
+# 用尽后系统注入收尾提示词并停止（/goal budget N 可改当前目标）
+GOAL_MAX_TURNS = _resolve_number("limits", "goal_max_turns", 50)
+
 # 一轮内多个工具调用的并发执行上限（线程池 max_workers）。
 # 模型一次返回的多个调用中，可并行的部分最多同时跑这么多，其余排队；
 # 权限需确认/被拒的调用不走并发池，决策与展示均在主线程完成。
@@ -274,6 +284,25 @@ def widen_roots(roots):
             del _WIDENED_ROOTS[-len(added):]
 
 
+# 技能目录只读白名单：由 skills 子系统发现后写入。读工具放行（免越界确认），
+# 写工具（files._resolve(write=True)）不认——技能文件不可被静默改写。
+SKILL_READ_ROOTS: list = []
+
+
+def set_skill_roots(paths) -> None:
+    """替换技能只读白名单（skills.refresh 时全量重建）。"""
+    SKILL_READ_ROOTS[:] = [str(Path(p).resolve()) for p in paths]
+
+
+def skill_roots() -> list[Path]:
+    return [Path(p) for p in SKILL_READ_ROOTS]
+
+
+def read_roots() -> list[Path]:
+    """读工具的可用根：授权目录 + 技能只读白名单。"""
+    return allowed_roots() + skill_roots()
+
+
 def load_permissions():
     """读取 config.toml 的 [permissions] 段，返回 [(工具, 模式, 动作)]。
 
@@ -311,3 +340,66 @@ def load_tool_display():
         f"（可选 {' / '.join(TOOL_DISPLAYS)}），已用默认值 {DEFAULT_TOOL_DISPLAY}"
     )
     return DEFAULT_TOOL_DISPLAY
+
+
+# ---------- 技能（Skills） ----------
+
+SKILLS_PROJECT_MODES = ("ask", "on", "off")
+
+
+@dataclass(frozen=True)
+class SkillsConfig:
+    """[skills] 段的解析结果；非法项警告后回退默认值。"""
+
+    enabled: bool = True
+    paths: tuple = ()
+    project: str = "ask"
+    max_catalog_chars: int = 8000
+    disabled: tuple = ()
+
+
+def _str_list(value, label: str) -> tuple:
+    """字符串列表配置项：缺失返回 ()；类型不对警告后忽略。"""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        print(f"[警告] config.toml 的 {label} 应为字符串列表，已忽略")
+        return ()
+    return tuple(value)
+
+
+def load_skills_config() -> SkillsConfig:
+    """读取 [skills] 段：enabled / paths / project / max_catalog_chars / disabled。"""
+    data = _read_config_file().get("skills") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [skills] 段不是表，已忽略")
+        return SkillsConfig()
+
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        print(f"[警告] config.toml 的 skills.enabled = {enabled!r} 不是布尔值，已用默认值 True")
+        enabled = True
+
+    project = data.get("project", "ask")
+    if project not in SKILLS_PROJECT_MODES:
+        print(
+            f"[警告] config.toml 的 skills.project = {project!r} 无效"
+            f"（可选 {' / '.join(SKILLS_PROJECT_MODES)}），已用默认值 ask"
+        )
+        project = "ask"
+
+    budget = data.get("max_catalog_chars", 8000)
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        print(
+            f"[警告] config.toml 的 skills.max_catalog_chars = {budget!r} 无效"
+            "（应为正整数），已用默认值 8000"
+        )
+        budget = 8000
+
+    return SkillsConfig(
+        enabled=enabled,
+        paths=_str_list(data.get("paths"), "skills.paths"),
+        project=project,
+        max_catalog_chars=budget,
+        disabled=_str_list(data.get("disabled"), "skills.disabled"),
+    )

@@ -562,3 +562,60 @@ def test_session_reusable_after_interrupt(monkeypatch):
     result = agent.run("继续")
     assert result.status == "ok"
     assert result.text == "最终回复"
+
+
+def test_run_with_skill_injects_catalog_and_active_body(monkeypatch, tmp_path):
+    """端到端：目录进首轮系统提示词；use_skill 激活后，下一轮请求携带技能正文。"""
+    from smithcode import skills
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (home / "config.toml").write_text('[skills]\nproject = "on"\n', encoding="utf-8")
+    skill_dir = workspace / ".agents" / "skills" / "proj"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: 测试技能\n---\nBODY-MARKER\n", encoding="utf-8"
+    )
+
+    class SkillLLM:
+        def __init__(self):
+            self.requests = []
+            self.tools = []
+
+        def chat_stream(self, messages, tools=None):
+            self.requests.append([dict(m) for m in messages])
+            self.tools.append(tools)
+            if len(self.requests) == 1:
+                yield (
+                    "message",
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            _fake_tool_call("use_skill", json.dumps({"name": "proj"}))
+                        ],
+                    },
+                )
+            else:
+                yield ("message", {"role": "assistant", "content": "完成"})
+
+    skills.clear()
+    try:
+        monkeypatch.setattr("smithcode.agent.LLMClient", SkillLLM)
+        agent = Agent(session=Session())
+        agent.refresh_skills()
+
+        result = agent.run("用技能处理")
+
+        assert result.status == "ok"
+        assert "## 可用技能" in agent.llm.requests[0][0]["content"]
+        assert any(s["name"] == "use_skill" for s in agent.llm.tools[0])
+        second_prompt = agent.llm.requests[1][0]["content"]
+        assert "## 已激活技能" in second_prompt
+        assert "BODY-MARKER" in second_prompt
+    finally:
+        skills.clear()
