@@ -10,6 +10,10 @@ from .search import SKIP_DIRS
 MAX_READ_LINES = 2000  # read_file 单次最多返回的行数（可用 limit 调整）
 MAX_READ_LINE_LEN = 2000  # 单行展示的最大长度（超长行截断，避免撑爆上下文）
 
+# 行号与正文之间的分隔符：用一个醒目的非空白字符，而不是两个空格——否则
+# 分隔符会被误当成正文的缩进，old_string 一复制就多出前导空格、必然匹配失败。
+LINE_GUTTER = "│"
+
 # 本会话已读过/写过的文件（绝对路径）：write_file 覆盖与 edit_file 编辑前的强制校验依据
 READ_FILES: set[str] = set()
 
@@ -121,9 +125,10 @@ def _preview_edit(args: dict) -> str | None:
         "name": "read_file",
         "pattern_arg": "path",
         "describe": lambda args: f"read {args.get('path', '?')}",
-        "description": "读取工作区内一个文本文件，返回带行号的内容（形如「行号  代码」）。"
+        "description": "读取工作区内一个文本文件，返回带行号的内容（形如「行号│代码」，"
+        "`│` 是行号与正文的分隔符、不属于文件内容）。"
         "大文件用 offset/limit 分段读取；二进制文件会被拒绝。"
-        "行号前缀仅供定位，edit_file 的 old_string 不要把它复制进去。",
+        "行号与 `│` 前缀仅供定位，edit_file 的 old_string 不要把它复制进去。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -167,7 +172,7 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
 
     width = len(str(start + len(selected) - 1))
     out = [
-        f"{start + i:>{width}}  {line[:MAX_READ_LINE_LEN]}"
+        f"{start + i:>{width}}{LINE_GUTTER}{line[:MAX_READ_LINE_LEN]}"
         for i, line in enumerate(selected)
     ]
     result = "\n".join(out)
@@ -217,7 +222,7 @@ def write_file(path: str, content: str) -> str:
         "describe": lambda args: f"edit {args.get('path', '?')}",
         "preview": _preview_edit,
         "description": "精确替换文件中的一段文本。old_string 必须与文件内容逐字符完全一致"
-        "（从 read_file 输出复制，不含行号前缀），且本会话须先 read_file 过该文件。"
+        "（从 read_file 输出复制，不含「行号│」前缀），且本会话须先 read_file 过该文件。"
         "默认要求唯一匹配（多带几行上下文保证唯一），replace_all=true 时替换全部匹配。",
         "parameters": {
             "type": "object",
@@ -247,7 +252,7 @@ def edit_file(path: str, old_string: str, new_string: str,
     count = text.count(old_string)
     if count == 0:
         return ("错误: old_string 未找到，请先用 read_file 核对最新内容"
-                "（注意不要把行号前缀复制进去）")
+                "（注意不要把「行号│」前缀复制进去）")
     if count > 1 and not replace_all:
         linenos = _match_linenos(text, old_string)
         shown = "、".join(f"第 {n} 行" for n in linenos[:5])

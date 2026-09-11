@@ -64,10 +64,10 @@ class PermissionPanel(Vertical):
         self._footer: Static | None = None
 
     def compose(self):
-        yield Static(f"△ 需要授权：{self._title}", classes="perm-title")
+        yield Static(f"△ 需要授权：{self._title}", classes="perm-title", markup=False)
         self._body = Static(self._render_options())
         yield self._body
-        self._footer = Static(self._hints(), classes="ask-hint")
+        self._footer = Static(self._hints(), classes="ask-hint", markup=False)
         yield self._footer
 
     def on_mount(self) -> None:
@@ -174,14 +174,14 @@ class QuestionPanel(Vertical):
         return len(self._options)  # 最后一项固定为自定义输入
 
     def compose(self):
-        yield Static(f"[提问] {self._question}", classes="ask-title")
+        yield Static(f"[提问] {self._question}", classes="ask-title", markup=False)
         self._input = Input(placeholder="输入回答（Enter 提交，Esc 取消）")
         if self._options:
             self._body = Static(self._render_options())
             yield self._body
             self._input.display = False
         yield self._input
-        self._footer = Static(self._hints(), classes="ask-hint")
+        self._footer = Static(self._hints(), classes="ask-hint", markup=False)
         yield self._footer
 
     def on_mount(self) -> None:
@@ -369,13 +369,13 @@ class SelectionPanel(Vertical):
         self._scroll: VerticalScroll | None = None
 
     def compose(self):
-        yield Static(self._title, classes="selection-title")
+        yield Static(self._title, classes="selection-title", markup=False)
         self._body = Static(self._render_items(), classes="selection-body")
         # 内容超出可视区时可滚动；滚动容器本身不抢焦点（按键归面板）
         self._scroll = VerticalScroll(self._body, classes="selection-scroll")
         self._scroll.can_focus = False
         yield self._scroll
-        yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint")
+        yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint", markup=False)
 
     def on_mount(self) -> None:
         self.focus()  # 不聚焦，按键会落进隐藏的输入框

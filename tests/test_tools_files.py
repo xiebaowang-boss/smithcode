@@ -21,16 +21,17 @@ def test_write_and_read_file(workspace):
 def test_read_file_returns_numbered_lines(workspace):
     files.write_file("n.txt", "a\nb\nc")
     out = files.read_file("n.txt")
-    assert "1  a" in out
-    assert "3  c" in out
+    assert "1│a" in out
+    assert "3│c" in out
+    assert "1  a" not in out  # 分隔符不是空格：避免被误当成正文缩进（old_string 复制陷阱）
     assert "(显示" not in out  # 全部内容一次读完，不加范围提示
 
 
 def test_read_file_offset_limit(workspace):
     files.write_file("m.txt", "\n".join(f"line{i}" for i in range(1, 101)))
     out = files.read_file("m.txt", offset=50, limit=10)
-    assert "50  line50" in out
-    assert "59  line59" in out
+    assert "50│line50" in out
+    assert "59│line59" in out
     assert "line60" not in out
     assert "共 100 行" in out
 

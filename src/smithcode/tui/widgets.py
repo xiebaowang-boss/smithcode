@@ -202,6 +202,7 @@ class RunningIndicator(Static):
     FRAMES: ClassVar = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     def __init__(self, *args, **kwargs):
+        kwargs.setdefault("markup", False)
         super().__init__(*args, **kwargs)
         self._frame = 0
         self._start: float | None = None
@@ -264,8 +265,8 @@ class ThinkingBlock(Vertical):
         self._body: Static | None = None
 
     def compose(self):
-        self._header = Static(self._running_text(), classes="think-header")
-        self._body = Static("", classes="think-body")
+        self._header = Static(self._running_text(), classes="think-header", markup=False)
+        self._body = Static("", classes="think-body", markup=False)
         self._body.display = False
         yield self._header
         yield self._body
@@ -376,8 +377,9 @@ class ToolCall(Vertical):
         self._body: Static | None = None
 
     def compose(self):
-        self._header = Static(self._header_text(), classes="tool-header")
-        body = Static(self._body_content(), classes="tool-body")
+        # 工具摘要是模型给的自由文本（URL 等），禁止 markup 解析，防止 "[" 被当标签
+        self._header = Static(self._header_text(), classes="tool-header", markup=False)
+        body = Static(self._body_content(), classes="tool-body", markup=False)
         # pending 且已带变更预览（diff）时直接展开：审核前改动内容就可见
         body.display = self._expanded or bool(self._pending and self._detail)
         self._body = body
