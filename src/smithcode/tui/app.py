@@ -1,7 +1,7 @@
 """Textual 聊天界面（复刻 Claude Code 风格）：应用组装层。
 
 - 上半：ChatView 消息区（流式回复、可折叠工具调用块）
-- 右上：计划侧边栏（todo 清单实时更新，Ctrl+O 切换显示）
+- 右上：侧边栏（终端够宽时显示：会话标题、用量、目标卡片、计划清单）
 - 下半：多行输入框 + 状态栏 + Footer 快捷键提示
 
 Agent 在后台线程同步运行，TuiRenderer 用 post_message（线程安全）把事件桥到

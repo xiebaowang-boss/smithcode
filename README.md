@@ -2,7 +2,7 @@
 
 终端 AI 编程助手：让大模型调用工具，帮你读写文件、执行命令、完成编程任务。
 
-你用自然语言描述任务，SmithCode 自主规划步骤、调用工具、根据结果继续推理，直到任务完成——全程流式输出，敏感操作逐个向你确认。
+你用自然语言描述任务，SmithCode 自主规划步骤、调用工具、根据结果继续推理，直到任务完成——全程流式输出，敏感操作逐个向你确认。交互终端下是一个全屏聊天界面（复刻 Claude Code 风格），管道 / CI 下自动退化为行式 REPL。
 
 > **Harbormaster:** Hold up there, you. It's a shilling to tie up your boat at the dock... and I shall need to know your name.
 >
@@ -12,34 +12,85 @@
 
 ## 功能特性
 
-### 智能体
+### 全屏 TUI
 
-- **内置工具**：读 / 写 / 精确编辑文件（读文件带行号、支持分段读取；写 / 编辑强制先读后写，编辑支持 replace_all）、apply_patch 批量原子改文件、列目录、glob 文件名搜索（按修改时间排序）、grep 内容搜索（支持忽略大小写、上下文行、只列文件/计数模式）、webfetch 网页抓取、websearch 网页搜索（DuckDuckGo，返回标题/链接/摘要）、执行 shell 命令（默认 60 秒超时，可延长至 300 秒）、任务中途向用户提问（ask_user）、维护任务拆分清单（todo_write）
-- **自主多步执行**：模型自主决定调用哪些工具、调用几次，直到完成任务；可配置单次任务最大迭代轮数
-- **任务拆分与分步骤执行**：多步任务动手前模型先列出步骤清单，逐步骤执行、每完成一步实时更新状态（进行中 / 已完成 / 取消），终端随时代查看进度；`/plan` 命令随时查看当前计划
-- **流式输出**：回复与思考内容实时逐字显示，工具调用打印一行短摘要（如 `read src/agent.py`）
+交互终端启动 `smithcode` 直接进入全屏聊天界面（Textual 实现）：
+
+- **消息区**：助手回复无前缀纯文本流式输出；思考过程折叠成块（只显示字符计数，不刷屏，Enter / 空格展开）；工具调用折叠成块；连续的读取 / 搜索工具汇总成一个可折叠的「已探索」块；用户消息带面板底色与角色色竖线；每轮任务结束追加「▣ 模型 · 用时 Ns」页脚
+- **输入区**：多行输入框（Enter 发送，Shift+Enter / Ctrl+J 换行）；下方底行最左显示「权限模式 · 模型 · 思考强度」与运行状态，最右显示 git 分支与上下文占用
+- **侧边栏**（终端宽 ≥ 120 列时出现）：会话标题、token 用量 / 上下文占用 / 压缩次数、持久目标卡片、任务计划清单、版本号与工作区路径
+- **弹窗**：权限确认与 `ask_user` 提问以模态弹窗呈现，↑↓ 选择、Enter 确认、Esc 取消
+- **中断**：任务运行时按 Esc 即时中断（正在进行的长命令会被终止进程树），空闲时按 Esc 清空输入框
+
+管道 / CI 等非交互环境不走 TUI，退回行式 REPL，行为不变。
+
+### 智能体与工具
+
+内置 16 个工具（`use_skill` 仅在发现可用技能时向模型开放），模型自主决定调用哪些、调用几次（可配置单次任务最大迭代轮数，默认 30）：
+
+| 工具 | 说明 |
+| ---- | ---- |
+| `read_file` | 读文件，返回带行号内容（`12│code`），支持 `offset` / `limit` 分段读取；拒绝二进制与目录 |
+| `write_file` | 创建 / 覆盖写入；覆盖已存在文件前强制先 `read_file` |
+| `edit_file` | 精确替换文本，`old_string` 须逐字符一致；支持 `replace_all` |
+| `apply_patch` | patch 信封格式的批量多文件修改（Add / Update / Delete），原子落盘 |
+| `list_dir` | 列目录（名称 / 大小 / 修改时间），跳过 `.git`、`.venv`、`node_modules` 等 |
+| `glob` | 按通配符搜文件名，支持 `**` 递归，结果按修改时间新→旧排序 |
+| `grep` | 按正则搜内容，支持忽略大小写、上下文行、只列文件 / 计数模式 |
+| `run_command` | 执行 shell 命令，默认 60 秒超时（可延长至 300 秒），跨平台终止进程树 |
+| `webfetch` | 抓取网页（仅 http/https）转纯文本，支持一次并行抓多个 URL |
+| `websearch` | DuckDuckGo 网页检索，返回标题 / 链接 / 摘要 |
+| `ask_user` | 任务中途向你提问（一次可提 1-4 个，带候选项） |
+| `todo_write` / `todo_read` | 维护 / 读取任务步骤清单 |
+| `goal_update` / `goal_read` | 更新 / 读取持久目标状态 |
+| `use_skill` | 加载某个技能的完整指令 |
+
+多个工具调用**流式调度**：边预检边执行，可并行的只读 / 网络调用进线程池并发跑，有跨调用状态的工具（shell、写文件、交互确认）在主线程串行执行并作为顺序屏障，结果按提交顺序回传。
+
+### 任务拆分与持久目标
+
+- **任务拆分**：多步任务动手前，模型先用 `todo_write` 列出步骤清单，逐步执行并实时更新状态（进行中 / 已完成 / 取消）。清单在终端实时渲染，TUI 侧边栏随做随更；`/plan` 随时查看
+- **持久目标 `/goal`**：`/goal <目标>` 设定一个跨回合存活的使命，Agent 在每轮任务结束后自动接续推进，直到逐条核验证据后声明完成、你暂停 / 清除，或回合预算（默认 50）用尽。`/goal` 查看状态，`/goal pause | resume | clear | budget <N>` 控制生命周期
+
+### 技能（Agent Skills）
+
+兼容 agentskills.io 开放格式：技能是含 `SKILL.md`（YAML frontmatter 的 `name` + `description`，正文写指令，可附 `scripts/`、`references/` 资源）的目录。
+
+- **渐进式披露**：启动只把技能名与描述装进系统提示词（约 100 token/技能），命中任务后由模型调用 `use_skill` 按需加载完整指令
+- **发现位置**：项目 `.agents/skills/`、用户 `~/.smithcode/skills/`，以及 `[skills].paths` 追加的目录
+- **信任门控**：项目级技能来自可能不可信的仓库，默认首次发现时确认（可「始终信任」落盘）
+- **用户操作**：`/skills` 弹选择框（选中即加载）、`/skills list` 查看来源与诊断、`/skills refresh` 重扫磁盘；`/skill <名称> [任务]` 或 `/技能名 [任务]` 直达
 
 ### 上下文管理
 
-- **占用可视化**：`/context` 按角色分桶查看当前上下文的 token 占用与压缩阈值距离
-- **自动摘要压缩**：上下文越过阈值时自动把早期历史压缩为结构化摘要（任务目标、关键决策、已完成、下一步），保留近期对话，任务不中断
-- **手动压缩**：`/compact` 随时主动释放上下文空间
-- **溢出自愈**：服务商返回上下文超限错误时，自动压缩后重试，无需人工干预
-- **用量统计**：`/usage` 查看 token 消耗（按"应用启动以来 / 当前会话"两个口径），每轮任务结束显示本轮用量速览
+- **占用可视化**：`/context` 按角色分桶查看上下文 token 占用与压缩阈值距离
+- **自动摘要压缩**：越过阈值时自动把早期历史压缩为结构化摘要（自包含检查点，保留系统提示词与近期尾部），任务不中断
+- **手动压缩**：`/compact` 随时释放上下文空间
+- **溢出自愈**：服务商返回上下文超限错误时，自动压缩后重试
+- **用量统计**：`/usage` 查看 token 消耗（按「应用启动以来 / 当前会话」两个口径）
+
+### 会话管理
+
+- **自动持久化**：每条非 system 消息实时追加到本地 JSONL 转录（`~/.smithcode/projects/<项目>/sessions/<会话 id>.jsonl`），崩溃 / 关窗也能恢复
+- **恢复入口**：`-c` 恢复当前目录最近会话、`-r/--resume [ID]` 指定恢复（支持唯一前缀）；会话内用 `/sessions` 无参弹选择框（选中即切换）、`/sessions <id|序号>` 直接切换、`/sessions list` 文本列表、`/sessions delete <id>` 删除
+- **崩溃修复**：工具结果落盘前进程被杀留下的悬空 `tool_calls`，恢复时自动补占位或截断，保证历史合法
+- **自动标题**：首轮结束后后台生成会话标题，`/rename <名称>` 可随时覆盖
+- **其它**：`/new [名称]` 开新会话（旧会话保留在磁盘）、`/save` 立即写盘并显示路径、`--no-session-persistence` 本次不落盘
 
 ### 权限与安全
 
 - **三级权限规则**：`allow` / `ask` / `deny`，按工具与参数通配符匹配，通过 `~/.smithcode/config.toml` 自定义
-- **保护路径**：`.env` 的内容不在变更预览与确认框中回显（防止密钥泄露），访问本身按普通权限规则处理（读默认放行、写默认确认）；`.git` 目录只读（禁止写入/编辑、读取放行），防止仓库破坏
-- **工作区沙箱**：文件操作默认限制在工作区内，越界访问需逐次确认
-- **非交互安全**：管道 / CI 环境下无法弹确认时，所有需确认的操作一律拒绝（fail-closed），不会崩溃
+- **权限模式**：TUI 中 Shift+Tab 在 `Smith`（逐个确认）→ `Accept Edits`（编辑族自动放行）→ `Auto`（全部放行）间循环切换
+- **安全命令免确认**：一批内置只读命令（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在默认 `ask` 下自动放行；真正运行代码的用法（`pytest`、`python x.py`、`npm run` 等）不放行
+- **命令前缀记忆**：选「总是允许」时记住 argv 前缀（如 `python -m pytest *`），文件 / 参数变化仍命中
+- **保护路径**：`.env` 内容不在预览与确认框中回显；`.git` 目录只读（禁止写入 / 编辑，读取放行）
+- **工作区沙箱**：文件操作默认限制在授权目录内，越界需逐次确认；技能目录只读白名单
+- **非交互 fail-closed**：管道 / CI 下无法弹确认时，所有需确认的操作一律拒绝，不挂起、不崩溃
 
-### 使用体验
+### 跨平台与模型无关
 
-- **会话管理**：消息实时自动保存到本地转录（`~/.smithcode/projects/<项目>/sessions/`），`/new` 开新会话（旧的仍可找回），`/sessions` 查看/切换（无参弹选择框、选中即切换）、`/rename` 命名；启动时 `-c` 续最近会话、`-r` 指定会话；会话自动标题（可用 `/rename` 覆盖）
-- **多行输入**：粘贴多行文本自动合并为一条消息
-- **跨平台**：Windows / Linux / macOS，自动适配系统编码与 shell 风格（Windows 下提醒模型用 cmd 语法）
-- **模型无关**：任何 OpenAI 兼容接口均可接入（DeepSeek、通义、Kimi 等）
+- Windows / Linux / macOS，自动适配系统编码与 shell 风格（Windows 下提醒模型用 cmd 语法）
+- 任何 OpenAI 兼容接口均可接入（DeepSeek、通义、Kimi 等），支持自定义请求头与思考强度档位
 
 ## 快速开始
 
@@ -53,7 +104,7 @@ pip install -e .
 
 ### 2. 初始化配置
 
-运行向导，按提示填入接口地址、模型名、API Key 与上下文预算（直接回车保留默认/已有值）：
+运行向导，按提示填入接口地址、模型名、API Key 与上下文预算（直接回车保留默认 / 已有值）：
 
 ```bash
 smithcode setup
@@ -68,43 +119,50 @@ smithcode setup
 
 也可以跳过向导，直接用环境变量（优先级高于文件）：`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`。
 
-主要配置项（写在 `~/.smithcode/config.toml`，均有内置默认值）：
-
-| 配置项 | 默认 | 说明 |
-| ---- | ---- | ---- |
-| `[provider] model` | `deepseek-v4-flash` | 模型名 |
-| `[provider] url` | 服务商官方地址 | OpenAI 兼容接口地址 |
-| `[context] budget` | 65536 | 上下文预算（token），建议不超过模型窗口大小 |
-| `[context] compact_trigger` | 0.8 | 占预算的比例，越过即触发自动压缩 |
-| `[context] compact_keep_tokens` | 15000 | 压缩时尾部原样保留的 token 数 |
-| `[sessions] enabled` | true | 会话自动保存总开关（false 等于永久 `--no-session-persistence`） |
-| `[sessions] cleanup_days` | 30 | 转录保留天数；0 = 不自动清理 |
-| `[sessions] auto_title` | true | 首轮结束后自动生成会话标题（失败静默，可用 `/rename` 覆盖） |
-| `[sessions] title_model` | 空 | 标题专用模型（空 = 当前模型；建议配廉价快模型） |
-
 ### 3. 运行
 
 ```bash
-smithcode                        # 交互模式（REPL，多轮对话）
+smithcode                        # 交互模式：交互终端进全屏 TUI，管道下走行式 REPL
 smithcode 帮我写个斐波那契函数    # 单次任务模式，完成即退出
 python -m smithcode              # 等价的另一种启动方式
 ```
 
 ## 使用方法
 
+### TUI 快捷键
+
+| 按键 | 作用 |
+| ---- | ---- |
+| `Enter` | 发送消息 |
+| `Shift+Enter` / `Ctrl+J` | 输入换行 |
+| `↑` / `↓` | 翻输入历史（命令菜单弹出时为移动高亮） |
+| `Ctrl+W` | 删除前一个词 |
+| `/` | 唤出命令 / 技能补全菜单，↑↓ 选择后回车 |
+| `Shift+Tab` | 循环切换权限模式 |
+| `Esc` | 任务运行中：中断；空闲时：清空输入框 |
+| `Ctrl+Q` | 退出 |
+
+弹窗与折叠块：权限 / 提问弹窗用 ↑↓（或 `j`/`k`）选择、Enter 确认、Esc 取消；工具调用、思考块用 Enter / 空格展开收起。
+
 ### 交互模式命令
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `/help` | 显示帮助 |
+| `/help` | 显示帮助（自动列出全部命令） |
 | `/new [名称]` | 开启新会话（可带名称），旧会话保留在磁盘、仍可恢复 |
-| `/sessions [list [数量]\|delete <id>]` | 历史会话：无参弹选择框（选中即切换）、`list` 文本列表、`delete` 删除、`<id\|序号>` 直接切换 |
+| `/sessions [list [数量]\|delete <id>\|<id\|序号>]` | 历史会话：无参弹选择框（选中即切换）、`list` 文本列表、`delete` 删除、直接切序号 / id |
 | `/rename <名称>` | 重命名当前会话 |
 | `/plan` | 显示当前任务计划（步骤清单） |
 | `/save` | 立即写盘并显示会话转录路径 |
 | `/usage` | 查看 token 用量统计 |
 | `/context` | 查看上下文占用分布与压缩次数 |
 | `/compact` | 手动压缩上下文 |
+| `/model [名称]` | 切换模型（无参弹候选列表） |
+| `/effort [档位]` | 调整思考强度（none / minimal / low / medium / high / xhigh / max） |
+| `/goal <目标> \| pause \| resume \| clear \| budget <N>` | 设定 / 管理持久目标；无参查看状态 |
+| `/skills [list\|refresh]` | 无参弹技能选择框（选中即加载）、`list` 查看列表与诊断、`refresh` 重扫磁盘 |
+| `/skill [名称] [任务]` | 加载技能；带任务时加载后立即开跑 |
+| `/技能名 [任务]` | 技能名直达（等价 `/skill`） |
 | `/exit` | 退出程序 |
 
 ### 命令行参数
@@ -119,13 +177,13 @@ python -m smithcode              # 等价的另一种启动方式
 | `-r, --resume [ID]` | 恢复指定会话（id 或唯一前缀；不带值时恢复最近一次） |
 | `--name 名称` | 给新会话命名（仅新会话可用） |
 | `--no-session-persistence` | 本次运行不保存会话记录（不可与 `-c/--resume` 同用） |
-| `-y, --yes` | 自动批准所有确认（deny 规则依然生效），慎用 |
+| `-y, --yes` | 自动批准所有确认（等价 Auto 档，`deny` 规则依然生效），慎用 |
 | `--max-iterations N` | 单次任务最大迭代轮数（默认 30） |
 | `-V, --version` | 显示版本号 |
 
-### 权限确认
+### 权限确认与权限模式
 
-默认情况下：读文件、列目录自动放行；写文件、编辑、执行命令需要你确认：
+默认情况下：读取 / 搜索 / 抓取类工具自动放行；写文件、编辑、执行命令需要你确认：
 
 ```
 ⚠️  Agent 请求执行: run_command
@@ -133,9 +191,7 @@ python -m smithcode              # 等价的另一种启动方式
    允许? [y]本次 / [n]拒绝 / [a]总是允许该模式:
 ```
 
-选 `a` 后该模式在本会话内静默放行，`/new` 或退出后清零。
-
-### 权限模式（Shift+Tab 切换）
+选 `a` 后该命令前缀在本会话内静默放行（`/new` 或退出后清零）。
 
 TUI 中按 **Shift+Tab** 在三档权限模式间循环切换，输入框底行最左侧实时显示当前档位：
 
@@ -156,16 +212,47 @@ TUI 中按 **Shift+Tab** 在三档权限模式间循环切换，输入框底行�
 read_file = "allow"
 write_file = { "*" = "ask", "*.env" = "deny" }
 run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
-
-# 工具调用的终端展示粒度：summary（默认）/ detail
-tool_display = "summary"
 ```
-
-配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。
 
 上例含义：文件读取放行；写文件需确认、写 `.env` 直接拒绝；git 命令放行、`rm -rf` 直接拒绝、其余命令需确认。
 
-`tool_display` 控制工具调用的终端展示粒度：`summary`（默认）只显示短摘要行，`detail` 追加结果内容（前 500 字符）。
+### 配置项
+
+主要配置项写在 `~/.smithcode/config.toml`，均有内置默认值：
+
+| 配置项 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `[provider] model` | `deepseek-v4-flash` | 模型名 |
+| `[provider] url` | `https://api.deepseek.com/v1` | OpenAI 兼容接口地址（向导预填此默认值，按你的服务商修改） |
+| `[provider] reasoning_effort` | `high` | 思考强度档位，同时作为请求参数下发给模型 |
+| `[provider] models` | 空 | `/model` 候选模型列表（空则尝试远端 `/models`） |
+| `[provider.headers]` | 空 | 随每个请求发送的自定义请求头，值内 `{$session}` 替换为当前会话 id |
+| `[context] budget` | 65536 | 上下文预算（token），建议不超过模型窗口大小 |
+| `[context] compact_trigger` | 0.8 | 占预算的比例，越过即触发自动压缩 |
+| `[context] compact_keep_tokens` | 15000 | 压缩时尾部原样保留的 token 数 |
+| `[limits] max_iterations` | 30 | 单次任务最大迭代轮数 |
+| `[limits] command_timeout` | 60 | `run_command` 默认超时（秒） |
+| `[limits] command_timeout_max` | 300 | `run_command` 超时参数上限（秒） |
+| `[limits] max_tool_output` | 20000 | 单次工具输出进入上下文的最大字符数 |
+| `[limits] max_retries` | 3 | LLM 瞬时错误自动重试次数 |
+| `[limits] llm_timeout` | 120 | 单次 LLM 请求超时（秒） |
+| `[limits] goal_max_turns` | 50 | 持久目标默认回合预算 |
+| `[limits] max_tool_concurrency` | 5 | 一轮内可并行工具的最大并发数 |
+| `[sessions] enabled` | true | 会话自动保存总开关 |
+| `[sessions] cleanup_days` | 30 | 转录保留天数；0 = 不自动清理 |
+| `[sessions] persist_state` | true | 是否随会话持久化 goal / plan / 技能激活集 |
+| `[sessions] list_limit` | 20 | `/sessions` 默认展示条数 |
+| `[sessions] auto_title` | true | 首轮结束后自动生成会话标题 |
+| `[sessions] title_model` | 空 | 标题专用模型（空 = 当前模型，建议配廉价快模型） |
+| `[sessions] title_max_chars` | 60 | 标题长度上限 |
+| `[skills] enabled` | true | 技能子系统总开关 |
+| `[skills] paths` | 空 | 追加的技能扫描目录 |
+| `[skills] project` | `ask` | 项目级技能信任策略：`ask` / `on` / `off` |
+| `[skills] max_catalog_chars` | 8000 | 技能目录注入系统提示词的字符预算 |
+| `[skills] disabled` | 空 | 按通配符禁用技能 |
+| `tool_display` | `summary` | 工具调用终端展示粒度：`summary` 只显示短摘要，`detail` 追加结果内容 |
+
+配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。`SMITHCODE_HOME` 可覆盖配置根目录。
 
 ### 典型用法
 
@@ -176,17 +263,18 @@ smithcode 运行 pytest 里有 3 个失败，帮我修掉
 # 跨项目操作：主工作区之外再授权一个目录
 smithcode --add ../frontend 重构前端里所有调 /api/v1 的地方，改成 /api/v2
 
-# CI / 脚本中无人值守运行（需确认的操作会被拒绝而非挂起）
-smithcode -y 跑一遍测试并总结失败原因
+# CI / 脚本中无人值守运行并恢复最近会话
+smithcode -c -y 跑一遍测试并总结失败原因
 ```
 
 ## 安全说明
 
 - API Key 只存在两处：本机的 `~/.smithcode/credentials.json`，或环境变量 `SMITHCODE_KEY`；`config.toml` 不含秘密、可安全分享
 - 所有需确认的操作在非交互环境（管道 / CI）下一律拒绝，不挂起、不崩溃
-- `-y` 跳过所有 `ask` 确认（含工作区外路径访问），但显式 `deny` 规则依然生效——仅在信任任务时使用
-- shell 命令 60 秒超时；LLM 请求 120 秒超时，限流 / 断网自动重试
+- `-y` / `Auto` 档跳过所有 `ask` 确认（含工作区外路径访问），但显式 `deny` 规则依然生效——仅在信任任务时使用
+- shell 命令默认 60 秒超时；LLM 请求 120 秒超时，限流 / 断网自动重试
 - 单次工具输出超长时自动头尾截断，防止撑爆上下文
+- 技能根目录只读；技能的 `allowed-tools` 声明不产生任何授权效果
 
 ## 开发
 
@@ -196,7 +284,9 @@ pytest                    # 运行测试（不依赖真实 API）
 ruff check src tests      # 代码检查
 ```
 
+项目用 [uv](https://docs.astral.sh/uv/) 管理（有 `uv.lock`），也可用 `uv run pytest` / `uv run ruff check src tests`。
+
 ## 文档
 
-- [架构说明](docs/architecture.md)：模块划分、安全边界设计、如何新增一个工具
+- [架构说明](docs/architecture.md)：模块划分、Agent 循环、安全边界设计、如何新增一个工具
 - [更新日志](CHANGELOG.md)
