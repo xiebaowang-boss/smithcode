@@ -239,6 +239,104 @@ def test_agent_executes_todo_write_and_renders(monkeypatch, capsys):
     assert any("步骤一" in str(m.get("content", "")) for m in agent.session.messages)
 
 
+def _todo_write_call(call_id, todos):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "todo_write",
+                    "arguments": json.dumps({"todos": todos}),
+                },
+            }
+        ],
+    }
+
+
+class _PlanRenderer:
+    """记录工具行与 plan 事件的假渲染后端。"""
+
+    def __init__(self):
+        self.tool_calls = []
+        self.plans = []
+        self.seq = 0
+
+    def tool_call(self, line, display="inline", name=""):
+        self.seq += 1
+        self.tool_calls.append((name, display))
+        return self.seq
+
+    def tool_result(self, result, tool_id=None, expand=False):
+        pass
+
+    def plan(self, summary, rendered, *, created=False, tool_id=None):
+        self.plans.append((created, tool_id))
+
+    def stream(self, kind, chunk):
+        pass
+
+    def stream_done(self):
+        pass
+
+    def info(self, text):
+        pass
+
+
+def test_agent_prints_plan_only_when_created(monkeypatch, capsys):
+    """新建清单打印一次 [计划]；后续每步更新只静默刷新，不再往对话区重复打印。"""
+    monkeypatch.setattr(
+        "smithcode.agent.LLMClient",
+        _fake_llm_class(
+            [
+                _todo_write_call(
+                    "1",
+                    [
+                        {"title": "步骤一", "status": "in_progress"},
+                        {"title": "步骤二", "status": "pending"},
+                    ],
+                ),
+                _todo_write_call(
+                    "2",
+                    [
+                        {"title": "步骤一", "status": "completed"},
+                        {"title": "步骤二", "status": "in_progress"},
+                    ],
+                ),
+            ]
+        ),
+    )
+    agent = Agent(session=Session())
+    assert agent.run("多步任务").text == "完成"
+    out = capsys.readouterr().out
+    assert out.count("[计划]") == 1
+    assert out.count("步骤一") == 1
+
+
+def test_agent_skips_tool_row_on_plan_update(monkeypatch):
+    """新建清单生成可折叠的 plan 工具块；后续更新不再生成工具行（避免刷屏）。"""
+    monkeypatch.setattr(
+        "smithcode.agent.LLMClient",
+        _fake_llm_class(
+            [
+                _todo_write_call("1", [{"title": "步骤一", "status": "in_progress"}]),
+                _todo_write_call("2", [{"title": "步骤一", "status": "completed"}]),
+            ]
+        ),
+    )
+    cap = _PlanRenderer()
+    monkeypatch.setattr("smithcode.renderer._current", cap)
+
+    agent = Agent(session=Session())
+    agent.run("多步任务")
+
+    todo_rows = [display for name, display in cap.tool_calls if name == "todo_write"]
+    assert todo_rows == ["block"]  # 仅新建时上屏，且为可折叠详情块
+    assert [created for created, _ in cap.plans] == [True, False]
+
+
 def test_agent_todo_write_denied_by_user_rule(monkeypatch, tmp_path):
     """用户 deny 规则生效：todo_write 被拒时结果回传"用户拒绝了此操作"。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))

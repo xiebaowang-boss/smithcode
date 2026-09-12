@@ -61,17 +61,17 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
    │
    ▼
 todo_write(全量最新清单)  ── 首次调用：列出完整步骤（pending）
-   │                         ▸ [计划] 共 N 步 实时渲染到终端
+   │                         ▸ 新建清单：对话区展示一次可折叠计划详情
    ▼
 逐步执行：开始某步 → todo_write(该步 in_progress) → 执行工具 → 验证
-   │                         ▸ 完成 → todo_write(该步 completed, 下一步 in_progress)
+   │                         ▸ 完成 → todo_write(updated)：仅静默刷新侧边栏
    ▼
 计划不合理 → todo_write(调整清单 + reason)；用户改主意 → 标 cancelled 保留
 ```
 
 - **数据模型**：每项含服务端分配的稳定 `id` + `title`（标题，创建后不可变，侧边栏只显示它）+ `description`（可选详情，可改）+ `reason` + `status`（`pending` / `in_progress`（同一时刻仅一个）/ `completed` / `cancelled`）。`todo_write` 传**全量最新清单**（非增量），每次整体替换：带 `id` 的项按 id 匹配（标题不可变，其余字段可更新），无 `id` 时按标题匹配既有项，匹配不到视为新项并分配新 id；空标题忽略、非法状态降级为 `pending`，单份上限 50 步。
 - **状态归属**：清单存于 `plan.py` 的进程内单例（会话口径），`/new` 时 `reset()`；`/plan` 命令随时查看当前计划。
-- **展示**：`todo_write` 的计划无论 display_mode 都完整渲染聊天 [计划] 块（标题 + 描述 + reason，in_progress 加粗、完成/取消置灰），不走 `tool_result` 的粒度分支；TUI 侧边栏用 `render_titles` 只展示标题；回传给模型的工具结果保持明文清单，供后续轮次参考。
+- **展示**：仅**新建清单**（此前无未完结步骤）时才在对话区展示一次计划详情，并复用 `todo_write` 的工具块（`display: block`、静态清单图标 `☰`）承载——可展开 / 收起、默认展开；后续每步更新只静默刷新 TUI 侧边栏，不再生成工具行或对话块。REPL 也只在新建时打印 `[计划]`。TUI 侧边栏用 `render_titles` 只展示标题；回传给模型的工具结果保持明文清单，供后续轮次参考。
 - **只读**：`todo_read` 随时拉取当前清单权威快照（含 id），支持 `status` 过滤与 `summary_only` 摘要；`todo_write` 与 `todo_read` 均默认 `allow`，可用 `deny` 规则禁用。
 - **提示词纪律**：系统提示词要求多步任务（3 步以上）动手前先列清单、完成并验证后才标 completed、更新时用 `todo_read` 取 id 并保留、标题不可变、计划不合理时调整而非无视、单步简单任务不拆分。
 

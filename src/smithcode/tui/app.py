@@ -54,6 +54,10 @@ _GOAL_STATUS_COLORS = {
     "budget_limited": "#f7768e",
 }
 
+# 计划工具（todo_write）用静态清单图标，不用 pending 转轮——它的执行是瞬时的，
+# 转轮既无意义又容易被误认为"卡住/一直转"
+_PLAN_ICON = "☰"
+
 
 def _message_text(content) -> str:
     """历史消息 content 的纯文本（兼容多模态列表）。"""
@@ -406,7 +410,10 @@ class SmithTUI(App):
     def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
                       name: str = "") -> None:
         """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。"""
-        widget = ToolCall(summary, pending=True, display=display)
+        widget = ToolCall(
+            summary, pending=True, display=display,
+            icon=_PLAN_ICON if name == "todo_write" else "",
+        )
         self._tool_widgets[tool_id] = widget
         self.query_one(ChatView).place_tool(tool_id, name, widget)
 

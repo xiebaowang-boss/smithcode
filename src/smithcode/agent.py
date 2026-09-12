@@ -29,7 +29,7 @@ from .llm.models import (
     RemoteModelSource,
 )
 from .permission import Permission
-from .plan import render_current, summary
+from .plan import has_active, render_current, summary
 from .session import Session
 from .tools import (
     DESCRIBERS,
@@ -708,9 +708,15 @@ class Agent:
 
         line = self._describe(name, args)
         display = DISPLAY.get(name, "inline")
-        tool_id = renderer.current().tool_call(
-            line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display, name
-        )
+        # 既有计划的更新不上屏工具行：todo_write 每完成一步就更新一次，若每次都
+        # 生成工具块会往对话区反复打印进度；更新只静默刷新侧边栏，新建清单才展示
+        todo_update = name == "todo_write" and has_active()
+        if todo_update:
+            tool_id = None
+        else:
+            tool_id = renderer.current().tool_call(
+                line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display, name
+            )
         denied_plan = _ToolPlan(tc, name, tool_id, lambda: DENIED_RESULT)
 
         # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
@@ -744,6 +750,7 @@ class Agent:
         if name == "todo_write":
             if not self.permission.check(name, args, content=line):
                 return denied_plan, True
+            created = not todo_update  # 此前无未完结步骤 → 本次新建清单
 
             def run_todo() -> str:
                 try:
@@ -752,7 +759,9 @@ class Agent:
                     result = f"错误: {type(e).__name__}: {e}"
                     renderer.current().tool_result(result, tool_id)
                     return result
-                renderer.current().plan(summary(), render_current(color=True))
+                renderer.current().plan(
+                    summary(), render_current(color=True), created=created, tool_id=tool_id
+                )
                 return result
 
             # todo_write 改写会话级状态机并渲染计划，必须独占主线程

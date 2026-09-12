@@ -635,6 +635,48 @@ def test_tui_sidebar_shows_plan_section(monkeypatch):
     _run(_run_case())
 
 
+def test_tui_plan_created_shows_expandable_detail(monkeypatch):
+    """新建清单：详情作为 plan 工具块展示（可折叠、默认展开）；更新不再新增对话块。"""
+    no_prompting(monkeypatch)
+    from smithcode import plan as plan_mod
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 30)) as pilot:
+            plan_mod.current().replace(
+                [{"title": "读文件", "status": "in_progress", "description": "细节内容"}]
+            )
+            app.ui_tool_start(1, "plan (1 步)", "block", "todo_write")
+            await pilot.pause()
+            pending = app.query_one(ToolCall)
+            assert pending._pending is True
+            assert pending._spin_timer is None  # pending 期也不转轮
+            assert pending._header_text().startswith("☰ plan (1 步)")
+            TuiRenderer(app).plan(
+                "共 1 步", plan_mod.render_current(color=True), created=True, tool_id=1
+            )
+            await pilot.pause()
+
+            # plan 工具块已收尾，默认展开，正文含计划内容
+            assert 1 not in app._tool_widgets
+            block = app.query_one(ToolCall)
+            assert block._pending is False
+            assert block._expanded is True
+            assert block._spin_timer is None  # 静态图标：不启用转轮
+            assert "☰ plan (1 步)" in str(block.query_one(".tool-header").content)
+            assert "读文件" in str(block.query_one(".tool-body").render())
+
+            # 更新（created=False）：只刷侧边栏，不再新增对话块
+            before = len(app.query(ToolCall))
+            TuiRenderer(app).plan(
+                "共 1 步", plan_mod.render_current(color=True), created=False, tool_id=None
+            )
+            await pilot.pause()
+            assert len(app.query(ToolCall)) == before
+
+    _run(_run_case())
+
+
 def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
     """opencode 式：无任务或全部完成/取消时侧边栏任务区隐藏，有未完结步骤才展示。"""
     no_prompting(monkeypatch)

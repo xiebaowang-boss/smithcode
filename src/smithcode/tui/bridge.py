@@ -64,10 +64,13 @@ class TuiRenderer(renderer.Renderer):
         expanded = is_error or expand or config.load_tool_display() == "detail"
         self._post("tool_result", tool_id, result, expanded, is_error)
 
-    def plan(self, summary: str, rendered: str) -> None:
-        self._post("block", f"[计划] {summary}\n{rendered}", "magenta")
-        # 侧边栏只展示标题（紧凑渲染），聊天 [计划] 块保持全量（标题+描述+reason）
+    def plan(self, summary: str, rendered: str, *, created: bool = False,
+             tool_id: int | None = None) -> None:
+        # 侧边栏始终刷新；聊天区仅新建清单时展示一次详情——复用 plan 工具块，
+        # 可展开/收起、默认展开；后续每步更新不再往对话区重复打印进度
         self._post("plan_sidebar", plan.render_titles(color=True))
+        if created:
+            self._post("tool_result", tool_id, plan.render_current(), True, False)
 
     def info(self, text: str) -> None:
         self._post("line", text, "grey50")

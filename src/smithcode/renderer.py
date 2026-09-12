@@ -70,8 +70,14 @@ class Renderer:
         tool_id 非空时按 id 配对更新对应 pending 行。
         expand 标记写/编辑类工具：REPL 在执行后展示结果确认语，TUI 详情默认展开。"""
 
-    def plan(self, summary: str, rendered: str) -> None:
-        """任务步骤清单更新。"""
+    def plan(self, summary: str, rendered: str, *, created: bool = False,
+             tool_id: int | None = None) -> None:
+        """任务步骤清单更新。
+
+        created=True 表示本次是**新建**清单（此前无未完结步骤）：仅此时在
+        对话区展示整份计划详情，后续每步更新只静默刷新常驻区域（侧边栏），
+        避免把完成进度反复打印到对话区。tool_id 为对应 plan 工具块（新建时
+        用于承载可展开 / 收起的详情）。"""
 
     def info(self, text: str) -> None:
         """状态/错误/上下文等杂项信息。"""
@@ -181,7 +187,11 @@ class ConsoleRenderer(Renderer):
             # 变更预览（diff）已在 tool_preview 阶段（执行前）展示过
             print(f"  {result}\n")
 
-    def plan(self, summary: str, rendered: str) -> None:
+    def plan(self, summary: str, rendered: str, *, created: bool = False,
+             tool_id: int | None = None) -> None:
+        # 仅新建清单时打印整份计划；后续更新（created=False）静默刷新，避免刷屏
+        if not created:
+            return
         print(f"\n[计划] {summary}")
         print(rendered)
         print()

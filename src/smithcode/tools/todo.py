@@ -15,6 +15,7 @@ from .base import register
     {
         "name": "todo_write",
         "describe": lambda args: f"plan ({len(args.get('todos') or [])} 步)",
+        "display": "block",
         "serial": True,
         "description": "创建并维护任务拆分后的步骤清单（分步骤执行的状态机）。"
         "参数传全量最新清单（不是增量），状态取 pending（未开始）/ in_progress（进行中，"

@@ -444,7 +444,7 @@ class ToolCall(Vertical):
 
     def __init__(self, summary: str, result: str = "", *, expanded: bool = False,
                  pending: bool = False, is_error: bool = False, display: str = "inline",
-                 detail: str = "", **kwargs):
+                 detail: str = "", icon: str = "", **kwargs):
         super().__init__(**kwargs)
         self._summary = summary
         self._result = result
@@ -453,6 +453,7 @@ class ToolCall(Vertical):
         self._is_error = is_error
         self._display = display
         self._detail = detail
+        self._icon = icon  # 非空时以静态图标替代 pending 转轮（如 plan 工具）
         self._spin_frame = 0
         self._spin_timer = None
         self._header: Static | None = None
@@ -469,18 +470,20 @@ class ToolCall(Vertical):
         yield body
 
     def on_mount(self) -> None:
-        if self._pending:
+        if self._pending and not self._icon:  # 静态图标不启用转轮
             self._spin_timer = self.set_interval(0.1, self._spin)
         self._apply_state_style()
 
     def _header_text(self) -> str:
         if self._pending:
+            if self._icon:  # 静态图标（如 plan）：pending 期也不转轮
+                return f"{self._icon} {self._summary}"
             return f"{self.SPINNER[self._spin_frame]} ⚙ {self._summary}"
         mark = "▾" if self._expanded else "▸"
         stat = ""
         if self._display == "inline" and self._result:
             stat = f" · {len(self._result.splitlines())} 行"
-        return f"{mark} ⚙ {self._summary}{stat}"
+        return f"{mark} {self._icon or '⚙'} {self._summary}{stat}"
 
     def _body_renderable(self, width: int) -> Text:
         """正文渲染：diff 详情优先左右对照，窄屏或非 diff 回退逐行文本。"""
