@@ -248,7 +248,7 @@ class Permission:
         if action == ALLOW:
             return True
         if action == DENY:
-            renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（模式 {pattern}）")
+            renderer.current().error(f"已被权限规则拒绝: {tool_name}（模式 {pattern}）")
             return False
         return self._dispatch_ask(tool_name, asked, remember, content)
 
@@ -297,7 +297,7 @@ class Permission:
             for pat in patterns
         ]
         if any(a == DENY for a in actions):
-            renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（目标含保护/受限路径）")
+            renderer.current().error(f"已被权限规则拒绝: {tool_name}（目标含保护/受限路径）")
             return False
         if any(a == ASK for a in actions):
             if self.approved_all:
@@ -320,7 +320,7 @@ class Permission:
         if self.approved_all:
             return "once", root
         if not confirmations_available():
-            renderer.current().info(f"\n⛔ 非交互模式，无法确认越界访问，已拒绝: {raw_path}")
+            renderer.current().error(f"非交互模式，无法确认越界访问，已拒绝: {raw_path}")
             return "deny", None
         r = renderer.current()
         title = f"允许访问授权目录之外的路径 {raw_path}?"
@@ -420,8 +420,8 @@ class Permission:
         remember=False 时只提供 y/n。变更预览（diff）不在这里展示——它由 Agent 在
         确认前推送到工具调用块，与权限框解耦。"""
         if not confirmations_available():
-            renderer.current().info(
-                f"\n⛔ 非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）"
+            renderer.current().error(
+                f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）"
             )
             return False
         r = renderer.current()

@@ -26,6 +26,25 @@ from textual.widgets import Static
 
 from .. import commands, config, context, goal, permission, plan, renderer, welcome
 from .bridge import TuiRenderer
+from .chat import (
+    Assistant,
+    Block,
+    Footer,
+    Level,
+    Notice,
+    StreamDelta,
+    StreamEnd,
+    ThinkingDelta,
+    ThinkingEnd,
+    ThinkingStart,
+    ToolPreview,
+    ToolResult,
+    ToolStart,
+    User,
+    Welcome,
+    coerce_level,
+    level_from_style,
+)
 from .panels import (
     PermissionPanel,
     QuestionPanel,
@@ -40,8 +59,6 @@ from .widgets import (
     CommandMenu,
     RunningIndicator,
     Sidebar,
-    ThinkingBlock,
-    ToolCall,
     UiAction,
 )
 
@@ -149,29 +166,31 @@ class SmithTUI(App):
         padding: 0 2;
     }
 
-    /* 统一间距规则：每个顶层块与前一个块之间留一行（margin-top），不用 margin-bottom，
-       避免两个相邻块各带下边距时出现双倍间隔；组内工具行紧凑（下方覆盖为 0）。 */
-    ToolCall { height: auto; padding-left: 3; margin-top: 1; }
+    /* 对话区统一布局：所有顶层消息带 .chat-item，缩进 / 间距只在此定义一次，
+       避免各调用点各自 print 导致格式漂移。左起点 = 3；用户消息的左边框占 1 列，
+       故其 padding-left 设为 2，正文同样落到列 3，与其它消息左对齐。
+       顶层块之间留一行（margin-top），不用 margin-bottom，避免相邻块双倍间隔。 */
+    .chat-item { padding-left: 3; margin-top: 1; }
+    /* 欢迎横幅（Logo + 问候）：保持原样的齐左版式，不参与消息缩进 */
+    .chat-item.welcome { padding-left: 0; margin-top: 0; }
+    .chat-item.user-msg {
+        background: #141414;
+        border-left: solid #23d18b;
+        padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
+    }
+    ToolCall { height: auto; }
     ToolCall .tool-header { color: #808080; }
     ToolCall .tool-header.tool-error { color: #f7768e; }
     ToolCall .tool-body { color: #808080; margin-left: 2; }
     ToolCall .tool-body.tool-error { color: #f7768e; }
-    ContextGroup { height: auto; padding-left: 3; margin-top: 1; }
+    ContextGroup { height: auto; }
     ContextGroup .group-header { color: #808080; }
     /* Vertical 默认 height: 1fr，会让展开的汇总块撑满可用高度；明细区须按内容自适应 */
     ContextGroup .group-body { height: auto; margin-left: 2; }
     ContextGroup ToolCall { padding-left: 0; margin-top: 0; }
-    ThinkingBlock { height: auto; padding-left: 3; margin-top: 1; }
+    ThinkingBlock { height: auto; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
-    .assistant-stream { padding-left: 3; margin-top: 1; }
-
-    .user-msg {
-        background: #141414;
-        border-left: solid #23d18b;
-        padding: 1 1 1 2;
-        margin-top: 1;
-    }
     QuestionPanel {
         height: auto;
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
@@ -219,10 +238,6 @@ class SmithTUI(App):
     SelectionPanel .selection-body { height: auto; }
     SelectionPanel .selection-scroll { height: 1fr; }
     SelectionPanel .selection-hint { color: #808080; dock: bottom; }
-    .turn-footer {
-        padding-left: 3;
-        margin-top: 1;
-    }
     """
 
     BINDINGS: ClassVar = [
@@ -239,9 +254,19 @@ class SmithTUI(App):
         super().__init__()
         self.agent = agent
         self._busy = False
-        self._thinking_block: ThinkingBlock | None = None
         self._turn_start: float | None = None
-        self._tool_widgets: dict[int, ToolCall] = {}  # tool_id → pending 中的工具行
+
+    @property
+    def _tool_widgets(self):
+        """当前 pending 工具块映射（代理到 ChatView；瞬时状态收归消息区）。"""
+        return self.query_one(ChatView)._tool_widgets
+
+    def _chat(self) -> ChatView:
+        return self.query_one(ChatView)
+
+    def _notice(self, text: str, level=Level.INFO) -> None:
+        """对话区系统通知的统一出口（信息 / 警告 / 错误）。"""
+        self._chat().apply(Notice(text, level))
 
     def compose(self) -> ComposeResult:
         # opencode 式布局：侧边栏通高居右；对话列（消息区 + 输入框 + 状态行）居左
@@ -285,19 +310,17 @@ class SmithTUI(App):
                 role = message.get("role")
                 text = _message_text(message.get("content"))
                 if role == "user" and text:
-                    chat.add_user(text)
+                    chat.apply(User(text))
                 elif role == "assistant" and text.strip():
-                    chat.begin_stream("content")
-                    chat.append_stream("content", text)
-                    chat.end_stream()
+                    chat.apply(Assistant(text))
 
     def _show_welcome(self) -> None:
         """在聊天区渲染欢迎横幅（启动与 /new 后复用）。
 
         终端放得下就用完整版（Logo），太窄降级为单行紧凑版。"""
         width = self.size.width
-        self.query_one(ChatView).add_line_text(
-            welcome.banner(compact=width < welcome.LOGO_WIDTH + 12)
+        self.query_one(ChatView).apply(
+            Welcome(welcome.banner(compact=width < welcome.LOGO_WIDTH + 12))
         )
 
     # ----- 斜杠命令菜单 -----
@@ -384,69 +407,55 @@ class SmithTUI(App):
     def on_ui_action(self, message: UiAction) -> None:
         handler = getattr(self, f"ui_{message.action}", None)
         if handler is None:
-            self.ui_line(f"（未知 UI 动作: {message.action}）", "red")
+            self.ui_notice(f"（未知 UI 动作: {message.action}）", "error")
             return
         handler(*message.args)
 
+    def ui_notice(self, text: str, level: str = "info") -> None:
+        """系统通知（信息 / 警告 / 错误）落对话区，级别决定颜色与图标。"""
+        self._chat().apply(Notice(text, coerce_level(level)))
+
     def ui_line(self, text: str, style: str | None = None) -> None:
-        self.query_one(ChatView).add_line(text, style)
+        """兼容旧调用点：style 字符串映射为语义级别（新代码请用 ui_notice）。"""
+        self._chat().apply(Notice(text, level_from_style(style)))
 
     def ui_title(self, title: str) -> None:
         """后台自动标题生成完成（Renderer.title_changed）：刷新底栏标题。"""
         self.ui_status()
 
     def ui_block(self, text: str, style: str | None = None) -> None:
-        """多行文本块；from_ansi 解析内嵌 ANSI 转义（如 [计划] 清单的颜色码），
-        避免转义符作为字面字符进入渲染流（真实终端会打花整个界面）。"""
-        for line in Text.from_ansi(text, style=style).split("\n"):
-            self.query_one(ChatView).add_line_text(line, style)
+        """多行文本块；解析内嵌 ANSI 转义（如计划清单的颜色码），避免转义符作为
+        字面字符进入渲染流（真实终端会打花整个界面）。"""
+        self._chat().apply(Block(text, level_from_style(style)))
 
     def ui_stream(self, kind: str, chunk: str) -> None:
-        self.query_one(ChatView).append_stream(kind, chunk)
+        self._chat().apply(StreamDelta(kind, chunk))
 
     def ui_stream_done(self) -> None:
-        self.query_one(ChatView).end_stream()
+        self._chat().apply(StreamEnd())
 
     def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
                       name: str = "") -> None:
         """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。"""
-        widget = ToolCall(
-            summary, pending=True, display=display,
-            icon=_PLAN_ICON if name == "todo_write" else "",
-        )
-        self._tool_widgets[tool_id] = widget
-        self.query_one(ChatView).place_tool(tool_id, name, widget)
+        icon = _PLAN_ICON if name == "todo_write" else ""
+        self._chat().apply(ToolStart(tool_id, summary, display, name, icon))
 
     def ui_tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：更新对应 pending 工具块，审核时改动已可见。"""
-        widget = self._tool_widgets.get(tool_id) if tool_id is not None else None
-        if widget is not None:
-            widget.set_detail(detail)
+        self._chat().apply(ToolPreview(tool_id, detail))
 
     def ui_tool_result(self, tool_id: int | None, result: str, expanded: bool,
                        is_error: bool) -> None:
-        widget = self._tool_widgets.pop(tool_id, None) if tool_id is not None else None
-        if widget is not None:
-            widget.set_result(result, expanded=expanded, is_error=is_error)
-            self.query_one(ChatView).mark_tool_done(tool_id)
-        else:  # 无配对（理论上不发生）：退化为独立块，不丢结果
-            self.query_one(ChatView).add_widget(
-                ToolCall("[Tool]", result, expanded=expanded, is_error=is_error)
-            )
+        self._chat().apply(ToolResult(tool_id, result, expanded, is_error))
 
     def ui_thinking_start(self) -> None:
-        block = ThinkingBlock()
-        self._thinking_block = block
-        self.query_one(ChatView).add_widget(block)
+        self._chat().apply(ThinkingStart())
 
     def ui_thinking_tick(self, chunk: str) -> None:
-        if self._thinking_block is not None:
-            self._thinking_block.append(chunk)
+        self._chat().apply(ThinkingDelta(chunk))
 
     def ui_thinking_done(self) -> None:
-        if self._thinking_block is not None:
-            self._thinking_block.finish()
-            self._thinking_block = None
+        self._chat().apply(ThinkingEnd())
 
     def ui_plan_sidebar(self, rendered: str) -> None:
         self.query_one(Sidebar).update_plan(rendered, plan.has_active())
@@ -652,12 +661,12 @@ class SmithTUI(App):
         if text.startswith("/"):
             self.handle_command(text)
         else:
-            self.query_one(ChatView).add_user(text)  # 回显用户消息，避免"发出去没反应"
+            self._chat().apply(User(text))  # 回显用户消息，避免"发出去没反应"
             self.start_task(text)
 
     def start_task(self, text: str) -> None:
         if self._busy:
-            self.ui_line("（上一条任务还在运行，请等待）", "yellow")
+            self.ui_notice("（上一条任务还在运行，请等待）", "warning")
             return
         self._busy = True
         self._turn_start = time.monotonic()
@@ -672,7 +681,9 @@ class SmithTUI(App):
             result = self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
             status = result.status
         except Exception as e:  # noqa: BLE001
-            self.post_message(UiAction("line", f"[错误] {type(e).__name__}: {e}", "red"))
+            self.post_message(
+                UiAction("notice", f"{type(e).__name__}: {e}", "error")
+            )
             status = "error"
         finally:
             self._busy = False
@@ -706,12 +717,12 @@ class SmithTUI(App):
         self._turn_start = None
         found = self.query(ChatView)
         if found:
-            found.first().add_turn_footer(
+            found.first().apply(Footer(
                 config.MODEL,
                 config.REASONING_EFFORT or config.DEFAULT_EFFORT,
                 format_duration(elapsed),
                 "已停止" if status == "interrupted" else None,
-            )
+            ))
 
     def handle_command(self, text: str) -> None:
         """斜杠命令统一走 commands.dispatch，按结果标记做 TUI 侧的收尾动作。"""
@@ -719,7 +730,7 @@ class SmithTUI(App):
         # 中途重置/切换会撕裂进行中的轮次（工具结果落入悬空的新会话），先行拦截
         tokens = text.strip().split()
         if self._busy and tokens and tokens[0].lower() in ("/new", "/sessions"):
-            self.ui_line("（任务运行中，不能切换会话；请等待完成或先按 Esc 中断）", "yellow")
+            self.ui_notice("（任务运行中，不能切换会话；请等待完成或先按 Esc 中断）", "warning")
             return
         outcome = commands.dispatch(self.agent, text)
         if outcome.exit:
@@ -752,24 +763,19 @@ class SmithTUI(App):
             # 会在当前轮结束后读到新目标状态并自动接续
             if self._busy:
                 if outcome.echo_input:  # 技能手动激活：不排队，提示用户等待/中断
-                    self.ui_line("（上一条任务还在运行，请等待完成或先按 Esc 中断）", "yellow")
+                    self.ui_notice("（上一条任务还在运行，请等待完成或先按 Esc 中断）", "warning")
                 else:
-                    self.ui_line("（目标已记录，当前任务结束后自动接续）", "grey50")
+                    self.ui_notice("（目标已记录，当前任务结束后自动接续）", "info")
             else:
                 if outcome.echo_input:  # 技能手动激活带任务：用户输入原文整体回显
-                    self.query_one(ChatView).add_user(text)
+                    self._chat().apply(User(text))
                 self.start_task(outcome.start_task)
 
     def reset_chat(self) -> None:
         """开新会话：清空聊天区并重新渲染欢迎横幅，屏幕回归会话起点。
 
-        连带清掉残留的瞬时渲染状态：工具块映射（widget 已随聊天区移除，
-        映射不清理会滞留旧引用）、思考块与轮次计时。"""
-        chat = self.query_one(ChatView)
-        chat.reset_context()
-        chat.remove_children()
-        self._tool_widgets.clear()
-        self._thinking_block = None
+        连带清掉残留的瞬时渲染状态（工具块映射、思考块、轮次计时收归 ChatView）。"""
+        self.query_one(ChatView).reset()
         self._turn_start = None
         self._show_welcome()
 

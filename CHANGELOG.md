@@ -4,6 +4,16 @@
 
 ## [未发布]
 
+### 变更
+
+- **TUI 对话区消息打印统一（唯一入口 + 级别化通知 + 统一缩进）**：此前对话区内容由多条路径零散产生（renderer 事件、宿主回显、命令输出、欢迎横幅、错误兜底各写各的），且通知行走 `_mk` 无缩进类、与工具/正文块左起点不一致，导致格式漂移。本次收口：
+  - 新增 `tui/chat.py` 语义消息模型（`Level` + `User` / `Assistant` / `Notice` / `Block` / `Footer` / `StreamDelta` / `Thinking*` / `Tool*` / `Welcome`，纯数据无 Textual 依赖）；`ChatView.apply(item)` 成为**唯一打印入口**，工具块映射与思考块引用一并收归消息区，宿主只负责路由。
+  - 统一布局：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源），用户消息左边框占 1 列故其 padding-left 为 2，正文与其它消息左对齐；修复信息行齐左、与块不对齐的问题。
+  - `Renderer` 新增 `warn()` / `error()`（默认降级为 `info`，TUI 按级别着色 + 固定 1 格图标），LLM 重试、权限拒绝、会话降级、目标暂停等改走对应级别，调用点不再手写 `\n` / `⛔` / `[LLM]` 前缀；命令层旧 `style` 字符串由集中映射兼容，命令零改动。
+  - 宿主旁路（欢迎横幅、历史回放、用户回显、轮次页脚、任务异常兜底、命令输出）全部改经 `apply`；新增 `tests/test_tui_chat.py` 覆盖级别映射、唯一入口与「所有顶层消息都带 `chat-item`」的对齐回归。
+
+## [0.8.0] - 2026-09-12
+
 ### 新增
 
 - **会话持久化与恢复（自动落盘 + 崩溃修复 + 标题）**：会话不再依赖手动 `/save`——每条非 system 消息实时追加到用户目录的 append-only JSONL 转录（`~/.smithcode/projects/<项目 slug>/sessions/<会话 id>.jsonl`；懒物化，没有消息不建文件），进程崩溃/关窗也能恢复。新增 `sessions/` 子系统（`paths` / `format` / `model` / `store` / `title`，格式与容错可离线单测），`Session` 升级为会话聚合根（`MessageLog` 追加钩子、`restore_state` 原地装载、`set_compacted`、`set_title`，对象身份跨 `/new` 与恢复不变）：

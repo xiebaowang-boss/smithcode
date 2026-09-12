@@ -137,6 +137,9 @@ class _CaptureRenderer:
     def info(self, text):
         self.infos.append(text)
 
+    warn = info
+    error = info
+
     def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
         self.calls.append((prompt, valid, detail, descriptions, content))
         return "n"

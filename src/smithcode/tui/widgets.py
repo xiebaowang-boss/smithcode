@@ -16,6 +16,27 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 
 from .. import __version__, config, renderer
+from .chat import (
+    LEVEL_MARK,
+    LEVEL_STYLE,
+    Assistant,
+    Block,
+    ChatItem,
+    Footer,
+    Notice,
+    StreamDelta,
+    StreamEnd,
+    ThinkingDelta,
+    ThinkingEnd,
+    ThinkingStart,
+    ToolPreview,
+    ToolResult,
+    ToolStart,
+    User,
+    Welcome,
+    coerce_level,
+    level_from_style,
+)
 from .render import (
     context_category,
     context_summary,
@@ -57,23 +78,145 @@ class ChatView(VerticalScroll):
         self._last_render = 0.0  # 上次渲染时刻（尾部块重渲染节流用）
         self._context_group: ContextGroup | None = None  # 当前进行中的「已探索」组
         self._context_groups: dict[int, ContextGroup] = {}  # 未出结果的上下文工具 → 所属组
+        self._tool_widgets: dict[int, ToolCall] = {}  # tool_id → pending 中的工具行
+        self._thinking_block: ThinkingBlock | None = None  # 进行中的思考块
+
+    # ----- 唯一打印入口 -----
+
+    def apply(self, item: ChatItem) -> None:
+        """把一条语义消息挂载 / 更新到对话区（所有内容输出的唯一入口）。
+
+        生产者只构造 ``tui/chat.py`` 的语义消息；缩进、着色、图标、间距统一
+        由此分派到各私有方法 + 集中 CSS，调用点不再各自拼字符串 / 样式。"""
+        if isinstance(item, StreamDelta):
+            self.append_stream(item.kind, item.text)
+        elif isinstance(item, StreamEnd):
+            self.end_stream()
+        elif isinstance(item, ThinkingStart):
+            self._thinking_begin()
+        elif isinstance(item, ThinkingDelta):
+            self._thinking_tick(item.text)
+        elif isinstance(item, ThinkingEnd):
+            self._thinking_finish()
+        elif isinstance(item, ToolStart):
+            self._tool_begin(item)
+        elif isinstance(item, ToolPreview):
+            self._tool_detail(item.tool_id, item.detail)
+        elif isinstance(item, ToolResult):
+            self._tool_finish(item)
+        elif isinstance(item, User):
+            self._user(item.text)
+        elif isinstance(item, Assistant):
+            self._assistant(item.text)
+        elif isinstance(item, Welcome):
+            self._mk(item.text, classes="welcome")
+        elif isinstance(item, Notice):
+            self._notice(item.text, item.level)
+        elif isinstance(item, Block):
+            self._notice_block(item.text, item.level)
+        elif isinstance(item, Footer):
+            self._footer(item)
+        else:  # 防御：新增类型忘接线时快速暴露，而不是静默丢弃
+            raise TypeError(f"未知对话区消息类型: {type(item).__name__}")
+
+    # ----- 内容项 -----
+
+    def _user(self, text: str) -> None:
+        """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
+
+        提交自己的消息视为回到最新位置：无条件滚到底（不受锚定约束）。"""
+        self._finalize_context()
+        block = Static(Text(text), classes="chat-item user-msg")
+        block.can_focus = False
+        self.mount(block)
+        self.scroll_end(animate=False)
+
+    def _assistant(self, text: str) -> None:
+        """静态整段正文（历史回放）：复用流式按块渲染，一次定型。"""
+        self.begin_stream("content")
+        self.append_stream("content", text)
+        self.end_stream()
+
+    def _notice(self, text: str, level) -> None:
+        """系统通知：固定 1 格级别图标，正文左起点不随级别漂移。"""
+        level = coerce_level(level)
+        line = Text()
+        line.append(f"{LEVEL_MARK[level]} ", style=LEVEL_STYLE[level])
+        line.append(text, style=LEVEL_STYLE[level])
+        self._mk(line, classes="notice")
+
+    def _notice_block(self, text: str, level) -> None:
+        """多行文本块：解析内嵌 ANSI，逐行按级别着色（如 /help、计划清单）。"""
+        level = coerce_level(level)
+        for line in Text.from_ansi(text, style=LEVEL_STYLE[level]).split("\n"):
+            self._mk(line, classes="notice")
+
+    def _footer(self, item: Footer) -> None:
+        """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时。
+
+        status 非空时追加在行尾——中断收尾时显示「· 已停止」，不再另起一行。"""
+        text = Text()
+        text.append("▣ ", style="#fab283")
+        text.append(item.model, style="#eeeeee")
+        text.append(f" · {item.effort} · {item.elapsed}", style="#808080")
+        if item.status:
+            text.append(f" · {item.status}", style="#f7768e")
+        self._mk(text, classes="turn-footer")
+
+    # ----- 工具 / 思考生命周期 -----
+
+    def _tool_begin(self, item: ToolStart) -> None:
+        """pending 工具行：读取/搜索/列目录类归入「已探索」汇总组，其余独立成块。"""
+        is_context = context_category(item.name) is not None
+        widget = ToolCall(
+            item.summary, pending=True, display=item.display, icon=item.icon,
+            classes=None if is_context else "chat-item",
+        )
+        self._tool_widgets[item.tool_id] = widget
+        self.place_tool(item.tool_id, item.name, widget)
+
+    def _tool_detail(self, tool_id, detail: str) -> None:
+        widget = self._tool_widgets.get(tool_id) if tool_id is not None else None
+        if widget is not None:
+            widget.set_detail(detail)
+
+    def _tool_finish(self, item: ToolResult) -> None:
+        widget = (self._tool_widgets.pop(item.tool_id, None)
+                  if item.tool_id is not None else None)
+        if widget is not None:
+            widget.set_result(item.result, expanded=item.expand, is_error=item.is_error)
+            self.mark_tool_done(item.tool_id)
+        else:  # 无配对（理论上不发生）：退化为独立块，不丢结果
+            self.add_widget(ToolCall(
+                "[Tool]", item.result, expanded=item.expand,
+                is_error=item.is_error, classes="chat-item",
+            ))
+
+    def _thinking_begin(self) -> None:
+        block = ThinkingBlock(classes="chat-item")
+        self._thinking_block = block
+        self.add_widget(block)
+
+    def _thinking_tick(self, chunk: str) -> None:
+        if self._thinking_block is not None:
+            self._thinking_block.append(chunk)
+
+    def _thinking_finish(self) -> None:
+        if self._thinking_block is not None:
+            self._thinking_block.finish()
+            self._thinking_block = None
+
+    # ----- 兼容旧调用点（内部 / 测试）：新代码请优先 apply -----
 
     def add_line(self, text: str, style: str | None = None) -> None:
-        self._mk(Text.from_ansi(text, style=style))
+        self.apply(Notice(text, level_from_style(style)))
 
     def add_line_text(self, text: Text, style: str | None = None) -> None:
         """直接挂一个已构造好的 Text（内嵌样式已就绪，不再二次解析）。"""
         self._mk(text)
 
     def add_user(self, text: str) -> None:
-        """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
-
-        提交自己的消息视为回到最新位置：无条件滚到底（不受锚定约束）。"""
-        self._finalize_context()
-        block = Static(Text(text), classes="user-msg")
-        block.can_focus = False
-        self.mount(block)
-        self.scroll_end(animate=False)
+        self.apply(User(text))
 
     def add_block(self, text: str, style: str | None = None) -> None:
         for line in text.splitlines() or [""]:
@@ -81,22 +224,7 @@ class ChatView(VerticalScroll):
 
     def add_turn_footer(self, model: str, effort: str, elapsed: str,
                         status: str | None = None) -> None:
-        """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时（▣ 用强调色，缩进 3 格）。
-
-        status 非空时追加在行尾——中断收尾时显示「· 已停止」，不再往对话区
-        另起一行。"""
-        self._finalize_context()
-        at_bottom = self._at_bottom()
-        text = Text()
-        text.append("▣ ", style="#fab283")
-        text.append(model, style="#eeeeee")
-        text.append(f" · {effort} · {elapsed}", style="#808080")
-        if status:
-            text.append(f" · {status}", style="#f7768e")
-        block = Static(text, classes="turn-footer")
-        block.can_focus = False
-        self.mount(block)
-        self._follow(at_bottom)
+        self.apply(Footer(model, effort, elapsed, status))
 
     def add_widget(self, widget) -> None:
         """挂载任意消息组件（如可折叠的工具调用块）。"""
@@ -116,7 +244,7 @@ class ChatView(VerticalScroll):
             self.mount(widget)
         else:
             if self._context_group is None:
-                self._context_group = ContextGroup(classes="context-group")
+                self._context_group = ContextGroup(classes="context-group chat-item")
                 self.mount(self._context_group)
             self._context_group.add_tool(tool_id, name, widget)
             self._context_groups[tool_id] = self._context_group
@@ -132,6 +260,16 @@ class ChatView(VerticalScroll):
         """清空分组引用（会话重置 / 聊天区清空时调用）。"""
         self._finalize_context()
         self._context_groups.clear()
+
+    def reset(self) -> None:
+        """清空对话区与全部瞬时渲染状态（会话重置 / 回放前调用）。
+
+        工具块映射、思考块引用随聊天区一并清理，否则会滞留已卸载 widget 的引用。"""
+        self._finalize_context()
+        self._context_groups.clear()
+        self._tool_widgets.clear()
+        self._thinking_block = None
+        self.remove_children()
 
     def _finalize_context(self) -> None:
         """封口当前「已探索」组（幂等）；后续上下文工具将另起一组。"""
@@ -224,7 +362,8 @@ class ChatView(VerticalScroll):
     def _mk(self, renderable, classes: str | None = None) -> Static:
         self._finalize_context()
         at_bottom = self._at_bottom()
-        block = Static(renderable, classes=classes)
+        # 所有顶层消息统一带 chat-item：缩进 / 间距的唯一来源（见 app.py 的 CSS）
+        block = Static(renderable, classes="chat-item" if not classes else f"chat-item {classes}")
         block.can_focus = False
         self.mount(block)
         self._follow(at_bottom)

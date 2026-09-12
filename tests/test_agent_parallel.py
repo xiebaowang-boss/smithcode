@@ -338,6 +338,9 @@ def test_tool_start_events_precede_ordered_results(monkeypatch):
         def info(self, text):
             pass
 
+        warn = info
+        error = info
+
     monkeypatch.setattr("smithcode.renderer._current", CapRenderer())
     agent.run("契约")
 
@@ -371,6 +374,9 @@ class _CapRenderer:
 
     def info(self, text):
         pass
+
+    warn = info
+    error = info
 
 
 def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):

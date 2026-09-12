@@ -36,7 +36,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | 模块 | 职责 |
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
-| `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线 + 集中 CSS）、`widgets.py` 自包含控件、`panels.py` 弹窗面板、`bridge.py` 线程桥（`TuiRenderer`）、`render.py` 纯函数工具 |
+| `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据）、`widgets.py` 自包含控件（消息区 `ChatView.apply` 是唯一打印入口）、`panels.py` 弹窗面板、`bridge.py` 线程桥（`TuiRenderer`）、`render.py` 纯函数工具 |
 | `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
 | `agent.py` | Agent 循环编排（`_BatchScheduler` 流式调度：边预检边执行、并行波次 + 串行屏障、结果按提交序；todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`）；`run_with_goal()` 是 `/goal` 的续跑驱动器 |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |

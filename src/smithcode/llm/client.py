@@ -110,8 +110,8 @@ class LLMClient:
                 if attempt == config.MAX_RETRIES or emitted:
                     raise
                 wait = 2**attempt + random.random()
-                renderer.current().info(
-                    f"\n[LLM] 请求失败，{wait:.0f}s 后重试"
+                renderer.current().warn(
+                    f"[LLM] 请求失败，{wait:.0f}s 后重试"
                     f"（{attempt + 1}/{config.MAX_RETRIES}）..."
                 )
                 time.sleep(wait)

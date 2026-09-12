@@ -80,7 +80,15 @@ class Renderer:
         用于承载可展开 / 收起的详情）。"""
 
     def info(self, text: str) -> None:
-        """状态/错误/上下文等杂项信息。"""
+        """状态/上下文等普通信息。"""
+
+    def warn(self, text: str) -> None:
+        """警告级信息（重试、降级等）；默认降级为 info，子类可覆盖着色。"""
+        self.info(text)
+
+    def error(self, text: str) -> None:
+        """错误级信息（拒绝、失败等）；默认降级为 info，子类可覆盖着色。"""
+        self.info(text)
 
     def title_changed(self, title: str) -> None:
         """会话标题变化（后台自动标题 / /rename）：宿主可刷新状态栏。默认忽略。"""

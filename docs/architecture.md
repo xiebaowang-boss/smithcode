@@ -52,6 +52,10 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 
 工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止（附带展示 write/edit 的变更预览 diff），`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。TUI 侧另有一层纯展示的**上下文汇总**（对齐 opencode 的「已探索」）：连续的读取 / 搜索工具（`read_file` / `list_dir` 计入读取，`glob` / `grep` 计入搜索）汇总成一个可折叠块（头行按类别计数，展开看逐条明细），遇到非上下文工具、助手正文/思考流或回合结束时封口；分组不改变 `ConsoleRenderer` 行为与回传模型的内容。
 
+### 对话区消息模型（TUI）
+
+TUI 对话区的全部内容经**唯一入口** `ChatView.apply(item)` 挂载/更新，item 为 `tui/chat.py` 的纯数据语义消息（`User` / `Assistant` / `Notice` / `Block` / `Footer` / `Welcome` / `StreamDelta` / `Thinking*` / `Tool*`）。生产者（`TuiRenderer` 事件桥、命令输出、宿主回显、欢迎横幅、历史回放、任务异常兜底）只表达**语义与级别**，缩进 / 着色 / 图标 / 间距统一由渲染层与集中 CSS 决定：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源，用户消息左边框占 1 列故 padding-left 为 2，正文左对齐）；通知按 `Level`（info / success / warning / error / retry）着色并带固定 1 格图标，正文左起点不随级别漂移。`Renderer` 提供 `info()` / `warn()` / `error()` 三个语义方法（`ConsoleRenderer` 保持纯文本打印、TUI 映射到通知级别），命令层旧的 `style` 字符串由集中映射兼容。工具块映射与思考块引用收归 `ChatView`，宿主 `SmithTUI` 只做事件路由。
+
 ## 任务拆分与分步骤执行
 
 借鉴 opencode 的 TodoWrite：模型用 `todo_write` 工具维护一份会话级步骤清单，把复杂任务拆成可追踪、可展示的步骤逐步执行。清单不是独立于循环的新架构——仍是同一个 Agentic Loop，只是多了"先列计划、边做边更"的纪律：
@@ -183,7 +187,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 | `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
 | `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
-| `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
+| `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
 
 ## 安全边界
 

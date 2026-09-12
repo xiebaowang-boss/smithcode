@@ -202,7 +202,7 @@ class _BatchScheduler:
         self._agent._collect(denied_plan, denied_plan.run())
         for tc in remaining_tcs:
             self._agent._placeholder(SKIPPED_RESULT, tc["id"])
-        renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
+        renderer.current().error("权限请求被拒绝，任务已停止")
         return "denied"
 
     def _abort_interrupted(self, pending_plans: list[_ToolPlan],
@@ -492,12 +492,12 @@ class Agent:
                 if result.status in ("denied", "max_iterations") and goal.pause(
                     "上一次任务未正常结束，已暂停自动推进"
                 ):
-                    renderer.current().info("\n[目标] 已暂停自动推进（/goal resume 可继续）")
+                    renderer.current().warn("[目标] 已暂停自动推进（/goal resume 可继续）")
                 break
             if not result.tools_used:
                 if goal.pause("本轮没有产生工具调用，已暂停自动推进以防空转"):
-                    renderer.current().info(
-                        "\n[目标] 已暂停：本轮没有产生工具调用（/goal resume 可继续）"
+                    renderer.current().warn(
+                        "[目标] 已暂停：本轮没有产生工具调用（/goal resume 可继续）"
                     )
                 break
             current = goal.current()
@@ -505,8 +505,8 @@ class Agent:
                 break
             if current.turns >= current.max_turns:
                 goal.budget_limited()
-                renderer.current().info(
-                    f"\n[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
+                renderer.current().warn(
+                    f"[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
                 )
                 result = self.run(current.wrapup_prompt())
                 self._note_goal_run(result)
@@ -516,7 +516,7 @@ class Agent:
             if marker is None:  # 目标在本轮结束时被清除
                 break
             renderer.current().info(
-                f"\n[目标] 继续推进 · 第 {marker.turns}/{marker.max_turns} 回合"
+                f"[目标] 继续推进 · 第 {marker.turns}/{marker.max_turns} 回合"
             )
             result = self.run(marker.continuation_prompt())
             self._note_goal_run(result)
@@ -583,7 +583,7 @@ class Agent:
         except Exception as e:
             if not is_context_overflow(e):
                 raise
-        renderer.current().info("\n[context] 上下文溢出，压缩后重试…")
+        renderer.current().info("[context] 上下文溢出，压缩后重试…")
         self.compact()
         return self._chat()
 
@@ -628,7 +628,7 @@ class Agent:
         )
         self.context.compact_count += 1
         renderer.current().info(
-            f"\n[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens"
+            f"[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens"
         )
         return True
 

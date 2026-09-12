@@ -73,7 +73,13 @@ class TuiRenderer(renderer.Renderer):
             self._post("tool_result", tool_id, plan.render_current(), True, False)
 
     def info(self, text: str) -> None:
-        self._post("line", text, "grey50")
+        self._post("notice", text, "info")
+
+    def warn(self, text: str) -> None:
+        self._post("notice", text, "warning")
+
+    def error(self, text: str) -> None:
+        self._post("notice", text, "error")
 
     def title_changed(self, title: str) -> None:
         """会话标题变化（/rename 或后台自动标题）：通知主线程刷新底栏。"""

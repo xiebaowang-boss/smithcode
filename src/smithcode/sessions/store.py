@@ -167,8 +167,8 @@ class SessionStore:
         try:
             from .. import renderer
 
-            renderer.current().info(
-                f"\n[会话] 无法写入会话记录（{type(exc).__name__}: {exc}），"
+            renderer.current().warn(
+                f"[会话] 无法写入会话记录（{type(exc).__name__}: {exc}），"
                 "本次会话不会被自动保存。"
             )
         except Exception:  # noqa: BLE001 渲染失败不影响主流程

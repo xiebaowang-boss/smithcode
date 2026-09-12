@@ -290,6 +290,9 @@ def test_finish_expands_write_edit_tools_only(monkeypatch, tmp_path, capsys):
         def info(self, text):
             pass
 
+        warn = info
+        error = info
+
     monkeypatch.setattr(agent_mod.renderer, "current", lambda: CapRenderer())
     bare = agent_mod.Agent.__new__(agent_mod.Agent)
     agent_mod.Agent._finish(bare, "已写入", None, "write_file")
