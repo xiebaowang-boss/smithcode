@@ -6,6 +6,10 @@
 
 ### 新增
 
+- **`websearch` 网页检索工具**：新增 `tools/websearch.py`，用 DuckDuckGo HTML 版检索网页并返回若干结果的标题 / 链接 / 摘要，纯标准库实现（`urllib` + 正则，无 API key、无新依赖，与 webfetch 同款哲学）；DuckDuckGo 的跳转链接（`//duckduckgo.com/l/?uddg=<真实地址>`）自动还原为真实 URL，结果按 URL 去重，`max_results` 控制条数（默认 5、上限 10）。与 webfetch 分工：websearch 给候选，需要正文时再对结果链接调用 webfetch。默认权限 `allow`（只读、无本地副作用，用户可收紧或 deny），可与只读工具并行。此前系统提示词与 CHANGELOG 已提及 `websearch` 但工具并不存在（幽灵能力），本次补齐
+
+- **ask_user 支持一次提多个问题**（复数入参 + 单面板切换 + 答完确认页）：`ask_user` 入参由单数 `question` 改为复数 `questions`（1-N 项，每项 `{question, options?, multiple?}`），可把相关的多个决策一次问完，避免来回打断。工具把入参归一化后交给 `Renderer.ask_form`——CLI 逐题串行提问（多题带 `(i/n)` 前缀），TUI 用**一个 `QuestionPanel` 承载全部问题**：标题显示当前题号与已答标记（`(2/3) ✔ …`），←/→ 或 Tab / Shift+Tab 手动翻页（已答题可回跳修改），单选 Enter 即答、多选空格勾选 + Enter 提交，答完**按顺序进下一题**（回改中间某题也一样，不会跳到确认页；只有提交最后一题时才回头补前面漏答的题）。**多个问题时全部答完后进入确认页**（标题「确认提交」，不计入 `(i/n)` 编号，只是沿用同样的翻页交互）：把各题答案列在**其问题下方**供核对，Enter 直接提交整组、←/→ 可切回任一题修改，无需选中某行——避免最后一题答完即提交、没有修改余地；单问题不进入确认页（直接提交）。Esc 取消整组。回传格式：单题直接返回答案（与旧行为一致），多题按「编号. 问题 → 答案」逐行列出、未答项标「已取消」。`QuestionPanel` 的结果键由 `value` 改为 `values`（列表），TUI 侧新增 `TuiRenderer.ask_form`、`show_question_panel` 签名改为 `(questions, result, evt)`，系统提示词同步补充多题用法与返回格式
+
 - **TUI「已探索」上下文汇总**（对齐 opencode）：TUI 中连续的读取 / 搜索工具（`read_file` / `list_dir` 计入读取，`glob` / `grep` 计入搜索）不再逐条平铺，而是汇总成一个可折叠块——头行进行中显示 `⠋ ⚙ 正在探索 · 3 次读取，2 次搜索`，完成后 `▸ ⚙ 已探索 · …`（只列非零类别），展开可见逐条明细；遇到非上下文工具、助手正文/思考流或回合结束时封口，之后的上下文工具另起一组。分组只影响 TUI 展示，`ConsoleRenderer` 与回传给模型的内容完全不变。实现：`Renderer.tool_call` 新增可选 `name` 参数（Agent 预检传入工具名，不靠解析摘要猜工具），TUI 侧新增 `ContextGroup` 控件与 `ChatView.place_tool` / `mark_tool_done` 分组生命周期，分类与中文汇总为 `tui/render.py` 纯函数（`CONTEXT_TOOLS` / `context_category` / `context_summary`）
 - **技能（Agent Skills）**：兼容 agentskills.io 开放格式（`SKILL.md`：YAML frontmatter 的 `name` + `description`，正文写指令，可选 `scripts/`、`references/` 等资源），采用渐进式披露——启动只把技能名与描述装进系统提示词（约 100 token/技能，带字符预算三级降级），命中任务后由模型调用 `use_skill` 加载完整指令，资源文件按需读取：
   - 新增 `skills/` 子系统：`frontmatter.py` 自研宽容解析器（支持引号、`|`/`>` 块标量、`description` 内冒号，不引入 PyYAML；缺 `description` 才跳过，`name` 不符目录名等只告警）；`registry.py` 扫描发现（项目 `.agents/skills/` + 用户 `~/.smithcode/skills/` + `[skills].paths`，递归深度 4、跳过 `.git`/`node_modules`、同名"附加 > 项目 > 用户"先命中生效并记诊断）；`state.py` 会话级激活集合；`render.py` 目录段与已激活段渲染
@@ -51,13 +55,27 @@
 - 工具调用块展示**变更预览（diff）**，审核前先看清改动，写/编辑工具**默认展开**：
   - `write_file` / `edit_file` 在**执行前**（权限确认之前）把 unified diff 推送到**工具调用块**：pending 态就地展开，审核 y/n/a 时改动内容已可见（权限申请框只负责决策、保持纯净）；执行后 diff 保留在调用详情里回看（diff 在前、执行确认语在后，REPL 与 TUI 一致）。REPL 中按行着色打印（增行绿、删行红、`@@` 位置头青色），TUI 工具块内嵌着色 diff，超 40 行自动截断并提示省略行数；执行确认语（如「已编辑 c.txt」）在**真正调用后**展示
   - `write_file` / `edit_file` 的调用详情在 TUI 中**默认展开**（diff 直接可见，可手动收起）；`read_file` 等读取工具维持默认收起（整文件内容不上屏）
-  - 机制上工具注册表新增 `preview` 声明（`describe` 同款零侵入模式），其他工具可按需接入；`.env` 等禁读文件不生成预览避免密钥回显终端，预览生成失败只影响展示、不影响确认与执行
+  - 机制上工具注册表新增 `preview` 声明（`describe` 同款零侵入模式），其他工具可按需接入；`.env` 等敏感文件不生成预览避免密钥回显终端，预览生成失败只影响展示、不影响确认与执行
 - 自定义请求头 `[provider.headers]`：随每个 LLM 请求发送任意 HTTP 头，值为字符串原样发送、含 `{$session}` 占位符时替换为**当前会话 id**（会话开始与 `/new` 时自动轮换，一次对话内稳定）。适配要求会话级请求头的 OpenAI 兼容网关，如 OpenCode Go 需要每会话稳定的 `x-opencode-session`（`[provider.headers]` 下写 `x-opencode-session = "{$session}"`）。未配置则完全不发送额外请求头，既有行为不变
 - **`/effort` 命令：调整思考强度**（交互与 `/model` 一致）：TUI 中输入 `/effort`（无参）弹出居中选择框（选中即执行），`/effort <档位>` 直接切换，底栏「思考强度」实时刷新。候选为**本地默认维护**的完整档位列表（`models.DEFAULT_EFFORTS`，不调用远端接口）：`none / minimal / low / medium / high / xhigh / max`（即 OpenAI `reasoning.effort` 的完整支持范围）。思考强度改为**始终显式下发**，内置默认 `high`（`config.DEFAULT_EFFORT`，`config.toml` 的 `[provider].reasoning_effort` 可覆盖），不再提供「不发送」档。带参切换不校验取值，服务商不支持时可改传其他值
 - **`/model` 命令、模型目录与通用选择面板**（对齐 Claude Code / opencode）：TUI 中输入 `/model`（无参）弹出**居中遮罩选择框**（半透明背景 + 居中卡片，↑↓/j/k/数字键选择、Enter 确认、Esc 取消，当前模型标绿「(当前)」），选中后自动切换并刷新底栏；`/model <名称>` 直接切换（本会话生效）。候选由新的 **`ModelCatalog`**（`models.py`，线程安全）统一维护，来源按优先级组合：`config.toml [provider].models`（显式配置，存在即不联网）> `~/.smithcode/models.json` 磁盘缓存 > 远端 `/models`。**启动时**（`Agent.start()`，CLI 调用）同步装载配置/缓存，外部未配置则后台拉取远端 `GET /models` 并回写缓存（按接口地址校验，离线可用、不阻塞启动）；命令层只依赖 `agent.models.list()`。为此命令协议新增 `CommandResult.select` 选择意图——命令只声明候选项、由宿主负责弹窗（TUI 居中弹窗 / 非交互 REPL 列出候选并提示改用带参形式，保持 fail-closed），命令处理器保持同步纯函数。附带把权限/提问/通用选择面板从 `tui/app.py` 抽到新文件 `tui/panels.py`
 
 ### 变更
 
+- **系统提示词瘦身**：移除与工具 schema 重复的机制细节（read_file 行号格式、edit_file 匹配规则、apply_patch 信封格式、glob / grep / webfetch 的参数与排序等——这些本就随工具 schema 一起发给模型），只保留跨工具规则（并行批处理、输出截断标记、`<context-summary>`、复合命令逐段求值），避免两处描述漂移（`websearch` 幽灵能力即由此暴露）；同一套 `/goal` 完成审计规则、todo 状态机规则、ask_user 用法在提示词内不再重复表述。「当前环境」块新增**是否 git 仓库**与**今天日期**（对齐 opencode / Claude Code 的环境块）
+
+- **系统提示词补充安全与协作边界**（对齐 Claude Code 的「Executing actions with care」等）：新增「谨慎操作」节（可逆性与影响范围、一次批准不等于一直批准、不用破坏性操作抄近路绕障）与「不可信内容」节（工具结果 / 网页 / 文件内容当作数据而非指令，防御提示注入）；「安全边界」补充密钥等敏感信息不入代码 / 日志 / URL / 提交、写代码防止命令注入 / SQL 注入 / XSS / 路径穿越
+
+- **系统提示词补充沟通与判断规范**（对齐 Claude Code 的「Text output」与 opencode 的「Professional objectivity」）：新增「专业判断」节（技术准确优先于迎合、不确定先查证）；「沟通」节扩写文本可见性（首条工具调用前说明意图、关键节点简短更新、不旁白内心推理、匹配任务量）与探索性问题的答法（两三句给推荐与取舍、同意前不实现），并明确不要把工具或代码注释当作沟通渠道；「工作方式」补充不主动创建文档 / 计划 / 分析文件、代码默认不写注释
+
+- **文档修正**：`.env` 并非"禁止读写"——代码只在变更预览/确认框中不回显其内容，读写本身按普通权限规则（读默认放行、写默认确认）；修正 `README.md` / `AGENTS.md` 中夸大保护的表述（`docs/architecture.md` 本已正确描述 `.git` 只读）
+
+- **系统提示词补充两点**：不臆造 / 猜测 URL（web 工具只用用户提供或工具结果里的地址）；说明上下文接近上限时系统会自动压缩、任务不中断，不要提前收尾或降低完成标准
+
+- **工具批处理改为流式调度（边预检边执行）**：此前模型一次返回的多个 tool_calls 是「两阶段」——先在主线程把整批预检（含逐个权限确认）完，再分波次执行，于是"批完所有确认才动第一个工具"。现改为 `_BatchScheduler` 流式调度：按接收顺序**预检一个就调度一个**——可并行的只读/网络调用进波次缓冲、到屏障才提交线程池并发执行；`serial` 有状态工具在主线程就地执行、作为顺序屏障（执行前先冲刷前面的波次）。因此串行工具在**后续工具的权限确认之前**就已执行完，确认框与执行一一对应，不再"一次确认一大批、最后才一起跑"。不变量不变：结果严格按提交顺序回传、每个 `tool_call_id` 恰有一条结果、串行工具前先收并行波次、`max_tool_concurrency=1`/单计划仍不进线程池。**行为变更**：并行波次在屏障前不产生副作用（并行工具仅只读/网络类），故"首个串行工具执行前"的整段仍可原子取消；但一旦某个已确认的串行工具执行完，之后再被拒/中断即不再回滚它（partial apply）——这是流式换来的即时性代价。`_execute_batch` 退化为 `_BatchScheduler`（`agent.py`）的适配器；中断/拒绝的占位补齐与会话完整性保持不变
+- **ask_user 工具块展示优化**：工具块头部由原来的 `[Tool] ask_user({...})` 改为「提问：<问题>」（注册 `describe`），用户回答独立成块（`display: block`）并**默认展开**——页面只展示「提问 + 问题」，正文展示所选选项 / 自定义回答。`_finish` 的默认展开集合由 `FILE_EXPAND_TOOLS` 更名为 `DEFAULT_EXPAND_TOOLS` 并纳入 `ask_user`（write/edit/apply_patch 行为不变）
+- **TUI 变更预览改为 IDEA 式左右对照 diff（带行号）**：write/edit/apply_patch 的调用详情不再用 `+/-` 各占一行的统一 diff（改动稍多就拖很长），改为左右两栏对照——左栏旧文件、右栏新文件，各自显示真实行号；删除行在左栏、新增行在右栏，配对到同一行、未配对的一侧留白，**行内容带 `-` / `+` 前缀并做红 / 绿配色**（不依赖颜色也能看出增删）；整块 diff（含上下文与留白侧）铺统一底色 `#141414`、每行等宽铺满，块内**不展示文件名**（工具摘要已含路径），上下各留 1 行 padding，`@@` hunk 头不再占行。实现为零新依赖的纯 stdlib（difflib 解析）+ rich `Text`（`tui/render.py` 的 `side_by_side_diff` / `_parse_unified`）；终端太窄放不下两栏时自动回退为原逐行统一 diff。`ToolCall` 的详情控件改为 `_ToolBody`，在 `render()` 里按当前宽度实时生成，窗口缩放自动重排；折叠态仍按行数截断（新增省略提示）。带 diff 的工具执行成功后不再重复展示「已编辑/已写入/已应用」确认语（审核时已看过 diff），失败仍展示错误。REPL 的 `+/-` 着色打印保持不变
+- **TUI 中断提示改挂到「用时」行尾（不再占用对话区）**：按 Esc 中断时不再往对话区打「（正在停止…）」或「⏹ 已中断」行——改为底部运行动画行尾**动态**追加「· 正在停止…」（随动画每 100ms 刷新，计时继续），任务真正收尾后轮次页脚行尾显示「· 已停止」。Agent 不再经 renderer 打印中断行（`INTERRUPTED_NOTE` 保留给 REPL / 一次性任务，由宿主按 `RunResult.status == "interrupted"` 渲染）；TUI 侧 `_run_task` 把最终 status 传给 `ui_turn_end`，`RunningIndicator.mark_stopping` 置停止态，`ChatView.add_turn_footer` 新增可选 `status`
 - **`list_dir` 输出规范化**：每行三列「名称  大小  修改时间」——目录在前（以 `/` 结尾、大小列留空），文件在后并标注大小，末尾附本地时间 `YYYY-MM-DD HH:MM`；去掉了每行重复的 `[文件]` / `[目录]` 前缀，与 `glob` 的「相对路径 + 目录带 `/`」约定一致，更省 token 也更好扫读。文件名按终端显示宽度对齐（中文全角按 2 列计），中文名不再错位。工具 schema 描述与系统提示词同步说明各列含义，让模型理解返回信息
 - **`/new` 重置收敛与 TUI 清屏**：会话级状态的重置逻辑原先散落在命令层（`commands/session.py` 直接清 session / 权限规则 / 信任目录 / 压缩计数 / 计划清单），现集中为 `Agent.new_session()` 一处，并补齐两项漏网状态——工具侧「已读文件」记录（漏清会让新会话绕过 write/edit 前的已读校验）与上下文计量中的真实 token 锚点 `last_actual`（漏清会让 `/context` 用旧会话的真实值误导对比）。TUI 中执行 `/new` 现在会**彻底清空聊天区**（含欢迎横幅，连带清掉残留的工具块映射与思考块），且不再追加「已开启新会话。」提示文本——清空本身即反馈；REPL 仍打印该提示。**任务运行中 `/new` 会被拦截**（对齐 opencode 的 busy 拒绝）：只提示「请等待完成或先按 Esc 中断」，避免后台线程写历史时中途重置撕裂轮次。新增 `Agent.new_session` / `Permission.new_session` / `ContextMeter.new_session` 三个重置入口与对应测试
 - **修复运行计时动画首次显示不可见**：`RunningIndicator` 的 `width: auto` 空组件初始宽度为 0，而每次 tick 的更新走 `layout=False` 免重排——首次 `display=True` 不会触发布局，导致**第一轮任务的「Working…」计时全程渲染了却看不见**（第二次起 `display` 翻转强制重排才恢复）。修复为 `start()` 时立即渲染初始文案并触发一次布局定宽，组件状态初始化挪入 `__init__`；新增回归测试断言首次显示即有宽度
@@ -79,13 +97,25 @@
 - TUI 修复侧边栏**无任务时底部信息被顶到上方**：计划区隐藏（`display:none`）后 Sidebar 内不再有弹性占位，版本号与工作区路径随卡片从顶部堆起。现将用量/上下文卡片与计划区整体包进常驻的 `#sidebar-top`（`height: 1fr`）弹性容器，无论计划区是否展示，底部版本号 / `项目名 | 路径` 始终钉在侧边栏底部
 - TUI 修复运行期间**输入框左侧竖线底部抖动**：三处 100ms 动画（运行提示 / 工具行转轮 / 思考转轮）此前每次 `Static.update()` 都触发全屏布局重排（Textual 默认 `layout=True`），输入框 `border-left` 底格紧贴动画所在底行，缝两侧被分批清空重绘导致抖动。现转轮类更新改为 `layout=False`（内容尺寸不变时跳过重排，只做 cell 级 diff 重绘），运行提示的耗时文案改为分段定宽格式（`59s` / `5.3m` / `1.2h`，右对齐恒 5 列），任意时长下文案宽度恒定、全程零重排
 
+- **权限 / 提问面板改为 opencode 式「标题 + 带说明的编号选项」**：两个 composer 位面板顶部只展示标题，选项统一为竖排编号列表（选中行暗色底），有提示或副作用的选项在其下方附一行灰色小字。
+  - 权限确认：标题统一为「允许执行 <工具名>?」，工具摘要（`describe`，如 `command git status` / `fetch <url>` / `write <path>`）**紧跟标题同排展示**（灰色小字，与标题留间隔）——此前只有带 `pattern_arg` 的工具（edit / write / run_command 等）有目标、webfetch / todo 等没有，现所有工具一致；「本会话将记住: …」作为「总是允许」项的小字。`Permission.check` / `check_paths` 新增 `content` 参数（由 Agent 传入 describe 摘要），`Renderer.confirm_choice` 新增可选 `descriptions`（按选项键索引）与 `content`；权限信息不再先用 `renderer.info()` 打到聊天区再弹框（去掉重复）；越界路径授权、项目技能信任同样收口
+  - 版式：标题与选项区之间增加一行间隔（`.perm-title` / `.ask-title` 加 `margin-bottom`）
+  - 提问面板：`ask_user` 每个 option 的 `description` 经 `ask_choice(..., descriptions=...)` 透传并渲染在选项下方（此前被丢弃），标题去掉 `[提问]` 前缀
+  - REPL 行为不变：`ConsoleRenderer` 仍把说明打印在提示前 / 选项下方；导航键统一为 ↑↓ / j / k，字母键 y/n/a 与数字键仍是隐藏快捷键
+  - 版式对齐：两个面板加 `margin: 0 2` 与输入框左右缩进保持一致；选项说明与「输入自定义回答」输入框的缩进对齐选项文字
+
+- **`webfetch` 默认放行**：`DEFAULT_RULES` 新增 `("webfetch", "*", ALLOW)`，抓取网页不再逐个弹确认（此前无匹配规则默认 `ask`）。抓取是只读网络操作、对本地文件无副作用，故默认放行以减少确认疲劳；需要收紧时用 `[permissions]` 写 `webfetch = "ask"` / `"deny"`（用户规则命中优先于内置默认），`-y` / auto 档与 `deny` 语义均不变。
+
 ### 修复
 
+- **中断事件回写上下文，下一轮模型可见**：此前手动中断（TUI Esc / REPL Ctrl+C）后，模型在下一轮只看到被截断的部分输出，并不知道任务是被用户主动叫停的，容易把未完成的中间结果当成最终结果。现 `Agent.run` 在返回 `interrupted` 时追加一条 user 消息（`INTERRUPTED_CONTEXT`：任务未完成、部分输出可能不完整、未执行的工具已标记为未执行），**不触发任何新请求**，只写入会话历史；下一轮用户提问时模型即可看到，作为后续决策依据
 - **权限被拒 / 中断时，已预检未执行的 TUI 工具块停在 pending 转轮**：这类计划此前只补了会话占位结果（防悬空 `tool_call_id`），没有更新渲染后端，TUI 对应的工具行——以及「已探索」汇总组里的子项——会一直转轮。现 `_placeholder` 增加可选的渲染器配对 id，拒绝路径与 `_interrupt_batch` 对**已预检**的计划补一次 `tool_result` 收尾；尚未预检的剩余 `tool_calls` 没有控件、行为不变，回传模型的消息序列完全不变（REPL 的 summary 模式输出也不受影响）
 - **TUI「已探索」汇总块展开时撑满可用高度**：明细容器 `.group-body` 是 `Vertical`，而 Textual 容器默认 `height: 1fr`，展开即吃掉整块高度。现显式改为 `height: auto` 按内容自适应，并加回归测试断言展开后高度与明细行数相当
 - **TUI 因工具摘要/提问文本含方括号而被 Textual markup 解析崩溃**：`Static` 默认按 console markup 解析字符串，当模型给的自由文本含 `[link=https://...]` 一类方括号结构（如 webfetch 的 `fetch <url>` 摘要）时，Textual 抛 `MarkupError` 直接崩掉整个界面（且异常常在退出排布时才暴露）。现把展示动态文本的控件统一禁用 markup：工具调用块头部、思考块头部、运行动画、权限/提问/选择面板标题与提示（正文本就是 rich `Text`，不受影响）——原样展示方括号，不再当样式标签解析
 - **TUI 执行 `/new` 后欢迎横幅（Logo）不再消失**：`reset_chat` 清空聊天区后漏了重新渲染欢迎语，导致新会话屏幕只剩空白、启动时的 Logo 不见了。现将欢迎横幅渲染抽为 `SmithTUI._show_welcome`，`on_mount` 与 `reset_chat` 共用——`/new` 后聊天区回归会话起点、Logo 与问候语重新出现
 - **read_file 行号分隔符由两个空格改为 `│`，消除 old_string 复制的隐性陷阱**：此前输出形如 `12  code`，行号与正文间的两个空格是**排版分隔符、不属于文件内容**，却极易被当成正文的缩进一并复制进 `old_string`（列首的行 + 长行场景尤甚，如 CHANGELOG 的列表项），导致 `text.count(old_string) == 0` 报「old_string 未找到」而反复踩坑。现改为醒目非空白分隔符 `12│code`，并同步 read_file / edit_file 的工具描述、系统提示词示例与报错文案（`（注意不要把「行号│」前缀复制进去）`），测试断言一并更新
+
+- **多题提问面板回改中间题时直接跳到确认页**：`QuestionPanel._advance` 此前是「跳到下一道**未答题**」（自当前题向后环绕扫描），回改中间某题时因后面都已答完而扫描不到未答题，直接落到确认页——与「改完接着看下一题」的预期不符。现改为**按顺序进下一题**（回改中间题同样进下一题），只有提交**最后一题**时才回头补前面漏答的题（补齐后再进确认页，避免带着空答案提交）；单问题仍直接提交、不进确认页
 
 ## [0.7.0] - 2026-09-07
 
