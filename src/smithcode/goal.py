@@ -430,3 +430,39 @@ def reset() -> None:
     """清空当前会话的目标（/new 时调用）。"""
     global _current
     _current = None
+
+
+def snapshot() -> dict | None:
+    """会话级目标快照（持久化投影缓存用；不含回合计数与 token 基线）。"""
+    if _current is None:
+        return None
+    return {
+        "objective": _current.objective,
+        "status": _current.status,
+        "max_turns": _current.max_turns,
+        "evidence": _current.evidence,
+        "note": _current.note,
+    }
+
+
+def restore(data) -> None:
+    """从快照恢复目标（原地重建单例）；回合计数与 token 基线有意重置。
+
+    对齐 Claude Code：活跃目标跨进程存活，但回合数/计时/用量从零重新开始，
+    避免恢复后立即触发预算收尾。非法数据等同于清空。
+    """
+    global _current
+    if not isinstance(data, dict) or not str(data.get("objective") or "").strip():
+        _current = None
+        return
+    restored = Goal(
+        objective=str(data["objective"]).strip(),
+        max_turns=int(data.get("max_turns") or config.GOAL_MAX_TURNS),
+    )
+    status = data.get("status")
+    restored.status = status if status in STATUSES else ACTIVE
+    restored.evidence = str(data.get("evidence") or "")
+    restored.note = str(data.get("note") or "")
+    if restored.status != ACTIVE:
+        restored.ended_at = time.time()
+    _current = restored

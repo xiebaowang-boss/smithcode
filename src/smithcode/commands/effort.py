@@ -15,7 +15,8 @@ def _effort(ctx):
     if ctx.args:
         value = ctx.args[0]
         config.REASONING_EFFORT = value
-        return CommandResult(text=f"思考强度已切换: {value}", style="green", refresh_status=True)
+        # 静默切换：反馈由底栏「思考强度」刷新承担，不再打印提示行
+        return CommandResult(refresh_status=True)
 
     current = config.REASONING_EFFORT or config.DEFAULT_EFFORT
     choices = [

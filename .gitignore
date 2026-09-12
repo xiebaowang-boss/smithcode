@@ -3,8 +3,8 @@
 .env.local
 .env.*.local
 
-# 会话记录（可能含对话与工作区内容）
-sessions/
+# 会话记录（可能含对话与工作区内容；仅仓库根的旧版导出目录）
+/sessions/
 
 # Python 缓存
 __pycache__/

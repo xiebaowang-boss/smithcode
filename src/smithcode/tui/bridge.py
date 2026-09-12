@@ -72,6 +72,10 @@ class TuiRenderer(renderer.Renderer):
     def info(self, text: str) -> None:
         self._post("line", text, "grey50")
 
+    def title_changed(self, title: str) -> None:
+        """会话标题变化（/rename 或后台自动标题）：通知主线程刷新底栏。"""
+        self._post("title", title)
+
     def ask_form(self, questions: list[dict]) -> list[str]:
         """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
         result, evt = {}, threading.Event()

@@ -30,6 +30,8 @@ from .state import (  # noqa: F401 公共 API
     model_skills,
     refresh,
     reset,
+    restore,
+    snapshot,
 )
 
 

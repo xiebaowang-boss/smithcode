@@ -55,6 +55,19 @@ _GOAL_STATUS_COLORS = {
 }
 
 
+def _message_text(content) -> str:
+    """历史消息 content 的纯文本（兼容多模态列表）。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return ""
+
+
 class SmithTUI(App):
     CSS = """
     Screen { layout: horizontal; }
@@ -91,6 +104,8 @@ class SmithTUI(App):
         padding: 0 2;
         background: #1e1e1e;
         overflow: hidden auto;
+        /* 隐藏滚动条：候选超出时仍可用滚轮 / 键盘滚动，只是不绘制（与聊天区一致） */
+        scrollbar-size-vertical: 0;
     }
     #command-menu .menu-item {
         width: 1fr;  /* 拉满整行，选中项的高亮底色才贯通 */
@@ -249,7 +264,28 @@ class SmithTUI(App):
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
         self._show_welcome()
+        if getattr(self.agent.session, "messages", None):
+            self._replay_history()  # 启动时恢复的会话：回放历史
         self.ui_status()
+
+    def _replay_history(self) -> None:
+        """恢复会话后回放历史：user / assistant 文本走既有渲染路径静态上屏。
+
+        工具调用与结果不逐条回放（历史长且没有 pending 状态语义），也不追加
+        任何恢复提示；用 batch_update 一次性绘制，避免逐条 append 闪屏。
+        """
+        messages = getattr(self.agent.session, "messages", None) or []
+        chat = self.query_one(ChatView)
+        with self.batch_update():
+            for message in messages:
+                role = message.get("role")
+                text = _message_text(message.get("content"))
+                if role == "user" and text:
+                    chat.add_user(text)
+                elif role == "assistant" and text.strip():
+                    chat.begin_stream("content")
+                    chat.append_stream("content", text)
+                    chat.end_stream()
 
     def _show_welcome(self) -> None:
         """在聊天区渲染欢迎横幅（启动与 /new 后复用）。
@@ -350,6 +386,10 @@ class SmithTUI(App):
 
     def ui_line(self, text: str, style: str | None = None) -> None:
         self.query_one(ChatView).add_line(text, style)
+
+    def ui_title(self, title: str) -> None:
+        """后台自动标题生成完成（Renderer.title_changed）：刷新底栏标题。"""
+        self.ui_status()
 
     def ui_block(self, text: str, style: str | None = None) -> None:
         """多行文本块；from_ansi 解析内嵌 ANSI 转义（如 [计划] 清单的颜色码），
@@ -489,6 +529,7 @@ class SmithTUI(App):
         self.query_one("#composer-mode").update(mode)
         self.query_one("#composer-model").update(model)
         self.query_one("#composer-thinking").update(thinking)
+        sidebar.update_title(self._session_title())
         marker = goal.marker()  # 「◎ 目标 3/50」；无目标时隐藏该段
         goal_status = self.query_one("#composer-goal")
         goal_status.update(marker)
@@ -558,6 +599,26 @@ class SmithTUI(App):
         thinking = Text("· ", style="#808080")
         thinking.append(config.REASONING_EFFORT or config.DEFAULT_EFFORT, style="#e0af68")
         return mode, model, thinking
+
+    def _session_title(self) -> Text:
+        """侧边栏顶部的会话标题：标题优先，未生成时回退首轮 user 消息截断。
+
+        无任何可展示内容时返回空 Text，由 Sidebar 整段隐藏。标题可能来自
+        `/rename`（用户）或首轮后的后台自动生成，两个入口都经 `ui_status` 刷新。"""
+        session = self.agent.session
+        title = str(getattr(session, "title", "") or "").strip()
+        if not title:
+            for message in session.messages:
+                if message.get("role") == "user":
+                    title = _message_text(message.get("content")).strip()
+                    if title:
+                        break
+        title = " ".join(title.split())
+        if not title:
+            return Text("")
+        if len(title) > 30:
+            title = title[:29] + "…"
+        return Text(title, style="#7dcfff")
 
     def _status_text(self) -> Text:
         """底部状态栏：git 分支 / 上下文占用条（模型与思考强度已移入输入框内）。"""
@@ -648,10 +709,10 @@ class SmithTUI(App):
     def handle_command(self, text: str) -> None:
         """斜杠命令统一走 commands.dispatch，按结果标记做 TUI 侧的收尾动作。"""
         # 对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
-        # 中途重置会撕裂进行中的轮次（工具结果落入悬空的新会话），先行拦截
+        # 中途重置/切换会撕裂进行中的轮次（工具结果落入悬空的新会话），先行拦截
         tokens = text.strip().split()
-        if self._busy and tokens and tokens[0].lower() == "/new":
-            self.ui_line("（任务运行中，不能开启新会话；请等待完成或先按 Esc 中断）", "yellow")
+        if self._busy and tokens and tokens[0].lower() in ("/new", "/sessions"):
+            self.ui_line("（任务运行中，不能切换会话；请等待完成或先按 Esc 中断）", "yellow")
             return
         outcome = commands.dispatch(self.agent, text)
         if outcome.exit:
@@ -660,6 +721,13 @@ class SmithTUI(App):
         if outcome.session_reset:
             # /new：清空聊天区本身就是全部反馈，不再追加提示文本（REPL 侧仍有文字）
             self.reset_chat()
+        elif outcome.session_resume:
+            # /sessions <id|序号>（或选择框选中）：清屏后回放切换后的历史
+            self.reset_chat()
+            self._replay_history()
+            self.query_one(Sidebar).update_plan(
+                plan.render_titles(color=True), plan.has_active()
+            )
         else:
             if outcome.text is not None:
                 if outcome.kind == "block":

@@ -238,3 +238,64 @@ def test_read_configured_models_skips_non_string_items(tmp_path, monkeypatch, ca
     monkeypatch.setenv("SMITHCODE_HOME", str(home))
     assert config.read_configured_models() == ["a"]
     assert "警告" in capsys.readouterr().out
+
+
+# ---------- [sessions] 配置与会话 id 采用 ----------
+
+def test_sessions_config_defaults(tmp_path, monkeypatch):
+    home = _make_home(tmp_path)
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_sessions_config()
+    assert cfg.enabled is True
+    assert cfg.cleanup_days == 30
+    assert cfg.persist_state is True
+    assert cfg.list_limit == 20
+    assert cfg.auto_title is True
+    assert cfg.title_model == ""
+    assert cfg.title_max_chars == 60
+
+
+def test_sessions_config_reads_values(tmp_path, monkeypatch):
+    home = _make_home(tmp_path, toml_text=(
+        "[sessions]\n"
+        "enabled = false\n"
+        "cleanup_days = 7\n"
+        "persist_state = false\n"
+        "list_limit = 5\n"
+        "auto_title = false\n"
+        'title_model = "fast-model"\n'
+        "title_max_chars = 20\n"
+    ))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_sessions_config()
+    assert cfg.enabled is False
+    assert cfg.cleanup_days == 7
+    assert cfg.persist_state is False
+    assert cfg.list_limit == 5
+    assert cfg.auto_title is False
+    assert cfg.title_model == "fast-model"
+    assert cfg.title_max_chars == 20
+
+
+def test_sessions_config_invalid_values_degrade(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, toml_text=(
+        "[sessions]\n"
+        'enabled = "yes"\n'
+        "cleanup_days = -5\n"
+        "title_max_chars = 0\n"
+        "list_limit = -1\n"
+    ))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_sessions_config()
+    assert cfg.enabled is True
+    assert cfg.cleanup_days == 30
+    assert cfg.title_max_chars == 60
+    assert cfg.list_limit == 20
+    assert "警告" in capsys.readouterr().out
+
+
+def test_use_session_id_adopts_persisted_id():
+    before = config.SESSION_ID
+    assert config.use_session_id("abc123") == "abc123"
+    assert config.SESSION_ID == "abc123"
+    config.use_session_id(before)  # 还原，避免污染其他用例

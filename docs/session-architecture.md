@@ -1,8 +1,9 @@
 # 会话管理架构设计
 
-> 状态：**设计稿（未实施）**。调研原始材料见仓库根目录 `SESSION_MANAGEMENT_RESEARCH.md`；
-> 本文是其落地版：给出架构、模块接口、磁盘格式 v1、恢复语义、集成改动与分阶段路线。
-> 文中代码坐标以当前工作区为准。
+> 状态：**Phase 1 已落地**（自动落盘、`-c`/`--resume`、崩溃修复、状态投影恢复、会话标题、
+> 列表/恢复/删除/导入/保留期清理，TUI 回放与选择器已接入）；分支、导出、并发锁按路线图推进。
+> 调研原始材料见仓库根目录 `SESSION_MANAGEMENT_RESEARCH.md`；本文是其落地版：给出架构、模块接口、
+> 磁盘格式 v1、恢复语义、集成改动与分阶段路线。文中代码坐标以当前工作区为准。
 
 ---
 
@@ -84,6 +85,15 @@ Crush 整体 SQLite（单连接串行写）；Aider 用仓库内 Markdown 追加
 3. **懒物化**：没有真实消息就不建文件（启动、只看 `/help` 不产生噪声文件）。
 4. **持久化是尽力而为**：失败降级、损坏行容忍，永不阻断任务。
 5. **对内稳定、对外可演进**：`messages` 是稳定接口；JSONL 记录带 `v` 版本，未知记录忽略。
+6. **状态按来源分层**：先判定一条状态的来源，再决定它对持久化的义务。
+
+| 层 | 内容 | 持久化策略 |
+| ---- | ---- | ---- |
+| 真相源（不可再生） | 消息转录、compact 检查点、元数据（id / cwd / model / created / 血缘） | **必须落盘**；缺失即恢复失败或降级 |
+| 投影缓存（可重建） | plan 清单、技能激活集、goal 控制面、usage 汇总、context 计数、title | 落盘只为恢复速度与保真；**损坏/缺失可降级**，不阻断恢复 |
+| 易失 / 禁用 | 权限会话规则、越界信任目录、read-tracking、in-flight 工具、取消令牌、进程服务（LLMClient / 工具注册表 / 模型目录 / 权限引擎）、UI 状态 | **不落盘、不恢复** |
+
+判定顺序：① 不可再生 → 必须存；② 能从转录廉价重建 → 只做投影缓存；③ 恢复语义错误或无意义 → 丢弃。
 
 ### 3.1 总体结构
 
@@ -99,10 +109,10 @@ Crush 整体 SQLite（单连接串行写）；Aider 用仓库内 Markdown 追加
 │  messages(投影) │                                    ▲
 └───────┬────────┘                                    │ load
         │ sync_system / run                           │
-┌───────▼────────┐   resume  ┌──────────────┐   ┌─────┴──────────┐
-│ Agent           │◀─────────│ CLI / 命令层  │   │ TUI picker     │
-│ run / compact   │  report  │ -c / --resume│   │ /resume 选择框  │
-└────────────────┘          └──────────────┘   └────────────────┘
+┌───────▼────────┐   resume  ┌───────────────┐   ┌─────────────────┐
+│ Agent           │◀─────────│ CLI / 命令层   │   │ TUI picker      │
+│ run / compact   │  report  │ -c / --resume │   │ /sessions 选择框 │
+└────────────────┘          └───────────────┘   └─────────────────┘
 ```
 
 数据流一句话：**消息从 `Session` 单向追加到转录；恢复时从转录反向装配 `Session` 并重建状态**。
@@ -277,15 +287,15 @@ for tc in 尾部 assistant 消息的 tool_calls:            # 按出现顺序
     ▼                     │ /new（旧会话闭合，仍在磁盘）
   active ── /branch ──▶ 新的 active（父会话不动）
     │  ▲                  │
-    │  └── /resume ───────┤
+    │  └── /sessions ─────┤
     │                     ▼
     └─ 退出/崩溃 ─▶ stopped（转录可恢复，尾部可能需 §3.6 修复）
                       │
                       └─ /sessions delete / 保留期 sweep ─▶ 文件移除
 ```
 
-- 同一时刻只有一个活动会话文件可写；切换（`/resume`、`/new`、`/branch`）必须先闭合旧 store。
-- TUI 沿用 busy 守卫：任务运行中不允许 `/resume` / `/new`（`tui/app.py:650` 既有逻辑）。
+- 同一时刻只有一个活动会话文件可写；切换（`/sessions`、`/new`、`/branch`）必须先闭合旧 store。
+- TUI 沿用 busy 守卫：任务运行中不允许 `/sessions` / `/new`（`tui/app.py` 既有逻辑）。
 
 ### 3.9 恢复语义表（设计决策）
 
@@ -311,9 +321,11 @@ for tc in 尾部 assistant 消息的 tool_calls:            # 按出现顺序
 **`session.py`**：
 
 ```python
-class Session:
+class Session:                                  # 会话聚合根：对象身份跨 /new / resume 不变
+    # 持有：id / created_at / title / model / messages / usage
     def __init__(self, store=None): ...
     def bind_store(self, store) -> None
+    def restore_state(self, messages: list, meta: dict) -> None   # 原地恢复，不新建 Session
     def set_compacted(self, summary: dict, tail: list, before: int, after: int) -> None
     def state_snapshot(self) -> dict            # goal/plan/skills → store.append_state
     def save(self) -> Path                      # 语义变更：flush + 返回转录路径（不再是 workspace dump）
@@ -323,13 +335,18 @@ class Session:
 
 ```python
 class Agent:
+    # 进程级服务留在 Agent（不随会话存取）：LLMClient / Permission / ModelCatalog / 工具注册表 / 令牌
     def __init__(..., store=None)               # 默认按 [sessions].enabled 创建
-    def resume(self, target) -> ResumeReport    # 装配：load → repair → 重建 Session + 恢复状态
-    def new_session(self) -> None               # 既有：+ 闭合旧 store、开新 store
+    def resume(self, target) -> ResumeReport    # 原地恢复：load → repair → session.restore_state + registry
+    def new_session(self) -> None               # 原地重置：闭合旧 store、开新 store、registry reset
+    def _state_registry(self) -> list           # [(snapshot, restore, reset)]：goal/plan/skills/context
     def _snapshot_state_if_changed(self)        # 每轮结束/状态变更时写 state 记录（去重）
     def close(self) -> None                     # flush/close（cli 退出路径）
 ```
 
+- **状态部件统一协议**：`goal` / `plan` / `skills` 各实现 `snapshot() / restore(data) / reset()`，
+  `context` 以 `new_session() + compact_count` 参与；`Agent` 遍历注册表执行，`new_session` 与
+  `resume` 共用同一张表——新增会话级状态必须注册，配测试断言"注册表 = 重置清单"。
 - `_run_loop` 每轮结束时调 `store.append_usage(...)`（若 provider 给出用量）与
   `_snapshot_state_if_changed()`（序列化比较，不变不写）。
 - `run_once` 创建的 store 标记 `oneshot=True`（仅元数据差异）。
@@ -338,8 +355,8 @@ class Agent:
 
 | 命令 | 行为 |
 | ---- | ---- |
-| `/sessions [n\|delete <id>]` | 列出当前项目最近会话（短 id / 更新时间 / 标题或首轮摘要 / 模型 / 大小）；`delete` 删除文件 |
-| `/resume [<id\|序号>]` | 无参：返回 `CommandSelect`（TUI 弹 `SelectionPanel`，REPL 走既有 `_print_select` 降级）；带参直连 |
+| `/sessions` | 无参：返回 `CommandSelect`（TUI 弹 `SelectionPanel`，选中即切换；REPL 走既有 `_print_select` 降级）；`list [数量]` 文本列表；`delete <id>` 删除；`<id\|序号>` 直接切换；切换完成后置 `session_resume=True` |
+| `/resume`（仅 CLI） | 启动参数 `-c` / `-r/--resume [ID]`；会话内**不**提供该命令 |
 | `/rename <名称>` | 追加 `title` 记录，列表与 picker 即刻生效 |
 | `/branch [名称]` | 复制转录到新 id 并切换（原会话闭合但保留） |
 | `/new` | 语义微调：旧会话**保留在磁盘**（从"破坏性清空"变为"开新会话"）；TUI 行为不变（清聊天区） |
@@ -356,12 +373,15 @@ class Agent:
 
 - `-c` 与 `--resume` 互斥（argparse `mutually_exclusive_group`）；可与一次性任务组合
   （`smithcode -c "继续上次的任务"`：先恢复最近会话，再把该文本作为下一轮任务执行）。
-- 非交互 REPL 的 `/resume` 无参：打印列表 + 要求显式 id，不弹框（复用 `_print_select` 路径）。
+- 非交互 REPL 的 `/sessions` 无参：打印列表 + 要求显式 id/序号，不弹框（复用 `_print_select` 路径）。
 - `--resume <path>` 兼容旧 `.json`：走 `import_json` 导入后继续（§3.13）。
 
 **TUI（`tui/`）**：
 
 - picker 复用 `SelectionPanel` / `show_selection`（`tui/app.py:447`），选项 value = 会话短 id。
+- `CommandResult` 新增 `session_resume: bool` 标记（与 `session_reset` 并列）：TUI 收到后清聊天区，
+  再用 `replay_history(messages)` 一次性绘制恢复内容（`batch_update` 包住，避免逐条 append 闪屏）；
+  REPL 只打印恢复摘要。
 - 切换会话时不复用聊天区增量逻辑，新增 `replay_history(messages)`：user/assistant 文本静态渲染，
   tool 调用折叠为块（结果截断预览），占位/中断结果灰显；随后 `reset_chat()` 再回放。
 - 状态栏/侧边栏按恢复后的 goal/plan/token 刷新；busy 守卫拒绝运行中切换。
@@ -403,9 +423,46 @@ enabled = true          # false = 等价 --no-session-persistence（永久关闭
 cleanup_days = 30       # 保留天数；0 = 不自动清理
 persist_state = true    # 是否持久化 goal / plan / skills 激活集（false = 只存消息）
 list_limit = 20         # /sessions 与 picker 默认展示条数
+auto_title = true       # 首轮结束后自动生成会话标题（后台、失败静默）
+title_model = ""        # 标题专用模型；空 = 当前模型（建议配廉价快模型）
+title_max_chars = 60    # 标题长度上限
 ```
 
 解析沿用 `config.py` 的"类型不对警告并回退默认值"模式。
+
+### 3.15 会话标题（调研与设计）
+
+**成熟实现对照**
+
+| | 手动命名 | 自动标题 | 存储与读取 | 备注 |
+| ---- | ---- | ---- | ---- | ---- |
+| Claude Code | `--name` / `/rename` | 后台小模型（Haiku）从首轮 prompt 生成，写入 `ai-title` 条目 | transcript 逐条追加 `custom-title`/`ai-title`，列表扫文件尾 64KB，最后一条生效 | 用户命名优先；坑：长会话把 title 挤出 64KB 窗口会丢、工具输出中的 `"customTitle"` 文本会污染扫描、压缩可能覆盖 |
+| Codex | `/rename`、`/new "名称"`（v0.146+）、社区提案 `--name` | v0.150 起 auto-titling（配置 `[session] auto_name`）；此前 title 默认为整条首轮 prompt | `session_index.jsonl`（id→name）+ SQLite `threads.title` 双源 | 按名称 resume；双源可能不一致（索引为简短标题、SQLite 仍是长 prompt） |
+| opencode | 会话行 `title` 字段可改 | 内置隐藏 title agent：首条消息后会话 idle 时用 `small_model` 生成；默认名 `New session - <时间戳>` | SQLite session 行 | 生成失败静默（社区抱怨缺 fallback）；插件常见两段式：关键词标题即时出现 → 回复后 AI 精炼 |
+
+**共同规律**：① 标题是独立元数据流，不占主对话上下文；② 手动命名永远优先，自动生成不覆盖用户标题；
+③ 自动标题走廉价小模型 + 异步（idle / 首轮后），失败保留 fallback；④ fallback = 首轮 prompt 截断
+（Claude/Gemini）或时间戳（opencode）；⑤ append-only、最后一条生效，反复改名天然安全。
+
+**SmithCode 设计**
+
+- **存储**：复用格式 ⑤ `t=title` 记录，`source ∈ {user, auto}`，最后一条生效；`compact` 是独立检查点，
+  天然不会覆盖标题（规避 Claude Code 的"压缩覆盖标题"问题）。
+- **展示 fallback**：`title or 首轮 user 消息截断 40 字`（列表读取时派生，不落冗余字段）。
+- **手动**：`/rename <名称>`（追加 `source=user` 记录）；`--name <名称>` 启动即命名；
+  `/new [名称]` 开新会话时可带名（对齐 Codex v0.146）。用户标题即 pin：自动标题写盘前检查最新记录，
+  已有 `source=user` 则放弃。
+- **自动**：首轮任务正常结束后仅触发一次；后台 daemon 线程调用
+  `sessions/title.py` 构造请求（首轮 user + 助手正文截断），经 `LLMClient.chat_stream(tools=None)`
+  拿结果，校验（长度 ≤ `title_max_chars`、拒绝前言/错误句式）后追加 `source=auto` 记录；
+  失败静默，保留 fallback。`SessionStore` 增加**写锁**（标题线程与主线程并发追加）。
+- **提示词**：要求 3-6 个词、返回 JSON `{"title": ...}`、首字母大写（对齐 Claude Code title generator
+  的形态）；纯逻辑函数 `build_title_request()` / `clean_title()` 可离线单测，LLM 调用由 Agent 注入。
+- **UI**：`/sessions` 与 picker 显示 `title`（无则 fallback）；TUI 侧边栏顶部显示标题（无历史时隐藏），
+  `/rename` 与后台生成完成经渲染层刷新（不闪）；REPL 不主动播报。
+- **恢复**：加载取最后一条 `title`；Phase 2 支持 `--resume <名称>` 按标题精确匹配，多命中报歧义。
+- **坑规避**：解析走 **typed JSONL**（`t=="title"`），不会被工具输出里的字符串污染；列表头/尾窗口
+  未命中 title 时回退全文扫描；不建索引文件（单一真相源 = 转录，规避 Codex 的双源不一致）。
 
 ---
 
@@ -416,15 +473,17 @@ list_limit = 20         # /sessions 与 picker 默认展示条数
 - 新增 `sessions/`（`paths` / `format` / `store` / `__init__`）；`Session` 接 `MessageLog` +
   `bind_store` + `set_compacted`；`Agent` 创建/绑定 store、`resume()`；`compact()` 改一行。
 - CLI：`-c` / `--resume <id|path>` / `--no-session-persistence`。
-- 命令：`/sessions` 列表、`/resume <id>`（带参直连）、`/save` 改为 flush + 路径。
+- 命令：`/sessions`（无参选择框 / list 列表 / delete 删除 / id|序号直切）、`/save` 改为 flush + 路径。
 - 崩溃修复（§3.6）与容错解析（§3.3）。
 - 验证：跑一轮任务 → 退出 → `smithcode -c` 历史一致且模型可见；杀进程后恢复能修复悬空
   `tool_calls`；权限确认不恢复；`pytest` 全绿。
 
 ### Phase 2 —— 好找好认（元数据 + picker + 回放）
 
-- `title`（手动 `/rename`；首轮 prompt 截断作默认展示名）、oneshot 过滤、`list_sessions` 头部优化。
-- `/resume` 无参选择器（TUI picker / REPL 列表降级）；TUI `replay_history`。
+- 标题：`/rename` / `--name` / `/new [名称]` 手动命名 + 首轮后自动生成（§3.15：廉价模型、后台、用户优先、
+  失败保留"首轮 prompt 截断"fallback）；picker / `/sessions` / TUI 侧边栏顶部展示。
+- oneshot 过滤、`list_sessions` 头部优化。
+- `/sessions` 无参选择器（TUI picker / REPL 列表降级）；TUI `replay_history`。
 - model/effort 恢复规则落地（显式 CLI/env 优先）。
 - 保留期 `sweep` 接入启动路径；`/sessions delete`。
 - 验证：picker 可选中恢复、标题生效、一次性任务不进列表、过期会话被清理。
@@ -433,7 +492,7 @@ list_limit = 20         # /sessions 与 picker 默认展示条数
 
 - `goal.snapshot()/restore()`、`plan.snapshot()/restore()`、`skills` 激活集恢复（含重新校验）。
 - 状态快照写盘（去重）与恢复后的 `/goal` `/plan` 展示一致。
-- `/branch` 与 `--resume --fork`（可选）；会话内 `/resume` 切换。
+- `/branch` 与 `--resume --fork`（可选）；会话内 `/sessions` 切换。
 - 验证：恢复后 goal 回合/token 计数重置、plan 内容一致、权限规则**不**被恢复（安全断言）、
   分支后父会话不变。
 
@@ -453,7 +512,7 @@ list_limit = 20         # /sessions 与 picker 默认展示条数
 | `tests/test_sessions_store.py`（新） | 创建/追加/加载往返、懒物化、checkpoint 投影、列举头/尾读取、rename/branch/delete、sweep、写失败降级 |
 | `tests/test_session.py`（扩展） | `MessageLog` 钩子、system 不入盘、`set_compacted`、`bind_store` |
 | `tests/test_agent_resume.py`（新） | 崩溃修复（悬空 tool_calls）、恢复语义表逐项断言（权限不恢复、goal 计数重置、skills 重新校验） |
-| `tests/test_commands.py`（扩展） | `/sessions` `/resume` `/rename` `/save` 文案与标记；非交互降级 |
+| `tests/test_commands.py`（扩展） | `/sessions` `/rename` `/save` 文案与标记；非交互降级 |
 | `tests/test_cli_sessions.py`（新） | `-c` / `--resume` / `--no-session-persistence` 解析与互斥；旧 `.json` 导入 |
 
 - 全部持久化测试经 `SMITHCODE_HOME` 指向 tmp 目录隔离（沿用既有测试做法），不依赖真实 API。
@@ -475,6 +534,226 @@ list_limit = 20         # /sessions 与 picker 默认展示条数
 - **同会话多进程并发**：明确不支持；Phase 4 再考虑锁。
 - 次要风险：磁盘增长率（长会话 + 不清理）、Windows 句柄占用导致文件删除失败（先 close 再删），
   均在测试与文档中固化。
+
+---
+
+## 流程图：新建 / 追加 / 恢复
+
+### 图 1 新建会话（进程启动 或 `/new`）
+
+```text
+启动（无 -c/--resume）                /new（仅空闲时；busy 由 TUI 守卫拦截）
+        │                                     │
+        ▼                                     ▼
+ Agent.__init__                        Agent.new_session()
+   ├ SessionStore.create()               ├ 1. 旧 store：flush + close
+   │   不建文件（懒物化）                 │      └ 旧会话从未写过任何消息行 → 删除空文件
+   └ session.bind_store(store)           ├ 2. session.reset()（原地，不换对象）
+        │                                │      ├ config.new_session_id()
+        ▼                                │      ├ messages = []（MessageLog 重挂钩子）
+ 进入 REPL / TUI                         │      ├ created_at = now
+        │                                │      └ usage.reset_session()（会话口径清零）
+        │                                ├ 3. 状态注册表遍历 reset():
+        │                                │      goal / plan / skills / context
+        │                                │      permission / SESSION_EXTRA_ROOTS / read_tracking
+        │                                └ 4. SessionStore.create() + session.bind_store()
+        │                                     │
+        ▼                                     ▼
+  第一条非 system 消息产生            宿主视图：TUI 清聊天区 + 刷新状态栏
+  （用户输入 / goal 首轮提示）          REPL 打印「已开启新会话。」
+        │
+        ▼
+  MessageLog.append(msg)
+        │
+        ▼
+  Session._on_append(msg) ── role == "system" → 丢弃（system 不落盘）
+        │
+        ▼
+  SessionStore.append_message(msg)
+        ├ 文件不存在 → 先写 meta 行（t=meta：id/cwd/created/model/effort/app/oneshot）
+        ├ 一行 JSON（ensure_ascii=False）+ "\n"：单次 write() + flush
+        └ 任何 OSError → 警告一次 + store.disable()，本次会话纯内存（不阻断）
+```
+
+### 图 2 追加落盘（保存）——一个回合内的全部写入
+
+```text
+Agent.run() 回合
+  │
+  ├─ ① session.add("user", 输入) ──────────────┐
+  ├─ ② LLM 流式回复 → messages.append(助手消息) │   每个 append 自动走：
+  │       （tool_calls 原样保留）                │   MessageLog.append
+  ├─ ③ 工具执行：_collect / _placeholder ──────┤     → Session._on_append
+  │       （role=tool + tool_call_id；           │     → store.append_message
+  │        拒绝/中断的占位结果同样落盘）          │   （system 跳过）
+  │                                             ┘
+  ├─ ④ compact()（阈值预检 / /compact / 溢出恢复 共用）
+  │       摘要通过 validate_summary 后：
+  │       session.set_compacted(summary, tail, before, after)
+  │         ├ 内存：messages = [summary] + tail
+  │         └ 转录：追加一行 t=compact（自包含检查点；
+  │                 旧消息保留在文件中，不重写、不删除）
+  │
+  ├─ ⑤ 轮末 store.append_usage(usage)
+  │       （provider 返回 token 用量时写 t=usage）
+  │
+  └─ ⑥ 轮末 _snapshot_state_if_changed()
+          goal / plan / skills 序列化 → 与上次比较
+            ├ 相同 → 不写（去重，避免每轮刷一条 state）
+            └ 变化 → 追加一行 t=state（加载时取最后一条）
+
+  └─ ⑦ 首轮正常结束（仅一次，auto_title=true 时）
+          后台 daemon 线程：build_title_request(首轮 user + 助手正文截断)
+            → LLM(tools=None, title_model) → clean_title 校验
+            → 最新标题已是 source=user？放弃 : 追加 t=title(source=auto)
+            → 渲染层刷新（TUI 状态栏）；失败静默，保留 fallback
+
+ 写入语义：
+   - append-only，无读放大、无整文件重写；
+   - 每条记录一次 write()，崩溃最多丢最后一条残行（加载时静默忽略）；
+   - 写入失败只降级持久化，绝不影响 Agent 循环与消息历史。
+```
+
+### 图 3 恢复会话（`smithcode -c` / `--resume <id>` / `/sessions`）
+
+```text
+触发：cli -c | cli --resume <id|前缀|路径> | 会话内 /sessions <id|序号>（空闲时）
+        │
+        ▼
+ ① 定位 sessions（不读全文）
+    ├ -c            → find_last(cwd)：本项目 sessions/*.jsonl，mtime 最新
+    ├ --resume <id> → find(前缀)：读每个文件头部 meta，前缀唯一命中
+    │                    ├ 多命中 → 报「前缀不唯一」并列出候选
+    │                    ├ 零命中 → 友好错误；参数是旧 .json 路径 → import_json
+    │                    └ 命中多个项目 → 默认仅本项目（Phase 2 再加唯一跨项目）
+    └ /sessions 无参 → CommandSelect → TUI picker / 非 tty 列表 + 要求显式 id
+        │
+        ▼
+ ② 解析转录 sessions.load(summary)（单遍流式 + 容错）
+    for rec in iter_records(path):
+        t=meta    → 元数据（首行损坏 → 由文件名/mtime 合成）
+        t=msg     → messages.append(rec.m)
+        t=compact → messages = [rec.summary] + rec.tail     # 投影重置（O(1)）
+        t=state   → state = rec                             # 取最后一条
+        t=title   → title
+    坏行：中间行跳过并计数警告；末行残行静默忽略；未知 t / 未知字段忽略
+    完全不可读 → 结构化错误 → 宿主提示后回落「新建会话」，不崩溃
+        │
+        ▼
+ ③ 崩溃修复 repair_dangling_tool_calls(messages)
+    ├ 尾部 assistant(tool_calls) 缺配对 tool 结果
+    │     → 按序补 {"role":"tool","tool_call_id":id,"content":"（未执行：上次会话中断）"}
+    └ 中段悬空（手改/截断等异常）→ 从该 assistant 处截断 + 警告
+        │
+        ▼
+ ④ Agent.resume()：原地装载（Session / Agent 对象身份不变）
+    ├ session.bind_store(SessionStore.open(path))   # 后续消息继续追加到同一转录
+    ├ session.restore_state(messages, meta)         # 原地写：messages/id/created/title/model/usage
+    ├ 状态注册表遍历 restore:
+    │     goal.restore(state.goal)     # objective/status/预算/证据；turns 与 token 基线重置
+    │     plan.restore(state.plan)     # items 原样（id 保留）
+    │     skills.restore(state.skills) # 仅名称，重新校验 disabled/不可用后激活
+    │     context.new_session()        # 锚点作废；compact_count = 检查点条数；其余由 messages 重算
+    └ 安全例外（不恢复）：permission 会话规则 / SESSION_EXTRA_ROOTS / read-tracking
+        │
+        ▼
+ ⑤ config.use_session_id(meta.id)     # {$session} 请求头跨进程稳定
+        │
+        ▼
+ ⑥ session.sync_system()              # messages[0] 按当前提示词重建（技能目录 + goal 段）
+        │
+        ▼
+ ⑦ 宿主渲染
+    ├ TUI：reset_chat() → replay_history(messages)（batch_update 一次性绘制）
+    │       + 刷新状态栏 / 侧边栏（goal/plan/usage/context）
+    └ REPL：打印「已恢复会话 <短id>（N 条消息）」
+        │
+        ▼
+ 空闲；下一次用户输入直接复用恢复后的 messages 发请求
+```
+
+### 图 4 分支与删除（补充）
+
+```text
+/branch [名称]                              /sessions delete <id> / sweep 到期
+     │                                            │
+     ▼                                            ▼
+ ① 读取父转录（只读，不改写父文件）           ① 若目标会话正处于活动状态 → 先 flush + close
+ ② 新文件：meta（新 id）+ t=branch(from=父id)  ② 删除 <id>.jsonl（Windows：句柄已关才能删）
+ ③ 复制父记录逐行写入（含 compact/state）      ③ 删除失败 → 提示占用原因，不重试不崩溃
+ ④ session.bind_store(新) + 原地切换
+     └ 父会话停留在磁盘，可独立 resume
+```
+
+---
+
+## 实现方案与改造点
+
+### 新增模块：`src/smithcode/sessions/`
+
+| 文件 | 内容 | 关键 API |
+| ---- | ---- | ---- |
+| `__init__.py` | 公共 API 汇总（其余模块只从这里导入） | `SessionStore` / `SessionSummary` / `LoadedSession` / `list_sessions` / `find_last` / `find` / `load` / `delete` / `rename` / `branch` / `import_json` / `sweep` |
+| `paths.py` | 项目分区与路径 | `project_slug(cwd)`（非法字符→`-`、截 48 字符 + `sha1(cwd)[:8]`）、`sessions_dir(cwd)`、`session_path(cwd, id)`、`ensure_private_dir()`（0700/0600） |
+| `format.py` | v1 记录编解码（**纯函数，零 IO，可单测**） | 各记录构造（meta/msg/compact/state/title/branch/usage）、`dump_record()`、`iter_records(path)`、`repair_dangling_tool_calls(messages)`、版本与容错规则（§3.3） |
+| `model.py` | 数据类 | `SessionSummary`（id/cwd/created/updated/model/title/first_prompt/oneshot/size）、`LoadedSession`（messages/meta/state/title/compact_count） |
+| `store.py` | 单会话写路径 + 项目级查询 | `SessionStore.create/open`、`append_message` / `append_compaction` / `append_state` / `append_title` / `append_usage` / `flush` / `close` / `disable`；`list_sessions`（只读头/尾，未命中 title 回退全文）、`find_last`、`find`、`load`、`delete`、`rename`、`branch`、`import_json`、`sweep` |
+| `title.py` | 标题生成纯逻辑（零 IO、零 LLM 依赖，可离线单测） | `TITLE_PROMPT`、`build_title_request(messages)`、`clean_title(text, max_chars)`、`should_generate(latest_title)`（用户标题优先判定） |
+
+### 修改清单（逐文件改造点）
+
+| 文件 | 改造点 |
+| ---- | ---- |
+| `config.py` | 新增 `use_session_id(sid)`（恢复时采用持久 id）；新增 `SessionsConfig` + `load_sessions_config()`（`[sessions]` enabled / cleanup_days / persist_state / list_limit / auto_title / title_model / title_max_chars，沿用"类型不对警告并回退默认"模式）；新增 `sessions_home()` |
+| `session.py` | 新增 `MessageLog(list)`（`append` 触发 `on_append`；`insert` 不触发——system 专用）；`messages` 改 property/setter，任何赋值都重新包裹，钩子永不丢；`_on_append(msg)`（system 跳过、store 禁用时 no-op）；新增 `restore_state(messages, meta)`；新增 `set_compacted(summary, tail, before, after)`；新增 `set_title(title, source)`（原地更新 + store 追加 `t=title`）；`reset()` 保持原语义（store 轮换由 Agent 负责）；`save()` 改为 `store.flush()` + 返回路径（无 store 时过渡期保留旧实现）；删除模块级 `load()` 死代码 |
+| `agent.py` | `__init__` 按配置创建 store 并 bind（`--no-session-persistence` / `[sessions].enabled=false` 时不创建）；`new_session()`：闭合旧 store（从未物化的空文件删除）→ 开新 store → 重置链改为遍历 `_state_registry()`；新增 `resume(target) -> ResumeReport`；新增 `_state_registry()`；新增 `_persist_turn(usage)`（轮末 usage + state 去重快照）；首轮正常结束后触发自动标题（daemon 线程 + store 写锁，用户标题优先）；新增 `rename_session(name)`；`compact()` 仅改一行：`session.set_compacted(...)` 替代 `messages = assemble(...)`；新增 `close()` |
+| `goal.py` | 新增 `snapshot()` / `restore(data)`；restore 时 `turns=0`、`tokens_at_start` 由 Agent 传入当前基线——落 §3.9 |
+| `plan.py` | 新增 `snapshot()` / `restore(items)`（`TodoList(items)`，id 保留） |
+| `skills/state.py` | 新增 `snapshot()`（= `active_names()`）/ `restore(names)`（仅保留 `_index` 中存在且未 disabled 的名称，静默激活） |
+| `context/meter.py` | 恢复路径：`new_session()` 后由 Agent 写入 `compact_count`（检查点条数）；无其他改动 |
+| `commands/base.py` | `CommandResult` 新增 `session_resume: bool = False`（宿主清屏 + 回放） |
+| `commands/session.py` | 新增 `/sessions [list [数量]\|delete <id>\|<id\|序号>]`（无参 → `CommandSelect`，value=短 id，选中即切换）、`/rename <名称>`、`/branch [名称]`；`/new [名称]` 支持带名新建；`/save` 文案改为"已写入会话记录：<路径>" |
+| `cli.py` | 新增互斥组 `-c/--continue` 与 `-r/--resume [ID\|路径]`（`nargs="?"`，空值 = picker/latest）、`--name <名称>`（启动即命名）与 `--no-session-persistence`；`main()` 启动后恢复（失败 → 提示 + 新建）；非 tty 无参 resume 降级为列表 + 要求显式 id；`finally` 调 `agent.close()` |
+| `tui/app.py` / `tui/render.py` | `on_mount` 检测已恢复历史 → `replay_history(messages)`（`batch_update`）；`handle_command` 处理 `session_resume`（清屏 + 回放 + 刷新侧栏）；侧边栏顶部显示会话标题（无则回退首轮 prompt 截断） |
+| `README.md` / `docs/architecture.md` / `CHANGELOG.md` | 按仓库约定同步「会话与 /new」、模块职责与 `[未发布]` 条目；`prompts.py` 预计不需要改（会话持久化对模型不可见） |
+
+### 状态部件统一协议
+
+```python
+class _StatePart(NamedTuple):        # Agent._state_registry() 的元素
+    name: str                        # "goal" / "plan" / "skills"
+    snapshot: Callable[[], object]   # → 可 JSON 序列化的 payload
+    restore: Callable[[object], None]
+    reset: Callable[[], None]        # 已有：goal.reset / plan.reset / skills.reset
+```
+
+- `Agent.new_session()` 遍历 `reset()`；`Agent.resume()` 遍历 `restore(payload)`；
+  `_snapshot_state_if_changed()` 遍历 `snapshot()` 组装 `t=state` 记录。
+- 配一条测试：**注册表覆盖 `new_session` 的全部会话级状态**（新增状态未注册即红灯），
+  从机制上防止"恢复漏一项"。
+- `state` 记录定位是**投影缓存**：缺失/损坏时恢复继续，只是 goal/plan 回到默认值并提示；
+  转录（`msg` + `compact`）永远足以独立恢复。
+
+### 实施顺序（与 §4 阶段对应）
+
+1. `sessions/paths.py` + `format.py` + 单测（零依赖，先钉死格式与容错）
+2. `sessions/store.py` + 单测（写路径、懒物化、列举头/尾、失败降级）
+3. `session.py`（MessageLog / restore_state / set_compacted）+ 单测
+4. `agent.py`（store 绑定 / resume / 注册表 / compact 一行改）+ 单测（含崩溃修复）
+5. `config.py`（配置 + `use_session_id`）
+6. `commands/session.py` + `cli.py`（列表 / 直连恢复 / flags）
+7. TUI 回放与 picker（Phase 2）、状态恢复与分支（Phase 3）、导出与锁（Phase 4）
+
+### Phase 1 验收清单
+
+- [ ] 跑一轮任务 → 退出 → `smithcode -c`：页面上历史一致，模型能引用上一轮内容
+- [ ] `/new` 后旧会话仍在磁盘且可 `--resume <id>` 找回
+- [ ] 任务中途杀进程（在工具结果落盘前）→ `-c` 能修复悬空 `tool_calls` 并正常发请求
+- [ ] `[sessions].enabled=false` / `--no-session-persistence` 下无任何文件产生
+- [ ] 只读 home / 磁盘写满模拟：警告一次后会话照常运行
+- [ ] 权限"总是允许"、越界信任、read-tracking **不**跨进程恢复（安全断言）
+- [ ] 旧 `<workspace>/sessions/*.json` 可通过 `--resume <路径>` 导入
+- [ ] `pytest` 全绿
 
 ---
 

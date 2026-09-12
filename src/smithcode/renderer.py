@@ -76,6 +76,9 @@ class Renderer:
     def info(self, text: str) -> None:
         """状态/错误/上下文等杂项信息。"""
 
+    def title_changed(self, title: str) -> None:
+        """会话标题变化（后台自动标题 / /rename）：宿主可刷新状态栏。默认忽略。"""
+
     def ask_text(self, question: str) -> str:
         """ask_user 工具：向用户提问并返回回答；失败返回空串由调用方兜底。"""
 

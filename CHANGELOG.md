@@ -6,6 +6,15 @@
 
 ### 新增
 
+- **会话持久化与恢复（自动落盘 + 崩溃修复 + 标题）**：会话不再依赖手动 `/save`——每条非 system 消息实时追加到用户目录的 append-only JSONL 转录（`~/.smithcode/projects/<项目 slug>/sessions/<会话 id>.jsonl`；懒物化，没有消息不建文件），进程崩溃/关窗也能恢复。新增 `sessions/` 子系统（`paths` / `format` / `model` / `store` / `title`，格式与容错可离线单测），`Session` 升级为会话聚合根（`MessageLog` 追加钩子、`restore_state` 原地装载、`set_compacted`、`set_title`，对象身份跨 `/new` 与恢复不变）：
+  - **入口**：`smithcode -c` 恢复当前目录最近会话、`-r/--resume [ID]` 指定恢复（支持唯一前缀、`.jsonl` 路径与旧 `.json` 导入；不带值恢复最近）、`--name` 启动即命名、`--no-session-persistence` 本次不落盘；命令侧新增 `/sessions`（无参弹选择框、**选中即切换**，与 `/model` / `/skills` 一样在命令菜单里选中即弹；`list` 文本列表、`delete <id>` 删除、`<id|序号>` 直接切换）、`/rename`，`/new [名称]` 支持带名新建，`/save` 改为"立即写盘并显示转录路径"（会话内不提供 `/resume`，恢复入口只有 CLI 的 `-c`/`--resume`）；TUI 切换后清屏回放历史（busy 时拒绝切换会话），REPL 打印切换摘要
+  - **恢复语义**：消息历史 + goal/plan/技能激活集（`t=state` 投影缓存，损坏/缺失只降级不阻断）复原；权限"总是允许"、越界信任目录、已读记录一律不恢复（安全优先）；goal 回合计数与 token 基线重置；会话 id 沿用（`{$session}` 请求头跨进程稳定）
+  - **崩溃修复**：工具结果落盘前进程被杀会留下悬空 `tool_calls`，恢复时按序补「未执行：上次会话中断」占位并写回转录（悬空在中段则截断），保证「每个 `tool_call_id` 恰有一条结果」不变量，下一次请求不会被服务商拒绝
+  - **压缩升级为自包含检查点**：自动压缩与 `/compact` 追加一行 `compact` 记录（摘要 + 尾部 + token 前后值），旧消息保留在转录供导出/审计；加载只装配「最近检查点 + 其后消息」（`ContextMeter.compact_count` 按检查点恢复）
+  - **会话标题**：首轮正常结束后后台线程用 `title_model`（空 = 当前模型）生成 3-6 词标题，JSON 输出校验、失败静默；`/rename` 的用户命名优先且自动标题不可覆盖；列表展示"标题或首轮 prompt 截断"。解析走 typed JSONL，不会被工具输出中的字符串污染。TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断、无历史时整段隐藏），`/rename` 与后台生成完成经渲染层即时刷新
+  - **配置**：新增 `[sessions]` 段——`enabled`（总开关）、`cleanup_days`（保留期清理，默认 30 天，启动时 best-effort）、`persist_state`、`list_limit`、`auto_title`、`title_model`、`title_max_chars`；`format.SessionStore` 写失败只警告一次并降级为纯内存会话，绝不阻断任务
+  - 兼容：旧 `<workspace>/sessions/*.json` 可经 `--resume <路径>.json` 导入；落盘位置在用户目录，不污染工作区
+
 - **`websearch` 网页检索工具**：新增 `tools/websearch.py`，用 DuckDuckGo HTML 版检索网页并返回若干结果的标题 / 链接 / 摘要，纯标准库实现（`urllib` + 正则，无 API key、无新依赖，与 webfetch 同款哲学）；DuckDuckGo 的跳转链接（`//duckduckgo.com/l/?uddg=<真实地址>`）自动还原为真实 URL，结果按 URL 去重，`max_results` 控制条数（默认 5、上限 10）。与 webfetch 分工：websearch 给候选，需要正文时再对结果链接调用 webfetch。默认权限 `allow`（只读、无本地副作用，用户可收紧或 deny），可与只读工具并行。此前系统提示词与 CHANGELOG 已提及 `websearch` 但工具并不存在（幽灵能力），本次补齐
 
 - **ask_user 支持一次提多个问题**（复数入参 + 单面板切换 + 答完确认页）：`ask_user` 入参由单数 `question` 改为复数 `questions`（1-N 项，每项 `{question, options?, multiple?}`），可把相关的多个决策一次问完，避免来回打断。工具把入参归一化后交给 `Renderer.ask_form`——CLI 逐题串行提问（多题带 `(i/n)` 前缀），TUI 用**一个 `QuestionPanel` 承载全部问题**：标题显示当前题号与已答标记（`(2/3) ✔ …`），←/→ 或 Tab / Shift+Tab 手动翻页（已答题可回跳修改），单选 Enter 即答、多选空格勾选 + Enter 提交，答完**按顺序进下一题**（回改中间某题也一样，不会跳到确认页；只有提交最后一题时才回头补前面漏答的题）。**多个问题时全部答完后进入确认页**（标题「确认提交」，不计入 `(i/n)` 编号，只是沿用同样的翻页交互）：把各题答案列在**其问题下方**供核对，Enter 直接提交整组、←/→ 可切回任一题修改，无需选中某行——避免最后一题答完即提交、没有修改余地；单问题不进入确认页（直接提交）。Esc 取消整组。回传格式：单题直接返回答案（与旧行为一致），多题按「编号. 问题 → 答案」逐行列出、未答项标「已取消」。`QuestionPanel` 的结果键由 `value` 改为 `values`（列表），TUI 侧新增 `TuiRenderer.ask_form`、`show_question_panel` 签名改为 `(questions, result, evt)`，系统提示词同步补充多题用法与返回格式
@@ -61,6 +70,12 @@
 - **`/model` 命令、模型目录与通用选择面板**（对齐 Claude Code / opencode）：TUI 中输入 `/model`（无参）弹出**居中遮罩选择框**（半透明背景 + 居中卡片，↑↓/j/k/数字键选择、Enter 确认、Esc 取消，当前模型标绿「(当前)」），选中后自动切换并刷新底栏；`/model <名称>` 直接切换（本会话生效）。候选由新的 **`ModelCatalog`**（`models.py`，线程安全）统一维护，来源按优先级组合：`config.toml [provider].models`（显式配置，存在即不联网）> `~/.smithcode/models.json` 磁盘缓存 > 远端 `/models`。**启动时**（`Agent.start()`，CLI 调用）同步装载配置/缓存，外部未配置则后台拉取远端 `GET /models` 并回写缓存（按接口地址校验，离线可用、不阻塞启动）；命令层只依赖 `agent.models.list()`。为此命令协议新增 `CommandResult.select` 选择意图——命令只声明候选项、由宿主负责弹窗（TUI 居中弹窗 / 非交互 REPL 列出候选并提示改用带参形式，保持 fail-closed），命令处理器保持同步纯函数。附带把权限/提问/通用选择面板从 `tui/app.py` 抽到新文件 `tui/panels.py`
 
 ### 变更
+
+- **`/effort` 切换改为静默**：不再打印「思考强度已切换」，反馈由输入框底栏「模型 · 思考强度」的即时刷新承担（与 `/skills` 手动加载的静默语义一致）
+
+- **TUI 命令菜单隐藏滚动条**：候选超出固定展示行数时仍可用滚轮 / 键盘滚动，只是不再绘制右侧滚动条（与聊天区一致），避免菜单紧贴输入框时把滚动条位置误看成"整块悬浮层"
+
+- **`/new` 与 `/save` 语义微调**：`/new` 从"破坏性清空、旧会话不可找回"变为"开新会话，旧会话仍在磁盘、可 `/sessions`/`-c` 找回"（TUI 仍清屏、busy 守卫不变）；`/save` 从"导出原始 JSON 到工作区 `sessions/`"变为"立即 flush 并显示转录路径"（旧格式可用 `--resume <路径>.json` 导入）
 
 - **系统提示词瘦身**：移除与工具 schema 重复的机制细节（read_file 行号格式、edit_file 匹配规则、apply_patch 信封格式、glob / grep / webfetch 的参数与排序等——这些本就随工具 schema 一起发给模型），只保留跨工具规则（并行批处理、输出截断标记、`<context-summary>`、复合命令逐段求值），避免两处描述漂移（`websearch` 幽灵能力即由此暴露）；同一套 `/goal` 完成审计规则、todo 状态机规则、ask_user 用法在提示词内不再重复表述。「当前环境」块新增**是否 git 仓库**与**今天日期**（对齐 opencode / Claude Code 的环境块）
 

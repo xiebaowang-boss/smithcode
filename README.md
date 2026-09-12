@@ -36,7 +36,7 @@
 
 ### 使用体验
 
-- **会话管理**：多轮对话、`/new` 开新会话、`/save` 保存会话记录
+- **会话管理**：消息实时自动保存到本地转录（`~/.smithcode/projects/<项目>/sessions/`），`/new` 开新会话（旧的仍可找回），`/sessions` 查看/切换（无参弹选择框、选中即切换）、`/rename` 命名；启动时 `-c` 续最近会话、`-r` 指定会话；会话自动标题（可用 `/rename` 覆盖）
 - **多行输入**：粘贴多行文本自动合并为一条消息
 - **跨平台**：Windows / Linux / macOS，自动适配系统编码与 shell 风格（Windows 下提醒模型用 cmd 语法）
 - **模型无关**：任何 OpenAI 兼容接口均可接入（DeepSeek、通义、Kimi 等）
@@ -77,6 +77,10 @@ smithcode setup
 | `[context] budget` | 65536 | 上下文预算（token），建议不超过模型窗口大小 |
 | `[context] compact_trigger` | 0.8 | 占预算的比例，越过即触发自动压缩 |
 | `[context] compact_keep_tokens` | 15000 | 压缩时尾部原样保留的 token 数 |
+| `[sessions] enabled` | true | 会话自动保存总开关（false 等于永久 `--no-session-persistence`） |
+| `[sessions] cleanup_days` | 30 | 转录保留天数；0 = 不自动清理 |
+| `[sessions] auto_title` | true | 首轮结束后自动生成会话标题（失败静默，可用 `/rename` 覆盖） |
+| `[sessions] title_model` | 空 | 标题专用模型（空 = 当前模型；建议配廉价快模型） |
 
 ### 3. 运行
 
@@ -93,9 +97,11 @@ python -m smithcode              # 等价的另一种启动方式
 | 命令 | 说明 |
 | ---- | ---- |
 | `/help` | 显示帮助 |
-| `/new` | 开启新会话 |
+| `/new [名称]` | 开启新会话（可带名称），旧会话保留在磁盘、仍可恢复 |
+| `/sessions [list [数量]\|delete <id>]` | 历史会话：无参弹选择框（选中即切换）、`list` 文本列表、`delete` 删除、`<id\|序号>` 直接切换 |
+| `/rename <名称>` | 重命名当前会话 |
 | `/plan` | 显示当前任务计划（步骤清单） |
-| `/save` | 保存会话记录到 `sessions/` 目录 |
+| `/save` | 立即写盘并显示会话转录路径 |
 | `/usage` | 查看 token 用量统计 |
 | `/context` | 查看上下文占用分布与压缩次数 |
 | `/compact` | 手动压缩上下文 |
@@ -109,6 +115,10 @@ python -m smithcode              # 等价的另一种启动方式
 | `-w, --workspace` | 指定工作区目录（默认当前目录） |
 | `--add DIR` | 追加授权目录（可重复传入），跨项目访问用 |
 | `-m, --model` | 指定模型名（覆盖配置文件与环境变量） |
+| `-c, --continue` | 恢复当前目录最近一次的交互会话 |
+| `-r, --resume [ID]` | 恢复指定会话（id 或唯一前缀；不带值时恢复最近一次） |
+| `--name 名称` | 给新会话命名（仅新会话可用） |
+| `--no-session-persistence` | 本次运行不保存会话记录（不可与 `-c/--resume` 同用） |
 | `-y, --yes` | 自动批准所有确认（deny 规则依然生效），慎用 |
 | `--max-iterations N` | 单次任务最大迭代轮数（默认 30） |
 | `-V, --version` | 显示版本号 |

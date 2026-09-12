@@ -89,3 +89,67 @@ def test_sync_system_includes_skills_section(tmp_path, monkeypatch):
         assert "## 可用技能" in session.messages[0]["content"]
     finally:
         skills.clear()
+
+
+# ---------- 持久化绑定与原地恢复 ----------
+
+@pytest.fixture
+def _isolated_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    return home
+
+
+def test_message_log_persists_appends(_isolated_home):
+    from smithcode.sessions import SessionStore, load, summary_from_path
+
+    store = SessionStore.create()
+    session = Session(store=store)
+    assert config.SESSION_ID == store.id  # 绑定时采用转录 id
+    session.add("user", "你好")
+    session.sync_system()  # system 不入转录
+    session.messages.append({"role": "assistant", "content": "在"})
+    store.close()
+
+    loaded = load(summary_from_path(store.path))
+    assert [m["role"] for m in loaded.messages] == ["user", "assistant"]
+
+
+def test_set_compacted_writes_checkpoint(_isolated_home):
+    from smithcode.sessions import SessionStore, load, summary_from_path
+
+    store = SessionStore.create()
+    session = Session(store=store)
+    session.add("user", "旧")
+    summary = {"role": "user", "content": "<context-summary>摘要</context-summary>"}
+    tail = [{"role": "user", "content": "新"}]
+    session.set_compacted(summary, tail, before=10, after=5)
+    assert session.messages == [summary, *tail]
+
+    loaded = load(summary_from_path(store.path))
+    assert loaded.compact_count == 1
+    assert loaded.messages[1]["content"] == "新"
+
+
+def test_restore_state_is_in_place(_isolated_home):
+    session = Session()
+    identity = session
+    session.restore_state(
+        [{"role": "user", "content": "历史"}],
+        {"created": 123.0},
+        title="标题",
+        title_source="user",
+    )
+    assert session is identity
+    assert session.created_at == 123.0
+    assert session.title == "标题"
+
+
+def test_set_title_auto_does_not_override_user(_isolated_home):
+    from smithcode.sessions import SessionStore
+
+    session = Session(store=SessionStore.create())
+    session.set_title("用户命名", source="user")
+    session.set_title("自动命名", source="auto")
+    assert session.title == "用户命名"

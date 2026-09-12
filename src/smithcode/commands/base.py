@@ -43,6 +43,7 @@ class CommandResult:
     style: str | None = None      # TUI 着色提示（REPL 忽略），如 "green"
     exit: bool = False            # 要求退出（REPL 跳出循环 / TUI 结束应用）
     session_reset: bool = False   # 会话已重置（TUI 需清空计划侧栏）
+    session_resume: bool = False  # 会话已切换/恢复（TUI 清聊天区后回放历史）
     refresh_status: bool = False  # 会话状态可能变化（TUI 需刷新状态栏）
     select: CommandSelect | None = None  # 非空时宿主弹出选择器
     start_task: str | None = None  # 非空时宿主立即以此文本发起一次任务（如 /goal 开跑）

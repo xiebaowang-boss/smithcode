@@ -1,4 +1,6 @@
 """LLM 客户端封装：OpenAI 兼容接口，统一走流式，自带瞬时错误重试。"""
+from __future__ import annotations
+
 import random
 import time
 from contextlib import closing
@@ -64,8 +66,11 @@ class LLMClient:
                 names.append(name)
         return names or None
 
-    def chat_stream(self, messages, tools=None):
+    def chat_stream(self, messages, tools=None, model: str | None = None):
         """发起流式对话请求，逐段 yield 模型输出。
+
+        model 非空时覆盖当前会话模型（会话标题等后台小请求用），默认
+        使用 `config.MODEL`。
 
         yield 的元素为 (kind, payload)：
           ("reasoning", 文本)  — 模型思考内容（如有），仅供展示
@@ -79,7 +84,7 @@ class LLMClient:
         由 agent 侧拼装部分消息。
         """
         kwargs = {
-            "model": config.MODEL,
+            "model": model or config.MODEL,
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},

@@ -712,6 +712,15 @@ class Sidebar(Vertical):
     can_focus = False
     DEFAULT_CSS = """
     Sidebar .section-title { color: #808080; text-style: bold; }
+    Sidebar .sidebar-title {
+        color: #7dcfff;
+        text-style: bold;
+        height: 1;
+        margin-bottom: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+        display: none;
+    }
     Sidebar #sidebar-top { height: 1fr; }
     Sidebar #sidebar-goal-section { height: auto; display: none; margin-bottom: 1; }
     Sidebar #sidebar-plan-section { height: 1fr; display: none; }
@@ -739,8 +748,11 @@ class Sidebar(Vertical):
         self._goal_title = Static("目标", classes="section-title")
         self._goal = Static("", classes="goal-body")
         self._plan = Static("（暂无任务计划）", classes="plan-body")
+        self._title = Static("", classes="sidebar-title")
 
     def compose(self):
+        # 会话标题置顶（/rename 或后台自动生成；无内容/新会话时整段隐藏）
+        yield self._title
         # 「用量」「上下文」各自成卡（浅色底小标题分组），下方计划清单沿用原样。
         # 卡片 + 计划区包进 #sidebar-top（1fr）：计划区隐藏时仍有弹性占位，
         # 保证底部版本号 / 工作区路径始终钉在侧边栏底部。
@@ -795,6 +807,11 @@ class Sidebar(Vertical):
         self._goal_title.update(title)
         self._goal.update(body)
         section.display = True
+
+    def update_title(self, title: Text) -> None:
+        """更新侧边栏顶部的会话标题；空内容整段隐藏。"""
+        self._title.update(title)
+        self._title.display = bool(str(title))
 
 
 # ---------- 输入区 ----------

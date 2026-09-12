@@ -747,6 +747,119 @@ def test_tui_sidebar_hidden_narrow(monkeypatch):
     _run(_run_case())
 
 
+def test_tui_resume_blocked_while_busy(monkeypatch):
+    """空闲守卫覆盖 /sessions 切换：任务运行中不允许切换会话。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            app._busy = True
+            app.handle_command("/sessions abc")
+            await pilot.pause()
+            assert "不能切换会话" in _chat_text(app)
+
+    _run(_run_case())
+
+
+def test_tui_replays_restored_history(monkeypatch):
+    """启动时若会话已有历史（-c/--resume 恢复），TUI 回放 user/assistant 文本。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.messages = [
+            {"role": "user", "content": "恢复的问题"},
+            {"role": "assistant", "content": "恢复的回答"},
+        ]
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = _chat_text(app)
+            assert "恢复的问题" in text
+            assert "恢复的回答" in text
+            assert "已恢复" not in text  # 不打印恢复提示
+
+    _run(_run_case())
+
+
+# ---------- 侧边栏会话标题 ----------
+
+def test_tui_sidebar_shows_session_title(monkeypatch):
+    """侧边栏顶部展示会话标题，且用户命名不被自动标题覆盖。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.set_title("重构会话管理")
+        app = SmithTUI(agent)
+        async with app.run_test(size=(140, 30)) as pilot:  # 够宽：侧边栏可见
+            await pilot.pause()
+            sidebar = app.query_one(Sidebar)
+            widget = sidebar.query_one(".sidebar-title")
+            assert widget.display is True
+            assert "重构会话管理" in str(widget.content)
+            assert sidebar.children[0] is widget  # 置顶
+
+            agent.session.set_title("数据库迁移", source="auto")  # 用户标题优先
+            await pilot.pause()
+            assert "重构会话管理" in str(widget.content)
+
+    _run(_run_case())
+
+
+def test_tui_sidebar_title_falls_back_to_first_prompt(monkeypatch):
+    """标题未生成时回退首轮 user 消息截断（与 /sessions 一致）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.add("user", "帮我重构 session 持久化并补测试")
+        app = SmithTUI(agent)
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            assert "帮我重构 session" in str(
+                app.query_one(".sidebar-title").content
+            )
+
+    _run(_run_case())
+
+
+def test_tui_sidebar_title_hidden_without_history(monkeypatch):
+    """新会话尚无任何消息：标题段整体隐藏，不占侧边栏空间。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            assert app.query_one(".sidebar-title").display is False
+
+    _run(_run_case())
+
+
+def test_tui_title_changed_action_refreshes(monkeypatch):
+    """后台自动标题生成完成：Renderer.title_changed → 侧边栏刷新。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        app = SmithTUI(agent)
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            assert app.query_one(".sidebar-title").display is False
+
+            agent.session.set_title("后台生成的标题")
+            TuiRenderer(app).title_changed("后台生成的标题")
+            await pilot.pause()
+            widget = app.query_one(".sidebar-title")
+            assert widget.display is True
+            assert "后台生成的标题" in str(widget.content)
+
+    _run(_run_case())
+
+
 def test_tui_sidebar_usage_section(monkeypatch):
     """侧边栏上半：「用量」「上下文」两张卡片各自成块、内容就位。"""
     no_prompting(monkeypatch)
@@ -1806,6 +1919,44 @@ def test_command_menu_immediate_command_executes(monkeypatch):
     _run(_run_case())
 
 
+def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
+    """/sessions immediate：菜单选中直接弹选择框，选中后切换会话并回放历史。"""
+    no_prompting(monkeypatch)
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+
+    from smithcode.sessions import SessionStore
+
+    store = SessionStore.create(cwd=str(workspace))
+    store.append_message({"role": "user", "content": "旧会话的问题"})
+    store.append_message({"role": "assistant", "content": "旧会话的回答"})
+    store.close()
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("/sessions")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert inp.text == ""  # 未填入输入框
+            assert isinstance(app.screen, SelectionScreen)  # 直接弹选择框
+
+            await pilot.press("enter")  # 选中唯一会话 → 切换
+            await pilot.pause()
+            text = _chat_text(app)
+            assert "旧会话的问题" in text
+            assert "旧会话的回答" in text
+
+    _run(_run_case())
+
+
 def test_command_menu_effort_immediate_and_switch(monkeypatch):
     """/effort immediate：菜单选中直接弹选择框，选定后切换思考强度。"""
     no_prompting(monkeypatch)
@@ -1877,9 +2028,11 @@ def test_command_menu_scroll_when_overflow(monkeypatch):
                 await pilot.pause()
                 assert len(menu._candidates) >= 13
                 assert menu.size.height == MENU_VISIBLE_ITEMS  # 高度封顶
+                assert menu.scrollbar_size_vertical == 0  # 不绘制滚动条（滚动功能不受影响）
                 menu.move(-1)  # ↑ 回绕到最后一项（可视区外）
                 await pilot.pause()
                 assert menu.scroll_offset.y > 0  # 自动滚动
+                assert menu.scroll_offset.y == menu.max_scroll_y  # 末项贴底
                 menu.move(1)  # ↓ 回到第一项，滚回顶部
                 await pilot.pause()
                 assert menu.scroll_offset.y == 0

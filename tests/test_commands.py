@@ -99,6 +99,11 @@ def test_model_command_is_immediate():
     assert base.get_command("model").immediate is True
 
 
+def test_sessions_command_is_immediate():
+    """/sessions 与 /model、/skills 一致：TUI 菜单选中即弹选择框。"""
+    assert base.get_command("sessions").immediate is True
+
+
 # ---------- /effort：思考强度切换（本地档位列表，交互同 /model） ----------
 
 def test_effort_builtin_default_is_high():
@@ -111,7 +116,7 @@ def test_effort_switches_with_arg(monkeypatch):
     monkeypatch.setattr(config, "REASONING_EFFORT", "low")
     _, outcome = _run("/effort high")
     assert config.REASONING_EFFORT == "high"
-    assert "思考强度已切换" in outcome.text
+    assert outcome.text is None  # 静默切换：反馈由底栏状态刷新承担
     assert outcome.refresh_status
 
 
@@ -149,7 +154,7 @@ def test_dispatch_unknown_command():
 
 
 def test_dispatch_rejects_args_on_no_arg_command():
-    agent, outcome = _run("/new 多余参数")
+    agent, outcome = _run("/compact 多余参数")
     assert "用法" in outcome.text
     assert not agent.reset_called  # 未执行命令本体
 

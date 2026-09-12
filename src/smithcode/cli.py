@@ -1,8 +1,9 @@
 import argparse
 import sys
 import threading
+from pathlib import Path
 
-from . import __version__, commands, config
+from . import __version__, commands, config, sessions
 from .agent import INTERRUPTED_NOTE, Agent
 from .session import Session
 from .utils.terminal import (
@@ -34,6 +35,24 @@ def build_parser():
     parser.add_argument(
         "-m", "--model",
         help=f"模型名（默认 {config.MODEL}）",
+    )
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument(
+        "-c", "--continue", dest="continue_session", action="store_true",
+        help="恢复当前目录最近一次的交互会话",
+    )
+    session_group.add_argument(
+        "-r", "--resume", dest="resume", nargs="?", const="", default=None,
+        metavar="ID",
+        help="恢复指定会话（id 或唯一前缀；不带值时恢复最近一次）",
+    )
+    parser.add_argument(
+        "--name", metavar="名称",
+        help="给新会话命名，便于之后按名称查找与恢复",
+    )
+    parser.add_argument(
+        "--no-session-persistence", action="store_true",
+        help="本次运行不保存会话记录（不可与 -c/--resume 同用）",
     )
     parser.add_argument(
         "-y", "--yes", action="store_true",
@@ -129,7 +148,7 @@ def _print_select(select):
     for index, choice in enumerate(select.items, 1):
         mark = "（当前）" if choice.current else ""
         print(f"  {index}. {choice.label}{mark}")
-    print(f"非交互模式无法弹出选择器，请用 /{select.command} <名称> 指定。")
+    print(f"非交互模式无法弹出选择器，请用 /{select.command} <候选值> 指定。")
 
 
 def run_once(agent: Agent, task: str):
@@ -142,12 +161,71 @@ def run_once(agent: Agent, task: str):
         print(INTERRUPTED_NOTE)
 
 
+def _cleanup_old_sessions() -> None:
+    """启动时按 [sessions].cleanup_days 清理过期转录（best-effort，静默）。"""
+    cfg = config.load_sessions_config()
+    if not cfg.enabled or cfg.cleanup_days <= 0:
+        return
+    try:
+        sessions.sweep(cfg.cleanup_days)
+    except Exception:  # noqa: BLE001 清理失败不影响启动
+        return
+
+
+def _locate_session(last: bool, target: str):
+    """定位 -c/--resume 的目标；无匹配返回 None，歧义/坏文件抛 StoreError。"""
+    if last or target == "":
+        return sessions.find_last()
+    path = Path(target)
+    if path.is_file():
+        if path.suffix == ".json":
+            return sessions.import_json(path)  # 旧格式：导入后继续
+        return sessions.summary_from_path(path)
+    summary = sessions.find(target)
+    if summary is None:
+        raise sessions.StoreError(f"未找到会话：{target}")
+    return summary
+
+
+def _resume_session(agent: Agent, last: bool, target: str) -> None:
+    """启动时恢复会话：失败只提示并保持新会话，绝不阻断启动。"""
+    try:
+        summary = _locate_session(last, target)
+    except sessions.StoreError as exc:
+        print(f"[会话] {exc}；已开始新会话。")
+        return
+    if summary is None:
+        print("[会话] 当前目录没有可恢复的会话，已开始新会话。")
+        return
+    try:
+        report = agent.resume(summary)
+    except sessions.StoreError as exc:
+        print(f"[会话] 恢复失败：{exc}；已开始新会话。")
+        return
+    note = f"[会话] 已恢复 {report.session_id[:8]}（{report.message_count} 条消息）"
+    if report.title:
+        note += f"：{report.title}"
+    if report.repair == "appended":
+        note += "；已修复中断留下的未完成工具调用"
+    elif report.repair == "truncated":
+        note += "；检测到历史损坏，已截断修复"
+    if report.bad_lines:
+        note += f"；跳过 {report.bad_lines} 行损坏记录"
+    print(note)
+
+
 def main(argv=None):
     setup_console_encoding()
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.task == ["setup"]:  # 仅当唯一位置参数恰好是 setup，避免 subparsers 破坏自由文本任务
         sys.exit(run_setup())
+    restoring = args.continue_session or args.resume is not None
+    if args.name and restoring:
+        parser.error("--name 只能用于新会话，不能与 -c/--resume 同用")
+    if args.no_session_persistence and restoring:
+        parser.error("--no-session-persistence 与 -c/--resume 不能同用")
     if args.workspace:
         config.set_workspace(args.workspace)
     for extra in args.add or []:
@@ -156,19 +234,32 @@ def main(argv=None):
         config.MODEL = args.model
 
     try:
-        agent = Agent(Session(), max_iterations=args.max_iterations)
+        agent = Agent(
+            Session(),
+            max_iterations=args.max_iterations,
+            persist=not args.no_session_persistence,
+            oneshot=bool(args.task),
+        )
     except config.ConfigError as e:
         print(e)  # 指引文案由 ConfigError 自带，打印后安静退出，不甩 traceback
         sys.exit(1)
     if args.yes:
         agent.permission.approved_all = True
     agent.start()  # 启动模型目录：外部未配置时后台拉取 /models（不阻塞启动）
+    _cleanup_old_sessions()
+    if restoring:
+        _resume_session(agent, args.continue_session, args.resume)
+    if args.name:
+        agent.rename_session(args.name)
 
-    if args.task:
-        run_once(agent, " ".join(args.task))
-    elif confirmations_available():  # 交互终端：全屏 TUI（Textual）
-        from .tui import run_tui
+    try:
+        if args.task:
+            run_once(agent, " ".join(args.task))
+        elif confirmations_available():  # 交互终端：全屏 TUI（Textual）
+            from .tui import run_tui
 
-        run_tui(agent)
-    else:
-        repl(agent)  # 非 tty（管道/CI）保持富行式 REPL
+            run_tui(agent)
+        else:
+            repl(agent)  # 非 tty（管道/CI）保持富行式 REPL
+    finally:
+        agent.close()  # flush + 关闭转录句柄

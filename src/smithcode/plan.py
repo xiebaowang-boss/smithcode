@@ -132,6 +132,18 @@ def reset() -> None:
     _current = TodoList()
 
 
+def snapshot() -> dict:
+    """会话级步骤清单快照（持久化投影缓存用）。"""
+    return {"items": [dict(item) for item in _current.items]}
+
+
+def restore(data) -> None:
+    """从快照恢复清单（id 与标题不可变语义保留；非法数据清空）。"""
+    global _current
+    items = data.get("items") if isinstance(data, dict) else None
+    _current = TodoList(items if isinstance(items, list) else [])
+
+
 def has_active() -> bool:
     """是否存在未完结步骤（pending / in_progress）——侧边栏任务区是否展示的依据。
 

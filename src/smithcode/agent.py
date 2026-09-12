@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
-from . import config, goal, plan, renderer, skills
+from . import config, goal, plan, renderer, sessions, skills
 from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
@@ -69,6 +72,27 @@ INTERRUPTED_CONTEXT = (
     "（用户手动中断了上一个任务，任务未完成。此前部分输出可能不完整，"
     "未执行的工具已标记为「未执行：用户中断了任务」。请以用户的最新输入为准。）"
 )
+
+
+@dataclass
+class ResumeReport:
+    """恢复会话的结果摘要：宿主据此渲染（标题 / 条数 / 崩溃修复情况）。"""
+
+    path: Path
+    session_id: str
+    title: str
+    message_count: int
+    repair: str  # none / appended / truncated
+    bad_lines: int
+
+
+class _StatePart(NamedTuple):
+    """会话级状态的统一协议：快照 / 恢复 / 重置（注册表遍历执行）。"""
+
+    name: str
+    snapshot: Callable[[], object]
+    restore: Callable[[object], None]
+    reset: Callable[[], None]
 
 
 def _diff_preview(name: str, args: dict) -> str:
@@ -191,7 +215,8 @@ class _BatchScheduler:
 
 
 class Agent:
-    def __init__(self, session: Session | None = None, max_iterations: int | None = None):
+    def __init__(self, session: Session | None = None, max_iterations: int | None = None,
+                 store=None, persist: bool = False, oneshot: bool = False):
         reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
         self.llm = LLMClient()
         self.session = session or Session()
@@ -199,6 +224,15 @@ class Agent:
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
+        # 进程级服务留在 Agent（不随会话存取）：llm / permission / models / 令牌
+        self.sessions_config = config.load_sessions_config()
+        self._persist = bool(persist) and self.sessions_config.enabled
+        self._last_state = None  # 最近一次写盘的 state 快照（去重）
+        self._title_attempted = False  # 自动标题只触发一次
+        if store is not None:
+            self.session.bind_store(store)
+        elif self._persist:
+            self.session.bind_store(self._new_store(oneshot=oneshot))
         # 候选模型目录：命令层只读 `agent.models.list()`，不关心来源与装载时机
         cache = ModelCache()
         self.models = ModelCatalog(
@@ -206,6 +240,12 @@ class Agent:
             cached=CachedModelSource(cache),
             remote=RemoteModelSource(self.llm, cache),
             current_model=lambda: config.MODEL,
+        )
+
+    def _new_store(self, oneshot: bool = False):
+        """新建一个会话转录（轮换 id，文件懒物化）。"""
+        return sessions.SessionStore.create(
+            model=config.MODEL, effort=config.REASONING_EFFORT, oneshot=oneshot,
         )
 
     def start(self) -> None:
@@ -224,21 +264,170 @@ class Agent:
         return diagnostics
 
     def new_session(self) -> None:
-        """开启新会话（/new 的实际动作）：集中重置全部会话口径状态。
+        """开启新会话（/new 的实际动作）：原地重置全部会话口径状态。
 
         覆盖：消息历史与会话 id、会话用量、权限会话规则、越界信任目录、
         上下文快照（压缩计数与真实 token 锚点）、工具侧「已读文件」记录、
-        步骤清单、持久目标、技能激活集合。新增会话级状态时在对应模块加
-        reset 后在此补一行，命令层（commands）不感知重置细节。
+        步骤清单、持久目标、技能激活集合，以及转录文件的轮换（旧会话保留
+        在磁盘、仍可恢复）。新增会话级状态时注册进 `_state_registry`，
+        命令层（commands）不感知重置细节。
         """
+        if self.session.store is not None:
+            self.session.store.close()  # 旧转录闭合；从未物化则不产生文件
         self.session.reset()
         self.permission.new_session()
         config.SESSION_EXTRA_ROOTS.clear()
         self.context.new_session()
         reset_read_tracking()
-        plan.reset()
-        goal.reset()
-        skills.reset()
+        for part in self._state_registry():
+            part.reset()
+        self._last_state = None
+        self._title_attempted = False
+        if self._persist:
+            self.session.bind_store(self._new_store())
+        else:
+            self.session.bind_store(None)
+
+    # ---------- 会话恢复（原地装载，不换对象） ----------
+
+    def resume(self, target) -> ResumeReport:
+        """恢复一个已保存的会话。
+
+        target 支持 SessionSummary / 会话 id / 唯一前缀 / `.jsonl` 路径 /
+        旧 `.json` 路径。装载是原地的——`self.session` 对象身份不变，宿主
+        对它的引用与渲染绑定始终有效。安全语义（§3.9）：权限会话规则、
+        越界信任目录、已读记录一律重置不恢复。
+        """
+        summary = self._resolve_target(target)
+        loaded = sessions.load(summary)
+
+        if self.session.store is not None:
+            self.session.store.close()
+        # 沿用持久化 id：{$session} 请求头跨进程稳定
+        store = sessions.SessionStore.open(
+            loaded.path, loaded.id, cwd=loaded.cwd or None
+        )
+        self.session.bind_store(store)
+        self.session.restore_state(
+            loaded.messages, loaded.meta,
+            title=loaded.title, title_source=loaded.title_source,
+        )
+        # 崩溃修复补的占位结果落盘：否则下次恢复会被误判成中段损坏
+        for message in loaded.repaired:
+            store.append_message(message)
+
+        # 安全例外：跨进程不继承（对齐 Claude Code 的 fork 语义）
+        self.permission.new_session()
+        config.SESSION_EXTRA_ROOTS.clear()
+        reset_read_tracking()
+
+        # 计量重算：真实 token 锚点作废，压缩次数按转录里的检查点数恢复
+        self.context.new_session()
+        self.context.compact_count = loaded.compact_count
+
+        # 投影缓存恢复：先全部重置，再按记录恢复（缺失时保持默认值）
+        for part in self._state_registry():
+            part.reset()
+        if self.sessions_config.persist_state and loaded.state:
+            for part in self._state_registry():
+                if part.name in loaded.state:
+                    part.restore(loaded.state[part.name])
+        self._last_state = None
+        self._title_attempted = False
+        self.session.sync_system()  # system 段按当前提示词立即重建
+
+        return ResumeReport(
+            path=loaded.path,
+            session_id=loaded.id,
+            title=loaded.title,
+            message_count=len(loaded.messages),
+            repair=loaded.repair,
+            bad_lines=loaded.bad_lines,
+        )
+
+    @staticmethod
+    def _resolve_target(target):
+        """定位恢复目标：摘要对象 / 文件路径 / id / 唯一前缀。"""
+        if isinstance(target, sessions.SessionSummary):
+            return target
+        text = str(target or "").strip()
+        if not text:
+            raise sessions.StoreError("未指定要恢复的会话。")
+        path = Path(text)
+        if path.is_file():
+            if path.suffix == ".json":
+                return sessions.import_json(path)  # 旧格式：导入后继续
+            return sessions.summary_from_path(path)
+        summary = sessions.find(text)
+        if summary is None:
+            raise sessions.StoreError(f"未找到会话：{text}")
+        return summary
+
+    def _state_registry(self) -> tuple:
+        """会话级状态注册表：new_session / resume / 快照共用同一张表。
+
+        新增会话级状态时在此注册（测试断言注册表覆盖重置清单），否则
+        恢复会静默漏项。进程级服务（llm / permission 引擎 / models）不在表内。
+        """
+        return (
+            _StatePart("goal", goal.snapshot, goal.restore, goal.reset),
+            _StatePart("plan", plan.snapshot, plan.restore, plan.reset),
+            _StatePart("skills", skills.snapshot, skills.restore, skills.reset),
+        )
+
+    def _persist_turn(self) -> None:
+        """一轮结束：把变化的会话级状态写入转录（投影缓存，序列化去重）。"""
+        if self.session.store is None or not self.sessions_config.persist_state:
+            return
+        payload = {part.name: part.snapshot() for part in self._state_registry()}
+        if payload == self._last_state:
+            return
+        self._last_state = payload
+        self.session.store.append_state(payload)
+
+    # ---------- 自动标题（后台，失败静默） ----------
+
+    def _maybe_generate_title(self) -> None:
+        """首轮正常结束后自动生成标题：仅一次，用户标题优先，失败保留 fallback。"""
+        if self._title_attempted or self.session.store is None:
+            return
+        if not self.sessions_config.auto_title:
+            return
+        self._title_attempted = True
+        if not sessions.should_generate(self.session.title, self.session.title_source):
+            return
+        # 在主线程取快照（后台线程不再读会话消息），再交给 daemon 线程
+        request = sessions.build_title_request(self.session.messages)
+        model = self.sessions_config.title_model or None
+        threading.Thread(
+            target=self._title_worker, args=(request, model),
+            name="smithcode-title", daemon=True,
+        ).start()
+
+    def _title_worker(self, request, model) -> None:
+        try:
+            text = self._complete(request, model=model)
+            title = sessions.clean_title(text, self.sessions_config.title_max_chars)
+            if not title:
+                return
+            self.session.set_title(title, source="auto")
+            renderer.current().title_changed(title)
+        except Exception:  # noqa: BLE001 标题失败静默，不影响主流程
+            return
+
+    def rename_session(self, title: str) -> bool:
+        """用户命名当前会话（/rename / --name）：刷新标题记录，自动标题不再覆盖。"""
+        text = str(title or "").strip()
+        if not text:
+            return False
+        self.session.set_title(text, source="user")
+        renderer.current().title_changed(text)
+        return True
+
+    def close(self) -> None:
+        """进程退出前收尾：flush + 关闭转录句柄。"""
+        if self.session.store is not None:
+            self.session.store.close()
 
     def interrupt(self) -> None:
         """请求中断当前任务（线程安全：TUI / REPL 主线程调用，Agent 在后台线程运行）。
@@ -266,6 +455,9 @@ class Agent:
         finally:
             self._token = None
             reset_token()
+        self._persist_turn()  # 状态投影缓存落盘（无变化不写）
+        if result.status == "ok":
+            self._maybe_generate_title()  # 首轮结束后自动标题（后台、仅一次）
         if result.status == "interrupted":
             self._note_interrupted()  # 回写上下文但不发请求，供下一轮模型看到
         return result
@@ -348,6 +540,8 @@ class Agent:
             msg, usage, interrupted = self._chat_with_recovery()
             self.session.usage.add(usage)
             self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
+            if usage and self.session.store is not None:
+                self.session.store.append_usage(usage)
             self.session.messages.append(msg)
 
             if interrupted:
@@ -425,8 +619,12 @@ class Agent:
             renderer.current().info("[context] 摘要未按模板生成，放弃本次压缩，原样继续")
             return False
 
-        self.session.messages = assemble(
+        assembled = assemble(
             messages[0].get("content", ""), summary, messages[tail_start:]
+        )
+        self.session.set_compacted(
+            assembled[1], assembled[2:], before=before,
+            after=total_tokens(assembled),
         )
         self.context.compact_count += 1
         renderer.current().info(
@@ -434,10 +632,11 @@ class Agent:
         )
         return True
 
-    def _complete(self, request: list[dict]) -> str:
-        """一次不带工具的补全，收集完整文本（摘要生成专用）。"""
+    def _complete(self, request: list[dict], model: str | None = None) -> str:
+        """一次不带工具的补全，收集完整文本（摘要 / 标题生成专用）。"""
         parts = []
-        for kind, payload in self.llm.chat_stream(request, tools=None):
+        kwargs = {"model": model} if model else {}
+        for kind, payload in self.llm.chat_stream(request, tools=None, **kwargs):
             if kind == "content":
                 parts.append(payload)
             elif kind == "message" and not parts:

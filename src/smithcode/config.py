@@ -147,6 +147,13 @@ def new_session_id() -> str:
     return SESSION_ID
 
 
+def use_session_id(session_id: str) -> str:
+    """恢复既有会话时采用持久化 id：同一对话跨进程的 {$session} 请求头保持稳定。"""
+    global SESSION_ID
+    SESSION_ID = str(session_id)
+    return SESSION_ID
+
+
 def load_provider_headers() -> dict:
     """读取 config.toml 的 [provider.headers] 段：随每个 LLM 请求发送的自定义请求头。
 
@@ -402,4 +409,83 @@ def load_skills_config() -> SkillsConfig:
         project=project,
         max_catalog_chars=budget,
         disabled=_str_list(data.get("disabled"), "skills.disabled"),
+    )
+
+
+# ---------- 会话（Sessions） ----------
+
+@dataclass(frozen=True)
+class SessionsConfig:
+    """[sessions] 段的解析结果；非法项警告后回退默认值。"""
+
+    enabled: bool = True
+    cleanup_days: float = 30  # 保留天数；0 = 不自动清理
+    persist_state: bool = True  # 是否持久化 goal / plan / skills 激活集
+    list_limit: int = 20  # /sessions 与 picker 默认展示条数
+    auto_title: bool = True  # 首轮结束后自动生成标题（后台、失败静默）
+    title_model: str = ""  # 标题专用模型；空 = 当前模型
+    title_max_chars: int = 60  # 标题长度上限
+
+
+def load_sessions_config() -> SessionsConfig:
+    """读取 [sessions] 段：enabled / cleanup_days / persist_state / list_limit /
+    auto_title / title_model / title_max_chars。"""
+    data = _read_config_file().get("sessions") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [sessions] 段不是表，已忽略")
+        return SessionsConfig()
+
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        print(
+            f"[警告] config.toml 的 sessions.enabled = {enabled!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        enabled = True
+
+    cleanup_days = _resolve_number("sessions", "cleanup_days", 30)
+    if cleanup_days < 0:
+        print(
+            f"[警告] config.toml 的 sessions.cleanup_days = {cleanup_days!r} 不能为负，"
+            "已用默认值 30"
+        )
+        cleanup_days = 30
+
+    persist_state = data.get("persist_state", True)
+    if not isinstance(persist_state, bool):
+        print(
+            f"[警告] config.toml 的 sessions.persist_state = {persist_state!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        persist_state = True
+
+    auto_title = data.get("auto_title", True)
+    if not isinstance(auto_title, bool):
+        print(
+            f"[警告] config.toml 的 sessions.auto_title = {auto_title!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        auto_title = True
+
+    title_max_chars = data.get("title_max_chars", 60)
+    if not isinstance(title_max_chars, int) or isinstance(title_max_chars, bool) \
+            or title_max_chars <= 0:
+        print(
+            f"[警告] config.toml 的 sessions.title_max_chars = {title_max_chars!r} 无效"
+            "（应为正整数），已用默认值 60"
+        )
+        title_max_chars = 60
+
+    list_limit = _resolve_number("sessions", "list_limit", 20)
+    if list_limit <= 0:
+        list_limit = 20
+
+    return SessionsConfig(
+        enabled=enabled,
+        cleanup_days=float(cleanup_days),
+        persist_state=persist_state,
+        list_limit=int(list_limit),
+        auto_title=auto_title,
+        title_model=_file_str("sessions", "title_model") or "",
+        title_max_chars=title_max_chars,
     )

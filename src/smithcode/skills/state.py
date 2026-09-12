@@ -44,6 +44,20 @@ def reset() -> None:
     _active.clear()
 
 
+def snapshot() -> list:
+    """会话级激活集合快照（持久化投影缓存用）。"""
+    return list(_active)
+
+
+def restore(names) -> None:
+    """从快照恢复激活集合：仅保留当前发现结果中可用且未禁用的技能。"""
+    _active[:] = [
+        name
+        for name in (names or [])
+        if isinstance(name, str) and name in _index and not _index[name].disabled
+    ]
+
+
 def clear() -> None:
     """彻底清空全部状态与只读白名单（测试、进程内完全重载用）。"""
     global _skills, _index, _diagnostics, _settings, _loaded
