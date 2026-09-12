@@ -72,24 +72,38 @@ class TuiRenderer(renderer.Renderer):
     def info(self, text: str) -> None:
         self._post("line", text, "grey50")
 
+    def ask_form(self, questions: list[dict]) -> list[str]:
+        """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
+        result, evt = {}, threading.Event()
+        self.app.call_from_thread(self.app.show_question_panel, questions, result, evt)
+        evt.wait()
+        values = result.get("values")
+        if not values:
+            return [""] * len(questions)  # 空串 = 用户取消
+        return [str(value) for value in values]
+
     def ask_text(self, question: str) -> str:
-        result, evt = {}, threading.Event()
-        self.app.call_from_thread(self.app.show_question_panel, question, [], False, result, evt)
-        evt.wait()
-        return result.get("value") or "（用户未输入内容）"
+        answer = self.ask_form([{"question": question}])
+        return answer[0] or "（用户未输入内容）"
 
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False) -> str:
+    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
+                   descriptions: list[str] | None = None) -> str:
+        answer = self.ask_form([{
+            "question": question,
+            "options": options,
+            "descriptions": descriptions or [],
+            "multiple": multiple,
+        }])
+        return answer[0]  # 空串 = 用户取消
+
+    def confirm_choice(self, prompt: str, valid: str, hint: str,
+                       detail: list[str] | None = None,
+                       descriptions: dict[str, str] | None = None,
+                       content: str | None = None) -> str:
         result, evt = {}, threading.Event()
         self.app.call_from_thread(
-            self.app.show_question_panel, question, options, multiple, result, evt
-        )
-        evt.wait()
-        return result.get("value", "")  # 空串 = 用户取消
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str) -> str:
-        result, evt = {}, threading.Event()
-        self.app.call_from_thread(
-            self.app.show_permission_panel, prompt, valid, hint, result, evt
+            self.app.show_permission_panel, prompt, valid, hint, result, evt,
+            detail or [], descriptions or {}, content,
         )
         evt.wait()
         return result.get("value", "n")  # 异常兜底按拒绝处理

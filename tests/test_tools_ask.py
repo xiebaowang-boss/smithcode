@@ -1,4 +1,5 @@
-"""ask_user 工具测试：交互提问、非交互 fail-closed、空回答、权限放行。"""
+"""ask_user 工具测试：复数入参归一化、单/多题回传、交互提问、非交互 fail-closed、
+空回答、权限放行。"""
 import pytest
 
 from smithcode import config
@@ -15,14 +16,14 @@ def interactive(monkeypatch):
 def test_ask_user_returns_answer(monkeypatch, capsys):
     """交互模式下打印问题并返回用户回答。"""
     monkeypatch.setattr("smithcode.renderer.read_user_input", lambda prompt="回答> ": "是的")
-    assert ask_user("要继续吗？") == "是的"
+    assert ask_user([{"question": "要继续吗？"}]) == "是的"
     assert "[提问] 要继续吗？" in capsys.readouterr().out
 
 
 def test_ask_user_empty_answer(monkeypatch):
     """空白回答归一化为占位说明。"""
     monkeypatch.setattr("smithcode.renderer.read_user_input", lambda prompt="回答> ": "   ")
-    assert ask_user("问题") == "（用户未输入内容）"
+    assert ask_user([{"question": "问题"}]) == "（用户未输入内容）"
 
 
 def test_ask_user_fail_closed_non_interactive(monkeypatch, capsys):
@@ -32,7 +33,7 @@ def test_ask_user_fail_closed_non_interactive(monkeypatch, capsys):
         "smithcode.renderer.read_user_input",
         lambda prompt="回答> ": pytest.fail("非交互不应读取输入"),
     )
-    assert "无法向用户提问" in ask_user("问题")
+    assert "无法向用户提问" in ask_user([{"question": "问题"}])
 
 
 def test_ask_user_routes_through_console_renderer():
@@ -54,7 +55,7 @@ def test_ask_user_can_be_denied():
 
     perm = Permission()
     perm.user_rules = [("ask_user", "*", "deny")]
-    assert perm.check("ask_user", {"question": "x"}) is False
+    assert perm.check("ask_user", {"questions": [{"question": "x"}]}) is False
 
 
 def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
@@ -70,7 +71,8 @@ def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
     monkeypatch.setattr("smithcode.renderer.read_user_input", lambda prompt="回答> ": "继续")
 
     agent = Agent(session=Session())
-    call = {"function": {"name": "ask_user", "arguments": json.dumps({"question": "确认？"})}}
+    call = {"function": {"name": "ask_user", "arguments": json.dumps(
+        {"questions": [{"question": "确认？"}]})}}
     agent._execute_batch([call])
     assert agent.session.messages[-1]["content"] == "继续"
 
@@ -128,48 +130,117 @@ def test_ask_choice_invalid_number_reasks(monkeypatch, capsys):
     assert "无效编号" in capsys.readouterr().out
 
 
-def test_ask_user_with_options_routes_to_choice(monkeypatch):
-    """带 options 的 ask_user 走 ask_choice，返回所选项。"""
-
-    from smithcode import renderer
-    from smithcode.tools import ask as ask_mod
-
-    current = renderer.current()
-    monkeypatch.setattr(
-        current, "ask_choice", lambda q, opts, multiple=False: f"picked:{opts[1]}"
-    )
-    answer = ask_mod.ask_user("？", [{"label": "甲"}, {"label": "乙"}])
-    assert answer == "picked:乙"
+# ---------- 复数入参：归一化与回传格式 ----------
 
 
-def test_ask_user_without_options_uses_text(monkeypatch):
-    """不带 options 的 ask_user 走纯文本提问（老行为）。"""
-    from smithcode import renderer
-    from smithcode.tools import ask as ask_mod
-
-    current = renderer.current()
-    calls = []
-
-    def fake_ask_text(question):
-        calls.append(question)
-        return "自由回答"
-
-    monkeypatch.setattr(current, "ask_text", fake_ask_text)
-    assert ask_mod.ask_user("问啥？") == "自由回答"
-    assert calls == ["问啥？"]
-
-
-def test_ask_user_multiple_flag_passed_through(monkeypatch):
-    """multiple 标志透传给 ask_choice。"""
+def test_ask_user_passes_normalized_questions(monkeypatch):
+    """ask_user 把 options 拍平成 labels + descriptions 对齐后交给 renderer.ask_form。"""
     from smithcode import renderer
     from smithcode.tools import ask as ask_mod
 
     seen = {}
 
-    def fake_ask_choice(question, options, multiple=False):
-        seen["multiple"] = multiple
-        return "A, B"
+    def fake_ask_form(questions):
+        seen["questions"] = questions
+        return ["A", "B"]
 
-    monkeypatch.setattr(renderer.current(), "ask_choice", fake_ask_choice)
-    assert ask_mod.ask_user("？", [{"label": "A"}, {"label": "B"}], multiple=True) == "A, B"
-    assert seen["multiple"] is True
+    monkeypatch.setattr(renderer.current(), "ask_form", fake_ask_form)
+    out = ask_mod.ask_user([
+        {"question": "Q1", "options": [{"label": "甲", "description": "说明"}, {"label": "乙"}]},
+        {"question": "Q2", "multiple": True},
+    ])
+    assert seen["questions"] == [
+        {"question": "Q1", "options": ["甲", "乙"], "descriptions": ["说明", ""], "multiple": False},
+        {"question": "Q2", "options": [], "descriptions": [], "multiple": True},
+    ]
+    assert out == "1. Q1 → A\n2. Q2 → B"
+
+
+def test_ask_user_clamps_options_to_five(monkeypatch):
+    """强制遵守 1-5 个选项：模型多给时按上限截断。"""
+    from smithcode import renderer
+    from smithcode.tools import ask as ask_mod
+
+    seen = {}
+
+    def fake_ask_form(questions):
+        seen["questions"] = questions
+        return ["A"]
+
+    monkeypatch.setattr(renderer.current(), "ask_form", fake_ask_form)
+    ask_mod.ask_user([{
+        "question": "选一个",
+        "options": [{"label": f"O{i}"} for i in range(1, 9)],  # 8 项
+    }])
+    assert seen["questions"][0]["options"] == ["O1", "O2", "O3", "O4", "O5"]
+    assert seen["questions"][0]["descriptions"] == ["", "", "", "", ""]
+
+
+def test_ask_user_single_question_returns_answer(monkeypatch):
+    """单题直接返回答案（与旧行为一致，不做编号包裹）。"""
+    from smithcode import renderer
+    from smithcode.tools import ask as ask_mod
+
+    monkeypatch.setattr(renderer.current(), "ask_form", lambda questions: ["是的"])
+    assert ask_mod.ask_user([{"question": "继续？"}]) == "是的"
+
+
+def test_ask_user_multiple_marks_unanswered(monkeypatch):
+    """多题中未答（取消）的项标记为「已取消」。"""
+    from smithcode import renderer
+    from smithcode.tools import ask as ask_mod
+
+    monkeypatch.setattr(renderer.current(), "ask_form", lambda questions: ["A", ""])
+    out = ask_mod.ask_user([{"question": "Q1"}, {"question": "Q2"}])
+    assert out == "1. Q1 → A\n2. Q2 → （已取消）"
+
+
+def test_ask_user_empty_questions_returns_error(monkeypatch):
+    """空入参 / 缺题干的项不抛异常，返回可操作的报错文本。"""
+    from smithcode.tools import ask as ask_mod
+
+    assert ask_mod.ask_user([]).startswith("错误:")
+    assert ask_mod.ask_user(None).startswith("错误:")
+    assert ask_mod.ask_user([{"options": [{"label": "x"}]}]).startswith("错误:")
+
+
+def test_ask_user_multiple_flag_passed_through(monkeypatch):
+    """每题 multiple 标志透传到归一化结果。"""
+    from smithcode import renderer
+    from smithcode.tools import ask as ask_mod
+
+    seen = {}
+
+    def fake_ask_form(questions):
+        seen["q"] = questions
+        return ["A, B"]
+
+    monkeypatch.setattr(renderer.current(), "ask_form", fake_ask_form)
+    ask_mod.ask_user([{"question": "？", "options": [{"label": "A"}, {"label": "B"}], "multiple": True}])
+    assert seen["q"][0]["multiple"] is True
+
+
+def test_console_ask_form_loops_questions(monkeypatch, capsys):
+    """CLI 默认实现逐题串行提问，多题带 (i/n) 前缀。"""
+    from smithcode.renderer import ConsoleRenderer
+
+    _inputs(monkeypatch, ["1", "要"])
+    out = ConsoleRenderer().ask_form([
+        {"question": "端口？", "options": ["本地", "远程"], "descriptions": ["", ""], "multiple": False},
+        {"question": "鉴权？", "options": [], "descriptions": [], "multiple": False},
+    ])
+    assert out == ["本地", "要"]
+    text = capsys.readouterr().out
+    assert "（1/2）端口？" in text
+    assert "（2/2）鉴权？" in text
+
+
+def test_ask_user_describe_and_display():
+    """工具块摘要：单题显示题干，多题显示「首题 等 N 项」；用 block 形态独立成块。"""
+    from smithcode.tools.base import DESCRIBERS, DISPLAY
+
+    describe = DESCRIBERS["ask_user"]
+    assert describe({"questions": [{"question": "用哪个？"}]}) == "提问：用哪个？"
+    assert describe({"questions": [{"question": "端口？"}, {"question": "鉴权？"}]}) == "提问：端口？ 等 2 项"
+    assert describe({}) == "提问：?"
+    assert DISPLAY["ask_user"] == "block"

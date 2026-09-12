@@ -3,7 +3,7 @@ import sys
 import threading
 
 from . import __version__, commands, config
-from .agent import Agent
+from .agent import INTERRUPTED_NOTE, Agent
 from .session import Session
 from .utils.terminal import (
     confirmations_available,
@@ -53,9 +53,12 @@ def build_parser():
 def _run_agent_task(agent: Agent, text: str) -> None:
     """后台线程执行一次任务：结果/错误在流式过程中实时打印。"""
     try:
-        agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
+        result = agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
+        return
+    if result.status == "interrupted":
+        print(INTERRUPTED_NOTE)
 
 
 def _wait_for_task(agent: Agent, task: threading.Thread) -> None:
@@ -131,10 +134,12 @@ def _print_select(select):
 
 def run_once(agent: Agent, task: str):
     try:
-        agent.run_with_goal(task)  # 回复已在流式过程中实时打印
+        result = agent.run_with_goal(task)  # 回复已在流式过程中实时打印
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         sys.exit(1)
+    if result.status == "interrupted":
+        print(INTERRUPTED_NOTE)
 
 
 def main(argv=None):

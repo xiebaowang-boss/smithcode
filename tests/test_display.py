@@ -274,7 +274,10 @@ def test_diff_preview_truncates_long_diff(monkeypatch, tmp_path):
 
 
 def test_finish_expands_write_edit_tools_only(monkeypatch, tmp_path, capsys):
-    """_finish 只为写/编辑类工具带 expand 标记（TUI 默认展开），其他工具不带。"""
+    """_finish 只为写/编辑类工具带 expand 标记（TUI 默认展开），其他工具不带。
+
+    apply_patch 与 edit_file 同族、ask_user 的结果即页面主体，同样默认展开。
+    """
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     from smithcode import agent as agent_mod
 
@@ -290,5 +293,7 @@ def test_finish_expands_write_edit_tools_only(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(agent_mod.renderer, "current", lambda: CapRenderer())
     bare = agent_mod.Agent.__new__(agent_mod.Agent)
     agent_mod.Agent._finish(bare, "已写入", None, "write_file")
+    agent_mod.Agent._finish(bare, "已应用", None, "apply_patch")
+    agent_mod.Agent._finish(bare, "乙", None, "ask_user")
     agent_mod.Agent._finish(bare, "ok", None, "run_command")
-    assert captured == [True, False]
+    assert captured == [True, True, True, False]

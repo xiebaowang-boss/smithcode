@@ -20,7 +20,9 @@ from .render import (
     context_category,
     context_summary,
     format_duration,
+    is_unified_diff,
     render_markdown,
+    side_by_side_diff,
     split_md_blocks,
 )
 
@@ -77,14 +79,20 @@ class ChatView(VerticalScroll):
         for line in text.splitlines() or [""]:
             self._mk(Text(line, style=style))
 
-    def add_turn_footer(self, model: str, effort: str, elapsed: str) -> None:
-        """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时（▣ 用强调色，缩进 3 格）。"""
+    def add_turn_footer(self, model: str, effort: str, elapsed: str,
+                        status: str | None = None) -> None:
+        """opencode 式轮次元数据页脚：▣ 模型 · 思考强度 · 用时（▣ 用强调色，缩进 3 格）。
+
+        status 非空时追加在行尾——中断收尾时显示「· 已停止」，不再往对话区
+        另起一行。"""
         self._finalize_context()
         at_bottom = self._at_bottom()
         text = Text()
         text.append("▣ ", style="#fab283")
         text.append(model, style="#eeeeee")
         text.append(f" · {effort} · {elapsed}", style="#808080")
+        if status:
+            text.append(f" · {status}", style="#f7768e")
         block = Static(text, classes="turn-footer")
         block.can_focus = False
         self.mount(block)
@@ -252,6 +260,7 @@ class RunningIndicator(Static):
         super().__init__(*args, **kwargs)
         self._frame = 0
         self._start: float | None = None
+        self._stopping = False  # Esc 中断请求后置位：行尾追加「· 正在停止…」
 
     def on_mount(self) -> None:
         self.set_interval(0.1, self._spin)
@@ -259,6 +268,7 @@ class RunningIndicator(Static):
     def start(self) -> None:
         self._start = time.monotonic()
         self._frame = 0
+        self._stopping = False
         # 立即上屏初始文案并触发一次布局（默认重排）：组件初始无内容、width:auto
         # 下宽度为 0，而 _spin 的 layout=False 不再重排——若不在首次 start 定宽，
         # 第一次显示会因零宽整轮不可见（第二次起 display 翻转强制重排才恢复）
@@ -266,6 +276,17 @@ class RunningIndicator(Static):
 
     def stop(self) -> None:
         self._start = None
+
+    def mark_stopping(self) -> None:
+        """请求中断后调用：行尾追加「· 正在停止…」，动画与计时继续到轮次真正结束。
+
+        stopping 会改变文案宽度，这里用默认 update（layout=True）触发一次重排，
+        否则 _spin 的 layout=False 会让新增的后缀被裁掉。"""
+        if self._stopping:
+            return
+        self._stopping = True
+        if self._start is not None:
+            self.update(self._spin_text(time.monotonic() - self._start))
 
     def _spin(self) -> None:
         if self._start is None:
@@ -276,7 +297,8 @@ class RunningIndicator(Static):
     def _spin_text(self, elapsed: float) -> str:
         # 左对齐定宽（覆盖到 99h 的最大形态）：秒→分→秒 逐级变长不改变组件宽度，
         # 配合 layout=False 全程免布局重排（避免输入框竖线抖动）
-        return f"{self.FRAMES[self._frame]} Working… {format_duration(elapsed):<11}"
+        text = f"{self.FRAMES[self._frame]} Working… {format_duration(elapsed):<11}"
+        return text + " · 正在停止…" if self._stopping else text
 
 
 # ---------- 思考折叠块 ----------
@@ -379,6 +401,20 @@ class ThinkingBlock(Vertical):
 # ---------- 工具调用折叠块 ----------
 
 
+class _ToolBody(Static):
+    """工具详情正文：宽度已知时把统一 diff 渲染成左右对照，否则回退逐行样式。
+
+    Static 默认把内容固化在 update() 里，而左右对照需要知道可用列宽（布局后
+    才有、且随窗口缩放变化），因此改为在 render() 里按当前宽度实时生成。"""
+
+    def __init__(self, owner: ToolCall, **kwargs):
+        super().__init__("", **kwargs)
+        self._owner = owner
+
+    def render(self):
+        return self._owner._body_renderable(self.size.width)
+
+
 class ToolCall(Vertical):
     """opencode 式工具行：pending（spinner 摘要）→ 完成 / 失败原地更新。
 
@@ -425,7 +461,7 @@ class ToolCall(Vertical):
     def compose(self):
         # 工具摘要是模型给的自由文本（URL 等），禁止 markup 解析，防止 "[" 被当标签
         self._header = Static(self._header_text(), classes="tool-header", markup=False)
-        body = Static(self._body_content(), classes="tool-body", markup=False)
+        body = _ToolBody(self, classes="tool-body", markup=False)
         # pending 且已带变更预览（diff）时直接展开：审核前改动内容就可见
         body.display = self._expanded or bool(self._pending and self._detail)
         self._body = body
@@ -446,6 +482,24 @@ class ToolCall(Vertical):
             stat = f" · {len(self._result.splitlines())} 行"
         return f"{mark} ⚙ {self._summary}{stat}"
 
+    def _body_renderable(self, width: int) -> Text:
+        """正文渲染：diff 详情优先左右对照，窄屏或非 diff 回退逐行文本。"""
+        if self._detail and is_unified_diff(self._detail) and width > 0:
+            max_rows = None if self._expanded else self.BLOCK_COLLAPSE_LINES
+            rendered = side_by_side_diff(self._detail, width, max_rows=max_rows)
+            if rendered is not None:
+                if self._result and self._show_result():
+                    rendered.append("\n\n")
+                    for line in self._result.splitlines():
+                        rendered.append(line + "\n", style=self._line_style(line))
+                return rendered
+        return self._body_content()
+
+    def _show_result(self) -> bool:
+        """结果文本是否展示：带 diff 详情且执行成功时确认语冗余（审核时已看过改动），
+        不再重复；失败（错误）必须展示，无 diff 的工具照常展示。"""
+        return not (self._detail and not self._is_error)
+
     def _body_content(self):
         """详情内容：结果文本 + 变更预览（diff，按行着色）；block 形态未展开时按行截断。"""
         lines = self._body_lines()
@@ -464,7 +518,7 @@ class ToolCall(Vertical):
         lines = []
         if self._detail:
             lines.extend(self._detail.splitlines())
-        if self._result:
+        if self._result and self._show_result():
             if lines:
                 lines.append("")
             lines.extend(self._result.splitlines())
@@ -499,7 +553,7 @@ class ToolCall(Vertical):
         自然渲染（见 compose 的 pending+detail 展开逻辑）。"""
         self._detail = detail
         if self._body is not None:
-            self._body.update(self._body_content())
+            self._body.refresh(layout=True)
             self._body.display = True
 
     def set_result(self, result: str, *, expanded: bool, is_error: bool) -> None:
@@ -518,7 +572,7 @@ class ToolCall(Vertical):
         if self._header is not None:
             self._header.update(self._header_text())
         if self._body is not None:
-            self._body.update(self._body_content())
+            self._body.refresh(layout=True)
             self._body.display = expanded
         self._apply_state_style()
 
@@ -528,9 +582,8 @@ class ToolCall(Vertical):
         self._expanded = not self._expanded
         self.query_one(".tool-header").update(self._header_text())
         body = self.query_one(".tool-body")
-        body.update(self._body_content())
         body.display = self._expanded
-        body.refresh()
+        body.refresh(layout=True)
 
     def on_click(self, event) -> None:
         event.stop()

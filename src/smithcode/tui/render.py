@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import re
+from itertools import zip_longest
 from pathlib import Path
 
 from rich.console import Console
@@ -135,3 +137,188 @@ def context_summary(counts: dict) -> str:
     return "，".join(
         f"{counts[key]} 次{_CONTEXT_LABELS[key]}" for key in _CONTEXT_ORDER if counts.get(key)
     )
+
+
+# ---------- IDEA 式左右对照 diff ----------
+
+# 我们自己的 _unified 固定输出 `--- a/<path>` / `+++ b/<path>` 头，用 a/ 前缀
+# 可靠识别文件头（删除行即使内容以 `--` 开头也不会误判成头）。
+_OLD_FILE_RE = re.compile(r"^--- a/(.*)$")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+# 整块 diff 的底色（与侧边栏/面板同色），让未着色行也有统一背景；
+# 行号灰；增/删行用前景色 + 暗底整格高亮（左右各占半屏，近似 IDEA 的色块）
+_BLOCK_BG = "#141414"
+_GUTTER_STYLE = "#5c6370"
+_NOTE_STYLE = "#808080"
+_SEP_STYLE = "#3b4048"
+_CELL_STYLES = {
+    "del": "#f8c8cf on #35171e",
+    "add": "#b9f0cf on #102a1d",
+}
+# 左右两栏的内容前缀：删除 `-`、新增 `+`、上下文留一个空格——等宽前缀保证
+# 代码列始终对齐，同时让不依赖颜色的用户也能一眼看出增删。
+_SIGNS = {"del": "-", "add": "+"}
+
+
+def is_unified_diff(text: str) -> bool:
+    """粗判一段文本是否是统一 diff（TUI 决定是否走左右对照渲染）。"""
+    return "--- a/" in text and any(line.startswith("@@") for line in text.splitlines())
+
+
+def _parse_unified(unified: str) -> list[tuple]:
+    """把统一 diff 解析成带行号的行对。
+
+    行对形如 `("line", old_no, old_kind, old_text, new_no, new_kind, new_text)`，
+    kind ∈ {ctx, del, add, empty}，空侧的行号/文本为空；文件头为 `("file", path)`，
+    无法识别的行（截断提示、无法预览说明等）原样透传为 `("text", line)`。
+    """
+    rows: list[tuple] = []
+    old_no = new_no = 0
+    lines = unified.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        m = _OLD_FILE_RE.match(line)
+        if m:
+            rows.append(("file", m.group(1)))
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            i += 1
+            continue
+        hm = _HUNK_RE.match(line)
+        if hm:
+            old_no, new_no = int(hm.group(1)), int(hm.group(2))
+            i += 1
+            continue
+        if line.startswith("\\"):  # "\ No newline at end of file"
+            i += 1
+            continue
+        if line.startswith("-"):
+            dels = []
+            while i < n and lines[i].startswith("-") and not _OLD_FILE_RE.match(lines[i]):
+                dels.append(lines[i][1:])
+                i += 1
+            adds = []
+            while i < n and lines[i].startswith("+"):
+                adds.append(lines[i][1:])
+                i += 1
+            for d, a in zip_longest(dels, adds):
+                left = (old_no, "del", d) if d is not None else (None, "empty", "")
+                right = (new_no, "add", a) if a is not None else (None, "empty", "")
+                rows.append(("line", *left, *right))
+                if d is not None:
+                    old_no += 1
+                if a is not None:
+                    new_no += 1
+            continue
+        if line.startswith("+"):
+            while i < n and lines[i].startswith("+"):
+                rows.append(("line", None, "empty", "", new_no, "add", lines[i][1:]))
+                new_no += 1
+                i += 1
+            continue
+        if line.startswith(" "):
+            rows.append(("line", old_no, "ctx", line[1:], new_no, "ctx", line[1:]))
+            old_no += 1
+            new_no += 1
+            i += 1
+            continue
+        rows.append(("text", line))
+        i += 1
+    return rows
+
+
+def _gutter(no, width: int) -> Text:
+    """行号格（含尾部空格）：右对齐定宽，空侧留白，铺整块底色。"""
+    body = " " * width if no is None else f"{no:>{width}}"
+    return Text(body + " ", style=f"{_GUTTER_STYLE} on {_BLOCK_BG}")
+
+
+def _code_cell(content: str, width: int, kind: str) -> Text:
+    """代码格：增/删行带 `+`/`-` 前缀，按显示宽度截断、补空格到整格，再整体着色。
+
+    先补白再 `stylize`，背景铺满整格（未配对的留白侧也带底色）——这样左右
+    两栏像 IDEA 一样整行贯通。制表符先展开，避免终端 tab 位错乱对齐。"""
+    prefix = f"{_SIGNS.get(kind, ' ')} "
+    cell = Text()
+    clipped = Text(content.expandtabs(4))
+    clipped.truncate(max(0, width - len(prefix)), overflow="ellipsis")
+    cell.append(prefix)
+    cell.append_text(clipped)
+    pad = width - cell.cell_len
+    if pad > 0:
+        cell.append(" " * pad)
+    cell.stylize(_CELL_STYLES.get(kind) or f"on {_BLOCK_BG}")
+    return cell
+
+
+def _block_row(content: str, style: str, width: int) -> Text:
+    """铺满整块底色的普通行（省略提示等），右侧补齐到整宽。"""
+    row = Text(content, style=f"{style} on {_BLOCK_BG}")
+    pad = width - row.cell_len
+    if pad > 0:
+        row.append(" " * pad, style=f"{style} on {_BLOCK_BG}")
+    return row
+
+
+def _blank_row(width: int) -> Text:
+    """整宽空白行（带整块底色）：diff 块上下各留 1 行 padding。"""
+    return Text(" " * width, style=f"on {_BLOCK_BG}")
+
+
+def side_by_side_diff(unified: str, width: int, max_rows: int | None = None) -> Text | None:
+    """把统一 diff 渲染成 IDEA 式左右对照（左右行号 + 增删色块）。
+
+    宽度不足以放下两栏时返回 None，由调用方回退到逐行统一 diff；`max_rows`
+    非空时只展示前若干行并追加省略提示（对应折叠块的收起态）。
+    """
+    rows = [r for r in _parse_unified(unified) if r[0] != "file"]  # 块内不展示文件名
+    if not rows:
+        return None
+
+    num_w = max((r[1] or 0 for r in rows if r[0] == "line"), default=0)
+    for r in rows:
+        if r[0] == "line":
+            num_w = max(num_w, r[4] or 0)
+    num_w = max(3, len(str(num_w)))
+
+    # 固定开销：左行号+空格 + 分隔 + 右行号+空格；两栏代码均分剩余宽度
+    fixed = (num_w + 1) * 2 + 3
+    code_total = width - fixed
+    if code_total < 10:
+        return None
+    left_w = code_total // 2
+    right_w = code_total - left_w
+
+    if max_rows is not None and len(rows) > max_rows:
+        kept = []
+        shown = 0
+        for row in rows:
+            if row[0] == "line":
+                if shown >= max_rows:
+                    break
+                shown += 1
+            kept.append(row)
+        hidden = sum(1 for row in rows[len(kept):] if row[0] == "line")
+        if hidden:
+            kept.append(("text", f"…（+{hidden} 行，Enter / 点击展开）"))
+        rows = kept
+
+    text = Text()
+    text.append_text(_blank_row(width))  # 上 padding
+    for row in rows:
+        text.append("\n")
+        if row[0] == "text":
+            text.append_text(_block_row(f"  {row[1]}", _NOTE_STYLE, width))
+        else:
+            _, l_no, l_kind, l_text, r_no, r_kind, r_text = row
+            text.append_text(_gutter(l_no, num_w))
+            text.append_text(_code_cell(l_text, left_w, l_kind))
+            text.append(" │ ", style=f"{_SEP_STYLE} on {_BLOCK_BG}")
+            text.append_text(_gutter(r_no, num_w))
+            text.append_text(_code_cell(r_text, right_w, r_kind))
+    text.append("\n")
+    text.append_text(_blank_row(width))  # 下 padding
+    return text

@@ -200,7 +200,7 @@ class _DummyRenderer:
     def info(self, text):
         self.infos.append(text)
 
-    def confirm_choice(self, prompt, valid, hint):
+    def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
         return self.answer
 
 

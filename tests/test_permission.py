@@ -73,6 +73,8 @@ def test_evaluate_defaults_to_ask_when_no_match():
 def test_default_rules_actions():
     assert evaluate("read_file", "a.txt", DEFAULT_RULES)[2] == "allow"
     assert evaluate("list_dir", ".", DEFAULT_RULES)[2] == "allow"
+    assert evaluate("webfetch", "https://example.com", DEFAULT_RULES)[2] == "allow"
+    assert evaluate("websearch", "python", DEFAULT_RULES)[2] == "allow"
     assert evaluate("write_file", "a.txt", DEFAULT_RULES)[2] == "ask"
     assert evaluate("run_command", "ls", DEFAULT_RULES)[2] == "ask"
 
@@ -103,6 +105,18 @@ def test_safe_tools_pass_without_asking(make_perm, monkeypatch):
     assert make_perm().check("list_dir", {}) is True
 
 
+def test_webfetch_allowed_by_default(make_perm, monkeypatch):
+    """webfetch 默认放行：抓取公开网页不再弹确认。"""
+    refuse_input(monkeypatch)
+    assert make_perm().check("webfetch", {"url": "https://example.com"}) is True
+
+
+def test_webfetch_user_rule_can_tighten(make_perm, monkeypatch):
+    """用户规则命中优先于内置默认：可把 webfetch 收紧回 ask。"""
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    assert make_perm({"webfetch": "ask"}).check("webfetch", {"url": "https://example.com"}) is False
+
+
 def test_ask_denied_by_user(make_perm, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _: "n")
     assert make_perm().check("write_file", {"path": "a.txt"}) is False
@@ -113,6 +127,36 @@ def test_ask_approved_once_does_not_remember(make_perm, monkeypatch):
     perm = make_perm()
     assert perm.check("write_file", {"path": "a.txt"}) is True
     assert perm.session_rules == []
+
+
+class _CaptureRenderer:
+    def __init__(self):
+        self.infos = []
+        self.calls = []
+
+    def info(self, text):
+        self.infos.append(text)
+
+    def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
+        self.calls.append((prompt, valid, detail, descriptions, content))
+        return "n"
+
+
+def test_ask_renders_options_in_confirm_not_chat(make_perm, monkeypatch):
+    """权限信息经 confirm_choice 传参：标题统一、工具摘要作为 content、副作用进选项小字。"""
+    cap = _CaptureRenderer()
+    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
+    perm = make_perm(permissions={"write_file": "ask"})
+
+    assert perm.check("write_file", {"path": "a.txt"}, content="write a.txt") is False
+    assert cap.infos == []
+    prompt, valid, detail, descriptions, content = cap.calls[0]
+    assert "write_file" in prompt
+    assert content == "write a.txt"  # 工具摘要紧跟标题
+    assert not detail
+    assert valid == "yna"
+    assert "仅本次执行" in descriptions["y"]
+    assert "本会话将记住" in descriptions["a"]
 
 
 # ---------- check：模式级"总是允许" ----------
@@ -329,6 +373,24 @@ def test_ask_outside_access_once_always_deny(tmp_path, monkeypatch):
 
     monkeypatch.setattr("builtins.input", lambda _: "n")
     assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+
+
+def test_ask_outside_access_renders_detail(tmp_path, monkeypatch):
+    """越界路径授权信息也走 confirm_choice 传参，聊天区不重复打印。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-od")
+    outside.mkdir()
+    cap = _CaptureRenderer()
+    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
+
+    assert Permission().ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+    assert cap.infos == []
+    prompt, _valid, detail, descriptions, content = cap.calls[0]
+    assert "目录之外" in prompt and "x.py" in prompt
+    assert not detail and content is None
+    assert "仅本次访问" in descriptions["y"]
+    assert "信任目录" in descriptions["a"]
 
 
 def test_widen_roots_is_temporary(tmp_path, monkeypatch):

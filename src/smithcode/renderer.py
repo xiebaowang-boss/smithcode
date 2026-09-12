@@ -79,15 +79,45 @@ class Renderer:
     def ask_text(self, question: str) -> str:
         """ask_user 工具：向用户提问并返回回答；失败返回空串由调用方兜底。"""
 
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False) -> str:
+    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
+                   descriptions: list[str] | None = None) -> str:
         """ask_user 带选项提问：返回所选 label（多选逗号拼接）或自定义文本；
-        取消返回空串由调用方兜底。默认降级为纯文本提问。"""
+        取消返回空串由调用方兜底。descriptions 为与 options 对齐的选项说明
+        （展示在选项下方的小字，可空）。默认降级为纯文本提问。"""
         shown = " / ".join(options)
         suffix = "（可多选，逗号分隔编号）" if multiple else "（输编号选择，或直接输入自定义回答）"
         return self.ask_text(f"{question}\n候选: {shown}{suffix}")
 
-    def confirm_choice(self, prompt: str, valid: str, hint: str) -> str:
-        """y/n/a 类多选确认：循环直到输入合法，返回小写选择键。"""
+    def ask_form(self, questions: list[dict]) -> list[str]:
+        """ask_user 工具入口：一次提交 1-N 个问题，返回与 questions 对齐的答案
+        列表（空串 = 该题取消）。questions 每项为已归一化的
+        {question, options, descriptions, multiple}。默认实现逐题串行提问
+        （CLI 自然如此）；TUI 覆盖为单面板承载全部问题、可手动切题。"""
+        total = len(questions)
+        answers: list[str] = []
+        for index, item in enumerate(questions, 1):
+            question = item["question"]
+            if total > 1:
+                question = f"（{index}/{total}）{question}"
+            options = item.get("options") or []
+            if options:
+                answers.append(self.ask_choice(
+                    question, options, item.get("multiple", False),
+                    descriptions=item.get("descriptions"),
+                ))
+            else:
+                answers.append(self.ask_text(question))
+        return answers
+
+    def confirm_choice(self, prompt: str, valid: str, hint: str,
+                       detail: list[str] | None = None,
+                       descriptions: dict[str, str] | None = None,
+                       content: str | None = None) -> str:
+        """y/n/a 类多选确认：循环直到输入合法，返回小写选择键。
+
+        detail 为确认框上方的说明行；descriptions 为按选项键索引的小字说明
+        （如 `{"a": "本会话将记住 …"}`）；content 为紧跟在标题后的内容（工具摘要），
+        TUI 与标题同排展示，REPL 在提示前打印。默认无操作，保证旧调用点不受影响。"""
 
 
 class ConsoleRenderer(Renderer):
@@ -161,12 +191,16 @@ class ConsoleRenderer(Renderer):
         print(f"\n[提问] {question}")
         return read_user_input(prompt="回答> ").strip() or "（用户未输入内容）"
 
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False) -> str:
+    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
+                   descriptions: list[str] | None = None) -> str:
         """opencode 式编号选择：数字=选项，直接打字=自定义回答，空输入=取消。"""
         flush_pending_input()
         print(f"\n[提问] {question}")
         for index, opt in enumerate(options, 1):
             print(f"  {index}. {opt}")
+            desc = descriptions[index - 1] if descriptions and index <= len(descriptions) else ""
+            if desc:
+                print(f"     {desc}")
         if multiple:
             hint = "输入编号（可多个，逗号/空格分隔），或直接输入自定义回答，回车取消"
         else:
@@ -181,11 +215,24 @@ class ConsoleRenderer(Renderer):
             if picked:
                 return ", ".join(picked)
             print("   无效编号，请重新选择")
-            return self.ask_choice(question, options, multiple)
+            return self.ask_choice(question, options, multiple, descriptions)
         return answer  # 非数字输入视为自定义回答
 
-    def confirm_choice(self, prompt: str, valid: str, hint: str) -> str:
+    def confirm_choice(self, prompt: str, valid: str, hint: str,
+                       detail: list[str] | None = None,
+                       descriptions: dict[str, str] | None = None,
+                       content: str | None = None) -> str:
         flush_pending_input()  # 丢弃提前键入/粘贴的排队内容，防止被误当成回答
+        lines = list(detail or [])
+        if content:
+            lines.append(content)
+        for key, desc in (descriptions or {}).items():
+            if desc:
+                lines.append(f"[{key}] {desc}")
+        if lines:
+            print()
+            for line in lines:
+                print(f"   {line}", flush=True)
         return prompt_choice(prompt, valid, hint)
 
 

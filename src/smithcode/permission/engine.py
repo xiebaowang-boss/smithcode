@@ -39,6 +39,8 @@ DEFAULT_RULES = [
     ("list_dir", "*", ALLOW),
     ("glob", "*", ALLOW),
     ("grep", "*", ALLOW),
+    ("webfetch", "*", ALLOW),  # 抓取公开网页只读且无本地副作用，默认放行；可用 [permissions].webfetch 收紧
+    ("websearch", "*", ALLOW),  # 检索公开网页只读且无本地副作用，默认放行；可用 [permissions].websearch 收紧或 deny
     ("write_file", "*", ASK),
     ("write_file", "*.git", DENY),
     ("write_file", "*.git/**", DENY),
@@ -229,8 +231,11 @@ class Permission:
         保证未声明 family 的既有工具行为完全不变。"""
         return tuple(dict.fromkeys((tool_name, PATTERN_FAMILIES.get(tool_name, tool_name))))
 
-    def check(self, tool_name: str, args: dict | None = None) -> bool:
-        """判断一次工具调用是否放行。deny 直接拒绝；ask 弹出交互确认（非交互 fail-closed 拒绝）。"""
+    def check(self, tool_name: str, args: dict | None = None, content: str | None = None) -> bool:
+        """判断一次工具调用是否放行。deny 直接拒绝；ask 弹出交互确认（非交互 fail-closed 拒绝）。
+
+        content 为该工具的展示摘要（Agent 的 describe 行），统一渲染在确认框标题
+        下方，让每种工具的申请都带上同样的“目标内容”。"""
         pattern = self._pattern(tool_name, args or {})
         if PATTERN_ARGS.get(tool_name) == "command":
             # 复合命令拆分求值：放行 A 不能借 && 偷渡 B
@@ -245,7 +250,7 @@ class Permission:
         if action == DENY:
             renderer.current().info(f"\n⛔ 已被权限规则拒绝: {tool_name}（模式 {pattern}）")
             return False
-        return self._dispatch_ask(tool_name, asked, remember)
+        return self._dispatch_ask(tool_name, asked, remember, content)
 
     def _eval_segment(self, keys: tuple, segment: str) -> str:
         """单段命令求值：用户/会话规则优先，命中即按其裁决（可收紧为 ask/deny，
@@ -280,11 +285,11 @@ class Permission:
             return ASK, list(segments), False
         return ALLOW, [], True
 
-    def check_paths(self, tool_name: str, paths: list[str]) -> bool:
+    def check_paths(self, tool_name: str, paths: list[str], content: str | None = None) -> bool:
         """多路径工具（如 apply_patch）的聚合检查：任一路径 deny → 拒绝；任一 ask → 询问；
         全部放行 → 放行。路径归一化与单路径一致（相对命中授权根）。
         "总是允许"按每个待确认路径的精确模式逐条记忆（而非一次性宽泛放行），
-        下次同路径调用直接放行、新路径仍走确认。"""
+        下次同路径调用直接放行、新路径仍走确认。content 同 check。"""
         keys = self._keys(tool_name)
         patterns = [Permission._normalize_path_pattern(str(p)) for p in paths]
         actions = [
@@ -300,7 +305,7 @@ class Permission:
             if self.mode == "accept_edits" and PATTERN_FAMILIES.get(tool_name) in EDIT_FAMILIES:
                 return True
             asked = sorted({pat for pat, a in zip(patterns, actions) if a == ASK})
-            return self._ask(tool_name, asked)
+            return self._ask(tool_name, asked, content=content)
         return True
 
     def ask_outside_access(self, raw_path: str, target: Path) -> tuple[str, Path | None]:
@@ -318,14 +323,17 @@ class Permission:
             renderer.current().info(f"\n⛔ 非交互模式，无法确认越界访问，已拒绝: {raw_path}")
             return "deny", None
         r = renderer.current()
-        r.info("\n⚠️  Agent 请求访问授权目录之外的路径:")
-        r.info(f"   {raw_path}")
-        r.info(f"   解析为 {target}")
-        r.info(f"   将信任目录: {root}")
+        title = f"允许访问授权目录之外的路径 {raw_path}?"
+        descriptions = {
+            "y": f"仅本次访问 {target}",
+            "a": f"本会话信任目录: {root}",
+            "n": "拒绝本次访问",
+        }
         answer = r.confirm_choice(
-            "   允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
+            f"{title} [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
             "yan",
             "y / a / n",
+            descriptions=descriptions,
         )
         if answer == "y":
             return "once", root
@@ -363,18 +371,19 @@ class Permission:
         return raw
 
     def _dispatch_ask(self, tool_name: str, patterns: list[str],
-                      remember: bool = True) -> bool:
+                      remember: bool = True, content: str | None = None) -> bool:
         """按当前权限模式分派 ask 请求。
 
         auto：全部自动放行（原 -y 语义）。accept_edits：编辑族（edit_file /
         write_file，apply_patch 经 family 继承）自动放行，其余仍确认。
         smith：逐个确认。deny 永远到不了这里（check 已拦截）。
-        remember=False 时不提供"总是允许"（如 cd+git 组合守卫）。"""
+        remember=False 时不提供"总是允许"（如 cd+git 组合守卫）。
+        content 为确认框标题下的展示内容（工具摘要）。"""
         if self.approved_all:
             return True
         if self.mode == "accept_edits" and PATTERN_FAMILIES.get(tool_name) in EDIT_FAMILIES:
             return True
-        return self._ask(tool_name, patterns, remember)
+        return self._ask(tool_name, patterns, remember, content)
 
     def _remember_proposals(self, tool_name: str, patterns: list) -> list:
         """生成"总是允许"的记忆候选：[(展示文本, 规则键), ...]，按键去重。
@@ -401,32 +410,38 @@ class Permission:
         return unique
 
     def _ask(self, tool_name: str, patterns: list[str],
-             remember: bool = True) -> bool:
+             remember: bool = True, content: str | None = None) -> bool:
         """交互确认；patterns 为本次待确认的模式列表（命令工具为待确认的段）。
 
-        选"总是允许"时按候选逐条记入会话规则：命令工具记 argv 前缀（或精确串），
-        其余工具记模式串，保证记忆能被后续调用命中。remember=False 时只提供
-        y/n。变更预览（diff）不在这里展示——它由 Agent 在确认前推送到工具调用块，
-        与权限框解耦。"""
+        标题统一为「允许执行 <工具名>?」，目标内容（工具摘要，如 `command git status`
+        / `fetch <url>` / `write <path>`）由 Agent 作为 content 传入、渲染在标题下方，
+        保证每种工具的申请都带同样的内容行。选"总是允许"时按候选逐条记入会话规则：
+        命令工具记 argv 前缀（或精确串），其余工具记模式串，保证记忆能被后续命中。
+        remember=False 时只提供 y/n。变更预览（diff）不在这里展示——它由 Agent 在
+        确认前推送到工具调用块，与权限框解耦。"""
         if not confirmations_available():
             renderer.current().info(
                 f"\n⛔ 非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）"
             )
             return False
         r = renderer.current()
-        r.info(f"\n⚠️  Agent 请求执行: {tool_name}")
-        for pat in patterns:
-            r.info(f"   模式: {pat}")
         proposals = self._remember_proposals(tool_name, patterns) if remember else []
+        title = f"允许执行 {tool_name}?"
+        descriptions = {"y": "仅本次执行", "n": "拒绝并跳过该操作"}
         if proposals:
             shown = "、".join(display for display, _ in proposals)
-            r.info(f"   总是允许将记住: {shown}")
-        options = "yna" if proposals else "yn"
-        hint = "y / n / a" if proposals else "y / n"
+            descriptions["a"] = f"本会话将记住: {shown}"
+            prompt = f"{title} [y]本次 / [n]拒绝 / [a]总是允许: "
+            options, hint = "yna", "y / n / a"
+        else:
+            prompt = f"{title} [y]本次 / [n]拒绝: "
+            options, hint = "yn", "y / n"
         answer = r.confirm_choice(
-            "   允许? [y]本次 / [n]拒绝 / [a]总是允许: ",
+            prompt,
             options,
             hint,
+            content=content,
+            descriptions=descriptions,
         )
         if answer == "a":
             for _, key in proposals:
