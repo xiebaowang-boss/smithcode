@@ -11,6 +11,7 @@ from . import (  # noqa: F401
     skills,
     todo,
     web,
+    websearch,
 )
 
 SCHEMAS = base.SCHEMAS
