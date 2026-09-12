@@ -130,17 +130,19 @@ class SmithTUI(App):
         padding: 0 2;
     }
 
-    ToolCall { height: auto; padding-left: 3; }
+    /* 统一间距规则：每个顶层块与前一个块之间留一行（margin-top），不用 margin-bottom，
+       避免两个相邻块各带下边距时出现双倍间隔；组内工具行紧凑（下方覆盖为 0）。 */
+    ToolCall { height: auto; padding-left: 3; margin-top: 1; }
     ToolCall .tool-header { color: #808080; }
     ToolCall .tool-header.tool-error { color: #f7768e; }
     ToolCall .tool-body { color: #808080; margin-left: 2; }
     ToolCall .tool-body.tool-error { color: #f7768e; }
-    ContextGroup { height: auto; padding-left: 3; }
+    ContextGroup { height: auto; padding-left: 3; margin-top: 1; }
     ContextGroup .group-header { color: #808080; }
     /* Vertical 默认 height: 1fr，会让展开的汇总块撑满可用高度；明细区须按内容自适应 */
     ContextGroup .group-body { height: auto; margin-left: 2; }
-    ContextGroup ToolCall { padding-left: 0; }
-    ThinkingBlock { height: auto; padding-left: 3; margin-top: 1; margin-bottom: 1; }
+    ContextGroup ToolCall { padding-left: 0; margin-top: 0; }
+    ThinkingBlock { height: auto; padding-left: 3; margin-top: 1; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
     .assistant-stream { padding-left: 3; margin-top: 1; }
@@ -153,11 +155,12 @@ class SmithTUI(App):
     }
     QuestionPanel {
         height: auto;
+        margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
         border-left: solid #fab283;
     }
-    QuestionPanel .ask-title { color: #fab283; }
+    QuestionPanel .ask-title { color: #fab283; margin-bottom: 1; }
     QuestionPanel .ask-hint { color: #808080; }
     /* opencode 式自定义回答：单行、无边框，嵌在选项列表末尾 */
     QuestionPanel Input {
@@ -166,13 +169,17 @@ class SmithTUI(App):
         padding: 0 0 0 1;
         background: #1e1e2e;
     }
+    /* 自定义回答输入框：缩进对齐选项文字（"1. " 之后） */
+    QuestionPanel Input.custom-answer { padding: 0 0 0 4; }
     PermissionPanel {
         height: auto;
+        margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
         border-left: solid #fab283;
     }
-    PermissionPanel .perm-title { color: #fab283; }
+    PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
+    PermissionPanel .perm-detail { color: #a9b1d6; }
     PermissionPanel .ask-hint { color: #808080; }
     /* 通用选择弹窗：居中卡片（遮罩/变暗由 SelectionScreen 的 ModalScreen 背景负责） */
     SelectionPanel {
@@ -307,13 +314,16 @@ class SmithTUI(App):
     def action_interrupt(self) -> None:
         """Esc：任务运行中请求中断；空闲且无弹层时清空输入框（Claude Code 式）。
 
+        任务运行时不再往对话区打「正在停止…」行，改为让底部运行动画行尾追加
+        「· 正在停止…」（动态、随动画刷新），任务真正收尾时由轮次页脚补「· 已停止」。
+
         各弹层（权限 / 提问面板、选择弹窗、命令菜单）的 Esc 各有自己的
         取消语义且焦点在内时按键先被其消费，一般走不到这里；此处守卫是
         兜底（焦点不在弹层输入上时仍不干扰其语义）。
         """
         if self._busy:
             self.agent.interrupt()
-            self.ui_line("（正在停止…）", "grey50")
+            self.ui_running_stopping()
             return
         if (self.query(PermissionPanel) or self.query(QuestionPanel)
                 or self.command_menu_open or isinstance(self.screen, ModalScreen)):
@@ -398,20 +408,30 @@ class SmithTUI(App):
         self.query_one(ChatInput).focus()
 
     def show_question_panel(
-        self, question: str, options: list[str], multiple: bool, result: dict, evt: threading.Event
+        self, questions: list[dict], result: dict, evt: threading.Event
     ) -> None:
-        """提问面板原地替换输入框（含框内状态行），答完由 close_composer_panel 换回。"""
+        """提问面板原地替换输入框（含框内状态行），一次承载 1-N 个问题，答完由
+        close_composer_panel 换回。questions 为已归一化的
+        {question, options, descriptions, multiple} 列表。"""
         self.query_one("#input-wrap").display = False
         self.mount(
-            QuestionPanel(question, options, multiple, result, evt),
+            QuestionPanel(questions, result, evt),
             before=self.query_one("#input-wrap"),
         )
 
-    def show_permission_panel(self, prompt: str, valid: str, hint: str, result: dict, evt: threading.Event) -> None:
-        """权限申请面板原地替换输入框（含框内状态行），答完由 close_composer_panel 换回。"""
+    def show_permission_panel(self, prompt: str, valid: str, hint: str,
+                              result: dict, evt: threading.Event,
+                              detail: list[str] | None = None,
+                              descriptions: dict[str, str] | None = None,
+                              content: str | None = None) -> None:
+        """权限申请面板原地替换输入框（含框内状态行），答完由 close_composer_panel 换回。
+
+        detail 为标题下的说明行；descriptions 为按选项键索引的小字说明；
+        content 为跟在标题后的工具摘要（同排、小字灰色）。"""
         self.query_one("#input-wrap").display = False
         self.mount(
-            PermissionPanel(prompt, valid, hint, result, evt),
+            PermissionPanel(prompt, valid, hint, result, evt,
+                            detail or [], descriptions or {}, content),
             before=self.query_one("#input-wrap"),
         )
 
@@ -579,16 +599,19 @@ class SmithTUI(App):
         threading.Thread(target=self._run_task, args=(text,), daemon=True).start()
 
     def _run_task(self, text: str) -> None:
+        status = "ok"
         try:
-            self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
+            result = self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
+            status = result.status
         except Exception as e:  # noqa: BLE001
             self.post_message(UiAction("line", f"[错误] {type(e).__name__}: {e}", "red"))
+            status = "error"
         finally:
             self._busy = False
             self.post_message(UiAction("focus_input"))
             self.post_message(UiAction("status"))
             self.post_message(UiAction("running_off"))
-            self.post_message(UiAction("turn_end"))
+            self.post_message(UiAction("turn_end", status))
 
     def ui_running_off(self) -> None:
         # 应用退出时组件可能已卸载，消息晚到会导致 NoMatches——查不到就忽略
@@ -598,8 +621,17 @@ class SmithTUI(App):
         found.first().stop()
         found.first().display = False
 
-    def ui_turn_end(self) -> None:
-        """轮次结束：在会话末尾追加 opencode 式元数据页脚「▣ 模型 · 思考强度 · 用时」。"""
+    def ui_running_stopping(self) -> None:
+        """Esc 后让运行动画行尾显示「· 正在停止…」（组件已卸载则忽略）。"""
+        found = self.query("#running")
+        if found:
+            found.first().mark_stopping()
+
+    def ui_turn_end(self, status: str = "ok") -> None:
+        """轮次结束：在会话末尾追加 opencode 式元数据页脚「▣ 模型 · 思考强度 · 用时」。
+
+        中断收尾（status == "interrupted"）时在页脚行尾补「· 已停止」，替代此前
+        对话区单独一行的中断提示。"""
         if self._turn_start is None:
             return
         elapsed = time.monotonic() - self._turn_start
@@ -610,6 +642,7 @@ class SmithTUI(App):
                 config.MODEL,
                 config.REASONING_EFFORT or config.DEFAULT_EFFORT,
                 format_duration(elapsed),
+                "已停止" if status == "interrupted" else None,
             )
 
     def handle_command(self, text: str) -> None:

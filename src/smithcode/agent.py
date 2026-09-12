@@ -47,8 +47,9 @@ MAX_SUMMARY_LEN = 80
 # 变更预览（diff）最多展示的行数，超出截断
 MAX_PREVIEW_LINES = 40
 
-# 写/编辑类工具：调用详情默认展开（diff 是本次改动的关键信息，直接可见可收起）
-FILE_EXPAND_TOOLS = frozenset({"write_file", "edit_file"})
+# 结果详情默认展开的工具：写/编辑类的 diff 是本次改动的关键信息（apply_patch
+# 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体）；都直接可见、可收起。
+DEFAULT_EXPAND_TOOLS = frozenset({"write_file", "edit_file", "apply_patch", "ask_user"})
 
 
 # 权限被拒时的统一工具结果文本（回传模型 + 终端展示共用）
@@ -56,9 +57,18 @@ DENIED_RESULT = "用户拒绝了此操作"
 # 权限被拒后为同条 assistant 消息中剩余 tool_calls 补的占位结果（防悬空 tool_call_id）
 SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
 
-# Esc 中断：终端提示行与占位结果文本（语义同上两条）
+# Esc 中断：控制台（REPL / 一次性任务）收尾提示行与占位结果文本。
+# TUI 不再经 renderer 打印此提示，改由宿主机按 RunResult.status 渲染到
+# 运行动画行（正在停止）/ 轮次页脚（已停止）。
 INTERRUPTED_NOTE = "\n⏹ 已中断"
 INTERRUPTED_RESULT = "（未执行：用户中断了任务）"
+# 中断回写上下文：任务被手动中止时，作为一条 user 消息追加进会话历史
+# （不触发任何新请求），下一轮用户提问时模型即可看到上轮是被主动叫停的、
+# 任务未完成，避免把部分输出当成完整结果。
+INTERRUPTED_CONTEXT = (
+    "（用户手动中断了上一个任务，任务未完成。此前部分输出可能不完整，"
+    "未执行的工具已标记为「未执行：用户中断了任务」。请以用户的最新输入为准。）"
+)
 
 
 def _diff_preview(name: str, args: dict) -> str:
@@ -100,6 +110,84 @@ class _ToolPlan:
         self.run = run
         self.serial = serial
         self.display_result = display_result
+
+
+class _BatchScheduler:
+    """一次 assistant 消息内工具批次的流式调度器（只负责「顺序 + 并发」编排）。
+
+    与旧「两阶段（预检完全部再执行）」的区别：**边预检边调度**——预检一个就
+    决定其去向：可并行计划进入波次缓冲，串行计划作为顺序屏障先冲刷波次、再
+    就地执行。效果：串行工具在「后续工具的权限确认」之前就已执行完，确认框
+    与执行一一对应。
+
+    不变量（改动此处务必对照 tests/test_agent_parallel.py）：
+    - I1 结果消息 / tool_result 事件严格按 tool_call 提交顺序；
+    - I2 每个 tool_call_id 恰有一条结果（执行 / SKIPPED / INTERRUPTED 三路完备）；
+    - I3 串行工具是顺序屏障：执行前先冲刷前面的并行波次，保证副作用可见性；
+    - I4 波次缓冲期零副作用——并行计划只在屏障/结束时才提交线程池，因此
+      「首个串行工具执行前」的整段仍可原子取消；并行工具仅只读/网络类；
+    - I5 渲染只在 run 线程发生（worker 只算结果字符串，经 _collect 收集）；
+    - I7 limit==1 或波次仅 1 个计划时不启用线程池（退化为纯串行）。
+    """
+
+    def __init__(self, agent: Agent, token: CancellationToken | None, limit: int):
+        self._agent = agent
+        self._token = token
+        self._limit = limit
+        self._wave: list[_ToolPlan] = []  # 已预检、待并行执行的计划（保持提交顺序）
+
+    def run(self, tool_calls: list[dict]) -> str | None:
+        """按接收顺序「预检一个 → 调度一个」，返回 None / "denied" / "interrupted"。"""
+        i, n = 0, len(tool_calls)
+        while i < n:
+            if self._cancelled():  # 循环顶部中断：当前项尚未预检
+                return self._abort_interrupted(self._wave, tool_calls[i:])
+            tool_plan, denied = self._agent._preflight_safe(tool_calls[i])
+            if self._cancelled():  # 预检（含权限确认）期间中断：当前项也不执行
+                return self._abort_interrupted(self._wave + [tool_plan], tool_calls[i + 1:])
+            if denied:
+                return self._abort_denied(tool_plan, tool_calls[i + 1:])
+            if tool_plan.serial or self._limit == 1:  # 顺序屏障 / 退化纯串行
+                self._flush()  # 先收前面的并行波次，再执行串行项
+                self._agent._collect(tool_plan, tool_plan.run())
+            else:
+                self._wave.append(tool_plan)  # 缓冲，屏障 / 结束时才跑
+            i += 1
+        self._flush()
+        return None
+
+    def _flush(self) -> None:
+        """冲刷波次：按提交顺序执行并收集（I1）；长度 1 或 limit==1 走主线程（I7）。"""
+        wave, self._wave = self._wave, []
+        if not wave:
+            return
+        if len(wave) == 1 or self._limit == 1:
+            for p in wave:
+                self._agent._collect(p, p.run())
+            return
+        with ThreadPoolExecutor(max_workers=self._limit) as pool:
+            futures = [pool.submit(p.run) for p in wave]  # 按序提交
+            for p, future in zip(wave, futures):
+                self._agent._collect(p, future.result())  # 按提交序收集，不按完成序
+
+    def _abort_denied(self, denied_plan: _ToolPlan, remaining_tcs: list[dict]) -> str:
+        """权限被拒收尾：未执行的波次与被拒项之后的剩余项补 SKIPPED，
+        被拒项收尾为 DENIED（其 run() 返回 DENIED_RESULT），返回 "denied"。"""
+        for p in self._wave:
+            self._agent._placeholder(SKIPPED_RESULT, p.tc.get("id"), p.tool_id)
+        self._agent._collect(denied_plan, denied_plan.run())
+        for tc in remaining_tcs:
+            self._agent._placeholder(SKIPPED_RESULT, tc["id"])
+        renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
+        return "denied"
+
+    def _abort_interrupted(self, pending_plans: list[_ToolPlan],
+                           remaining_tcs: list[dict]) -> str:
+        """中断收尾：未执行的计划与剩余 tool_calls 一律补占位（顺序天然对齐）。"""
+        return self._agent._interrupt_batch(pending_plans, remaining_tcs)
+
+    def _cancelled(self) -> bool:
+        return self._token is not None and self._token.cancelled
 
 
 class Agent:
@@ -174,10 +262,20 @@ class Agent:
         self._token = token
         reset_token = activate_token(token)
         try:
-            return self._run_loop(token)
+            result = self._run_loop(token)
         finally:
             self._token = None
             reset_token()
+        if result.status == "interrupted":
+            self._note_interrupted()  # 回写上下文但不发请求，供下一轮模型看到
+        return result
+
+    def _note_interrupted(self) -> None:
+        """把「用户中断」事件作为 user 消息写进会话历史（不触发新请求）。
+
+        追加在所有占位结果之后，是本次轮次的最后一条消息；下一轮用户提问时
+        模型即可看到上一轮被主动中止、任务未完成，不会把部分输出当作结果。"""
+        self.session.add("user", INTERRUPTED_CONTEXT)
 
     def run_with_goal(self, user_input: str) -> RunResult:
         """执行一次任务，并在持久目标激活时自动续跑直到目标结束或触发刹车。
@@ -243,7 +341,6 @@ class Agent:
         tools_used: list = []  # 本任务执行过的工具名（去重保序），供 /goal 续跑裁决
         for _ in range(self.max_iterations):
             if token.cancelled:
-                renderer.current().info(INTERRUPTED_NOTE)
                 return RunResult("interrupted")
             # 每轮同步系统提示词：本轮加载的技能正文下一轮生效（内容不变时不重建）
             self.session.sync_system()
@@ -254,7 +351,6 @@ class Agent:
             self.session.messages.append(msg)
 
             if interrupted:
-                renderer.current().info(INTERRUPTED_NOTE)
                 return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
 
             if not msg.get("tool_calls"):
@@ -263,7 +359,6 @@ class Agent:
             if token.cancelled:
                 # 流刚好走完时才取消：这批 tool_calls 一个都未执行，补占位后停止
                 self._interrupt_batch([], msg.get("tool_calls", []))
-                renderer.current().info(INTERRUPTED_NOTE)
                 return RunResult("interrupted", tools_used=tuple(tools_used))
 
             for tc in msg["tool_calls"]:
@@ -276,7 +371,6 @@ class Agent:
                     "denied", "任务已停止：权限请求被用户拒绝。", tools_used=tuple(tools_used)
                 )
             if stopped == "interrupted":
-                renderer.current().info(INTERRUPTED_NOTE)
                 return RunResult("interrupted", tools_used=tuple(tools_used))
 
         return RunResult(
@@ -436,7 +530,7 @@ class Agent:
                     return denied_plan, True
                 if isinstance(pre, Path):
                     widened.append(pre)
-            if not self.permission.check_paths(name, paths):
+            if not self.permission.check_paths(name, paths, content=line):
                 return denied_plan, True
 
             snapshot = _diff_preview(name, args)  # 执行前快照（apply_patch 暂无 preview，为空串）
@@ -449,7 +543,7 @@ class Agent:
                              self._make_runner(name, args, widened), serial=bool(widened)), False
 
         if name == "todo_write":
-            if not self.permission.check(name, args):
+            if not self.permission.check(name, args, content=line):
                 return denied_plan, True
 
             def run_todo() -> str:
@@ -475,7 +569,7 @@ class Agent:
         preflight = self._preflight_outside_path(args, read_only=name in READ_ONLY_TOOLS)
         if preflight == "deny":
             return denied_plan, True
-        if not self.permission.check(name, args):
+        if not self.permission.check(name, args, content=line):
             return denied_plan, True
 
         # 注册为 serial 的工具（shell / 写文件 / 交互确认等）与需要临时放行的
@@ -503,70 +597,15 @@ class Agent:
         return run
 
     def _execute_batch(self, tool_calls: list[dict]) -> str | None:
-        """执行同一条 assistant 消息里的全部工具调用（两阶段：预检串行、执行并发）。
+        """执行同一条 assistant 消息里的全部工具调用（流式调度，见 _BatchScheduler）。
 
-        第一阶段（主线程，串行，按接收顺序）：逐个预检——解析参数、渲染摘要、
-        路径预检与权限确认；任一被拒即终止任务，为剩余 tool_calls 补占位结果
-        （防悬空 tool_call_id 破坏下一轮请求），此时还没有任何工具被执行。
-        每个预检项之前检查取消令牌：任务被中断时已过预检的计划与剩余
-        tool_calls 一律补占位、不再继续弹确认框（中断 = 不再发起任何新工作）。
-        第二阶段（并发）：按序分段——连续的可并行计划合并为一个波次扔进线程池，
-        serial 计划在主线程单独执行、作为顺序屏障（保证串行工具看见之前所有
-        副作用、后续工具又看见串行工具的改动）；结果一律按提交顺序收集，
-        模型看到的 tool 结果顺序与它请求的顺序严格一致。每个波次/串行项
-        之前检查取消令牌：任务被中断时未执行的计划补占位后停止，已提交
-        的波次让其自然跑完（线程不可强杀）并照常收集结果。
-
-        返回 None 表示正常完成；"denied" 表示权限被拒；"interrupted" 表示用户中断。
+        逐项预检、边预检边执行：可并行计划进波次缓冲，串行计划作为顺序屏障
+        （先冲刷前面的并行波次再执行），因此串行工具在后续工具的权限确认之前
+        就已执行完。结果严格按提交顺序回传；被拒 / 中断时未执行的项补占位结果，
+        保证每个 tool_call_id 成对。返回 None / "denied" / "interrupted"。
         """
-        token = current_token()
-        plans: list[_ToolPlan] = []
-        for i, tc in enumerate(tool_calls):
-            if token is not None and token.cancelled:
-                return self._interrupt_batch(plans, tool_calls[i:])
-            plan, denied = self._preflight_safe(tc)
-            if token is not None and token.cancelled:
-                # 预检（含权限确认）期间用户中断：优先按中断处理——当前项即使
-                # 刚答了 y/n 也不执行、不按 denied 收尾，整个批次补占位。
-                return self._interrupt_batch(plans, tool_calls[i:])
-            if denied:
-                # 此前已过预检但尚未执行的计划：任务中止，一并补占位结果
-                # （防悬空 tool_call_id 破坏下一轮请求；同步收尾已上屏的工具块）
-                for done in plans:
-                    self._placeholder(SKIPPED_RESULT, done.tc.get("id"), done.tool_id)
-                self._collect(plan, plan.run())
-                for pending in tool_calls[i + 1:]:
-                    self._placeholder(SKIPPED_RESULT, pending["id"])
-                renderer.current().info("\n⛔ 权限请求被拒绝，任务已停止")
-                return "denied"
-            plans.append(plan)
-
         limit = max(1, int(config.MAX_TOOL_CONCURRENCY))
-        if limit == 1 or len(plans) < 2 or all(p.serial for p in plans):
-            for idx, p in enumerate(plans):  # 纯串行路径：不启用线程，行为与逐个执行完全一致
-                if token is not None and token.cancelled:
-                    return self._interrupt_batch(plans[idx:], [])
-                self._collect(p, p.run())
-            return None
-
-        with ThreadPoolExecutor(max_workers=limit) as pool:
-            i = 0
-            while i < len(plans):
-                if token is not None and token.cancelled:
-                    return self._interrupt_batch(plans[i:], [])
-                if plans[i].serial:
-                    self._collect(plans[i], plans[i].run())
-                    i += 1
-                    continue
-                j = i
-                while j < len(plans) and not plans[j].serial:
-                    j += 1
-                wave = plans[i:j]
-                futures = [pool.submit(p.run) for p in wave]  # 按序提交
-                for p, f in zip(wave, futures):
-                    self._collect(p, f.result())  # 按提交序收集，不按完成序
-                i = j
-        return None
+        return _BatchScheduler(self, current_token(), limit).run(tool_calls)
 
     def _interrupt_batch(self, pending_plans: list[_ToolPlan],
                          remaining_tcs: list[dict]) -> str:
@@ -615,7 +654,7 @@ class Agent:
         tool_preview 阶段推入工具块）。"""
         result = truncate_output(result, config.MAX_TOOL_OUTPUT)
         renderer.current().tool_result(result, tool_id,
-                                       expand=name in FILE_EXPAND_TOOLS)
+                                       expand=name in DEFAULT_EXPAND_TOOLS)
         return result
 
     @staticmethod

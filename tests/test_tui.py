@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
-from smithcode.tui.panels import SelectionScreen
+from smithcode.tui.panels import PermissionPanel, QuestionPanel, SelectionScreen
 from smithcode.tui.render import (
     context_category,
     context_summary,
@@ -28,6 +29,7 @@ from smithcode.tui.widgets import (
     CommandMenu,
     CommandMenuItem,
     ContextGroup,
+    RunningIndicator,
     Sidebar,
     ThinkingBlock,
     ToolCall,
@@ -295,6 +297,59 @@ def test_permission_panel_arrow_keys_do_not_answer(monkeypatch):
     _run(_run_case())
 
 
+def test_permission_panel_shows_option_descriptions(monkeypatch):
+    """权限面板：顶部只展示标题，选项副作用以小字渲染在 ask 框内，聊天区不重复。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_permission_panel(
+                "允许执行 run_command? [y]本次 / [n]拒绝 / [a]总是允许: ",
+                "yna", "y / n / a", result, evt,
+                None,
+                {"y": "仅本次执行", "a": "本会话将记住: git status *"},
+                "command git status",
+            )
+            await pilot.pause()
+            panel = app.query_one(PermissionPanel)
+            title_text = str(panel.query_one(".perm-title").content)
+            assert "允许执行 run_command?" in title_text
+            assert "command git status" in title_text  # 内容与标题同排
+            assert not panel.query(".perm-detail")  # 不再有独立内容行
+            joined = "\n".join(str(s.content) for s in panel.query(Static))
+            assert "仅本次执行" in joined
+            assert "本会话将记住: git status *" in joined
+            assert not app.query("#chat .perm-detail")  # 详情只在 ask 框内
+            await pilot.press("y")
+            await pilot.pause()
+            assert result.get("value") == "y"
+
+    _run(_run_case())
+
+
+def test_question_panel_shows_option_descriptions(monkeypatch):
+    """提问面板：顶部只展示问题，选项说明以小字渲染在选项下方。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel(
+                [{"question": "用哪个？", "options": ["甲", "乙"],
+                  "descriptions": ["甲说明", "乙说明"], "multiple": False}], result, evt,
+            )
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            assert str(panel.query_one(".ask-title").content) == "用哪个？"
+            joined = "\n".join(str(s.content) for s in panel.query(Static))
+            assert "甲说明" in joined and "乙说明" in joined
+
+    _run(_run_case())
+
+
 def test_tool_preview_shown_in_pending_block_before_approval(monkeypatch):
     """审核前变更预览：diff 推送到 pending 工具调用块（而非权限框），就地展开可见。"""
     no_prompting(monkeypatch)
@@ -310,7 +365,7 @@ def test_tool_preview_shown_in_pending_block_before_approval(monkeypatch):
             assert body.display is False  # 无预览时 pending 不展示内容
             app.ui_tool_preview(7, "--- a/a.txt\n+++ b/a.txt\n-old\n+new")
             await pilot.pause()
-            plain = str(body.content)
+            plain = str(body.render())
             assert "-old" in plain
             assert "+new" in plain
             # 未配对 id 的预览不崩溃、不挂载孤儿块
@@ -328,13 +383,13 @@ def test_question_panel_resolves(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel("要继续吗?", [], False, result, evt)
+            app.show_question_panel([{"question": "要继续吗?"}], result, evt)
             await pilot.pause()
             assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("是")
             await pilot.press("enter")
             await pilot.pause()
-            assert result.get("value") == "是"
+            assert result.get("values") == ["是"]
             assert evt.is_set()
             assert app.query_one("#input-wrap").display is True  # 面板关闭后恢复
 
@@ -395,13 +450,13 @@ def test_tui_tool_call_collapsible(monkeypatch, tmp_path):
             assert body.display is False  # 读取工具默认收起（整文件内容不上屏）
             block.action_toggle()
             assert body.display is True
-            assert "文件内容" in str(body.content)
+            assert "文件内容" in str(body.render())
 
     _run(_run_case())
 
 
 def test_tool_call_shows_diff_detail(monkeypatch):
-    """write/edit 的调用详情：diff（改动内容）在前，「已编辑」确认语在后。"""
+    """write/edit 的调用详情：diff 以左右对照渲染（带行号），成功确认语不再重复。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -412,14 +467,109 @@ def test_tool_call_shows_diff_detail(monkeypatch):
                              display="block", detail=detail)
             app.query_one(ChatView).add_widget(block)
             await pilot.pause()
-            plain = str(block.query_one(".tool-body").content)
-            assert "-old" in plain
-            assert "+new" in plain
-            assert "已编辑 a.txt" in plain
-            assert "@@ -1 +1 @@" in plain
-            assert plain.find("+new") < plain.find("已编辑 a.txt")  # diff 在前
+            plain = str(block.query_one(".tool-body").render())
+            assert "- old" in plain and "+ new" in plain
+            assert "│" in plain  # 左右两栏分隔
+            assert "--- a/" not in plain  # 不再展示文件头
+            assert "@@ -1 +1 @@" not in plain  # 行对取代了 @@ 头
+            assert "已编辑 a.txt" not in plain  # 审核时已看过 diff，确认语冗余
 
     _run(_run_case())
+
+
+def test_tool_call_diff_shows_error_result(monkeypatch):
+    """带 diff 的工具执行失败时仍展示错误结果（只隐藏成功确认语）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            detail = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new"
+            block = ToolCall("edit a.txt", "错误: old_string 未找到", expanded=True,
+                             display="block", detail=detail, is_error=True)
+            app.query_one(ChatView).add_widget(block)
+            await pilot.pause()
+            plain = str(block.query_one(".tool-body").render())
+            assert "错误: old_string 未找到" in plain
+
+    _run(_run_case())
+
+
+def test_ask_user_block_shows_question_and_answer(monkeypatch):
+    """ask_user 工具块：头部只显示「提问：问题」，用户回答作为结果默认展开。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            block = ToolCall("提问：用哪个？", "乙", expanded=True, display="block")
+            app.query_one(ChatView).add_widget(block)
+            await pilot.pause()
+            assert "提问：用哪个？" in str(block.query_one(".tool-header").content)
+            body = block.query_one(".tool-body")
+            assert body.display is True  # 默认展开
+            assert "乙" in str(body.render())
+
+    _run(_run_case())
+
+
+def test_side_by_side_diff_pairs_del_add_rows():
+    """统一 diff 解析为左右对照：删/增并到同一行、带 +/- 前缀，不再各占一行。"""
+    from smithcode.tui.render import side_by_side_diff
+
+    unified = "--- a/x.py\n+++ b/x.py\n@@ -1,3 +1,3 @@\n keep\n-old\n+new\n tail"
+    plain = str(side_by_side_diff(unified, 80))
+    assert "- old" in plain and "+ new" in plain  # 两侧改动带 +/- 前缀
+    assert "│" in plain
+    assert plain.count("\n") == 4  # 上 padding + keep + old/new 同行 + tail + 下 padding
+    assert "@@" not in plain  # 丢掉 hunk 头
+    assert "x.py" not in plain  # 块内不展示文件名
+    assert plain.startswith(" ") and plain.endswith(" ")  # 上下各 1 行 padding
+
+
+def test_side_by_side_diff_line_numbers_track_both_sides():
+    """行号分别跟随新旧两侧：删除只进旧侧、新增只进新侧、上下文两侧同增。"""
+    from smithcode.tui.render import _parse_unified
+
+    unified = "--- a/f\n+++ b/f\n@@ -5,2 +5,3 @@\n ctx\n-a\n+b\n+c"
+    rows = [r for r in _parse_unified(unified) if r[0] == "line"]
+    assert rows[0] == ("line", 5, "ctx", "ctx", 5, "ctx", "ctx")
+    assert rows[1] == ("line", 6, "del", "a", 6, "add", "b")
+    assert rows[2] == ("line", None, "empty", "", 7, "add", "c")
+
+
+def test_side_by_side_diff_narrow_falls_back():
+    """宽度放不下两栏时返回 None，交由调用方回退逐行渲染。"""
+    from smithcode.tui.render import side_by_side_diff
+
+    unified = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b"
+    assert side_by_side_diff(unified, 12) is None
+
+
+def test_side_by_side_diff_truncates_rows():
+    """折叠态按行数上限截断并追加省略提示。"""
+    from smithcode.tui.render import side_by_side_diff
+
+    dels = "\n".join(f"-old{i}" for i in range(20))
+    adds = "\n".join(f"+new{i}" for i in range(20))
+    unified = f"--- a/f\n+++ b/f\n@@ -1,20 +1,20 @@\n{dels}\n{adds}"
+    plain = str(side_by_side_diff(unified, 80, max_rows=5))
+    assert "old0" in plain and "old4" in plain
+    assert "old5" not in plain
+    assert "…（+15 行" in plain
+
+
+def test_side_by_side_diff_block_has_uniform_background():
+    """整块 diff（文件头 / 上下文 / 留白侧）都铺统一底色，且每行等宽铺满。"""
+    from smithcode.tui.render import side_by_side_diff
+
+    unified = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n keep\n-old\n+new"
+    text = side_by_side_diff(unified, 60)
+    lines = text.split("\n")
+    for line in lines:
+        assert line.spans  # 每行都有样式
+        assert any("on " in str(seg.style) for seg in line.spans)  # 每行都带背景
+    assert len({len(str(line)) for line in lines}) == 1  # 行行等宽（铺满整块）
 
 
 def test_tool_call_summary_markup_not_parsed(monkeypatch):
@@ -449,7 +599,7 @@ def test_question_panel_question_markup_not_parsed(monkeypatch):
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
             question = "访问 [link=https://raw.githubusercontent.com/x] 吗？"
-            app.show_question_panel(question, [], False, result, evt)
+            app.show_question_panel([{"question": question}], result, evt)
             await pilot.pause()
             title = str(app.query_one(".ask-title").content)
             assert question in title
@@ -962,6 +1112,57 @@ def test_turn_footer_after_task(monkeypatch):
             assert config.MODEL in footer
             assert (config.REASONING_EFFORT or config.DEFAULT_EFFORT) in footer
             assert "用时" not in footer
+            assert "已停止" not in footer  # 正常结束不带中断状态
+
+    _run(_run_case())
+
+
+def test_running_indicator_stopping_suffix():
+    """Esc 停止态：运行动画行尾动态追加「· 正在停止…」，便于测试宽度稳定。"""
+    indicator = RunningIndicator()
+    base = indicator._spin_text(12.0)
+    indicator.mark_stopping()
+    stopping = indicator._spin_text(12.0)
+    assert stopping.startswith(base)
+    assert stopping.endswith(" · 正在停止…")
+
+
+def test_esc_marks_running_indicator_without_chat_line(monkeypatch):
+    """Esc 中断：不往对话区打「正在停止…」行，改让运行动画行尾动态显示。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            running = app.query_one("#running", RunningIndicator)
+            running.display = True
+            running.start()
+            await pilot.pause()
+            app._busy = True
+            app.agent.interrupt = lambda: None
+            before = len(app.query_one("#chat").children)
+            app.action_interrupt()
+            await pilot.pause()
+            assert running._stopping is True
+            assert "正在停止…" in str(running.render())
+            assert len(app.query_one("#chat").children) == before  # 未新增聊天行
+
+    _run(_run_case())
+
+
+def test_turn_footer_shows_stopped_on_interrupt(monkeypatch):
+    """中断收尾：轮次页脚行尾显示「· 已停止」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app._turn_start = time.monotonic()
+            app.ui_turn_end("interrupted")
+            await pilot.pause()
+            footer = str(app.query_one("#chat").children[-1].content)
+            assert footer.startswith("▣")
+            assert footer.endswith(" · 已停止")
 
     _run(_run_case())
 
@@ -1023,25 +1224,29 @@ def test_question_choice_modal_single_pick(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel("用哪个？", ["甲", "乙"], False, result, evt)
+            app.show_question_panel(
+                [{"question": "用哪个？", "options": ["甲", "乙"],
+                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
             await pilot.press("2")  # 数字快选：直接提交
             await pilot.pause()
-            assert result.get("value") == "乙"
+            assert result.get("values") == ["乙"]
             assert evt.is_set()
 
     _run(_run_case())
 
 
 def test_question_choice_modal_multiple_toggle(monkeypatch):
-    """多选：空格勾选两项，Enter 提交逗号拼接结果。"""
+    """多选：空格勾选两项，Enter 提交逗号拼接结果（单问题不进入确认页）。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel("选特征", ["红", "大", "圆"], True, result, evt)
+            app.show_question_panel(
+                [{"question": "选特征", "options": ["红", "大", "圆"],
+                  "descriptions": [], "multiple": True}], result, evt)
             await pilot.pause()
             await pilot.press("space")   # 勾选 1（红）
             await pilot.press("down")
@@ -1049,30 +1254,477 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
             await pilot.press("space")   # 勾选 3（圆）
             await pilot.press("enter")   # 提交
             await pilot.pause()
-            assert result.get("value") == "红, 圆"
+            assert result.get("values") == ["红, 圆"]
             assert evt.is_set()
 
     _run(_run_case())
 
 
 def test_question_choice_modal_custom_answer(monkeypatch):
-    """自定义回答：选最后一项进入编辑，输入文本提交。"""
+    """自定义回答：光标在「输入自定义回答」行回车进入编辑，输入后回车提交并前进。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel("颜色？", ["红", "蓝"], False, result, evt)
+            app.show_question_panel(
+                [{"question": "颜色？", "options": ["红", "蓝"],
+                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
+            panel = app.query_one(QuestionPanel)
             await pilot.press("down")
             await pilot.press("down")    # 移到"输入自定义回答"
             await pilot.press("enter")   # 进入编辑态
             await pilot.pause()
+            assert panel._input.has_focus
             await pilot.press("紫", "色")  # 向输入框键入
+            await pilot.press("enter")   # 提交并前进（单题 → 直接提交）
+            await pilot.pause()
+            assert result.get("values") == ["紫色"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_custom_esc_exits_input_then_reenter(monkeypatch):
+    """有选项题：输入态 Esc 只退出输入回选项列表（不取消整组），回车可再次进入编辑。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "颜色？", "options": ["红", "蓝"],
+                 "descriptions": [], "multiple": False}], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("down", "down", "enter")  # 选「输入自定义回答」
+            await pilot.pause()
+            assert panel._input.has_focus
+            await pilot.press("紫")
+            await pilot.press("escape")                 # 退出输入，回选项列表
+            await pilot.pause()
+            assert not evt.is_set()
+            assert panel._editing == [False]
+            assert not panel._input.has_focus
+            await pilot.press("enter")                  # 光标仍在自定义行 → 再次进入编辑
+            await pilot.pause()
+            assert panel._editing == [True]
+            assert panel._input.has_focus
+            assert panel._input.value == "紫"           # 已输入内容回填保留
+            await pilot.press("色", "enter")            # 追加，回车提交并前进
+            await pilot.pause()
+            assert result.get("values") == ["紫色"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_pure_input_esc_exits_not_cancel(monkeypatch):
+    """纯输入题（无选项）：Esc 退出输入但保留输入框，Enter 可重新聚焦继续输入。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "随便说点什么", "options": [],
+                 "descriptions": [], "multiple": False}], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            assert panel._input.has_focus
+            await pilot.press("a")
+            await pilot.press("escape")                 # 第一次 Esc：只退出输入
+            await pilot.pause()
+            assert not evt.is_set(), "Esc 不应取消整组"
+            assert panel._editing == [True]             # 仍处编辑态
+            assert panel._input.display is True         # 输入框保留
+            assert not panel._input.has_focus
+            assert panel._input.value == "a"
+            await pilot.press("enter")                  # Enter 重新聚焦
+            await pilot.pause()
+            assert panel._input.has_focus
+            await pilot.press("b", "enter")             # 追加并提交
+            await pilot.pause()
+            assert result.get("values") == ["ab"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_pure_input_typing_refocuses(monkeypatch):
+    """纯输入题 Esc 失焦后，直接敲字自动重新聚焦并写入（省去先按 Enter）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q", "options": [],
+                 "descriptions": [], "multiple": False}], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("x")                      # 失焦后敲字 → 自动聚焦并写入
+            await pilot.pause()
+            assert panel._input.has_focus
+            assert panel._input.value == "x"
             await pilot.press("enter")
             await pilot.pause()
-            assert result.get("value") == "紫色"
+            assert result.get("values") == ["x"]
+
+    _run(_run_case())
+
+
+def test_question_panel_pure_input_second_esc_cancels(monkeypatch):
+    """纯输入题：输入框失焦后，再按 Esc 才取消整组。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q", "options": [],
+                 "descriptions": [], "multiple": False}], result, evt)
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not evt.is_set()
+            await pilot.press("escape")                 # 第二次 Esc（未聚焦）：取消整组
+            await pilot.pause()
+            assert evt.is_set()
+            assert result.get("values") == [""]
+
+    _run(_run_case())
+
+
+def test_question_panel_switch_into_pure_input_keeps_focus_on_list(monkeypatch):
+    """切进纯输入题不抢焦点：输入框可见但失焦，←/→ 立即可切题，敲字再进入输入。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A", "B"], "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": [], "descriptions": [], "multiple": False},
+                {"question": "Q3", "options": ["C", "D"], "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("right")                  # → Q2（纯输入题）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/3) Q2"
+            assert panel._input.display is True         # 输入框可见
+            assert not panel._input.has_focus           # 但不抢焦点
+            await pilot.press("right")                  # 焦点在列表 → 直接切题
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(3/3) Q3"
+            await pilot.press("left")                   # ← 回到 Q2
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/3) Q2"
+            assert not panel._input.has_focus
+            await pilot.press("x")                      # 敲字 → 自动聚焦并写入
+            await pilot.pause()
+            assert panel._input.has_focus
+            assert panel._input.value == "x"
+            await pilot.press("enter")                  # 提交本题答案
+            await pilot.pause()
+            assert panel._answers[1] == "x"
+            assert not evt.is_set()                     # Q1/Q3 未答，整组未提交
+
+    _run(_run_case())
+
+
+def test_question_panel_switch_back_keeps_focus_on_list(monkeypatch):
+    """带选项题填了自定义回答后切走再切回：不聚焦输入框、选中项复位到第一项；
+    选项名不变、答案缩进显示在其下。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["红", "蓝"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["C", "D"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("down", "down", "enter")  # 选「输入自定义回答」
+            await pilot.pause()
+            await pilot.press("紫", "enter")            # 回车提交并前进 → Q2
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/2) Q2"
+            await pilot.press("left")                   # ← 切回 Q1
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(1/2) ✔ Q1"
+            assert not panel._input.has_focus           # 不抢焦点
+            assert panel._input.display is False        # 回列表态，输入框收起
+            assert panel._selected[0] == 0              # 选中项复位到第一个选项
+            body = str(panel._body.render())
+            assert "3. 输入自定义回答…" in body           # 选项名不变
+            assert "紫" in body                          # 答案缩进显示在末行下方
+            assert not evt.is_set()
+            # 回车进入编辑修改文本（已填内容回填），再回车提交前进
+            await pilot.press("down", "down")           # 移回自定义行
+            await pilot.press("enter")
+            await pilot.pause()
+            assert panel._input.has_focus
+            assert panel._input.value == "紫"
+            await pilot.press("色", "enter")            # 追加，回车提交并前进
+            await pilot.pause()
+            assert panel._answers[0] == "紫色"           # 改后答案为「紫色」
+            assert not evt.is_set()                     # Q2 未答，整组未提交
+
+    _run(_run_case())
+
+
+def test_question_panel_multiple_with_custom_merges(monkeypatch):
+    """多选 + 自定义输入：回车提交时把勾选项与自定义文本一起计入答案。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "想用哪些？", "options": ["A", "B", "C"],
+                 "descriptions": [], "multiple": True},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("space")                  # 勾 A
+            await pilot.press("down")
+            await pilot.press("space")                  # 勾 B
+            await pilot.pause()
+            await pilot.press("down")                   # 移到第三项 C
+            await pilot.press("down")                   # 移到最后一行「输入自定义回答」
+            await pilot.press("enter")
+            await pilot.pause()
+            assert panel._input.has_focus
+            await pilot.press("X", "Y")
+            await pilot.press("enter")                  # 提交：A, B + XY
+            await pilot.pause()
+            assert result.get("values") == ["A, B, XY"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_switch_resets_cursor_to_first_option(monkeypatch):
+    """切换问题时选中项复位到第一个选项（不沿用上一次的停留位置）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A1", "A2", "A3"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["B1", "B2"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("down", "down")           # Q1 光标移到第 3 项
+            await pilot.pause()
+            assert panel._selected[0] == 2
+            await pilot.press("right")                  # → Q2
+            await pilot.pause()
+            assert panel._selected[1] == 0              # Q2 光标在第一个选项
+            await pilot.press("left")                   # ← 回 Q1
+            await pilot.pause()
+            assert panel._selected[0] == 0              # Q1 也复位到第一项
+
+    _run(_run_case())
+
+
+def test_question_panel_multi_questions_auto_advance(monkeypatch):
+    """多题面板：逐题作答后自动前进到下一题，答完最后一题进入确认页再提交。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "端口？", "options": ["8000", "3000"],
+                 "descriptions": [], "multiple": False},
+                {"question": "鉴权？", "options": ["要", "不要"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(1/2) 端口？"
+            await pilot.press("1")  # Q1 选 8000 → 自动跳到 Q2
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/2) 鉴权？"
+            await pilot.press("2")  # Q2 选「不要」→ 进入确认页（不直接提交）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            assert not evt.is_set()  # 确认页尚未提交
+            await pilot.press("enter")  # 确认页 enter → 直接提交
+            await pilot.pause()
+            assert result.get("values") == ["8000", "不要"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_review_page_navigation(monkeypatch):
+    """确认页视作循环最后一页：←/→ 可切进切出，enter 提交，可回跳修改。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A1", "A2"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["B1", "B2"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            await pilot.press("1")  # Q1 = A1 → Q2
+            await pilot.press("1")  # Q2 = B1 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            joined = str(app.query_one(QuestionPanel)._body.render())
+            assert "Q1" in joined and "A1" in joined and "Q2" in joined and "B1" in joined
+            await pilot.press("left")  # 确认页 ← 回到 Q2
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/2) ✔ Q2"
+            await pilot.press("left")  # 再 ← 回到 Q1
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(1/2) ✔ Q1"
+            await pilot.press("2")     # 改成 A2 → 顺序进下一题（Q2），不直接跳到确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/2) ✔ Q2"
+            await pilot.press("right")  # 从最后一题 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("enter")  # 提交
+            await pilot.pause()
+            assert result.get("values") == ["A2", "B1"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_revisit_middle_advances_to_next(monkeypatch):
+    """回归：全部答完进入确认页后回改**中间**某题，提交应顺序进下一题，
+    而不是因后面都已答而直接跳回确认页。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A1", "A2"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["B1", "B2"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q3", "options": ["C1", "C2"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            await pilot.press("1", "1", "1")        # Q1/Q2/Q3 依次作答 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("left", "left")       # 确认页 ← ×2 → Q2（中间题）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/3) ✔ Q2"
+            await pilot.press("2")                  # 改选 B2 → 进下一题 Q3（非确认页）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(3/3) ✔ Q3"
+            assert not evt.is_set()
+            await pilot.press("2")                  # Q3 改选 C2 → 已在最后一题且全答完 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert result.get("values") == ["A1", "B2", "C2"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_manual_switch_revisit(monkeypatch):
+    """多题面板：←/→ 手动切题，回跳可改已答（已答题标题带 ✔）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A1", "A2"],
+                 "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["B1", "B2"],
+                 "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            await pilot.press("2")     # Q1 选 A2 → 自动进 Q2
+            await pilot.pause()
+            await pilot.press("left")  # 回跳 Q1（已答，带 ✔）
+            await pilot.pause()
+            title = str(app.query_one(".ask-title").content)
+            assert title == "(1/2) ✔ Q1"
+            await pilot.press("1")     # 改选 A1 → 顺序进仍未答的 Q2
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(2/2) Q2"
+            await pilot.press("right")  # Q2 未答仍可前进 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("right")  # 确认页再右移 → 环绕回 Q1
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "(1/2) ✔ Q1"
+            await pilot.press("left")   # 环绕：Q1 左移 → 确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("left")   # ← 回到 Q2 作答
+            await pilot.pause()
+            await pilot.press("1")      # Q2 选 B1 → 自动进确认页
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            await pilot.press("enter")  # 提交
+            await pilot.pause()
+            assert result.get("values") == ["A1", "B1"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_panel_multi_escape_cancels_group(monkeypatch):
+    """多题面板：Esc 取消整组，返回全空（调用方兜底为「已取消」）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "Q1", "options": ["A", "B"], "descriptions": [], "multiple": False},
+                {"question": "Q2", "options": ["C", "D"], "descriptions": [], "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            await pilot.press("1")     # Q1 选 A → 跳 Q2
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert result.get("values") == ["", ""]
             assert evt.is_set()
 
     _run(_run_case())
@@ -1420,6 +2072,7 @@ def test_context_tools_grouped_with_counts(monkeypatch):
             await pilot.pause()
             groups = app.query(ContextGroup)
             assert len(groups) == 1
+            assert groups.first().styles.margin.top == 1  # 与上方内容留出间隔
             header = str(groups.first().query_one(".group-header").content)
             assert "已探索" in header
             assert "2 次读取" in header  # read_file + list_dir
@@ -1447,6 +2100,28 @@ def test_non_context_tool_breaks_group(monkeypatch):
             top_tools = [w for w in app.query_one(ChatView).children if isinstance(w, ToolCall)]
             assert len(top_tools) == 1  # run_command 独立成块，不归组
             assert "command ls" in str(top_tools[0].query_one(".tool-header").content)
+
+    _run(_run_case())
+
+
+def test_context_group_tolerates_interleaved_results(monkeypatch):
+    """流式交错：上下文工具的结果晚于后续非上下文工具的 start 到达，分组仍正确。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app.ui_tool_start(1, "read a.py", "inline", "read_file")
+            app.ui_tool_start(2, "command ls", "block", "run_command")
+            app.ui_tool_result(1, "结果", False, False)  # read1 的结果晚到（越过 cmd 的 start）
+            app.ui_tool_start(3, "read b.py", "inline", "read_file")
+            app.ui_tool_result(2, "out", False, False)
+            app.ui_tool_result(3, "结果", False, False)
+            await pilot.pause()
+            groups = app.query(ContextGroup)
+            assert len(groups) == 2  # read1 / read2 被 run_command 切开，各自成组
+            assert len(groups[0].query(ToolCall)) == 1
+            assert len(groups[1].query(ToolCall)) == 1
 
     _run(_run_case())
 
@@ -1491,6 +2166,40 @@ def test_stream_breaks_context_group(monkeypatch):
             _start_tools(app, [(2, "read b.py", "read_file")])
             await pilot.pause()
             assert len(app.query(ContextGroup)) == 2
+
+    _run(_run_case())
+
+
+def test_top_level_blocks_uniform_top_margin(monkeypatch):
+    """统一间距：顶层块靠 margin-top 与前一块隔一行、不用 margin-bottom（避免双倍间隔），
+    组内工具行紧凑。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app.ui_stream("content", "正文")
+            app.ui_stream_done()
+            app.ui_thinking_start()
+            app.ui_thinking_tick("想")
+            app.ui_thinking_done()
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            app.ui_tool_result(1, "内容", False, False)
+            _start_tools(app, [(2, "command ls", "run_command")])
+            app.ui_tool_result(2, "ok", False, False)
+            await pilot.pause()
+
+            stream = app.query_one(".assistant-stream")
+            assert (stream.styles.margin.top, stream.styles.margin.bottom) == (1, 0)
+            thinking = app.query(ThinkingBlock).first()
+            assert (thinking.styles.margin.top, thinking.styles.margin.bottom) == (1, 0)
+            group = app.query(ContextGroup).first()
+            assert (group.styles.margin.top, group.styles.margin.bottom) == (1, 0)
+            assert group.query(ToolCall).first().styles.margin.top == 0  # 组内紧凑
+            top_tool = next(
+                w for w in app.query_one(ChatView).children if isinstance(w, ToolCall)
+            )
+            assert (top_tool.styles.margin.top, top_tool.styles.margin.bottom) == (1, 0)
 
     _run(_run_case())
 

@@ -1,4 +1,4 @@
-"""Agent 批量工具执行的两阶段并发测试：预检串行、波次执行、顺序保证。
+﻿"""Agent 批量工具执行的两阶段并发测试：预检串行、波次执行、顺序保证。
 
 用假 LLM + 假工具验证，不依赖真实 API：
 - 结果按提交顺序收集（与模型请求 tool_calls 的顺序一致）
@@ -49,7 +49,7 @@ def _make_agent(monkeypatch, batches):
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(batches))
     agent = Agent(session=Session())
     # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
-    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
     return agent
 
 
@@ -180,7 +180,7 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
 
     seen = []
 
-    def check(name, args):
+    def check(name, args, content=None):
         seen.append(name)
         return len(seen) == 1  # 第一次放行，第二次拒绝
 
@@ -194,6 +194,116 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
     assert [m["content"] for m in msgs] == ["（未执行：权限请求被拒绝，任务已中止）",
                                             "用户拒绝了此操作"]
     assert [m["tool_call_id"] for m in msgs] == ["1", "2"]
+
+
+# ---------- 流式调度：边预检边执行 ----------
+
+def test_serial_executes_before_later_preflight(monkeypatch, tmp_path):
+    """流式调度：串行工具在"后续工具的权限确认"之前就已执行。
+
+    旧两阶段会先把 cmd2 也确认了才执行 cmd1；流式下 cmd1 先跑完再确认 cmd2。
+    """
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    events = []
+
+    def par_tool(tag=""):
+        events.append(("run", tag))
+        return "par"
+
+    def cmd_tool(tag=""):
+        events.append(("run", tag))
+        return "cmd"
+
+    monkeypatch.setitem(FUNCTIONS, "par_tool", par_tool)
+    monkeypatch.setitem(FUNCTIONS, "cmd_tool", cmd_tool)
+    monkeypatch.setitem(SERIAL, "cmd_tool", True)
+
+    calls = [
+        _tc("par_tool", args='{"tag": "read"}', call_id="1"),
+        _tc("cmd_tool", args='{"tag": "cmd1"}', call_id="2"),
+        _tc("cmd_tool", args='{"tag": "cmd2"}', call_id="3"),
+    ]
+    monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
+    agent = Agent(session=Session())
+
+    def check(name, args, content=None):
+        events.append(("check", args.get("tag")))
+        return True
+
+    monkeypatch.setattr(agent.permission, "check", check)
+    agent.run("流式")
+
+    assert events.index(("run", "cmd1")) < events.index(("check", "cmd2"))
+
+
+def test_wave_runs_before_serial_barrier(monkeypatch, tmp_path):
+    """屏障前的并行波次真并发执行，且都先于串行工具执行。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    order = []
+    barrier = threading.Barrier(2)
+
+    def make_par(tag):
+        def tool():
+            barrier.wait(timeout=10)  # 串行执行时先到者超时 → 测试失败
+            order.append(("run", tag))
+            return tag
+
+        return tool
+
+    def cmd_tool(tag=""):
+        order.append(("run", tag))
+        return "cmd"
+
+    monkeypatch.setitem(FUNCTIONS, "par_a", make_par("a"))
+    monkeypatch.setitem(FUNCTIONS, "par_b", make_par("b"))
+    monkeypatch.setitem(FUNCTIONS, "cmd_tool", cmd_tool)
+    monkeypatch.setitem(SERIAL, "cmd_tool", True)
+
+    calls = [
+        _tc("par_a", call_id="1"),
+        _tc("par_b", call_id="2"),
+        _tc("cmd_tool", args='{"tag": "c"}', call_id="3"),
+    ]
+    monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+
+    agent.run("屏障")
+
+    assert order.index(("run", "a")) < order.index(("run", "c"))
+    assert order.index(("run", "b")) < order.index(("run", "c"))
+
+
+def test_denied_after_executed_serial_keeps_partial(monkeypatch, tmp_path):
+    """流式的 partial-apply 语义：已执行的串行工具保留，之后的被拒只占位其后。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    executed = []
+
+    def cmd_tool():
+        executed.append("cmd")
+        return "cmd done"
+
+    monkeypatch.setitem(FUNCTIONS, "cmd_tool", cmd_tool)
+    monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "no")
+    monkeypatch.setitem(SERIAL, "cmd_tool", True)
+
+    calls = [_tc("cmd_tool", call_id="1"), _tc("fake_tool", call_id="2")]
+    monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
+    agent = Agent(session=Session())
+
+    seen = []
+    monkeypatch.setattr(
+        agent.permission, "check",
+        lambda name, args, content=None: seen.append(name) or name == "cmd_tool",
+    )
+
+    result = agent.run("拒绝")
+    assert "权限" in result.text
+    assert executed == ["cmd"]  # 串行工具已执行、保留（不回滚）
+
+    msgs = _tool_messages(agent)
+    assert msgs[0]["content"] == "cmd done"
+    assert msgs[1]["content"] == "用户拒绝了此操作"
 
 
 # ---------- 展示分组的隐式契约 ----------
@@ -274,7 +384,7 @@ def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
         agent.permission, "check",
-        lambda name, args: seen.append(name) or len(seen) == 1,  # 第二次拒绝
+        lambda name, args, content=None: seen.append(name) or len(seen) == 1,  # 第二次拒绝
     )
     cap = _CapRenderer()
     monkeypatch.setattr("smithcode.renderer._current", cap)
@@ -287,24 +397,31 @@ def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
 
 
 def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
-    """中断：已预检未执行的计划补 tool_result 收尾 pending 工具块。"""
-    monkeypatch.setattr(config, "MAX_TOOL_CONCURRENCY", 1)  # 纯串行，顺序确定
-    calls = [_tc("step_tool", call_id="1"), _tc("fake_tool", call_id="2")]
+    """中断：已预检未执行的计划补 tool_result 收尾 pending 工具块。
+
+    流式调度下「已预检未执行」即缓冲区里的波次计划（此例为前两个并行计划）。
+    """
+    calls = [_tc("fake_tool", call_id="1"), _tc("fake_tool", call_id="2"),
+             _tc("fake_tool", call_id="3")]
     monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
-
-    def step_tool():
-        agent.interrupt()
-        return "第一步完成"
-
-    monkeypatch.setitem(FUNCTIONS, "step_tool", step_tool)
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
     agent = Agent(session=Session())
-    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+
+    seen = []
+
+    def check(name, args, content=None):
+        seen.append(name)
+        if len(seen) == 3:  # 预检第 3 个时用户按 Esc
+            agent.interrupt()
+        return True
+
+    monkeypatch.setattr(agent.permission, "check", check)
     cap = _CapRenderer()
     monkeypatch.setattr("smithcode.renderer._current", cap)
 
     agent.run("中断")
 
-    # 计划 1 正常完成；计划 2 被中断 → INTERRUPTED（收尾其 pending 块）
-    assert cap.results[0] == (1, "第一步完成")
-    assert cap.results[1] == (2, "（未执行：用户中断了任务）")
+    # 三个计划都已预检（各建了 pending 块）、都未执行 → 一律 INTERRUPTED 收尾
+    assert [r[0] for r in cap.results] == [1, 2, 3]
+    assert all(r[1] == "（未执行：用户中断了任务）" for r in cap.results)
+    assert len(_tool_messages(agent)) == 3  # 会话完整性：每个 id 都有配对结果

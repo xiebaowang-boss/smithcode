@@ -1,4 +1,4 @@
-"""Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
+﻿"""Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
 
 import json
 
@@ -140,7 +140,7 @@ def test_run_truncates_oversized_tool_result(monkeypatch):
     # 把上限调小，避免测试里塞几万字符
     monkeypatch.setattr("smithcode.config.MAX_TOOL_OUTPUT", 1000)
     agent = Agent(session=Session())
-    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
     agent.run("大输出")
 
@@ -397,8 +397,38 @@ def test_interrupt_during_stream_keeps_partial_content(monkeypatch):
     result = agent.run("写首诗")
     assert result.status == "interrupted"
     assert result.partial is True
-    assert agent.session.messages[-1]["role"] == "assistant"
-    assert agent.session.messages[-1]["content"] == "部分输出"
+    msgs = agent.session.messages
+    assert msgs[-2]["role"] == "assistant"
+    assert msgs[-2]["content"] == "部分输出"
+    # 中断事件回写上下文：末条是给模型看的 user 注释（不触发新请求）
+    assert msgs[-1]["role"] == "user"
+    assert "中断" in msgs[-1]["content"]
+
+
+def test_interrupt_writes_context_note_without_new_call(monkeypatch):
+    """中断回写：会话末尾追加一条 user 注释、不因此再发起请求，下一轮可见。"""
+    calls = []
+
+    class InterruptingLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            calls.append(list(messages))
+            yield ("content", "部分")
+            agent.interrupt()
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
+    agent = Agent(session=Session())
+
+    result = agent.run("做点事")
+    assert result.status == "interrupted"
+    assert len(calls) == 1  # 回写上下文没有触发新的模型调用
+    note = agent.session.messages[-1]
+    assert note["role"] == "user"
+    assert "中断" in note["content"]
+
+    # 下一轮提问：注释仍在历史里（模型可见），新输入追加在其后
+    agent.llm = FakeLLM()
+    agent.run("继续")
+    assert any("中断" in m.get("content", "") for m in agent.session.messages)
 
 
 def test_interrupt_before_tool_batch_fills_placeholders(monkeypatch):
@@ -453,7 +483,7 @@ def test_interrupt_mid_batch_stops_remaining(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolThenCancelLLM)
     agent = Agent(session=Session())
-    monkeypatch.setattr(agent.permission, "check", lambda name, args: True)
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
     result = agent.run("中断批处理")
     assert result.status == "interrupted"
@@ -475,7 +505,7 @@ def test_interrupt_during_preflight_skips_remaining(monkeypatch):
         executed.append(True)
         return "第一步完成"
 
-    def check(name, args):
+    def check(name, args, content=None):
         if not asked:
             agent.interrupt()  # 模拟确认第 1 个工具时用户按 Esc
         asked.append(name)
@@ -517,7 +547,7 @@ def test_interrupt_during_confirmation_overrides_denied(monkeypatch):
         executed.append(True)
         return "不应执行"
 
-    def check(name, args):
+    def check(name, args, content=None):
         agent.interrupt()  # 确认框弹出期间用户按 Esc
         return False       # 随后答 n——按中断语义优先，不转 denied
 
