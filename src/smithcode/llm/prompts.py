@@ -157,12 +157,17 @@ _SECTIONS = [
 ]
 
 
-def build_system_prompt(goal_section: str = "", skills_section: str = "") -> str:
-    """拼装系统提示词；skills_section / goal_section 非空时依次追加动态段。
+def build_system_prompt(
+    instructions_section: str = "",
+    skills_section: str = "",
+    goal_section: str = "",
+) -> str:
+    """拼装系统提示词；动态段非空时按序追加。
 
-    动态段由 session.sync_system() 传入（skills.render_section() 与
-    goal.render_section()）：技能段只在技能集合或激活集合变化时变化，目标段
-    只在目标变更时变化，普通回合保持逐字节稳定。
+    动态段由 session.sync_system() 传入（instructions.render_section() /
+    skills.render_section() / goal.render_section()），顺序即优先级阶梯：
+    base → 项目约定 → 技能 → 目标（越具体/越使命性越靠后）。各段只在自身
+    内容变化时变化，普通回合保持逐字节稳定。
     """
     sections = "\n\n".join(_SECTIONS)
     prompt = f"""你是一个运行在终端里的代码助手 Smith Code，通过调用工具读写文件、执行命令来帮用户完成编程任务。
@@ -171,6 +176,8 @@ def build_system_prompt(goal_section: str = "", skills_section: str = "") -> str
 {_env_info()}
 
 {sections}"""
+    if instructions_section:
+        prompt += "\n\n" + instructions_section
     if skills_section:
         prompt += "\n\n" + skills_section
     if goal_section:

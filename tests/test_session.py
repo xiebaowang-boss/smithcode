@@ -1,5 +1,6 @@
 """Session 测试：会话 id 轮换与系统提示词同步（含持久目标动态段）。"""
 
+import os
 import uuid
 
 import pytest
@@ -89,6 +90,39 @@ def test_sync_system_includes_skills_section(tmp_path, monkeypatch):
         assert "## 可用技能" in session.messages[0]["content"]
     finally:
         skills.clear()
+
+
+def test_sync_system_includes_instructions_section(tmp_path, monkeypatch):
+    """AGENTS.md 装载后进系统提示词；文件修改下一轮生效，删除后移除。"""
+    from smithcode import instructions
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (workspace / "AGENTS.md").write_text("初始约定标记", encoding="utf-8")
+
+    instructions.reset()
+    try:
+        session = Session()
+        session.sync_system()
+        assert "## 项目约定" in session.messages[0]["content"]
+        assert "初始约定标记" in session.messages[0]["content"]
+
+        (workspace / "AGENTS.md").write_text("改后的约定标记", encoding="utf-8")
+        stat = (workspace / "AGENTS.md").stat()
+        os.utime(workspace / "AGENTS.md", (stat.st_atime + 5, stat.st_mtime + 5))
+        session.sync_system()
+        assert "改后的约定标记" in session.messages[0]["content"]
+        assert "初始约定标记" not in session.messages[0]["content"]
+
+        (workspace / "AGENTS.md").unlink()
+        session.sync_system()
+        assert "## 项目约定" not in session.messages[0]["content"]
+    finally:
+        instructions.reset()
 
 
 # ---------- 持久化绑定与原地恢复 ----------

@@ -299,3 +299,62 @@ def test_use_session_id_adopts_persisted_id():
     assert config.use_session_id("abc123") == "abc123"
     assert config.SESSION_ID == "abc123"
     config.use_session_id(before)  # 还原，避免污染其他用例
+
+
+# ---------- [instructions] 项目指令配置 ----------
+
+def test_instructions_config_defaults(tmp_path, monkeypatch):
+    home = _make_home(tmp_path)
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_instructions_config()
+    assert cfg.enabled is True
+    assert cfg.files == ("AGENTS.md",)
+    assert cfg.paths == ()
+    assert cfg.max_chars == 8000
+
+
+def test_instructions_config_reads_values(tmp_path, monkeypatch):
+    home = _make_home(tmp_path, toml_text=(
+        "[instructions]\n"
+        "enabled = false\n"
+        'files = ["AGENTS.md", "CLAUDE.md"]\n'
+        'paths = ["docs/team.md", "C:/abs/notes.md"]\n'
+        "max_chars = 4000\n"
+    ))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_instructions_config()
+    assert cfg.enabled is False
+    assert cfg.files == ("AGENTS.md", "CLAUDE.md")
+    assert cfg.paths == ("docs/team.md", "C:/abs/notes.md")
+    assert cfg.max_chars == 4000
+
+
+def test_instructions_config_files_empty_list_disables_default_names(tmp_path, monkeypatch):
+    """显式空列表 = 不探测默认文件名（仅保留 paths 追加文件）。"""
+    home = _make_home(tmp_path, toml_text="[instructions]\nfiles = []\n")
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_instructions_config().files == ()
+
+
+def test_instructions_config_invalid_values_degrade(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, toml_text=(
+        "[instructions]\n"
+        'enabled = "yes"\n'
+        'files = "AGENTS.md"\n'
+        "max_chars = 0\n"
+        "paths = 3\n"
+    ))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    cfg = config.load_instructions_config()
+    assert cfg.enabled is True
+    assert cfg.files == ("AGENTS.md",)
+    assert cfg.paths == ()
+    assert cfg.max_chars == 8000
+    assert "警告" in capsys.readouterr().out
+
+
+def test_instructions_config_non_table_section_warns(tmp_path, monkeypatch, capsys):
+    home = _make_home(tmp_path, toml_text="instructions = 3\n")
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_instructions_config() == config.InstructionsConfig()
+    assert "警告" in capsys.readouterr().out

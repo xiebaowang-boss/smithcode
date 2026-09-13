@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from . import config, goal, plan, renderer, sessions, skills
+from . import config, goal, instructions, plan, renderer, sessions, skills
 from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
@@ -249,13 +249,15 @@ class Agent:
         )
 
     def start(self) -> None:
-        """启动期装载模型目录与技能目录：模型未配置时后台拉取 `/models`。
+        """启动期装载模型目录、技能目录与项目指令：模型未配置时后台拉取 `/models`。
 
         技能发现可能弹出项目级信任确认（渲染后端此时为 ConsoleRenderer，
-        TUI 尚未接管，交互行为一致）。
+        TUI 尚未接管，交互行为一致）。项目指令在首次 `sync_system()` 前装载，
+        使首个请求即带上 AGENTS.md；读取失败只警告、不阻断启动。
         """
         self.models.bootstrap()
         self.refresh_skills()
+        instructions.refresh()
 
     def refresh_skills(self) -> list:
         """重新发现技能并同步 use_skill 工具 schema（启动与 /skills refresh 共用）。"""

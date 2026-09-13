@@ -133,6 +133,16 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 - **安全边界**：技能根目录登记为**只读白名单**（`config.read_roots()`），读引用文件免越界确认、不弹权限框；写操作只认授权目录（`_resolve(write=True)`）；frontmatter 的 `allowed-tools` 不产生任何授权效果。
 - **会话与压缩**：`/new` 时 `skills.reset()` 清空激活集合（发现结果保留）；正文在 `messages[0]` 所以压缩不丢；`/context` 的 system 桶如实计量技能成本。
 
+## 项目指令（AGENTS.md）
+
+借鉴 Claude Code / Codex / opencode 的内存文件机制：启动时读取用户级 `~/.smithcode/AGENTS.md` 与项目级 `<工作区>/AGENTS.md`，外加 `[instructions].paths` 追加文件，把仓库的开发约定装进系统提示词，模型不必靠猜或反复读说明文件：
+
+- **注入通道**：`Session.sync_system()` 把 `instructions.render_section()` 作为动态段拼进 `messages[0]`（同 skills / goal 机制）——压缩天然保留、普通回合逐字节稳定、恢复会话按磁盘最新内容重建；不进 `t=state` 投影（指令与会话无关，无需持久化与重置）。
+- **优先级**：用户级 < 项目级 < `[instructions].paths`（越具体越靠后渲染）；段内 intro 声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed；与用户当前明确要求冲突时以用户为准）。
+- **变更检测**：`instructions.refresh()` 按 `(path, scope, mtime_ns, size)` 指纹判断，未变化时零读取；会话中途新增 / 修改 / 删除指令文件在下一轮 `sync_system()` 自动生效。`[instructions].enabled=false` 整体关闭；`files`（默认 `["AGENTS.md"]`）控制各根目录探测的文件名，显式空列表表示只加载 `paths`。
+- **预算**：`[instructions].max_chars`（默认 8000）按优先级分配——高优先级文件保证完整，低优先级按剩余额度截头并附 read_file 指引，放不下的整体省略并计数。
+- **安全**：不做信任门控——注入是纯文本，无法影响代码强制的安全边界（权限引擎 / 路径沙箱 / 非交互 fail-closed）；显式配置的 `paths` 文件缺失 / 不可用警告一次，默认探测位置缺失静默。
+
 ## 会话与 /new
 
 `/new` 命令开启新会话：所有会话口径状态的重置集中在 `Agent.new_session()`（`agent.py`），命令层只负责反馈与标记，不感知重置细节。覆盖项：
@@ -173,6 +183,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
 | `skills/` | 技能子系统（`skills-architecture.md` 的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级激活集合、`render.py` 目录段与已激活段渲染（字符预算降级）；`/new` 时重置激活集合 |
+| `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
@@ -195,6 +206,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **权限规则引擎**：三级动作 `allow / ask / deny`，规则 = (工具名, 参数模式, 动作)，通配符匹配，最后一条匹配的规则生效，无匹配默认 `ask`。规则三层叠加：内置默认 < `~/.smithcode/config.toml` 用户规则 < 会话内"总是允许"（命令记 argv 前缀，其余工具按模式串）；内置默认放行只读文件工具与 `webfetch` / `websearch`（抓取/检索网页只读、无本地副作用），用户规则可精确收紧。匹配在 Windows 下大小写不敏感（对齐 opencode v2）。
 - **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
 - **技能目录只读**：`skills.refresh()` 把技能根目录写入只读白名单（`config.read_roots()`），读工具（read_file / list_dir / glob / grep）访问技能引用文件免越界确认；写工具与 `apply_patch` 仍只认授权目录（`_resolve(write=True)`），技能文件不可被静默改写。
+- **项目指令只读注入**：`AGENTS.md` 等指令文件仅作为文本进入系统提示词（`messages[0]` 动态段），不产生任何授权效果——权限 / 沙箱仍由代码强制，文件内容无法绕过（故不做信任门控）；显式配置的不可用路径警告一次，默认探测位置缺失静默。
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框只展示工具摘要（`describe`）与带说明的选项、不重复 diff；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。TUI 中该 diff 以**左右对照**渲染——旧/新两栏、各带真实行号，改动行带 `-`/`+` 前缀并红/绿配色，整块统一底色、上下各 1 行 padding、块内不展示文件名（`tui/render.py` 的 `side_by_side_diff`，宽度不足时回退逐行统一 diff），REPL 仍按 `+/-` 行着色打印。`.env` 等敏感文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。

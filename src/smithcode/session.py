@@ -14,7 +14,7 @@ import json
 import time
 from pathlib import Path
 
-from . import config, goal, skills
+from . import config, goal, instructions, skills
 from .llm.prompts import build_system_prompt
 from .llm.usage import UsageTracker
 
@@ -87,12 +87,19 @@ class Session:
     def sync_system(self) -> None:
         """同步系统提示词到会话历史：首次插入，内容变化时原地刷新。
 
-        动态段包括持久目标（/goal）与技能（可用目录 + 已激活正文）；技能段
-        未装载时为空串。刷新只在内容确实不同时发生——动态段只含稳定信息，
-        普通回合间逐字节不变，避免每次请求都改前缀破坏服务商的提示缓存。
+        动态段依次为项目约定（AGENTS.md）、技能（可用目录 + 已激活正文）、
+        持久目标（/goal）；对应段未装载时为空串。刷新只在内容确实不同时发生
+        ——动态段只含稳定信息，普通回合间逐字节不变，避免每次请求都改前缀
+        破坏服务商的提示缓存。项目约定每轮做 stat 级变更检测：会话中途修改
+        文件后下一轮即生效，未修改时渲染结果保持不变。
         兼容 load() 读回的旧历史：首段是 system 时同样按最新内容校准。
         """
-        content = build_system_prompt(goal.render_section(), skills.render_section())
+        instructions.refresh()
+        content = build_system_prompt(
+            instructions_section=instructions.render_section(),
+            skills_section=skills.render_section(),
+            goal_section=goal.render_section(),
+        )
         if self._messages and self._messages[0].get("role") == "system":
             if self._messages[0].get("content") != content:
                 self._messages[0]["content"] = content

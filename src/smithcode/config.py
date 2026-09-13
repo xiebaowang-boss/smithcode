@@ -412,6 +412,66 @@ def load_skills_config() -> SkillsConfig:
     )
 
 
+# ---------- 项目指令（Instructions） ----------
+
+INSTRUCTIONS_DEFAULT_FILES = ("AGENTS.md",)
+
+
+@dataclass(frozen=True)
+class InstructionsConfig:
+    """[instructions] 段的解析结果；非法项警告后回退默认值。"""
+
+    enabled: bool = True
+    # 在各根目录（用户级 ~/.smithcode/ 与项目工作区）下探测的文件名；
+    # 显式空列表表示不探测默认名（仅加载 paths 追加文件）
+    files: tuple = INSTRUCTIONS_DEFAULT_FILES
+    paths: tuple = ()  # 追加指令文件（相对工作区或绝对路径），优先级最高
+    max_chars: int = 8000  # 注入段总字符预算，超出时从低优先级文件截断
+
+
+def load_instructions_config() -> InstructionsConfig:
+    """读取 [instructions] 段：enabled / files / paths / max_chars。
+
+    与 skills 配置同款风格：类型不对警告后回退默认值，不中断启动。
+    """
+    data = _read_config_file().get("instructions") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [instructions] 段不是表，已忽略")
+        return InstructionsConfig()
+
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        print(
+            f"[警告] config.toml 的 instructions.enabled = {enabled!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        enabled = True
+
+    files = data.get("files")
+    if files is None:
+        files = INSTRUCTIONS_DEFAULT_FILES
+    elif isinstance(files, list) and all(isinstance(v, str) for v in files):
+        files = tuple(files)  # 显式空列表：不探测默认名，仅加载 paths
+    else:
+        print("[警告] config.toml 的 instructions.files 应为字符串列表，已用默认值")
+        files = INSTRUCTIONS_DEFAULT_FILES
+
+    max_chars = data.get("max_chars", 8000)
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        print(
+            f"[警告] config.toml 的 instructions.max_chars = {max_chars!r} 无效"
+            "（应为正整数），已用默认值 8000"
+        )
+        max_chars = 8000
+
+    return InstructionsConfig(
+        enabled=enabled,
+        files=tuple(files),
+        paths=_str_list(data.get("paths"), "instructions.paths"),
+        max_chars=max_chars,
+    )
+
+
 # ---------- 会话（Sessions） ----------
 
 @dataclass(frozen=True)

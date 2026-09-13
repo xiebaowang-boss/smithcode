@@ -4,6 +4,10 @@
 
 ## [未发布]
 
+### 新增
+
+- **项目指令（AGENTS.md）自动注入**：启动时读取用户级 `~/.smithcode/AGENTS.md` 与项目级 `<工作区>/AGENTS.md`（`[instructions].files` 可增加 `CLAUDE.md` 等文件名、`paths` 可追加任意指令文件），作为系统提示词动态段注入 `messages[0]`——与 skills / goal 同通道，压缩天然保留、恢复会话按磁盘最新内容重建。优先级「越具体越优先」（用户级 < 项目级 < 追加文件），段内声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed，用户当前明确要求优先）。`instructions.refresh()` 按 `(path, scope, mtime_ns, size)` 指纹检测变化：会话中途修改文件下一轮自动生效，未修改时渲染逐字节稳定以保护提示缓存。`[instructions].max_chars`（默认 8000）预算内高优先级文件完整保留、低优先级截断并提示用 read_file 查看全部，放不下的文件省略并计数。不做信任门控：注入是纯文本，无法影响代码强制的安全边界；显式配置的 `paths` 文件缺失 / 不可用会警告一次，默认位置缺失静默
+
 ### 变更
 
 - **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
