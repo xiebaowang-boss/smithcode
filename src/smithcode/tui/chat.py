@@ -155,6 +155,7 @@ class ToolStart(ChatItem):
     display: str = "inline"
     name: str = ""
     icon: str = ""
+    running_label: str = ""
 
 
 @dataclass

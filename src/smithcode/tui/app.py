@@ -219,9 +219,12 @@ class SmithTUI(App):
     PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
     PermissionPanel .perm-detail { color: #a9b1d6; }
     PermissionPanel .ask-hint { color: #808080; }
-    /* 通用选择弹窗：居中卡片（遮罩/变暗由 SelectionScreen 的 ModalScreen 背景负责） */
+    /* 通用选择弹窗：居中卡片（遮罩/变暗由 SelectionScreen 的 ModalScreen 背景负责）。
+       宽度按档位取定值，由调用方经 CommandSelect.size 声明（默认 medium）；
+       面板不测量内容，选项过长由各命令自行控制（暂无截断）。
+       max-width 兜住窄终端：档位再宽也不会超出屏宽 90%。 */
     SelectionPanel {
-        width: 64;
+        width: 64;        /* medium（默认档） */
         max-width: 90%;
         height: auto;
         min-height: 16;   /* 比内容高，短列表也保持足够高度 */
@@ -229,14 +232,22 @@ class SmithTUI(App):
         background: #1e1e1e;
         padding: 1 2;
     }
+    SelectionPanel.size-small { width: 40; }
+    SelectionPanel.size-large { width: 88; }
+    SelectionPanel.size-xlarge { width: 116; }
     SelectionPanel .selection-title {
         color: #fab283;
         text-style: bold;
         padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
         margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
     }
-    SelectionPanel .selection-body { height: auto; }
     SelectionPanel .selection-scroll { height: 1fr; }
+    /* 每项一行：左侧占满剩余宽度，trailing（时间等）贴行尾右对齐；
+       选中行整行反白——底色由行承担，子项只设前景色，高亮才能贯通到行尾 */
+    SelectionPanel .selection-row { height: 1; width: 1fr; }
+    SelectionPanel .selection-row.selected { background: #fab283; }
+    SelectionPanel .selection-label { width: 1fr; height: 1; }
+    SelectionPanel .selection-trailing { width: auto; height: 1; }
     SelectionPanel .selection-hint { color: #808080; dock: bottom; }
     """
 
@@ -436,9 +447,12 @@ class SmithTUI(App):
 
     def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
                       name: str = "") -> None:
-        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。"""
+        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。
+
+        命令工具耗时不确定，pending 期显式标「执行中」；完成后统一转静态行。"""
         icon = _PLAN_ICON if name == "todo_write" else ""
-        self._chat().apply(ToolStart(tool_id, summary, display, name, icon))
+        running = "执行中" if name == "run_command" else ""
+        self._chat().apply(ToolStart(tool_id, summary, display, name, icon, running))
 
     def ui_tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：更新对应 pending 工具块，审核时改动已可见。"""
@@ -514,11 +528,13 @@ class SmithTUI(App):
                 value=choice.value,
                 description=choice.description,
                 current=choice.current,
+                trailing=choice.trailing,
             )
             for choice in select.items
         ]
         panel = SelectionPanel(
-            select.title, items, lambda value: self.screen.dismiss(value)
+            select.title, items, lambda value: self.screen.dismiss(value),
+            size=select.size,  # 宽度档位由命令声明，宿主不测量内容
         )
         self.push_screen(
             SelectionScreen(panel),

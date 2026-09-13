@@ -13,7 +13,7 @@ from typing import ClassVar
 
 from rich.text import Text
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
@@ -592,12 +592,14 @@ class QuestionPanel(Vertical):
 
 @dataclass
 class SelectionItem:
-    """选择面板的一行：label 展示、value 回传、description 补充、current 当前项标记。"""
+    """选择面板的一行：label 展示、value 回传、description 补充（跟在标题后）、
+    current 当前项标记、trailing 贴行尾右对齐（如时间）。"""
 
     label: str
     value: str
     description: str = ""
     current: bool = False
+    trailing: str = ""
 
 
 class SelectionScreen(ModalScreen):
@@ -630,7 +632,13 @@ class SelectionPanel(Vertical):
     只认识 SelectionItem，不认识具体业务；选中后经 on_done(value) 回调交回宿主
     （Esc 传 None）。主线程回调式，不阻塞事件循环——与 ask/权限面板的
     Event 阻塞协议区分开。
+
+    宽度按 size 档位取定值（宽度值定义在 SmithTUI.CSS 的 `.size-*` 规则里），
+    面板不测量内容；未知档位回退 DEFAULT_SIZE，避免调用方写错档位把面板撑坏。
     """
+
+    SIZES: ClassVar[tuple] = ("small", "medium", "large", "xlarge")
+    DEFAULT_SIZE: ClassVar[str] = "medium"
 
     can_focus = True
     BINDINGS: ClassVar = [
@@ -642,50 +650,81 @@ class SelectionPanel(Vertical):
         Binding("escape", "cancel", "取消", show=False),
     ]
 
-    def __init__(self, title: str, items: list, on_done, **kwargs):
+    def __init__(self, title: str, items: list, on_done, size: str = DEFAULT_SIZE,
+                 **kwargs):
         super().__init__(**kwargs)
         self._title = title
         self._items = list(items)
         self._on_done = on_done
+        self.size_class = size if size in self.SIZES else self.DEFAULT_SIZE
+        self.add_class(f"size-{self.size_class}")
         # 初始选中当前项（没有则第一项）
         self._selected = next(
             (i for i, item in enumerate(self._items) if item.current), 0
         )
-        self._body: Static | None = None
         self._scroll: VerticalScroll | None = None
 
     def compose(self):
         yield Static(self._title, classes="selection-title", markup=False)
-        self._body = Static(self._render_items(), classes="selection-body")
-        # 内容超出可视区时可滚动；滚动容器本身不抢焦点（按键归面板）
-        self._scroll = VerticalScroll(self._body, classes="selection-scroll")
-        self._scroll.can_focus = False
-        yield self._scroll
+        # 每项一行两列：左侧（标记 + 标题 + 说明）占满剩余宽度，右侧 trailing 贴行尾
+        # （时间等）——用列布局而非手工补空格，宽度随档位 / 终端自适应。
+        # 滚动容器本身不抢焦点（按键归面板）
+        with VerticalScroll(classes="selection-scroll") as scroll:
+            scroll.can_focus = False
+            self._scroll = scroll
+            for index, item in enumerate(self._items):
+                yield self._row(index, item)
         yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint", markup=False)
 
     def on_mount(self) -> None:
         self.focus()  # 不聚焦，按键会落进隐藏的输入框
 
-    def _render_items(self) -> Text:
+    def _row(self, index: int, item) -> Horizontal:
+        selected = index == self._selected
+        row = Horizontal(
+            Static(self._label_text(item, selected), classes="selection-label",
+                   markup=False),
+            Static(self._trailing_text(item, selected), classes="selection-trailing",
+                   markup=False),
+            classes="selection-row",
+        )
+        if selected:
+            row.add_class("selected")
+        return row
+
+    def _label_text(self, item, selected: bool) -> Text:
+        """左侧文本：选中行整行反白，底色由行承担，这里只设前景色。"""
         text = Text()
-        for index, item in enumerate(self._items):
-            if index:
-                text.append("\n")
-            if index == self._selected:
-                text.append(f"› {item.label}", style="bold black on #fab283")
-                if item.current:
-                    text.append("  (当前)", style="black on #fab283")
-            else:
-                text.append(f"  {item.label}", style="#a9b1d6")
-                if item.current:
-                    text.append("  (当前)", style="#23d18b")
+        if selected:
+            text.append(f"› {item.label}", style="bold black")
+            if item.description:
+                text.append(f"  {item.description}", style="black")
+            if item.current:
+                text.append("  (当前)", style="black")
+        else:
+            text.append(f"  {item.label}", style="#a9b1d6")
             if item.description:
                 text.append(f"  {item.description}", style="#565f89")
+            if item.current:
+                text.append("  (当前)", style="#23d18b")
         return text
 
+    def _trailing_text(self, item, selected: bool) -> Text:
+        if not item.trailing:
+            return Text()
+        return Text(item.trailing, style="black" if selected else "#565f89")
+
     def _refresh(self) -> None:
-        if self._body is not None:
-            self._body.update(self._render_items())
+        for index, row in enumerate(self.query(".selection-row")):
+            selected = index == self._selected
+            item = self._items[index]
+            row.set_class(selected, "selected")
+            row.query_one(".selection-label", Static).update(
+                self._label_text(item, selected)
+            )
+            row.query_one(".selection-trailing", Static).update(
+                self._trailing_text(item, selected)
+            )
 
     def _ensure_visible(self) -> None:
         """把当前选中项滚动进可视区（每项占一行，行号即索引）。"""

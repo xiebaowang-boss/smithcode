@@ -6,11 +6,8 @@
 
 ### 变更
 
-- **TUI 对话区消息打印统一（唯一入口 + 级别化通知 + 统一缩进）**：此前对话区内容由多条路径零散产生（renderer 事件、宿主回显、命令输出、欢迎横幅、错误兜底各写各的），且通知行走 `_mk` 无缩进类、与工具/正文块左起点不一致，导致格式漂移。本次收口：
-  - 新增 `tui/chat.py` 语义消息模型（`Level` + `User` / `Assistant` / `Notice` / `Block` / `Footer` / `StreamDelta` / `Thinking*` / `Tool*` / `Welcome`，纯数据无 Textual 依赖）；`ChatView.apply(item)` 成为**唯一打印入口**，工具块映射与思考块引用一并收归消息区，宿主只负责路由。
-  - 统一布局：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源），用户消息左边框占 1 列故其 padding-left 为 2，正文与其它消息左对齐；修复信息行齐左、与块不对齐的问题。
-  - `Renderer` 新增 `warn()` / `error()`（默认降级为 `info`，TUI 按级别着色 + 固定 1 格图标），LLM 重试、权限拒绝、会话降级、目标暂停等改走对应级别，调用点不再手写 `\n` / `⛔` / `[LLM]` 前缀；命令层旧 `style` 字符串由集中映射兼容，命令零改动。
-  - 宿主旁路（欢迎横幅、历史回放、用户回显、轮次页脚、任务异常兜底、命令输出）全部改经 `apply`；新增 `tests/test_tui_chat.py` 覆盖级别映射、唯一入口与「所有顶层消息都带 `chat-item`」的对齐回归。
+- **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
+- **TUI 选择面板改为两列行布局（`/sessions` 展示调整）**：每项由整块文本改为「左列（标记 + 标题 + 说明，占满剩余宽度）+ 右列 trailing（贴行尾右对齐）」的两列行，用列布局而非手工补空格，宽度随档位 / 终端自适应（`CommandChoice` / `SelectionItem` 新增 `trailing` 字段，选中行底色移到行上使高亮贯通整行）。`/sessions` 选择框据此调整：标题后紧跟短 id、更新时间右对齐、不再展示模型信息；列表本就按更新时间倒序（`list_sessions`）
 
 ## [0.8.0] - 2026-09-12
 
@@ -80,6 +77,13 @@
 - **`/model` 命令、模型目录与通用选择面板**（对齐 Claude Code / opencode）：TUI 中输入 `/model`（无参）弹出**居中遮罩选择框**（半透明背景 + 居中卡片，↑↓/j/k/数字键选择、Enter 确认、Esc 取消，当前模型标绿「(当前)」），选中后自动切换并刷新底栏；`/model <名称>` 直接切换（本会话生效）。候选由新的 **`ModelCatalog`**（`models.py`，线程安全）统一维护，来源按优先级组合：`config.toml [provider].models`（显式配置，存在即不联网）> `~/.smithcode/models.json` 磁盘缓存 > 远端 `/models`。**启动时**（`Agent.start()`，CLI 调用）同步装载配置/缓存，外部未配置则后台拉取远端 `GET /models` 并回写缓存（按接口地址校验，离线可用、不阻塞启动）；命令层只依赖 `agent.models.list()`。为此命令协议新增 `CommandResult.select` 选择意图——命令只声明候选项、由宿主负责弹窗（TUI 居中弹窗 / 非交互 REPL 列出候选并提示改用带参形式，保持 fail-closed），命令处理器保持同步纯函数。附带把权限/提问/通用选择面板从 `tui/app.py` 抽到新文件 `tui/panels.py`
 
 ### 变更
+
+- **TUI 对话区消息打印统一（唯一入口 + 级别化通知 + 统一缩进）**：此前对话区内容由多条路径零散产生（renderer 事件、宿主回显、命令输出、欢迎横幅、错误兜底各写各的），且通知行走 `_mk` 无缩进类、与工具/正文块左起点不一致，导致格式漂移。本次收口：
+  - 新增 `tui/chat.py` 语义消息模型（`Level` + `User` / `Assistant` / `Notice` / `Block` / `Footer` / `StreamDelta` / `Thinking*` / `Tool*` / `Welcome`，纯数据无 Textual 依赖）；`ChatView.apply(item)` 成为**唯一打印入口**，工具块映射与思考块引用一并收归消息区，宿主只负责路由。
+  - 统一布局：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源），用户消息左边框占 1 列故其 padding-left 为 2，正文与其它消息左对齐；修复信息行齐左、与块不对齐的问题。
+  - `Renderer` 新增 `warn()` / `error()`（默认降级为 `info`，TUI 按级别着色 + 固定 1 格图标），LLM 重试、权限拒绝、会话降级、目标暂停等改走对应级别，调用点不再手写 `\n` / `⛔` / `[LLM]` 前缀；命令层旧 `style` 字符串由集中映射兼容，命令零改动。
+  - 宿主旁路（欢迎横幅、历史回放、用户回显、轮次页脚、任务异常兜底、命令输出）全部改经 `apply`；新增 `tests/test_tui_chat.py` 覆盖级别映射、唯一入口与「所有顶层消息都带 `chat-item`」的对齐回归。
+  - **命令工具执行中状态**：`run_command` 耗时不确定，pending 期头部显式显示「执行中」+ 转轮（`⠋ 执行中 · command …`），执行完成后转回静态行（`▸ ⚙ command … · N 行`）；其它工具保持原转轮摘要。`ToolCall` 新增 `running_label`，`ToolStart` 透传。
 
 - **`/effort` 切换改为静默**：不再打印「思考强度已切换」，反馈由输入框底栏「模型 · 思考强度」的即时刷新承担（与 `/skills` 手动加载的静默语义一致）
 

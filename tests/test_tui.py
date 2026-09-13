@@ -14,7 +14,12 @@ from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
-from smithcode.tui.panels import PermissionPanel, QuestionPanel, SelectionScreen
+from smithcode.tui.panels import (
+    PermissionPanel,
+    QuestionPanel,
+    SelectionPanel,
+    SelectionScreen,
+)
 from smithcode.tui.render import (
     context_category,
     context_summary,
@@ -1980,7 +1985,8 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
-        async with app.run_test() as pilot:
+        # 终端够宽，large 档（88）不被 max-width: 90% 夹到，便于断言档位宽度
+        async with app.run_test(size=(140, 40)) as pilot:
             inp = app.query_one(ChatInput)
             inp.focus()
             inp.insert("/sessions")
@@ -1989,6 +1995,16 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
             await pilot.pause()
             assert inp.text == ""  # 未填入输入框
             assert isinstance(app.screen, SelectionScreen)  # 直接弹选择框
+            # /sessions 声明 large 档：面板比默认 medium 宽（会话标题 + 说明较长）
+            panel = app.screen.query_one("SelectionPanel")
+            assert panel.has_class("size-large")
+            assert panel.styles.width.value == 88
+            # 时间列（trailing）贴行尾右对齐，标题后跟短 id
+            row = panel.query(".selection-row").first()
+            trailing = row.query_one(".selection-trailing", Static)
+            assert trailing.region.right == row.region.right
+            assert str(trailing.content).strip()  # 时间为非空
+            assert store.id[:8] in str(row.query_one(".selection-label", Static).content)
 
             await pilot.press("enter")  # 选中唯一会话 → 切换
             await pilot.pause()
@@ -2015,6 +2031,9 @@ def test_command_menu_effort_immediate_and_switch(monkeypatch):
             await pilot.pause()
             assert isinstance(app.screen, SelectionScreen)
             panel = app.screen.query_one("SelectionPanel")
+            # 命令未指定档位 → 默认 medium（宽度 64）
+            assert panel.has_class("size-medium")
+            assert panel.styles.width.value == 64
             # low 是当前项，↓ 移到下一档 high
             start = panel._selected
             await pilot.press("down")
@@ -2111,6 +2130,20 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
 
 
 # ---------- 通用选择面板（居中弹窗） ----------
+
+def test_selection_panel_size_tiers_and_fallback():
+    """size 档位落到 CSS 类（宽度值在 SmithTUI.CSS）；未知档位回退默认 medium。"""
+
+    def make(size=None):
+        kwargs = {} if size is None else {"size": size}
+        return SelectionPanel("标题", [], lambda value: None, **kwargs)
+
+    assert make().has_class("size-medium")        # 调用方不指定 → medium
+    assert make("small").has_class("size-small")
+    assert make("large").has_class("size-large")
+    assert make("xlarge").has_class("size-xlarge")
+    assert make("huge").has_class("size-medium")  # 未知档位回退，不撑坏面板
+
 
 def test_selection_panel_centered_selects_and_redispatch(monkeypatch):
     """命令返回 select：弹出遮罩居中面板，选中后按 /命令 值 重新分发。"""

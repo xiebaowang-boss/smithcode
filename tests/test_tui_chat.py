@@ -25,7 +25,7 @@ from smithcode.tui.chat import (
     coerce_level,
     level_from_style,
 )
-from smithcode.tui.widgets import ChatView
+from smithcode.tui.widgets import ChatView, ToolCall
 
 
 @pytest.fixture(autouse=True)
@@ -186,5 +186,38 @@ def test_stream_end_does_not_break(monkeypatch):
             chat.apply(StreamEnd())
             await pilot.pause()
             assert True
+
+    _run(_run_case())
+
+
+def test_run_command_shows_executing_then_static(monkeypatch):
+    """命令工具：pending 期显式「执行中」+ 转轮，完成后转静态行。"""
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app.ui_tool_start(1, "command sleep 5", "block", "run_command")
+            await pilot.pause()
+            block = app.query_one(ToolCall)
+            assert "执行中 · command sleep 5" in block._header_text()
+            app.ui_tool_result(1, "done", False, False)
+            await pilot.pause()
+            header = block._header_text()
+            assert "执行中" not in header
+            assert "command sleep 5" in header
+
+    _run(_run_case())
+
+
+def test_non_command_tool_keeps_gear_spinner(monkeypatch):
+    """非命令工具 pending 期仍是转轮 + 齿轮，不显示「执行中」。"""
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app.ui_tool_start(1, "read a.py", "inline", "read_file")
+            await pilot.pause()
+            block = app.query_one(ToolCall)
+            header = block._header_text()
+            assert "执行中" not in header
+            assert "⚙ read a.py" in header
 
     _run(_run_case())

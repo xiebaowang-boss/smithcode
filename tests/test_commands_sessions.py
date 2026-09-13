@@ -1,5 +1,7 @@
 """会话命令：/sessions（列表/切换/删除）/rename /new [名称] 与选择器降级。"""
 
+import os
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -78,11 +80,25 @@ def test_sessions_delete():
 
 
 def test_sessions_without_args_returns_select():
-    _store_with()
+    store = _store_with()
     _, outcome = _run("/sessions")
     assert outcome.select is not None
     assert outcome.select.command == "sessions"
     assert len(outcome.select.items) == 1
+    assert outcome.select.size == "large"  # 会话行较长，指定大档宽度
+    item = outcome.select.items[0]
+    assert item.description == store.id[:8]  # 短 id 紧跟标题（不再含模型）
+    assert re.fullmatch(r"\d{2}-\d{2} \d{2}:\d{2}", item.trailing)  # 时间右对齐列
+
+
+def test_sessions_sorted_by_updated_desc():
+    """默认按更新时间倒序：后写入的排在最前。"""
+    older = _store_with(prompt="旧会话")
+    newer = _store_with(prompt="新会话")
+    os.utime(older.path, (1_600_000_000, 1_600_000_000))  # 显式定住 mtime，避免同秒并列
+    os.utime(newer.path, (1_700_000_000, 1_700_000_000))
+    _, outcome = _run("/sessions")
+    assert [item.value for item in outcome.select.items] == [newer.id[:8], older.id[:8]]
 
 
 def test_sessions_without_history_notice():

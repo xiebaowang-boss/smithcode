@@ -41,14 +41,13 @@ def _render_list(items) -> CommandResult:
 
 
 def _select_items(items):
+    """选择框候选：标题后跟短 id，更新时间贴行尾右对齐（列表已按时间倒序）。"""
     return [
         CommandChoice(
             label=_entry_label(item),
             value=item.short_id,
-            description=(
-                f"{_format_time(item.updated)} · {item.short_id}"
-                f" · {item.model or '未知模型'}"
-            ),
+            description=item.short_id,
+            trailing=_format_time(item.updated),
             current=item.id == config.SESSION_ID,
         )
         for item in items
@@ -148,6 +147,7 @@ def _sessions(ctx):
             title="切换会话",
             command="sessions",
             items=_select_items(items),
+            size="large",  # 会话标题 + 时间/短 id/模型说明比其他选择框长
         ))
     return _switch(ctx, items, args[0])
 

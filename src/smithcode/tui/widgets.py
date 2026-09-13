@@ -170,6 +170,7 @@ class ChatView(VerticalScroll):
         is_context = context_category(item.name) is not None
         widget = ToolCall(
             item.summary, pending=True, display=item.display, icon=item.icon,
+            running_label=item.running_label,
             classes=None if is_context else "chat-item",
         )
         self._tool_widgets[item.tool_id] = widget
@@ -583,7 +584,7 @@ class ToolCall(Vertical):
 
     def __init__(self, summary: str, result: str = "", *, expanded: bool = False,
                  pending: bool = False, is_error: bool = False, display: str = "inline",
-                 detail: str = "", icon: str = "", **kwargs):
+                 detail: str = "", icon: str = "", running_label: str = "", **kwargs):
         super().__init__(**kwargs)
         self._summary = summary
         self._result = result
@@ -593,6 +594,7 @@ class ToolCall(Vertical):
         self._display = display
         self._detail = detail
         self._icon = icon  # 非空时以静态图标替代 pending 转轮（如 plan 工具）
+        self._running_label = running_label  # 非空时 pending 期显示该文案（如命令「执行中」）
         self._spin_frame = 0
         self._spin_timer = None
         self._header: Static | None = None
@@ -617,6 +619,9 @@ class ToolCall(Vertical):
         if self._pending:
             if self._icon:  # 静态图标（如 plan）：pending 期也不转轮
                 return f"{self._icon} {self._summary}"
+            if self._running_label:  # 命令类：显式「执行中」文案 + 转轮
+                return (f"{self.SPINNER[self._spin_frame]} {self._running_label}"
+                        f" · {self._summary}")
             return f"{self.SPINNER[self._spin_frame]} ⚙ {self._summary}"
         mark = "▾" if self._expanded else "▸"
         stat = ""

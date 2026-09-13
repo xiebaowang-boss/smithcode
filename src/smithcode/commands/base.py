@@ -13,12 +13,17 @@ KIND_BLOCK = "block"
 
 @dataclass
 class CommandChoice:
-    """选择器的一个候选项：label 展示、value 回传、current 标记当前值。"""
+    """选择器的一个候选项：label 展示、value 回传、current 标记当前值。
+
+    description 跟在标题后（同一侧），trailing 贴行尾右对齐（如时间），
+    两者都是纯展示、可留空；TUI 选择面板按此排版，REPL 降级只列 label。
+    """
 
     label: str
     value: str
     description: str = ""
     current: bool = False
+    trailing: str = ""
 
 
 @dataclass
@@ -27,11 +32,15 @@ class CommandSelect:
 
     command 是被调用的命令名（如 "model"），宿主不关心选项语义，只负责
     展示并回填参数——命令处理器保持同步、纯函数。
+
+    size 是弹窗宽度档位（small / medium / large / xlarge），由调用方按内容
+    长度声明；缺省 medium，宿主不测量内容、只按档位取宽度。
     """
 
     title: str
     command: str
     items: list  # CommandChoice 列表
+    size: str = "medium"
 
 
 @dataclass
