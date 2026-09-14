@@ -38,7 +38,7 @@ budget = {budget}  # 上下文预算（token），建议不超过模型窗口大
 # compact_keep_tokens = 15000  # 压缩时尾部原样保留的 token 数
 
 [limits]
-# max_iterations = 30       # 单次任务最大迭代轮数
+# max_iterations = -1       # 单次任务最大迭代轮数，-1 为不限制；配置后达上限将请求模型总结
 # command_timeout = 60      # run_command 超时（秒）
 # max_tool_output = 20000   # 工具输出进入上下文的最大字符数
 # max_retries = 3           # LLM 瞬时错误（限流/断网/5xx）自动重试次数

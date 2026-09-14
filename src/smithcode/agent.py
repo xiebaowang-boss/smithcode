@@ -73,6 +73,14 @@ INTERRUPTED_CONTEXT = (
     "（用户手动中断了上一个任务，任务未完成。此前部分输出可能不完整，"
     "未执行的工具已标记为「未执行：用户中断了任务」。请以用户的最新输入为准。）"
 )
+# 迭代上限收尾提示词：`[limits].max_iterations` > 0 且用尽时，系统不再暴露工具，
+# 把它作为一条 user 消息注入并强制模型用纯文本总结收尾（对齐 opencode 的
+# max-steps「最后一轮只回文本」行为）。总结是本次任务的最后一条可见回复。
+MAX_ITERATIONS_WRAPUP = (
+    "已达到本次任务的迭代上限，系统将停止继续调用工具，请不要在本次回复中再发起"
+    "任何工具调用。请直接总结本次任务：已完成的工作（附关键文件与验证结果）、"
+    "尚未完成的部分或遇到的阻碍，以及建议的下一步。"
+)
 
 
 @dataclass
@@ -226,7 +234,10 @@ class Agent:
         # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
         self.mcp = McpService()
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
-        self.max_iterations = max_iterations or config.MAX_ITERATIONS
+        # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
+        self.max_iterations = (
+            config.MAX_ITERATIONS if max_iterations is None else int(max_iterations)
+        )
         # 进程级服务留在 Agent（不随会话存取）：llm / permission / models / 令牌
         self.sessions_config = config.load_sessions_config()
         self._persist = bool(persist) and self.sessions_config.enabled
@@ -490,7 +501,8 @@ class Agent:
         - 续跑轮没有任何工具调用 → 暂停目标，防止空转；
         - 被中断 → 保留 active，停止循环（用户主动叫停）；
         - 被拒 / 迭代上限 → 暂停目标（继续只会重复失败）；
-        - 回合数达到预算 → 标记预算用尽并注入收尾提示词跑最后一轮。
+        - 配置了回合预算且回合数达到上限 → 标记预算用尽并注入收尾提示词跑最后一轮
+          （默认预算不限，此时不触发）。
         """
         goal_turn = goal.is_active()
         if goal_turn:
@@ -513,7 +525,7 @@ class Agent:
             current = goal.current()
             if current is None:  # 目标在本轮结束时被清除
                 break
-            if current.turns >= current.max_turns:
+            if not current.unlimited and current.turns >= current.max_turns:
                 goal.budget_limited()
                 renderer.current().warn(
                     f"[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
@@ -526,7 +538,7 @@ class Agent:
             if marker is None:  # 目标在本轮结束时被清除
                 break
             renderer.current().info(
-                f"[目标] 继续推进 · 第 {marker.turns}/{marker.max_turns} 回合"
+                f"[目标] 继续推进 · 第 {marker.turn_label()} 回合"
             )
             result = self.run(marker.continuation_prompt())
             self._note_goal_run(result)
@@ -541,18 +553,15 @@ class Agent:
 
     def _run_loop(self, token: CancellationToken) -> RunResult:
         tools_used: list = []  # 本任务执行过的工具名（去重保序），供 /goal 续跑裁决
-        for _ in range(self.max_iterations):
+        iteration = 0  # 已执行的工具轮次（一轮 = 一次模型调用 + 执行其工具调用）
+        while True:
             if token.cancelled:
                 return RunResult("interrupted")
             # 每轮同步系统提示词：本轮加载的技能正文下一轮生效（内容不变时不重建）
             self.session.sync_system()
             self._compact_if_needed()
             msg, usage, interrupted = self._chat_with_recovery()
-            self.session.usage.add(usage)
-            self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
-            if usage and self.session.store is not None:
-                self.session.store.append_usage(usage)
-            self.session.messages.append(msg)
+            self._record_model_call(msg, usage)
 
             if interrupted:
                 return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
@@ -577,25 +586,60 @@ class Agent:
             if stopped == "interrupted":
                 return RunResult("interrupted", tools_used=tuple(tools_used))
 
-        return RunResult(
-            "max_iterations", "达到最大迭代次数，任务中止。", tools_used=tuple(tools_used)
-        )
+            iteration += 1
+            # 仅当配置为正整数时封顶；达到上限后走收尾轮而非硬中止
+            if self.max_iterations > 0 and iteration >= self.max_iterations:
+                return self._wrap_up(tools_used)
 
-    def _chat_with_recovery(self) -> tuple[dict, dict | None, bool]:
+    def _record_model_call(self, msg: dict, usage: dict | None) -> None:
+        """登记一次模型调用：会话用量 + 真实 token 锚点 + 转录用量 + 消息入库。"""
+        self.session.usage.add(usage)
+        self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
+        if usage and self.session.store is not None:
+            self.session.store.append_usage(usage)
+        self.session.messages.append(msg)
+
+    def _wrap_up(self, tools_used: list) -> RunResult:
+        """到达迭代上限后的收尾轮：不再暴露工具，要求模型用纯文本总结。
+
+        对齐 opencode 的 max-steps 语义——最后一轮强制 text-only（`tools=None`），
+        并把收尾提示词作为 user 消息入库，使总结成为本任务最后一条可见回复。
+        若模型仍返回 tool_calls，一律剥离、不执行，避免历史里留下悬空
+        `tool_call_id`（下一条请求会因此非法）。返回状态仍为 `max_iterations`，
+        宿主据此提示「已达上限」；总结正文已在流式过程中展示。
+        """
+        renderer.current().warn(
+            f"[迭代] 已达上限（{self.max_iterations} 轮），请求模型总结本次任务…"
+        )
+        self.session.add("user", MAX_ITERATIONS_WRAPUP)
+        self.session.sync_system()
+        self._compact_if_needed()
+        msg, usage, interrupted = self._chat_with_recovery(use_tools=False)
+        text = msg.get("content") or ""
+        if msg.get("tool_calls"):
+            # 收尾轮不执行工具：剥离残缺工具调用，只保留正文
+            msg = {"role": "assistant", "content": text}
+        self._record_model_call(msg, usage)
+        if interrupted:
+            return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
+        return RunResult("max_iterations", text, tools_used=tuple(tools_used))
+
+    def _chat_with_recovery(self, use_tools: bool = True) -> tuple[dict, dict | None, bool]:
         """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
 
         仅当错误文本命中溢出特征才走这条路，其他异常原样上抛。恢复后的
         调用再溢出就直接抛给 REPL——每步只重试一次，不反复烧钱。
+        `use_tools=False` 用于迭代上限的收尾轮（强制纯文本，不暴露工具）。
         返回 (消息, 用量, 是否被中断)。
         """
         try:
-            return self._chat()
+            return self._chat(use_tools=use_tools)
         except Exception as e:
             if not is_context_overflow(e):
                 raise
         renderer.current().info("[context] 上下文溢出，压缩后重试…")
         self.compact()
-        return self._chat()
+        return self._chat(use_tools=use_tools)
 
     def _compact_if_needed(self) -> None:
         """每轮调用前的预检：估算越过阈值（预算 × COMPACT_TRIGGER）就先压缩。"""
@@ -653,9 +697,10 @@ class Agent:
                 parts.append(payload.get("content") or "")
         return "".join(parts)
 
-    def _chat(self) -> tuple[dict, dict | None, bool]:
+    def _chat(self, use_tools: bool = True) -> tuple[dict, dict | None, bool]:
         """一次流式模型调用：思考与正文各占一行（均带 助手> 前缀）。
 
+        `use_tools=False` 时不暴露任何工具（迭代上限收尾轮强制纯文本）。
         返回 (消息, 用量, 是否被中断)。用量由 llm 层从流中提取，服务商
         不提供时为 None。渲染交给 renderer（CLI 逐字打印 / TUI 进组件）。
         任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼
@@ -668,7 +713,8 @@ class Agent:
         usage = None
         parts: list[str] = []
         r = renderer.current()
-        for kind, payload in self.llm.chat_stream(self.session.messages, tools=visible_schemas()):
+        schemas = visible_schemas() if use_tools else None
+        for kind, payload in self.llm.chat_stream(self.session.messages, tools=schemas):
             if kind == "message":
                 msg = payload
             elif kind == "usage":

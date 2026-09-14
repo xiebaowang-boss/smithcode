@@ -136,6 +136,24 @@ def test_run_with_goal_budget_limited_wraps_up(monkeypatch, capsys):
     assert "预算用尽" in capsys.readouterr().out
 
 
+def test_run_with_goal_unlimited_budget_keeps_going(monkeypatch):
+    """默认预算不限：回合数远超旧的 50 仍继续，直到目标声明完成。"""
+    script = []
+    for i in range(55):
+        script.append(_todo_step(f"步骤{i}", call_id=str(i)))
+        script.append(_text(f"第{i}轮"))
+    script.append(_tool("goal_update", {"status": "complete", "summary": "证据"}, "done"))
+    agent = _make_agent(monkeypatch, script)
+    goal.set("测试目标")  # 未指定预算 → 取配置默认 -1（不限）
+    assert goal.current().unlimited
+
+    agent.run_with_goal("开始")
+
+    current = goal.current()
+    assert current.status == goal.COMPLETE
+    assert current.turns == 56  # 远超旧默认 50，未触发预算收尾
+
+
 def test_run_with_goal_keeps_active_on_interrupt(monkeypatch):
     agent = _make_agent(monkeypatch, [])
     monkeypatch.setattr(agent, "run", lambda text: RunResult("interrupted"))

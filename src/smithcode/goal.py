@@ -2,7 +2,7 @@
 
 借鉴 Codex CLI 的 /goal：目标在多个回合间存活，模型围绕目标推进，直到逐条
 核验真实证据后调用 goal_update 声明完成（或同一阻碍连续多回合后声明受阻），
-或回合预算用尽由系统收尾。目标存于本模块的进程内单例（会话口径，/new 时
+或（配置了回合预算时）预算用尽由系统收尾。目标存于本模块的进程内单例（会话口径，/new 时
 reset()）；Agent.run_with_goal() 在每轮任务结束后检查状态，必要时注入续跑
 提示词自动开启下一回合——续跑只在宿主空闲、目标 active 且上一轮正常结束
 且有实际推进（用过工具）时发生，避免空转。
@@ -190,13 +190,22 @@ class Goal:
         return (self.ended_at or time.time()) - self.created_at
 
     @property
+    def unlimited(self) -> bool:
+        """回合预算是否为「不限」（`max_turns <= 0`，默认 -1）。"""
+        return self.max_turns <= 0
+
+    @property
     def turns_left(self) -> int:
         return max(0, self.max_turns - self.turns)
+
+    def turn_label(self) -> str:
+        """回合进度文案：有预算显示 `N/M`，不限则只显示 `N`。"""
+        return f"{self.turns}" if self.unlimited else f"{self.turns}/{self.max_turns}"
 
     def marker(self) -> str:
         """TUI 底栏指示文本；无目标由调用方处理（这里总返回非空）。"""
         if self.status == ACTIVE:
-            return f"{STATUS_ICONS[self.status]} 目标 {self.turns}/{self.max_turns}"
+            return f"{STATUS_ICONS[self.status]} 目标 {self.turn_label()}"
         return f"{STATUS_ICONS[self.status]} 目标{STATUS_LABELS[self.status]}"
 
     def sidebar(self) -> tuple:
@@ -206,7 +215,7 @@ class Goal:
         由宿主着色与展示，本模块不依赖 TUI。
         """
         if self.status == ACTIVE:
-            title = f"目标 · {self.turns}/{self.max_turns}"
+            title = f"目标 · {self.turn_label()}"
             detail = (
                 f"{STATUS_ICONS[self.status]} 进行中 · 约 {self.tokens_used:,} tokens"
                 f" · 用时 {_format_elapsed(self.elapsed)}"
@@ -214,7 +223,7 @@ class Goal:
         else:
             title = f"目标 · {STATUS_LABELS[self.status]}"
             detail = (
-                f"{STATUS_ICONS[self.status]} 第 {self.turns}/{self.max_turns} 回合"
+                f"{STATUS_ICONS[self.status]} 第 {self.turn_label()} 回合"
                 f" · 用时 {_format_elapsed(self.elapsed)}"
             )
         lines = [_clip(self.objective, 120), detail]
@@ -228,7 +237,7 @@ class Goal:
     def render_status(self) -> str:
         """面向用户/模型的完整状态块（/goal 与 goal_read 共用）。"""
         head = (
-            f"[目标] {STATUS_LABELS[self.status]} · 第 {self.turns}/{self.max_turns} 回合"
+            f"[目标] {STATUS_LABELS[self.status]} · 第 {self.turn_label()} 回合"
             f" · 用时 {_format_elapsed(self.elapsed)} · 约 {self.tokens_used:,} tokens"
         )
         lines = [head, f"目标: {self.objective}"]
@@ -265,11 +274,20 @@ class Goal:
     def _objective_block(self) -> str:
         return f"<objective>\n{self.objective}\n</objective>"
 
+    def _budget_line(self) -> str:
+        """提示词里的回合预算说明：有预算给上限，不限则说明持续自动推进。"""
+        if self.unlimited:
+            return (
+                "回合预算：不限。系统会在回合间持续自动接续，直到你核验证据后声明完成/受阻，"
+                "或用户暂停、清除、中断。"
+            )
+        return f"回合预算：最多 {self.max_turns} 个回合自动推进（当前为第 1 回合）。"
+
     def start_prompt(self) -> str:
         """设定目标后的首轮指令（由宿主的 start_task 发出）。"""
         return (
             "开始执行以下持久目标。该目标跨多个回合存活，系统会在回合之间自动接续，"
-            "直到你逐条核验证据后声明完成、或预算用尽。\n\n"
+            "直到你逐条核验证据后声明完成、或回合预算用尽。\n\n"
             f"{self._objective_block()}\n\n"
             "工作方式：\n"
             "1. 先把目标拆解为可核验的交付物与成功标准；需要多步时用 todo_write 建立步骤清单；\n"
@@ -282,14 +300,23 @@ class Goal:
             "不要因为回合将尽、工作量大或\"打算完成\"就标记完成；\n"
             "5. 同一阻碍连续出现且无用户输入无法继续时，才调用 "
             "goal_update(status=\"blocked\", summary=\"阻碍与所需输入\")。\n\n"
-            f"回合预算：最多 {self.max_turns} 个回合自动推进（当前为第 1 回合）。"
+            f"{self._budget_line()}"
         )
 
     def continuation_prompt(self) -> str:
         """自动续跑轮的提示词（Codex continuation.md 的中文化）。"""
+        if self.unlimited:
+            head = (
+                f"继续推进当前持久目标（第 {self.turns} 回合，预算不限，"
+                f"已用约 {self.tokens_used:,} tokens）。\n"
+            )
+        else:
+            head = (
+                f"继续推进当前持久目标（第 {self.turns}/{self.max_turns} 回合，"
+                f"剩余 {self.turns_left} 回合，已用约 {self.tokens_used:,} tokens）。\n"
+            )
         return (
-            f"继续推进当前持久目标（第 {self.turns}/{self.max_turns} 回合，"
-            f"剩余 {self.turns_left} 回合，已用约 {self.tokens_used:,} tokens）。\n"
+            f"{head}"
             "目标跨回合存活：本回合做不完不代表要把目标缩小；保持完整目标不变，"
             "围绕真正的交付物推进。\n\n"
             f"{self._objective_block()}\n\n"
@@ -342,11 +369,11 @@ def is_active() -> bool:
 
 
 def set(objective: str, max_turns: int | None = None, tokens_at_start: int = 0) -> Goal:
-    """设定（或替换）当前目标；max_turns 缺省取配置 GOAL_MAX_TURNS。"""
+    """设定（或替换）当前目标；max_turns 缺省取配置 GOAL_MAX_TURNS（默认 -1 不限）。"""
     global _current
     _current = Goal(
         objective=str(objective).strip(),
-        max_turns=int(max_turns) if max_turns else config.GOAL_MAX_TURNS,
+        max_turns=config.GOAL_MAX_TURNS if max_turns is None else int(max_turns),
         tokens_at_start=int(tokens_at_start or 0),
     )
     return _current
@@ -455,9 +482,13 @@ def restore(data) -> None:
     if not isinstance(data, dict) or not str(data.get("objective") or "").strip():
         _current = None
         return
+    try:
+        budget = int(data.get("max_turns"))
+    except (TypeError, ValueError):
+        budget = config.GOAL_MAX_TURNS
     restored = Goal(
         objective=str(data["objective"]).strip(),
-        max_turns=int(data.get("max_turns") or config.GOAL_MAX_TURNS),
+        max_turns=budget,
     )
     status = data.get("status")
     restored.status = status if status in STATUSES else ACTIVE

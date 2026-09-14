@@ -5,6 +5,7 @@ import random
 import time
 from contextlib import closing
 
+import httpx2
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -19,11 +20,16 @@ from ..cancel import current_token
 
 # 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
 # 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。
+# 流中途的传输层错误（对端掐断连接、读流超时等）由 OpenAI SDK 原样透传
+# （不再包装成 APIConnectionError），需单独纳入重试。
 RETRYABLE_ERRORS = (
     RateLimitError,
     APIConnectionError,
     APITimeoutError,
     InternalServerError,
+    httpx2.RemoteProtocolError,  # 对端中途断连（incomplete chunked read 等）
+    httpx2.ReadError,  # 读取流时连接被重置
+    httpx2.ReadTimeout,  # 模型长时间静默超过 llm_timeout
 )
 
 
@@ -78,10 +84,11 @@ class LLMClient:
           ("message", dict)    — 流结束时组装好的完整 assistant 消息
           ("usage", dict)      — 流中携带的 token 用量（服务商支持才发）
 
-        瞬时错误按指数退避自动重试；失败前已输出过内容则不重试，
-        避免把已打印的文本重放一遍。任务被取消时（取消令牌已触发）流在
-        下一块数据到达前截停并关闭 HTTP 连接，不再产出 message/usage，
-        由 agent 侧拼装部分消息。
+        瞬时错误按指数退避自动重试，每次重试前把错误打印出来；失败前已
+        输出过正文则不重试，避免把已打印的正文重放一遍（思考内容只展示、
+        不写入会话，流中断后可安全重算；工具调用在流结束前也不落历史）。
+        任务被取消时（取消令牌已触发）流在下一块数据到达前截停并关闭
+        HTTP 连接，不再产出 message/usage，由 agent 侧拼装部分消息。
         """
         kwargs = {
             "model": model or config.MODEL,
@@ -100,19 +107,20 @@ class LLMClient:
             kwargs["extra_headers"] = headers  # 自定义请求头，_open_stream 重连时随 kwargs 沿用
 
         for attempt in range(config.MAX_RETRIES + 1):
-            emitted = False
+            printed = False  # 已向终端输出正文：重试会重放，不再重试
             try:
                 for event in self._stream_once(kwargs):
-                    emitted = True
+                    if event[0] == "content":
+                        printed = True
                     yield event
                 return
-            except RETRYABLE_ERRORS:
-                if attempt == config.MAX_RETRIES or emitted:
+            except RETRYABLE_ERRORS as e:
+                if attempt == config.MAX_RETRIES or printed:
                     raise
                 wait = 2**attempt + random.random()
                 renderer.current().warn(
-                    f"[LLM] 请求失败，{wait:.0f}s 后重试"
-                    f"（{attempt + 1}/{config.MAX_RETRIES}）..."
+                    f"[LLM] 请求失败（{type(e).__name__}: {e}），"
+                    f"{wait:.0f}s 后重试（{attempt + 1}/{config.MAX_RETRIES}）..."
                 )
                 time.sleep(wait)
 

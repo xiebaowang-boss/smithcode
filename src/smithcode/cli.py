@@ -60,7 +60,7 @@ def build_parser():
     )
     parser.add_argument(
         "--max-iterations", type=int, default=None, metavar="N",
-        help=f"单次任务最大迭代轮数（默认 {config.MAX_ITERATIONS}）",
+        help="单次任务最大迭代轮数；-1 为不限（默认），正整数达上限后会请求模型总结收尾",
     )
     parser.add_argument(
         "-V", "--version", action="version",

@@ -222,7 +222,11 @@ def ensure_api_key():
 
 # ---------- 行为配置（只读 config.toml） ----------
 
-MAX_ITERATIONS = _resolve_number("limits", "max_iterations", 30)
+# 单次任务最大迭代轮数（一轮 = 一次模型调用 + 执行其返回的工具调用）。
+# -1 表示不限制（默认，对齐 opencode 的 steps 缺省「无限迭代」语义）；配置为
+# 正整数时到达上限，达到后不再执行工具，改为注入收尾提示、强制模型用纯文本
+# 总结已完成工作与剩余任务（对齐 opencode 的 max-steps 收尾行为）。
+MAX_ITERATIONS = _resolve_number("limits", "max_iterations", -1)
 COMMAND_TIMEOUT = _resolve_number("limits", "command_timeout", 60)
 COMMAND_TIMEOUT_MAX = _resolve_number("limits", "command_timeout_max", 300)  # run_command timeout 参数的上限
 MAX_TOOL_OUTPUT = _resolve_number("limits", "max_tool_output", 20_000)  # 单次工具输出进入上下文的最大字符数，超出则头尾截断
@@ -234,9 +238,11 @@ COMPACT_KEEP_TOKENS = _resolve_number("context", "compact_keep_tokens", 15000)  
 MAX_RETRIES = _resolve_number("limits", "max_retries", 3)  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
 LLM_TIMEOUT = _resolve_number("limits", "llm_timeout", 120)  # 单次 LLM 请求超时（秒）
 
-# /goal 持久目标的默认回合预算：目标存续期间最多自动推进的回合数，
-# 用尽后系统注入收尾提示词并停止（/goal budget N 可改当前目标）
-GOAL_MAX_TURNS = _resolve_number("limits", "goal_max_turns", 50)
+# /goal 持久目标的默认回合预算：正整数表示目标存续期间最多自动推进的回合数，
+# 用尽后系统注入收尾提示词并停止（/goal budget N 可改当前目标）。默认 -1 表示
+# 不限制——目标持续自动推进，直到模型核验证据后声明完成/受阻、或用户暂停/中断
+# （对齐 Claude Code /goal 无原生成轮上限、Codex 由用户显式配置预算的做法）。
+GOAL_MAX_TURNS = _resolve_number("limits", "goal_max_turns", -1)
 
 # 一轮内多个工具调用的并发执行上限（线程池 max_workers）。
 # 模型一次返回的多个调用中，可并行的部分最多同时跑这么多，其余排队；

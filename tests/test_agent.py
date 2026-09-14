@@ -56,19 +56,74 @@ def test_run_records_messages(monkeypatch):
     assert roles == ["system", "user", "assistant"]
 
 
-def test_agent_loop_stops_at_max_iterations(monkeypatch):
+def test_agent_loop_caps_and_wraps_up(monkeypatch):
     class ToolCallLoopLLM(FakeLLM):
-        """永远要求调用工具，用于验证最大迭代保护。"""
+        """持续请求工具；收尾轮（tools=None）返回纯文本总结。"""
+
+        def __init__(self):
+            super().__init__()
+            self.tool_turns = 0
+            self.tools_seen = []
 
         def chat_stream(self, messages, tools=None):
-            yield (
-                "message",
-                {"role": "assistant", "content": "", "tool_calls": [_fake_tool_call()]},
-            )
+            self.calls += 1
+            self.tools_seen.append(tools)
+            if tools is None:  # 收尾轮：不暴露工具，直接给总结
+                yield ("content", "总结：已完成 X，剩余 Y")
+                yield ("message", {"role": "assistant", "content": "总结：已完成 X，剩余 Y"})
+                return
+            self.tool_turns += 1
+            yield ("message", {"role": "assistant", "content": "", "tool_calls": [_fake_tool_call()]})
 
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolCallLoopLLM)
     agent = Agent(session=Session(), max_iterations=2)
-    assert agent.run("死循环").text == "达到最大迭代次数，任务中止。"
+    result = agent.run("死循环")
+    assert result.status == "max_iterations"
+    assert result.text == "总结：已完成 X，剩余 Y"
+    assert agent.llm.tool_turns == 2  # 只执行配置的 2 轮工具
+    assert agent.llm.tools_seen[-1] is None  # 收尾轮不暴露任何工具
+
+
+def test_agent_loop_unlimited_by_default(monkeypatch):
+    """未配置 max_iterations（默认 -1）时不封顶：可远超旧的 30 轮。"""
+
+    class LongLoopLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            self.calls += 1
+            if self.calls <= 40:
+                yield (
+                    "message",
+                    {"role": "assistant", "content": "", "tool_calls": [_fake_tool_call()]},
+                )
+            else:
+                yield ("message", {"role": "assistant", "content": "终于完成"})
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", LongLoopLLM)
+    agent = Agent(session=Session())
+    assert agent.max_iterations == -1
+    result = agent.run("多轮任务")
+    assert result.status == "ok"
+    assert result.text == "终于完成"
+
+
+def test_wrap_up_strips_unexpected_tool_calls(monkeypatch):
+    """收尾轮模型仍返回 tool_calls 时一律剥离，历史里不留悬空 tool_call_id。"""
+
+    class StubbornLLM(FakeLLM):
+        def chat_stream(self, messages, tools=None):
+            self.calls += 1
+            yield (
+                "message",
+                {"role": "assistant", "content": "部分总结", "tool_calls": [_fake_tool_call()]},
+            )
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", StubbornLLM)
+    agent = Agent(session=Session(), max_iterations=1)
+    result = agent.run("顽固")
+    assert result.status == "max_iterations"
+    assert result.text == "部分总结"
+    last = agent.session.messages[-1]
+    assert last["role"] == "assistant" and "tool_calls" not in last
 
 
 def test_run_stops_when_permission_denied(monkeypatch, tmp_path):

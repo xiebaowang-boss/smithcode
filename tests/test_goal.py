@@ -30,6 +30,17 @@ def test_set_default_budget_from_config(monkeypatch):
     assert goal.set("x").max_turns == 7
 
 
+def test_set_default_budget_unlimited(monkeypatch):
+    """默认配置为 -1：不限回合，进度文案与提示词都不再显示预算分母。"""
+    monkeypatch.setattr(config, "GOAL_MAX_TURNS", -1)
+    g = goal.set("x")
+    assert g.max_turns == -1 and g.unlimited
+    assert goal.marker() == "◎ 目标 0"
+    assert "预算不限" in g.continuation_prompt()
+    assert "不限" in g.start_prompt()
+    assert g.turn_label() == "0"
+
+
 def test_set_replaces_previous_goal():
     goal.set("旧目标", max_turns=3)
     g = goal.set("新目标", max_turns=9)

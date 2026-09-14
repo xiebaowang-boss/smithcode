@@ -10,7 +10,7 @@
     /goal               查看当前目标状态
     /goal pause         暂停自动推进（目标保留）
     /goal resume        恢复推进并立即接续一轮
-    /goal budget <N>    调整当前目标的回合预算
+    /goal budget <N>    调整当前目标的回合预算（unlimited/off 取消上限）
     /goal clear         清除目标（别名：stop / off / cancel / reset）
 """
 
@@ -30,6 +30,16 @@ def _tokens_now(ctx) -> int:
 def _start(outcome: CommandResult, prompt: str) -> CommandResult:
     outcome.start_task = prompt
     return outcome
+
+
+def _budget_usage() -> CommandResult:
+    return CommandResult(
+        text=(
+            "用法: /goal budget <N>（N 为正整数，表示最多自动推进的回合数）；"
+            "用 unlimited / off 取消上限（不限）。"
+        ),
+        style="yellow",
+    )
 
 
 @register(
@@ -95,22 +105,26 @@ def _goal(ctx):
             current.continuation_prompt(),
         )
 
-    # 调整预算
+    # 调整预算：正整数设回合上限；unlimited / off / none / -1 取消上限（不限）
     if head == "budget":
         if not goal.is_set():
             return CommandResult(text="当前没有持久目标，无法设置预算。", style="yellow")
-        if len(args) != 2 or not args[1].isdigit() or int(args[1]) <= 0:
-            return CommandResult(
-                text="用法: /goal budget <N>（N 为正整数，表示最多自动推进的回合数）",
-                style="yellow",
-            )
-        goal.set_budget(int(args[1]))
+        if len(args) != 2:
+            return _budget_usage()
+        raw = args[1].lower()
+        if raw in ("unlimited", "off", "none", "nolimit", "no-limit", "-1"):
+            budget = -1
+        elif raw.isdigit() and int(raw) > 0:
+            budget = int(raw)
+        else:
+            return _budget_usage()
+        goal.set_budget(budget)
         current = goal.current()
-        return CommandResult(
-            text=f"目标回合预算已设为 {current.max_turns}（当前第 {current.turns} 回合）。",
-            style="green",
-            refresh_status=True,
-        )
+        if current.unlimited:
+            text = f"目标回合预算已取消（不限；当前第 {current.turns} 回合）。"
+        else:
+            text = f"目标回合预算已设为 {current.max_turns}（当前第 {current.turns} 回合）。"
+        return CommandResult(text=text, style="green", refresh_status=True)
 
     # 其余情况：把参数整体当作目标描述
     objective = " ".join(args).strip()
@@ -128,10 +142,11 @@ def _goal(ctx):
             style="yellow",
         )
     current = goal.set(objective, tokens_at_start=_tokens_now(ctx))
+    budget_text = "不限" if current.unlimited else str(current.max_turns)
     return _start(
         CommandResult(
             text=(
-                f"已设定目标（回合预算 {current.max_turns}），开始推进。\n"
+                f"已设定目标（回合预算 {budget_text}），开始推进。\n"
                 f"目标: {objective}\n"
                 "自动接续中：/goal 查看状态，/goal pause 暂停，/goal clear 清除。"
             ),

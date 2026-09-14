@@ -362,6 +362,17 @@ def test_goal_budget_validation_and_set():
     assert "5" in good.text
 
 
+def test_goal_budget_can_be_cancelled():
+    """unlimited / off 取消回合上限（默认即为不限）。"""
+    _run("/goal 目标")
+    _run("/goal budget 5")
+    assert not goal.current().unlimited
+
+    _, outcome = _run("/goal budget unlimited")
+    assert goal.current().unlimited
+    assert "不限" in outcome.text
+
+
 def test_goal_objective_starting_with_verb_is_not_subcommand():
     """/goal clear the failures 是目标描述而非清除命令（子命令只在单 token 时识别）。"""
     _, outcome = _run("/goal clear the failing tests")

@@ -26,7 +26,7 @@
 
 ### 智能体与工具
 
-内置 16 个工具（`use_skill` 仅在发现可用技能时向模型开放），模型自主决定调用哪些、调用几次（可配置单次任务最大迭代轮数，默认 30）：
+内置 16 个工具（`use_skill` 仅在发现可用技能时向模型开放），模型自主决定调用哪些、调用几次（可配置单次任务最大迭代轮数，默认不限）：
 
 | 工具 | 说明 |
 | ---- | ---- |
@@ -50,7 +50,7 @@
 ### 任务拆分与持久目标
 
 - **任务拆分**：多步任务动手前，模型先用 `todo_write` 列出步骤清单，逐步执行并实时更新状态（进行中 / 已完成 / 取消）。清单在终端实时渲染，TUI 侧边栏随做随更；`/plan` 随时查看
-- **持久目标 `/goal`**：`/goal <目标>` 设定一个跨回合存活的使命，Agent 在每轮任务结束后自动接续推进，直到逐条核验证据后声明完成、你暂停 / 清除，或回合预算（默认 50）用尽。`/goal` 查看状态，`/goal pause | resume | clear | budget <N>` 控制生命周期
+- **持久目标 `/goal`**：`/goal <目标>` 设定一个跨回合存活的使命，Agent 在每轮任务结束后自动接续推进，直到逐条核验证据后声明完成、你暂停 / 清除，或回合预算（可选，默认不限）用尽。`/goal` 查看状态，`/goal pause | resume | clear | budget <N>` 控制生命周期
 
 ### 技能（Agent Skills）
 
@@ -198,7 +198,7 @@ python -m smithcode              # 等价的另一种启动方式
 | `--name 名称` | 给新会话命名（仅新会话可用） |
 | `--no-session-persistence` | 本次运行不保存会话记录（不可与 `-c/--resume` 同用） |
 | `-y, --yes` | 自动批准所有确认（等价 Auto 档，`deny` 规则依然生效），慎用 |
-| `--max-iterations N` | 单次任务最大迭代轮数（默认 30） |
+| `--max-iterations N` | 单次任务最大迭代轮数（默认 -1 不限；配置后达上限会请求模型总结收尾） |
 | `-V, --version` | 显示版本号 |
 
 ### 权限确认与权限模式
@@ -250,13 +250,13 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[context] budget` | 65536 | 上下文预算（token），建议不超过模型窗口大小 |
 | `[context] compact_trigger` | 0.8 | 占预算的比例，越过即触发自动压缩 |
 | `[context] compact_keep_tokens` | 15000 | 压缩时尾部原样保留的 token 数 |
-| `[limits] max_iterations` | 30 | 单次任务最大迭代轮数 |
+| `[limits] max_iterations` | -1 | 单次任务最大迭代轮数，-1 为不限制；达上限后请求模型总结收尾 |
 | `[limits] command_timeout` | 60 | `run_command` 默认超时（秒） |
 | `[limits] command_timeout_max` | 300 | `run_command` 超时参数上限（秒） |
 | `[limits] max_tool_output` | 20000 | 单次工具输出进入上下文的最大字符数 |
 | `[limits] max_retries` | 3 | LLM 瞬时错误自动重试次数 |
 | `[limits] llm_timeout` | 120 | 单次 LLM 请求超时（秒） |
-| `[limits] goal_max_turns` | 50 | 持久目标默认回合预算 |
+| `[limits] goal_max_turns` | -1 | 持久目标回合预算，-1 为不限；正整数达上限后收尾 |
 | `[limits] max_tool_concurrency` | 5 | 一轮内可并行工具的最大并发数 |
 | `[sessions] enabled` | true | 会话自动保存总开关 |
 | `[sessions] cleanup_days` | 30 | 转录保留天数；0 = 不自动清理 |
