@@ -10,6 +10,7 @@
 
 ### 变更
 
+- **选择面板支持逐级返回（TUI）**：选择面板的层级改由宿主 `SmithTUI._select_stack` 维护——进入下级菜单时把父级 `CommandSelect` 与本次选中的值压栈，Esc 未选中时逐级弹回上一级并把光标锚定回原行，根级 Esc 才关闭，执行实际动作后清空栈。命令结果处理收敛为 `_apply_outcome(outcome, text, nested)`，`handle_command` 只做 busy 守卫 + 分发，`_present_select` 统一挂载面板（`/model` / `/skills` / `/sessions` 等单级选择行为不变）
 - **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
 - **TUI 选择面板改为两列行布局（`/sessions` 展示调整）**：每项由整块文本改为「左列（标记 + 标题 + 说明，占满剩余宽度）+ 右列 trailing（贴行尾右对齐）」的两列行，用列布局而非手工补空格，宽度随档位 / 终端自适应（`CommandChoice` / `SelectionItem` 新增 `trailing` 字段，选中行底色移到行上使高亮贯通整行）。`/sessions` 选择框据此调整：标题后紧跟短 id、更新时间右对齐、不再展示模型信息；列表本就按更新时间倒序（`list_sessions`）
 

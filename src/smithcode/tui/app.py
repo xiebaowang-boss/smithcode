@@ -241,7 +241,11 @@ class SmithTUI(App):
         padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
         margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
     }
-    SelectionPanel .selection-scroll { height: 1fr; }
+    SelectionPanel .selection-scroll {
+        height: 1fr;
+        /* 与聊天区/命令菜单一致：不绘制滚动条，滚动功能不受影响 */
+        scrollbar-size-vertical: 0;
+    }
     /* 每项一行：左侧占满剩余宽度，trailing（时间等）贴行尾右对齐；
        选中行整行反白——底色由行承担，子项只设前景色，高亮才能贯通到行尾 */
     SelectionPanel .selection-row { height: 1; width: 1fr; }
@@ -266,6 +270,9 @@ class SmithTUI(App):
         self.agent = agent
         self._busy = False
         self._turn_start: float | None = None
+        # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
+        # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
+        self._select_stack: list = []
 
     @property
     def _tool_widgets(self):
@@ -512,14 +519,24 @@ class SmithTUI(App):
         chat_input = self.query_one(ChatInput)
         chat_input.focus()
 
-    # ----- 通用选择面板（居中弹窗） -----
+    # ----- 通用选择面板（居中弹窗，支持逐级返回） -----
 
     def show_selection(self, select) -> None:
         """按命令的选择意图弹出居中选择弹窗（如 /model 无参）。
 
-        ModalScreen 的半透明背景让底层界面轻微变暗（而非全黑）；选中后重新
-        分发 `/<command> <value>`，复用命令的参数路径做实际动作；Esc 取消
-        （value 为 None）不产生任何副作用。
+        选择层级由 `self._select_stack` 维护：进入下级时把父级压栈，Esc 未
+        选中值时逐级返回上一级（带锚点恢复光标），栈空（根级）则关闭。
+        ModalScreen 的半透明背景让底层界面轻微变暗；选中后重新分发
+        `/<command> <value>`，若结果仍是选择意图则继续下钻。
+        """
+        self._select_stack.clear()
+        self._present_select(select)
+
+    def _present_select(self, select, anchor: str | None = None) -> None:
+        """挂载一张选择面板；anchor 为返回上一级时要落回的光标位置。
+
+        anchor 只影响初始光标（走 SelectionPanel 的 initial 参数），不改变
+        条目的「(当前)」语义——返回上一级时不会给原选项加上「(当前)」。
         """
         self.query_one(CommandMenu).hide_menu()
         items = [
@@ -529,12 +546,15 @@ class SmithTUI(App):
                 description=choice.description,
                 current=choice.current,
                 trailing=choice.trailing,
+                trailing_style=choice.trailing_style,
+                separator=choice.separator,
             )
             for choice in select.items
         ]
         panel = SelectionPanel(
             select.title, items, lambda value: self.screen.dismiss(value),
             size=select.size,  # 宽度档位由命令声明，宿主不测量内容
+            initial=anchor,
         )
         self.push_screen(
             SelectionScreen(panel),
@@ -542,8 +562,29 @@ class SmithTUI(App):
         )
 
     def _after_selection(self, select, value) -> None:
-        if value is not None:
-            self.handle_command(f"/{select.command} {value}")
+        """选择面板收尾：Esc 返回上一级；选中则分发，若仍是选择意图则下钻。"""
+        if value is None:
+            self._select_back()
+            return
+        command = f"/{select.command} {value}"
+        outcome = self._dispatch_command(command)
+        if outcome is None:  # busy 守卫拦截：清栈，面板已关
+            self._select_stack.clear()
+            return
+        if outcome.select is not None:
+            self._select_stack.append((select, value))
+            self._apply_outcome(outcome, command, nested=True)
+            return
+        self._select_stack.clear()
+        self._apply_outcome(outcome, command)
+
+    def _select_back(self) -> None:
+        """Esc 逐级返回：有父级则带锚点重开；栈空（根级）不额外动作。"""
+        if not self._select_stack:
+            return
+        parent, anchor = self._select_stack.pop()
+        self._present_select(parent, anchor=anchor)
+
 
     def ui_status(self) -> None:
         usage_title, usage_body = self._sidebar_usage()
@@ -741,14 +782,30 @@ class SmithTUI(App):
             ))
 
     def handle_command(self, text: str) -> None:
-        """斜杠命令统一走 commands.dispatch，按结果标记做 TUI 侧的收尾动作。"""
-        # 对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
-        # 中途重置/切换会撕裂进行中的轮次（工具结果落入悬空的新会话），先行拦截
+        """斜杠命令统一入口：busy 守卫 → 分发 → 结果收尾。"""
+        outcome = self._dispatch_command(text)
+        if outcome is None:
+            return
+        self._apply_outcome(outcome, text)
+
+    def _dispatch_command(self, text: str):
+        """busy 守卫 + commands.dispatch；被拦截时提示并返回 None。
+
+        对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
+        中途重置 / 切换会撕裂进行中的轮次，先行拦截。
+        """
         tokens = text.strip().split()
         if self._busy and tokens and tokens[0].lower() in ("/new", "/sessions"):
             self.ui_notice("（任务运行中，不能切换会话；请等待完成或先按 Esc 中断）", "warning")
-            return
-        outcome = commands.dispatch(self.agent, text)
+            return None
+        return commands.dispatch(self.agent, text)
+
+    def _apply_outcome(self, outcome, text: str = "", nested: bool = False) -> None:
+        """把 CommandResult 落到界面：会话重置 / 切换、文本、选择、任务。
+
+        `nested=True`（选择面板下钻）表示父级已由调用方压栈，此处只展示新
+        一层选择、不重置层级栈。
+        """
         if outcome.exit:
             self.exit()
             return
@@ -769,7 +826,10 @@ class SmithTUI(App):
                 else:
                     self.ui_line(outcome.text, outcome.style)
             if outcome.select is not None:
-                self.show_selection(outcome.select)
+                if nested:
+                    self._present_select(outcome.select)
+                else:
+                    self.show_selection(outcome.select)
         if outcome.session_reset:
             self.query_one(Sidebar).update_plan("", has_active=False)
         if outcome.refresh_status:

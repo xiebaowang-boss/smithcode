@@ -15,8 +15,10 @@ KIND_BLOCK = "block"
 class CommandChoice:
     """选择器的一个候选项：label 展示、value 回传、current 标记当前值。
 
-    description 跟在标题后（同一侧），trailing 贴行尾右对齐（如时间），
-    两者都是纯展示、可留空；TUI 选择面板按此排版，REPL 降级只列 label。
+    description 跟在标题后（同一侧），trailing 贴行尾右对齐（如状态），
+    trailing_style 为 trailing 的颜色（选中行仍反白，由面板决定）；
+    separator=True 表示纯间隔行（不可选中）。两者都是纯展示、可留空；
+    TUI 选择面板按此排版，REPL 降级只列 label。
     """
 
     label: str
@@ -24,6 +26,8 @@ class CommandChoice:
     description: str = ""
     current: bool = False
     trailing: str = ""
+    trailing_style: str = ""
+    separator: bool = False
 
 
 @dataclass

@@ -593,13 +593,21 @@ class QuestionPanel(Vertical):
 @dataclass
 class SelectionItem:
     """选择面板的一行：label 展示、value 回传、description 补充（跟在标题后）、
-    current 当前项标记、trailing 贴行尾右对齐（如时间）。"""
+    current 当前项标记、trailing 贴行尾右对齐（如状态）、trailing_style 为其颜色
+    （选中行仍反白）、separator=True 为纯间隔行（不可选中）。
+
+    category 非空时按出现顺序插入分组表头（仅展示、不可选中）：相邻同 category
+    的条目归入同一个表头下，category 变化即开新组；空 category 表示不分组。
+    """
 
     label: str
     value: str
     description: str = ""
     current: bool = False
     trailing: str = ""
+    trailing_style: str = ""
+    separator: bool = False
+    category: str = ""
 
 
 class SelectionScreen(ModalScreen):
@@ -633,6 +641,10 @@ class SelectionPanel(Vertical):
     （Esc 传 None）。主线程回调式，不阻塞事件循环——与 ask/权限面板的
     Event 阻塞协议区分开。
 
+    支持分组（item.category）与间隔行（item.separator）：两者都渲染成不可选中的
+    行，键盘导航只在可选项中循环。面板内部先算一份「行计划」（表头 / 空行 / 选项），
+    渲染、刷新与滚动定位都基于它，行数与 item 数不再一一对应。
+
     宽度按 size 档位取定值（宽度值定义在 SmithTUI.CSS 的 `.size-*` 规则里），
     面板不测量内容；未知档位回退 DEFAULT_SIZE，避免调用方写错档位把面板撑坏。
     """
@@ -651,18 +663,46 @@ class SelectionPanel(Vertical):
     ]
 
     def __init__(self, title: str, items: list, on_done, size: str = DEFAULT_SIZE,
-                 **kwargs):
+                 initial: str | None = None, **kwargs):
         super().__init__(**kwargs)
         self._title = title
         self._items = list(items)
         self._on_done = on_done
         self.size_class = size if size in self.SIZES else self.DEFAULT_SIZE
         self.add_class(f"size-{self.size_class}")
-        # 初始选中当前项（没有则第一项）
-        self._selected = next(
-            (i for i, item in enumerate(self._items) if item.current), 0
-        )
+        # 可选中的行（跳过间隔行）；初始光标：initial 指定值优先（如从下级
+        # 返回时落回原行，仅移动光标、不显示「(当前)」），否则当前项、再否则首项
+        self._selectable = [
+            index for index, item in enumerate(self._items) if not item.separator
+        ]
+        self._rows: list = []          # 行计划：("header", 分类) / ("blank",) / ("item", 索引)
+        self._row_of_item: dict = {}   # item 索引 → 行号（滚动定位用）
+        self._build_rows()
+        self._selected = self._resolve_initial(initial)
         self._scroll: VerticalScroll | None = None
+
+    def _build_rows(self) -> None:
+        """按 category 变化插入分组表头（非首组前留一个空行），记录 item→行号。"""
+        last_category = ""
+        for index, item in enumerate(self._items):
+            category = item.category or ""
+            if category and category != last_category:
+                if self._rows:
+                    self._rows.append(("blank",))
+                self._rows.append(("header", category))
+            last_category = category
+            self._row_of_item[index] = len(self._rows)
+            self._rows.append(("item", index))
+
+    def _resolve_initial(self, initial: str | None) -> int:
+        if initial is not None:
+            for index in self._selectable:
+                if self._items[index].value == initial:
+                    return index
+        return next(
+            (index for index in self._selectable if self._items[index].current),
+            self._selectable[0] if self._selectable else 0,
+        )
 
     def compose(self):
         yield Static(self._title, classes="selection-title", markup=False)
@@ -672,15 +712,27 @@ class SelectionPanel(Vertical):
         with VerticalScroll(classes="selection-scroll") as scroll:
             scroll.can_focus = False
             self._scroll = scroll
-            for index, item in enumerate(self._items):
-                yield self._row(index, item)
+            for kind, *payload in self._rows:
+                yield self._row(kind, payload[0] if payload else None)
         yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint", markup=False)
 
     def on_mount(self) -> None:
         self.focus()  # 不聚焦，按键会落进隐藏的输入框
 
-    def _row(self, index: int, item) -> Horizontal:
-        selected = index == self._selected
+    def _row(self, kind: str, payload):
+        """按行计划产出一行：分组表头 / 空行 / 普通条目（含间隔行）。"""
+        if kind == "header":
+            return Static(
+                Text(f"  {payload}", style="bold #7aa2f7"),
+                classes="selection-row selection-header", markup=False,
+            )
+        if kind == "blank":
+            return Static("", classes="selection-row selection-separator")
+        item = self._items[payload]
+        if item.separator:
+            # 间隔行：占位一行、不可选中，仅用于分组留白
+            return Horizontal(classes="selection-row selection-separator")
+        selected = payload == self._selected
         row = Horizontal(
             Static(self._label_text(item, selected), classes="selection-label",
                    markup=False),
@@ -712,12 +764,18 @@ class SelectionPanel(Vertical):
     def _trailing_text(self, item, selected: bool) -> Text:
         if not item.trailing:
             return Text()
-        return Text(item.trailing, style="black" if selected else "#565f89")
+        style = "black" if selected else (item.trailing_style or "#565f89")
+        return Text(item.trailing, style=style)
 
     def _refresh(self) -> None:
-        for index, row in enumerate(self.query(".selection-row")):
-            selected = index == self._selected
+        for row, (kind, *payload) in zip(self.query(".selection-row"), self._rows):
+            if kind != "item":
+                continue  # 表头 / 空行不更新内容
+            index = payload[0]
             item = self._items[index]
+            if item.separator:
+                continue
+            selected = index == self._selected
             row.set_class(selected, "selected")
             row.query_one(".selection-label", Static).update(
                 self._label_text(item, selected)
