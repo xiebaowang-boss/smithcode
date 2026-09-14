@@ -182,6 +182,43 @@ def test_remote_template_flow():
     assert plan.config.oauth is True
 
 
+def test_remote_template_with_header_reference():
+    """远程模板可带请求头引用（官方 GitHub server），并为其引用变量安排密钥步骤。"""
+    wizard = _wizard()
+    _drive(wizard, ["template", "github"])
+    assert wizard.draft["env_vars"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    _drive(wizard, ["github", "user", "store", "ghp_x", "finish"])
+    plan = wizard.to_plan()
+    assert plan.config.type == "http"
+    assert plan.config.url == "https://api.githubcopilot.com/mcp/"
+    assert plan.config.oauth is False
+    assert plan.config.headers == {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
+    assert plan.secrets == [("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_x")]
+    assert plan.env_refs == []
+    assert plan.config.command == []
+
+
+def test_remote_template_header_can_reference_env():
+    wizard = _wizard()
+    _drive(wizard, ["template", "github"])
+    _drive(wizard, ["github", "user", "env", "finish"])
+    plan = wizard.to_plan()
+    assert plan.secrets == []
+    assert plan.env_refs == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+
+
+def test_remote_preview_shows_header_secret_placement():
+    wizard = _wizard()
+    _drive(wizard, ["template", "github"])
+    _drive(wizard, ["github", "user", "store", "ghp_secret_value"])
+    preview = wizard.preview()
+    assert "ghp_secret_value" not in preview
+    assert "凭据库" in preview
+    assert "api.githubcopilot.com" in preview
+
+
 def test_remote_preview_redacts_literal_header():
     wizard = _wizard(workspace="/proj")
     _drive(wizard, [

@@ -215,7 +215,8 @@ class McpWizard:
                 self.draft.update(
                     url=template.url, transport=template.transport,
                     oauth="yes" if template.oauth else "no",
-                    command="", env_vars=[], headers="",
+                    command="", headers=_format_headers(template.headers),
+                    env_vars=list(template.env),
                 )
             else:
                 self.draft["command"] = " ".join(
@@ -364,12 +365,23 @@ class McpWizard:
         name = self.draft["name"].strip() or self.default_name()
         if self._is_remote():
             headers, secrets = self._remote_headers()
+            # 模板 / 引用型请求头不在向导里输入值，需为被引用的变量安排密钥步骤
+            env_refs = []
+            for var in self.draft["env_vars"]:
+                entry = self.draft["secrets"].get(var, {})
+                if entry.get("mode") == "store" and entry.get("value"):
+                    secrets.append((var, entry["value"]))
+                elif entry.get("mode") == "env":
+                    env_refs.append(var)
             cfg = ServerConfig(
                 name=name, type=self.draft["transport"], url=self.draft["url"],
                 headers=dict(headers), oauth=self.draft["oauth"] == "yes",
                 scope=self.draft["scope"],
             )
-            return WizardPlan(config=cfg, scope=self.draft["scope"], secrets=secrets)
+            return WizardPlan(
+                config=cfg, scope=self.draft["scope"],
+                secrets=secrets, env_refs=env_refs,
+            )
 
         argv = self._argv()
         env = {var: "${" + var + "}" for var in self.draft["env_vars"]}
@@ -415,6 +427,10 @@ class McpWizard:
                     lines.append("oauth = true")
                 if headers:
                     lines.append(f"headers = {json.dumps(dict(headers), ensure_ascii=False)}")
+            handled = self._secret_lines()
+            if handled:
+                lines.append("")
+                lines.extend(handled)
             lines.append("")
             lines.append("提醒: 该服务器将以你的本机权限运行；远程内容按不可信处理。")
             if self.draft["oauth"] == "yes":
@@ -441,16 +457,7 @@ class McpWizard:
                 env = {v: "${" + v + "}" for v in self.draft["env_vars"]}
                 lines.append(f"env = {json.dumps(env, ensure_ascii=False)}")
 
-        handled = []
-        for var in self.draft["env_vars"]:
-            entry = self.draft["secrets"].get(var, {})
-            mode = entry.get("mode", "skip")
-            if mode == "store" and entry.get("value"):
-                handled.append(f"  密钥 {var} → 保存到凭据库（内容不回显）")
-            elif mode == "env":
-                handled.append(f"  密钥 {var} → 引用环境变量 ${{{var}}}")
-            else:
-                handled.append(f"  密钥 {var} → 暂不提供（连接时可能失败）")
+        handled = self._secret_lines()
         if handled:
             lines.append("")
             lines.extend(handled)
@@ -460,6 +467,28 @@ class McpWizard:
         if self.draft["scope"] == "project":
             lines.append("项目配置会随仓库提交，密钥只保存为 ${VAR} 引用。")
         return "\n".join(lines)
+
+    def _secret_lines(self) -> list:
+        """确认页的密钥处置说明：环境变量（stdio / 模板引用）与请求头字面值。"""
+        lines = []
+        covered = set()
+        if self._is_remote():
+            _, header_secrets = self._remote_headers()
+            for var, _value in header_secrets:
+                covered.add(var)
+                lines.append(f"  密钥 {var} → 保存到凭据库（内容不回显）")
+        for var in self.draft["env_vars"]:
+            if var in covered:
+                continue
+            entry = self.draft["secrets"].get(var, {})
+            mode = entry.get("mode", "skip")
+            if mode == "store" and entry.get("value"):
+                lines.append(f"  密钥 {var} → 保存到凭据库（内容不回显）")
+            elif mode == "env":
+                lines.append(f"  密钥 {var} → 引用环境变量 ${{{var}}}")
+            else:
+                lines.append(f"  密钥 {var} → 暂不提供（连接时可能失败）")
+        return lines
 
     def _fail(self, message: str) -> str:
         self.error = message
@@ -473,6 +502,11 @@ def apply_plan(service, plan: WizardPlan):
     for var, value in plan.secrets:
         store_secret(plan.config.name, var, value)
     return service.add(plan.config, plan.scope)
+
+
+def _format_headers(pairs) -> str:
+    """把模板的请求头 [(名, 值)] 还原成向导的 `K=V, K2=V2` 文本。"""
+    return ", ".join(f"{key}={value}" for key, value in pairs)
 
 
 def _parse_headers(text: str):

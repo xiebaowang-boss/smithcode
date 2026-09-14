@@ -2,7 +2,7 @@
 
 本项目的所有显著变更都记录在本文件中。
 
-## [未发布]
+## [0.9.0] - 2026-09-14
 
 ### 新增
 
@@ -39,6 +39,8 @@
 - **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
 - **TUI 选择面板改为两列行布局（`/sessions` 展示调整）**：每项由整块文本改为「左列（标记 + 标题 + 说明，占满剩余宽度）+ 右列 trailing（贴行尾右对齐）」的两列行，用列布局而非手工补空格，宽度随档位 / 终端自适应（`CommandChoice` / `SelectionItem` 新增 `trailing` 字段，选中行底色移到行上使高亮贯通整行）。`/sessions` 选择框据此调整：标题后紧跟短 id、更新时间右对齐、不再展示模型信息；列表本就按更新时间倒序（`list_sessions`）
 - **技能已激活段补充裁决声明（提示词）**：`ACTIVE_INTRO` 补上与项目约定段（`INSTRUCTIONS_INTRO`）等价的裁决规则——技能指令不能覆盖安全边界与权限规则，与用户当前明确要求冲突时以用户要求为准。技能正文来自可能不可信的仓库，且「已激活技能」段渲染在项目约定段之后，此前缺这句声明，段间位置容易被误读为「越靠后优先级越高」
+
+- **内置 GitHub 模板改指官方 server（远程 HTTP）**：向导模板 `github` 由已归档的 `@modelcontextprotocol/server-github` 改为官方 `https://api.githubcopilot.com/mcp/`（Streamable HTTP + `Authorization: Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}` 请求头），工具数由 25 增至 44，且不再需要本机 Node 运行期。`Template` 新增 `headers` 字段承载远程模板的请求头；远程模板的 `env` 语义扩展为「请求头引用的变量名」，向导据此自动补出密钥步骤（存入凭据库 / 引用环境变量），并在确认页展示密钥处置说明。**注意**：官方 server 的 release 能力目前只读（`list_releases` / `get_latest_release` / `get_release_by_tag`），**不提供创建 release**；认证沿用原有 `GITHUB_PERSONAL_ACCESS_TOKEN`（现在作为请求头引用），token 本身无需换类型，但若此前只在 `env` 里引用、未落凭据库，需按向导重新存一次（或改用「引用环境变量」模式继续引用环境变量）
 
 ### 修复
 

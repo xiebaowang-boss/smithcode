@@ -2,7 +2,8 @@
 
 模板只描述"怎么启动 / 连哪里 + 需要哪些密钥"，不携带任何凭据；`{workspace}`
 占位符在生成命令时替换为当前工作区路径（filesystem 类服务器需要目录参数）。
-远程模板用 `url` + `oauth` 描述端点与鉴权，wizard 据此走远程分支。
+远程模板用 `url` + `oauth` / `headers` 描述端点与鉴权，wizard 据此走远程分支；
+`env` 在远程模板里表示"请求头引用的变量名"，wizard 会为它们安排密钥步骤。
 """
 from __future__ import annotations
 
@@ -15,11 +16,12 @@ class Template:
     title: str
     description: str
     command: tuple = ()
-    env: tuple = ()
+    env: tuple = ()          # stdio：需要注入的环境变量名；远程：请求头引用的变量名
     note: str = ""
     url: str = ""            # 远程模板的端点（非空时 wizard 走远程分支）
     transport: str = "http"
     oauth: bool = False
+    headers: tuple = ()      # 远程模板的请求头 [(名, 值)]，值可含 ${VAR} 引用
 
 
 TEMPLATES = (
@@ -32,8 +34,9 @@ TEMPLATES = (
     Template(
         key="github",
         title="GitHub",
-        description="仓库、issue 与 PR 操作",
-        command=("npx", "-y", "@modelcontextprotocol/server-github"),
+        description="仓库、issue 与 PR 操作（官方 server，远程）",
+        url="https://api.githubcopilot.com/mcp/",
+        headers=(("Authorization", "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"),),
         env=("GITHUB_PERSONAL_ACCESS_TOKEN",),
         note="需要 GitHub Personal Access Token",
     ),

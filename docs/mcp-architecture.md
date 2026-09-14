@@ -39,7 +39,7 @@ SmithCode 通过 **Model Context Protocol** 接入外部工具服务器，把外
 | `catalog.py` | 工具命名、inputSchema 规整、CallToolResult → 文本映射（脱敏 + 截断） |
 | `service.py` | `McpService`：会话级连接管理、状态机、动态注册/反注册、调用路由、配置变更 |
 | `wizard.py` | 添加向导的纯状态机（TUI / REPL 共用）+ REPL 行式渲染器 + `apply_plan` |
-| `templates.py` | 内置模板（stdio 命令模板 + 远程 URL/OAuth 模板） |
+| `templates.py` | 内置模板（stdio 命令模板 + 远程 URL/OAuth/请求头模板） |
 | `errors.py` | `McpError` / `McpConfigError` / `McpAuthError` 异常层级 |
 
 外部对接点：
@@ -553,17 +553,22 @@ TUI 的 busy 守卫覆盖 `add|remove|enable|disable|reconnect|auth`——任务
 
 ```
 添加方式
- ├─ 模板：内置模板（stdio：filesystem/github/playwright/memory/everything；
- │         远程：linear/sentry 带 url+oauth）
+ ├─ 模板：内置模板（stdio：filesystem/playwright/memory/everything；
+ │         远程：github 带 url+请求头引用，linear/sentry 带 url+oauth）
  ├─ 手动命令：启动命令 → 环境变量名 → 密钥存放方式（凭据库 / 引用环境变量 / 跳过）
  └─ 远程 URL：URL → 传输（http/sse）→ 鉴权（OAuth / 请求头）→ 请求头 K=V
                 └─ 含 ${VAR} 的值原样引用；字面值自动存入凭据库
         ↓
-      名称（模板/URL 推导默认）→ 作用域（全局/项目）→ 密钥步骤（stdio 有）→ 预览确认
+      名称（模板/URL 推导默认）→ 作用域（全局/项目）
+      → 密钥步骤（stdio 的 env、远程模板 headers 引用的变量都有）→ 预览确认
 ```
 
-预览页展示脱敏后的配置片段、写入位置与风险提示；远程 OAuth 分支提示保存后运行
-`/mcp auth`。
+模板的 `headers` 描述远程模板的请求头（值可含 `${VAR}`）；远程模板的 `env`
+表示「请求头引用的变量名」，向导据此补出密钥步骤，与 stdio 模板的 env 走同一套
+密钥三模式（凭据库 / 引用环境变量 / 暂不提供）。
+
+预览页展示脱敏后的配置片段、写入位置、密钥处置说明与风险提示；远程 OAuth 分支
+提示保存后运行 `/mcp auth`。
 
 ## 12. 线程模型与并发
 
