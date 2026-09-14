@@ -21,10 +21,11 @@ from dataclasses import dataclass, field
 
 from .. import renderer
 from ..tools import DYNAMIC, register_dynamic, unregister_dynamic
-from . import catalog
+from . import auth, catalog
 from . import config as mcp_config
-from .client import StdioConnection
-from .errors import McpConfigError, McpError
+from .errors import McpAuthError, McpConfigError, McpError
+from .factory import create_connection
+from .runtime import AsyncRuntime
 from .secrets import redactor, resolve
 
 # 状态取值
@@ -33,6 +34,7 @@ CONNECTING = "connecting"
 CONNECTED = "connected"
 FAILED = "failed"
 MISSING_ENV = "missing_env"
+NEEDS_AUTH = "needs_auth"
 DISABLED = "disabled"
 DISCONNECTED = "disconnected"
 
@@ -44,6 +46,7 @@ _STATE_LABELS = {
     CONNECTED: "已连接",
     FAILED: "连接失败",
     MISSING_ENV: "缺少密钥",
+    NEEDS_AUTH: "需要授权",
     DISABLED: "已停用",
     DISCONNECTED: "已断开",
 }
@@ -57,6 +60,9 @@ class ServerStatus:
     scope: str
     state: str
     command: str = ""
+    transport: str = "stdio"
+    url: str = ""
+    oauth: bool = False
     tool_count: int = 0
     error: str = ""
     missing: list = field(default_factory=list)
@@ -75,12 +81,14 @@ class _Entry:
 
     def __init__(self, cfg: mcp_config.ServerConfig):
         self.cfg = cfg
-        self.conn: StdioConnection | None = None
+        self.conn = None
         self.state = PENDING
         self.error = ""
         self.missing: list = []
         self.tools: list = []  # list[catalog.ToolSpec]
-        self.intentional_close = False
+        # 连接代际：每次发起连接 / 断开递增；异步连接回写前校验代际，避免
+        # "连接仍在握手时被 disable/remove" 的结果覆盖（旧实现的竞态根因）。
+        self.generation = 0
 
     @property
     def exposed_names(self) -> list:
@@ -95,6 +103,7 @@ class McpService:
         self._entries: dict = {}
         self._order: list = []
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="smithcode-mcp")
+        self._runtime = AsyncRuntime()  # 所有连接共用的 asyncio loop 线程
         self._started = False
         self._stopped = False
         self.diagnostics: list = []
@@ -108,6 +117,7 @@ class McpService:
             if self._started or self._stopped:
                 return
             self._started = True
+        self._runtime.start()
         loaded = mcp_config.load_servers()
         self.diagnostics = list(loaded.diagnostics)
         self.project_path = loaded.project_path
@@ -136,6 +146,12 @@ class McpService:
                 self._set_state(cfg.name, MISSING_ENV, entry.error)
                 renderer.current().warn(f"[mcp] {cfg.name}: {entry.error}")
                 continue
+            if cfg.oauth and not auth.has_tokens(cfg.name):
+                entry = self._entries[cfg.name]
+                entry.error = f"需要 OAuth 授权：运行 /mcp auth {cfg.name}"
+                self._set_state(cfg.name, NEEDS_AUTH, entry.error)
+                renderer.current().warn(f"[mcp] {cfg.name}: {entry.error}")
+                continue
             self._pool.submit(self._connect, cfg.name)
 
     def stop(self) -> None:
@@ -147,6 +163,7 @@ class McpService:
             entries = list(self._entries.values())
         for entry in entries:
             self._disconnect(entry, DISCONNECTED)
+        self._runtime.stop()
         self._pool.shutdown(wait=False, cancel_futures=True)
 
     def wait(self, timeout: float = 5.0) -> bool:
@@ -286,6 +303,18 @@ class McpService:
         self._pool.submit(self._connect, name)
         return True
 
+    def authorize(self, name: str) -> bool:
+        """交互式 OAuth 授权：后台连接允许弹浏览器（`/mcp auth` 调用）。"""
+        entry = self.get(name)
+        if entry is None:
+            return False
+        if not entry.cfg.oauth or entry.cfg.type not in ("http", "sse"):
+            return False
+        self._disconnect(entry, DISCONNECTED)
+        self._set_state(name, PENDING)
+        self._pool.submit(self._connect, name, True)
+        return True
+
     def reload(self) -> list:
         """重新装载配置并 diff：新增连接、删除断开、指纹变化重连。"""
         loaded = mcp_config.load_servers()
@@ -329,17 +358,27 @@ class McpService:
 
     # ---------- 内部 ----------
 
-    def _connect(self, name: str) -> None:
-        """连接一个服务器（线程池中执行）：握手 → 拉工具 → 注册。"""
+    def _connect(self, name: str, interactive: bool = False) -> None:
+        """连接一个服务器（线程池中执行）：握手 → 拉工具 → 注册。
+
+        异步竞态防护：进入时记录 entry 代际，任何回写（连接、工具、状态）
+        前都用 `_is_current` / 代际比对确认这条连接仍是当前有效意图——避免
+        "握手期间被 disable/remove，结果仍把它连上并注册" 的旧缺陷。
+        `interactive=True` 仅由 `/mcp auth` 触发，允许 OAuth 弹浏览器。
+        """
         with self._lock:
             if self._stopped:
                 return
             entry = self._entries.get(name)
-        if entry is None:
-            return
+            if entry is None:
+                return
+            entry.generation += 1
+            generation = entry.generation
         self._set_state(name, CONNECTING)
         resolved = resolve(entry.cfg)
         if resolved.missing:
+            if not self._is_current(name, entry, generation):
+                return
             entry.missing = resolved.missing
             entry.error = f"缺少环境变量: {', '.join(resolved.missing)}"
             self._set_state(name, MISSING_ENV, entry.error)
@@ -347,79 +386,124 @@ class McpService:
             return
         entry.missing = []
 
-        conn = StdioConnection(
-            name,
-            resolved.command,
-            env=resolved.env,
-            cwd=resolved.cwd,
-            timeout=entry.cfg.timeout,
+        if entry.cfg.oauth and not interactive and not auth.has_tokens(name):
+            if not self._is_current(name, entry, generation):
+                return
+            entry.error = f"需要 OAuth 授权：运行 /mcp auth {name}"
+            self._set_state(name, NEEDS_AUTH, entry.error)
+            renderer.current().warn(f"[mcp] {name}: {entry.error}")
+            return
+
+        conn = create_connection(
+            entry.cfg, resolved, self._runtime,
             on_tools_changed=self._on_tools_changed,
             on_closed=self._on_closed,
+            interactive=interactive,
         )
         try:
             conn.start()
             tool_defs = conn.list_tools()
+        except McpAuthError as e:
+            conn.close()
+            if not self._is_current(name, entry, generation):
+                return
+            entry.error = str(e)
+            self._set_state(name, NEEDS_AUTH, entry.error)
+            renderer.current().warn(f"[mcp] {name}: {entry.error}")
+            return
         except McpError as e:
             tail = conn.stderr_tail(5)
             conn.close()
+            if not self._is_current(name, entry, generation):
+                return
             entry.error = str(e)
             if tail:
                 entry.error += f"（stderr: {redactor().scrub(tail)}）"
             self._set_state(name, FAILED, entry.error)
             renderer.current().error(f"[mcp] {name} 连接失败: {entry.error}")
             return
+        except Exception as e:  # noqa: BLE001 未预期异常也要落到 FAILED，不能停在 CONNECTING
+            conn.close()
+            if not self._is_current(name, entry, generation):
+                return
+            entry.error = f"{type(e).__name__}: {e}"
+            self._set_state(name, FAILED, entry.error)
+            renderer.current().error(f"[mcp] {name} 连接失败: {entry.error}")
+            return
 
         with self._lock:
-            if self._stopped:
+            current = (
+                not self._stopped
+                and self._entries.get(name) is entry
+                and entry.generation == generation
+                and entry.state != DISABLED
+            )
+            if current:
+                entry.conn = conn
+        if not current:
+            conn.close()  # 期间被 disable / remove / 重连：丢弃这条连接
+            return
+        with self._lock:
+            if self._entries.get(name) is not entry or entry.conn is not conn:
                 conn.close()
                 return
-            entry.conn = conn
-        self._sync_tools(entry, tool_defs)
-        self._set_state(name, CONNECTED)
+            self._sync_tools(entry, tool_defs)
+            self._set_state(name, CONNECTED)
         renderer.current().success(
             f"[mcp] {name} 已连接（{len(entry.tools)} 个工具）"
         )
 
-    def _refresh_tools(self, name: str) -> None:
-        entry = self.get(name)
-        conn = entry.conn if entry is not None else None
-        if conn is None or not conn.alive:
+    def _refresh_tools(self, conn) -> None:
+        if not conn.alive:
             return
+        name = conn.cfg.name
         try:
             tool_defs = conn.list_tools()
         except McpError:
             return
-        self._sync_tools(entry, tool_defs)
-        renderer.current().info(
-            f"[mcp] {name} 工具列表已更新（{len(entry.tools)} 个工具）"
-        )
-
-    def _on_tools_changed(self, name: str) -> None:
-        self._pool.submit(self._refresh_tools, name)
-
-    def _on_closed(self, name: str) -> None:
         with self._lock:
             entry = self._entries.get(name)
-        if entry is None or entry.conn is None:
-            return
-        if entry.intentional_close:
-            entry.intentional_close = False
-            return
-        entry.conn = None
+            if entry is None or entry.conn is not conn:
+                return
+            self._sync_tools(entry, tool_defs)
+            count = len(entry.tools)
+        renderer.current().info(f"[mcp] {name} 工具列表已更新（{count} 个工具）")
+
+    def _on_tools_changed(self, conn) -> None:
+        self._pool.submit(self._refresh_tools, conn)
+
+    def _on_closed(self, conn) -> None:
+        """连接非主动断开（进程退出 / 远端断开）：按连接身份判定，避免误伤新连接。"""
+        name = conn.cfg.name
+        with self._lock:
+            entry = self._entries.get(name)
+            if entry is None or entry.conn is not conn:
+                return
+            entry.conn = None
+            entry.generation += 1
         self._unregister(entry)
         entry.tools = []
-        self._set_state(name, FAILED, "服务器进程已退出")
-        renderer.current().error(f"[mcp] {name}: 服务器进程已退出")
+        self._set_state(name, FAILED, "服务器连接已断开")
+        renderer.current().error(f"[mcp] {name}: 服务器连接已断开")
 
     def _disconnect(self, entry: _Entry, state: str) -> None:
-        conn, entry.conn = entry.conn, None
+        with self._lock:
+            entry.generation += 1  # 使在途连接的回写失效
+            conn, entry.conn = entry.conn, None
         if conn is not None:
-            entry.intentional_close = True
             conn.close()
         self._unregister(entry)
         entry.tools = []
         entry.missing = []
         self._set_state(entry.cfg.name, state, entry.error if state == FAILED else "")
+
+    def _is_current(self, name: str, entry: _Entry, generation: int) -> bool:
+        with self._lock:
+            return (
+                not self._stopped
+                and self._entries.get(name) is entry
+                and entry.generation == generation
+            )
 
     def _sync_tools(self, entry: _Entry, tool_defs: list) -> None:
         """原子替换一个服务器的工具集：先反注册旧名，再注册新名。"""
@@ -478,7 +562,10 @@ def _snapshot(entry: _Entry) -> ServerStatus:
         name=entry.cfg.name,
         scope=entry.cfg.scope,
         state=entry.state,
-        command=" ".join(entry.cfg.command),
+        command=entry.cfg.target,
+        transport=entry.cfg.type,
+        url=entry.cfg.url,
+        oauth=entry.cfg.oauth,
         tool_count=len(entry.tools),
         error=entry.error,
         missing=list(entry.missing),

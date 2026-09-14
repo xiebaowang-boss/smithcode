@@ -2,8 +2,8 @@
 无需再修改分发处（与 tools 注册表同款机制，导入即注册）。"""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 # 渲染形态：line=一行式提示（REPL 直接 print / TUI 着色单行）；
 #           block=多行文本块（TUI 按块渲染并解析内嵌 ANSI 转义）。

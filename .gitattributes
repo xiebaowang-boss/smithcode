@@ -1,0 +1,4 @@
+# 统一行尾为 LF：仓库以 LF 为主（113/140），避免 Windows 检出与编辑工具
+# 写出 CRLF 后产生混合行尾，以及由此而来的整文件伪 diff。
+# text=auto 让 git 自动识别文本文件（二进制不受影响）。
+* text=auto eol=lf

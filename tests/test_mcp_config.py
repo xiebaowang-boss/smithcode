@@ -142,7 +142,7 @@ def test_bad_entries_are_diagnosed_not_fatal(isolated):
     _workspace, home = isolated
     target = home / "config.toml"
     target.write_text(
-        '[mcp.servers.good]\ncommand = ["npx", "ok"]\n\n[mcp.servers.no-command]\nenv = { A = "1" }\n\n[mcp.servers.http-type]\ntype = "http"\nurl = "https://example.com/mcp"\n\n[mcp.servers.bad-env]\ncommand = ["npx", "x"]\nenv = { N = 1 }' + "\n",
+        '[mcp.servers.good]\ncommand = ["npx", "ok"]\n\n[mcp.servers.no-command]\nenv = { A = "1" }\n\n[mcp.servers.bad-type]\ntype = "grpc"\nurl = "grpc://example.com"\n\n[mcp.servers.bad-env]\ncommand = ["npx", "x"]\nenv = { N = 1 }' + "\n",
         encoding="utf-8",
     )
 
@@ -204,5 +204,116 @@ def test_fingerprint_tracks_command_changes():
     first = mcp_config.ServerConfig(name="a", command=["npx", "x"])
     same = mcp_config.ServerConfig(name="a", command=["npx", "x"])
     changed = mcp_config.ServerConfig(name="a", command=["npx", "y"])
+    assert first.fingerprint == same.fingerprint
+    assert first.fingerprint != changed.fingerprint
+
+
+def test_remote_server_roundtrip(isolated):
+    _workspace, _home = isolated
+    cfg = mcp_config.ServerConfig(
+        name="linear", type="http", url="https://mcp.linear.app/mcp",
+        headers={"Authorization": "Bearer ${LINEAR_TOKEN}"},
+    )
+    path = mcp_config.write_user_server(cfg)
+
+    text = path.read_text(encoding="utf-8")
+    assert "url = " in text
+    assert "headers = {" in text
+    assert "command" not in text
+
+    loaded = mcp_config.load_servers().servers[0]
+    assert loaded.type == "http"
+    assert loaded.url == "https://mcp.linear.app/mcp"
+    assert loaded.headers == {"Authorization": "Bearer ${LINEAR_TOKEN}"}
+    assert loaded.command == []
+    assert loaded.target == "https://mcp.linear.app/mcp"
+
+
+def test_project_remote_server_parse(isolated):
+    workspace, _home = isolated
+    project = workspace / ".smithcode" / "mcp.json"
+    project.parent.mkdir(parents=True)
+    project.write_text(
+        json.dumps({
+            "mcpServers": {
+                "sentry": {
+                    "type": "http",
+                    "url": "https://mcp.sentry.dev/mcp",
+                    "headers": {"Authorization": "Bearer abc"},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    server = mcp_config.load_servers().servers[0]
+    assert server.type == "http"
+    assert server.scope == "project"
+    assert server.url == "https://mcp.sentry.dev/mcp"
+    assert server.headers == {"Authorization": "Bearer abc"}
+
+
+def test_transport_aliases(isolated):
+    _workspace, _home = isolated
+    target = _home / "config.toml"
+    target.write_text(
+        '[mcp.servers.remote]\ntype = "remote"\nurl = "https://a/mcp"\n\n'
+        '[mcp.servers.streamable]\ntype = "streamable-http"\nurl = "https://b/mcp"\n\n'
+        '[mcp.servers.local]\ntype = "local"\ncommand = ["npx", "x"]\n',
+        encoding="utf-8",
+    )
+    loaded = {s.name: s for s in mcp_config.load_servers().servers}
+    assert loaded["remote"].type == "http"
+    assert loaded["streamable"].type == "http"
+    assert loaded["local"].type == "stdio"
+
+
+def test_remote_entry_without_url_is_diagnosed(isolated):
+    _workspace, _home = isolated
+    target = _home / "config.toml"
+    target.write_text('[mcp.servers.bad]\ntype = "http"\n', encoding="utf-8")
+    result = mcp_config.load_servers()
+    assert result.servers == []
+    assert any("缺少 url" in message for message in result.diagnostics)
+
+
+def test_oauth_flag_roundtrip(isolated):
+    _workspace, _home = isolated
+    cfg = mcp_config.ServerConfig(
+        name="linear", type="http", url="https://mcp.linear.app/mcp", oauth=True
+    )
+    path = mcp_config.write_user_server(cfg)
+    assert "oauth = true" in path.read_text(encoding="utf-8")
+    assert mcp_config.load_servers().servers[0].oauth is True
+
+
+def test_oauth_on_stdio_is_ignored(isolated):
+    _workspace, _home = isolated
+    target = _home / "config.toml"
+    target.write_text(
+        '[mcp.servers.local]\noauth = true\ncommand = ["npx", "x"]\n',
+        encoding="utf-8",
+    )
+    server = mcp_config.load_servers().servers[0]
+    assert server.oauth is False
+
+
+def test_project_oauth_parse(isolated):
+    workspace, _home = isolated
+    project = workspace / ".smithcode" / "mcp.json"
+    project.parent.mkdir(parents=True)
+    project.write_text(
+        json.dumps({"mcpServers": {
+            "sentry": {"type": "http", "url": "https://mcp.sentry.dev/mcp", "oauth": {}}
+        }}),
+        encoding="utf-8",
+    )
+    server = mcp_config.load_servers().servers[0]
+    assert server.oauth is True
+
+
+def test_fingerprint_tracks_url_and_headers():
+    first = mcp_config.ServerConfig(name="a", type="http", url="https://a/mcp")
+    same = mcp_config.ServerConfig(name="a", type="http", url="https://a/mcp")
+    changed = mcp_config.ServerConfig(name="a", type="http", url="https://b/mcp")
     assert first.fingerprint == same.fingerprint
     assert first.fingerprint != changed.fingerprint

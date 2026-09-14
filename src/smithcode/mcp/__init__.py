@@ -5,7 +5,9 @@
 - `config`：双作用域配置加载/写入（用户 config.toml + 项目 .smithcode/mcp.json），
   启停状态是服务器条目的 `enabled` 字段（写在定义它的文件里）；
 - `secrets`：`${VAR}` 引用展开（进程环境 > 凭据库）、凭据存储、输出脱敏；
-- `client`：stdio 传输的同步协议客户端（握手 / tools / 取消 / 进程树终止）；
+- `auth`：OAuth token 持久化（`mcp_auth.json`）与浏览器回调（仅交互授权）；
+- `runtime` / `connection` / `factory`：基于官方 `mcp` SDK 的客户端——共享 loop
+  线程 + 同步门面，按传输类型（stdio / Streamable HTTP / SSE）构造；
 - `catalog`：工具命名、schema 与结果映射；
 - `service`：会话级连接管理与工具注册（agent.py 生命周期挂钩）。
 
@@ -14,7 +16,6 @@
 from __future__ import annotations
 
 from .catalog import ToolSpec, build_spec, format_result, normalize_schema
-from .client import StdioConnection
 from .config import (
     DEFAULT_TIMEOUT,
     LoadResult,
@@ -40,7 +41,6 @@ __all__ = [
     "Redactor",
     "ServerConfig",
     "ServerStatus",
-    "StdioConnection",
     "ToolSpec",
     "build_spec",
     "format_result",

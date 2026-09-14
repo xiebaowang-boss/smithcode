@@ -8,6 +8,8 @@ renderer 间接加载，顶层导入会形成环（mcp.service → tools.ask →
 """
 from __future__ import annotations
 
+import re
+
 from .base import (
     KIND_BLOCK,
     CommandChoice,
@@ -23,7 +25,8 @@ _USAGE = (
     "  /mcp list                   文本列表\n"
     "  /mcp add                    打开添加向导\n"
     "  /mcp add <名称> -- <命令...> [-e KEY=VALUE] [--scope user|project]\n"
-    "  /mcp tools|logs|reconnect|enable|disable|remove <名称>"
+    "  /mcp add <名称> --url <地址> [--type http|sse] [--header K=V] [--oauth] [--scope ...]\n"
+    "  /mcp tools|logs|reconnect|enable|disable|remove|auth <名称>"
 )
 
 # 状态 → 选择面板右侧状态文字的颜色（已连接绿；其余按语义区分）
@@ -33,6 +36,7 @@ _STATE_STYLES = {
     "pending": "#565f89",       # 灰：等待连接
     "failed": "#f7768e",        # 红：连接失败
     "missing_env": "#fab283",   # 橙：缺少密钥
+    "needs_auth": "#7aa2f7",    # 蓝：需要 OAuth 授权
     "disabled": "#565f89",      # 灰：已停用
     "disconnected": "#565f89",  # 灰：已断开
 }
@@ -63,7 +67,7 @@ def _mcp(ctx):
         return _tools(service, args[1:])
     if head == "logs":
         return _logs(service, args[1:])
-    if head in ("reconnect", "enable", "disable", "remove"):
+    if head in ("reconnect", "enable", "disable", "remove", "auth"):
         return _lifecycle(service, head, args[1:])
     # 无子命令时按服务器名处理：弹出该服务器的操作菜单
     if _find(service, args[0]) is not None:
@@ -101,13 +105,15 @@ def _server_menu(service, name: str) -> CommandResult:
     if status is None:
         return CommandResult(text=f"未找到 MCP 服务器 {name!r}。", style="yellow")
     toggle = ("启用", f"enable {name}") if status.state == "disabled" else ("停用", f"disable {name}")
-    items = [
-        CommandChoice("查看工具", f"tools {name}"),
+    items = [CommandChoice("查看工具", f"tools {name}")]
+    if getattr(status, "oauth", False):
+        items.append(CommandChoice("OAuth 授权", f"auth {name}", description="打开浏览器完成授权"))
+    items.extend([
         CommandChoice("重连", f"reconnect {name}"),
         CommandChoice(*toggle),
         CommandChoice("查看日志", f"logs {name}"),
         CommandChoice("删除", f"remove {name}", description="同时从配置文件移除"),
-    ]
+    ])
     title = f"{status.name} · {_scope_text(status.scope)} · {status.state_label}"
     return CommandResult(
         select=CommandSelect(title=title, command="mcp", items=items, size="medium")
@@ -123,19 +129,33 @@ def _add(ctx, service, rest: list) -> CommandResult:
         if not ctx.interactive:
             return CommandResult(text=_USAGE, style="yellow")
         return CommandResult(wizard=CommandWizard("mcp.add"))
-    name, scope, env_pairs, command = _parse_add(rest)
-    if not name or not command:
-        return CommandResult(text=_USAGE, style="yellow")
+    name, scope, env_pairs, command, remote = _parse_add(rest)
     if scope not in ("user", "project"):
         return CommandResult(text="--scope 只支持 user 或 project。", style="yellow")
 
-    cfg = mcp_config.ServerConfig(name=name, command=command)
-    for key, value in env_pairs.items():
-        if value.startswith("${") and value.endswith("}"):
-            cfg.env[key] = value
-        else:
-            store_secret(name, key, value)
-            cfg.env[key] = "${" + key + "}"
+    if remote["url"]:
+        if not name:
+            return CommandResult(text=_USAGE, style="yellow")
+        kind = remote["type"] or "http"
+        if kind not in ("http", "sse"):
+            return CommandResult(text="--type 只支持 http 或 sse。", style="yellow")
+        cfg = mcp_config.ServerConfig(
+            name=name, type=kind, url=remote["url"], oauth=remote["oauth"],
+            headers={
+                key: _reference_secret(name, key, value, store_secret)
+                for key, value in remote["headers"].items()
+            },
+        )
+    else:
+        if not name or not command:
+            return CommandResult(text=_USAGE, style="yellow")
+        cfg = mcp_config.ServerConfig(name=name, command=command)
+        for key, value in env_pairs.items():
+            if value.startswith("${") and value.endswith("}"):
+                cfg.env[key] = value
+            else:
+                store_secret(name, key, value)
+                cfg.env[key] = "${" + key + "}"
     try:
         service.add(cfg, scope)
     except McpConfigError as e:
@@ -148,19 +168,43 @@ def _add(ctx, service, rest: list) -> CommandResult:
 
 
 def _parse_add(rest: list):
-    """解析 `/mcp add <名称> -- <命令...> [-e K=V] [--scope ...]`。"""
+    """解析 `/mcp add`：stdio（`-- <命令...>`）或远程（`--url`）两种形态。
+
+    返回 (name, scope, env_pairs, command, remote)，remote 为
+    {"type", "url", "headers"}；省略 `--` 时名称之后的参数都当作命令。
+    """
     name = None
     scope = "user"
     env_pairs = {}
     command = []
+    remote = {"type": "", "url": "", "headers": {}, "oauth": False}
     index = 0
     while index < len(rest):
         token = rest[index]
         if token == "--":
             command = list(rest[index + 1:])
             break
+        if token == "--oauth":
+            remote["oauth"] = True
+            index += 1
+            continue
         if token == "--scope" and index + 1 < len(rest):
             scope = rest[index + 1].lower()
+            index += 2
+            continue
+        if token == "--type" and index + 1 < len(rest):
+            remote["type"] = rest[index + 1].lower()
+            index += 2
+            continue
+        if token == "--url" and index + 1 < len(rest):
+            remote["url"] = rest[index + 1]
+            index += 2
+            continue
+        if token == "--header" and index + 1 < len(rest):
+            pair = rest[index + 1]
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                remote["headers"][key] = value
             index += 2
             continue
         if token in ("-e", "--env") and index + 1 < len(rest):
@@ -175,7 +219,19 @@ def _parse_add(rest: list):
         else:
             command.append(token)  # 容错：省略 -- 时名称之后的都是命令
         index += 1
-    return name, scope, env_pairs, command
+    return name, scope, env_pairs, command, remote
+
+
+_REF_IN_TEXT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _reference_secret(name: str, key: str, value: str, store_secret) -> str:
+    """请求头值：含 ${VAR} 引用则原样保留（交给展开链），否则存凭据库并返回引用。"""
+    if _REF_IN_TEXT.search(value):
+        return value
+    var = "MCP_HEADER_" + re.sub(r"[^A-Za-z0-9_]", "_", key).upper()
+    store_secret(name, var, value)
+    return "${" + var + "}"
 
 
 def _tools(service, rest: list) -> CommandResult:
@@ -214,6 +270,12 @@ def _lifecycle(service, action: str, rest: list) -> CommandResult:
     name = rest[0]
     if _find(service, name) is None:
         return CommandResult(text=f"未找到 MCP 服务器 {name!r}。", style="yellow")
+    if action == "auth":
+        if not service.authorize(name):
+            return CommandResult(text=f"{name} 未启用 OAuth，无需授权。", style="yellow")
+        return CommandResult(
+            text=f"正在打开浏览器为 {name} 授权…完成后用 /mcp 查看状态。", style="retry"
+        )
     if action == "reconnect":
         service.reconnect(name)
         return CommandResult(text=f"MCP 服务器 {name} 正在重连…", style="retry")

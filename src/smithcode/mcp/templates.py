@@ -1,7 +1,8 @@
 """内置 MCP 服务器模板：向导第一步的快捷项。
 
-模板只描述"怎么启动 + 需要哪些密钥"，不携带任何凭据；`{workspace}` 占位符
-在生成命令时替换为当前工作区路径（filesystem 类服务器需要目录参数）。
+模板只描述"怎么启动 / 连哪里 + 需要哪些密钥"，不携带任何凭据；`{workspace}`
+占位符在生成命令时替换为当前工作区路径（filesystem 类服务器需要目录参数）。
+远程模板用 `url` + `oauth` 描述端点与鉴权，wizard 据此走远程分支。
 """
 from __future__ import annotations
 
@@ -13,9 +14,12 @@ class Template:
     key: str
     title: str
     description: str
-    command: tuple
+    command: tuple = ()
     env: tuple = ()
     note: str = ""
+    url: str = ""            # 远程模板的端点（非空时 wizard 走远程分支）
+    transport: str = "http"
+    oauth: bool = False
 
 
 TEMPLATES = (
@@ -51,6 +55,22 @@ TEMPLATES = (
         title="Everything（测试）",
         description="官方测试服务器，含多种工具与资源",
         command=("npx", "-y", "@modelcontextprotocol/server-everything"),
+    ),
+    Template(
+        key="linear",
+        title="Linear（远程）",
+        description="Issue / 项目协作（OAuth 登录）",
+        url="https://mcp.linear.app/mcp",
+        oauth=True,
+        note="需要浏览器完成 OAuth 授权",
+    ),
+    Template(
+        key="sentry",
+        title="Sentry（远程）",
+        description="错误与性能监控（OAuth 登录）",
+        url="https://mcp.sentry.dev/mcp",
+        oauth=True,
+        note="需要浏览器完成 OAuth 授权",
     ),
 )
 

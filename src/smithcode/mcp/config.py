@@ -30,8 +30,15 @@ from .errors import McpConfigError
 # 单次工具调用的默认超时（秒）；条目可覆盖
 DEFAULT_TIMEOUT = 60.0
 
-# 允许的传输类型；MVP 仅 stdio（别名 local 兼容部分生态写法）
-_SUPPORTED_TYPES = ("stdio", "local")
+# 传输类型别名 → 内部规范名（兼容 Claude / Cursor / VS Code / opencode 写法）
+_SUPPORTED_TYPES = {
+    "stdio": "stdio",
+    "local": "stdio",
+    "http": "http",
+    "remote": "http",
+    "streamable-http": "http",
+    "sse": "sse",
+}
 
 
 @dataclass
@@ -39,8 +46,12 @@ class ServerConfig:
     """一个 MCP 服务器的归一化配置（双作用域解析后的统一形态）。"""
 
     name: str
-    command: list = field(default_factory=list)  # argv（首项为可执行文件）
+    type: str = "stdio"     # 传输类型：stdio / http（Streamable HTTP）/ sse
+    command: list = field(default_factory=list)  # argv（首项为可执行文件，stdio）
     env: dict = field(default_factory=dict)      # 值可含 ${VAR} 引用，spawn 前展开
+    url: str = ""           # http / sse 的端点地址
+    headers: dict = field(default_factory=dict)  # http / sse 请求头，值可含 ${VAR} 引用
+    oauth: bool = False     # http / sse 是否走 OAuth（token 存 ~/.smithcode/mcp_auth.json）
     cwd: str = ""
     timeout: float = DEFAULT_TIMEOUT
     enabled: bool = True
@@ -49,13 +60,28 @@ class ServerConfig:
 
     @property
     def fingerprint(self) -> str:
-        """配置指纹：命令/参数/工作目录/环境键集变化的稳定摘要。"""
+        """配置指纹：传输/命令/端点/请求头键/工作目录/环境键集变化的稳定摘要。"""
         payload = json.dumps(
-            {"command": self.command, "cwd": self.cwd, "env": sorted(self.env)},
+            {
+                "type": self.type,
+                "command": self.command,
+                "url": self.url,
+                "headers": sorted(self.headers),
+                "oauth": self.oauth,
+                "cwd": self.cwd,
+                "env": sorted(self.env),
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def target(self) -> str:
+        """终端的短目标描述：stdio 显示命令，远程显示 URL。"""
+        if self.type in ("http", "sse"):
+            return self.url
+        return " ".join(self.command)
 
 
 @dataclass
@@ -142,31 +168,45 @@ def _parse_entry(name: str, entry, scope: str, source: str, diagnostics: list):
         diagnostics.append(f"{source}: mcp 服务器 {name!r} 的配置不是表/对象，已忽略")
         return None
 
-    transport = entry.get("type", "stdio")
-    if not isinstance(transport, str) or transport.lower() not in _SUPPORTED_TYPES:
+    raw_transport = entry.get("type", "stdio")
+    if not isinstance(raw_transport, str) or raw_transport.lower() not in _SUPPORTED_TYPES:
         diagnostics.append(
-            f"{source}: mcp 服务器 {name!r} 的 type={transport!r} 暂不支持"
-            f"（MVP 仅支持 stdio），已忽略"
+            f"{source}: mcp 服务器 {name!r} 的 type={raw_transport!r} 暂不支持"
+            f"（支持 stdio / http / sse），已忽略"
         )
         return None
+    transport = _SUPPORTED_TYPES[raw_transport.lower()]
 
-    command = _parse_command(name, entry, source, diagnostics)
-    if not command:
-        return None
+    url = ""
+    if transport == "stdio":
+        command = _parse_command(name, entry, source, diagnostics)
+        if not command:
+            return None
+    else:
+        command = []
+        raw_url = entry.get("url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            diagnostics.append(
+                f"{source}: mcp 服务器 {name!r}（{transport}）缺少 url，已忽略"
+            )
+            return None
+        url = raw_url.strip()
 
-    env: dict = {}
-    raw_env = entry.get("env")
-    if raw_env is not None:
-        if not isinstance(raw_env, dict):
-            diagnostics.append(f"{source}: mcp 服务器 {name!r} 的 env 不是表/对象，已忽略")
+    env = _parse_str_map(entry.get("env"), name, source, "env", diagnostics)
+    headers = _parse_str_map(entry.get("headers"), name, source, "headers", diagnostics)
+
+    oauth = False
+    raw_oauth = entry.get("oauth")
+    if raw_oauth is not None and raw_oauth is not False:
+        if raw_oauth is True or isinstance(raw_oauth, dict):
+            oauth = True
         else:
-            for key, value in raw_env.items():
-                if isinstance(value, str):
-                    env[str(key)] = value
-                else:
-                    diagnostics.append(
-                        f"{source}: mcp 服务器 {name!r} 的 env.{key} 不是字符串，已忽略"
-                    )
+            diagnostics.append(
+                f"{source}: mcp 服务器 {name!r} 的 oauth 不是布尔值/对象，按不启用处理"
+            )
+    if oauth and transport == "stdio":
+        oauth = False
+        diagnostics.append(f"{source}: mcp 服务器 {name!r} 为 stdio，oauth 仅对远程有效，已忽略")
 
     raw_cwd = entry.get("cwd")
     cwd = raw_cwd if isinstance(raw_cwd, str) else ""
@@ -191,9 +231,30 @@ def _parse_entry(name: str, entry, scope: str, source: str, diagnostics: list):
         enabled = True
 
     return ServerConfig(
-        name=name, command=command, env=env, cwd=cwd,
-        timeout=timeout, enabled=enabled, scope=scope, source=source,
+        name=name, type=transport, command=command, env=env, url=url,
+        headers=headers, oauth=oauth, cwd=cwd, timeout=timeout, enabled=enabled,
+        scope=scope, source=source,
     )
+
+
+def _parse_str_map(raw, name: str, source: str, field_name: str, diagnostics: list) -> dict:
+    """解析 env / headers 这类「字符串 → 字符串」表；非字符串值只忽略该项。"""
+    result: dict = {}
+    if raw is None:
+        return result
+    if not isinstance(raw, dict):
+        diagnostics.append(
+            f"{source}: mcp 服务器 {name!r} 的 {field_name} 不是表/对象，已忽略"
+        )
+        return result
+    for key, value in raw.items():
+        if isinstance(value, str):
+            result[str(key)] = value
+        else:
+            diagnostics.append(
+                f"{source}: mcp 服务器 {name!r} 的 {field_name}.{key} 不是字符串，已忽略"
+            )
+    return result
 
 
 def _parse_command(name: str, entry: dict, source: str, diagnostics: list) -> list:
@@ -233,7 +294,10 @@ def _parse_command(name: str, entry: dict, source: str, diagnostics: list) -> li
 
 def write_user_server(cfg: ServerConfig) -> Path:
     """写入/覆盖用户级服务器配置（tomlkit 保留注释）。"""
-    if not cfg.command:
+    if cfg.type in ("http", "sse"):
+        if not cfg.url:
+            raise McpConfigError(f"服务器 {cfg.name!r} 的 url 为空，无法写入")
+    elif not cfg.command:
         raise McpConfigError(f"服务器 {cfg.name!r} 的命令为空，无法写入")
     path = config.config_path()
     doc = _load_toml_document(path)
@@ -251,15 +315,22 @@ def write_user_server(cfg: ServerConfig) -> Path:
     entry = tomlkit.table()
     if not cfg.enabled:
         entry["enabled"] = False  # 启停字段放最前
-    entry["command"] = list(cfg.command)
-    if cfg.env:
-        # 内联表：一个服务器的属性（enabled / command / env / cwd / timeout）聚合在同一段
-        inline = tomlkit.inline_table()
-        for key, value in cfg.env.items():
-            inline[key] = value
-        entry["env"] = inline
-    if cfg.cwd:
-        entry["cwd"] = cfg.cwd
+    if cfg.type in ("http", "sse"):
+        if not cfg.url:
+            raise McpConfigError(f"服务器 {cfg.name!r} 的 url 为空，无法写入")
+        entry["type"] = cfg.type
+        entry["url"] = cfg.url
+        if cfg.oauth:
+            entry["oauth"] = True
+        if cfg.headers:
+            entry["headers"] = _inline_map(cfg.headers)
+    else:
+        entry["command"] = list(cfg.command)
+        if cfg.env:
+            # 内联表：一个服务器的属性聚合在同一段（command / env / cwd / timeout）
+            entry["env"] = _inline_map(cfg.env)
+        if cfg.cwd:
+            entry["cwd"] = cfg.cwd
     if cfg.timeout != DEFAULT_TIMEOUT:
         entry["timeout"] = cfg.timeout
     servers[cfg.name] = entry
@@ -351,7 +422,10 @@ def _set_enabled_project(name: str, enabled: bool) -> Path:
 
 def write_project_server(cfg: ServerConfig) -> Path:
     """写入/覆盖项目级 `.smithcode/mcp.json`，保留其他 keys 与未知字段。"""
-    if not cfg.command:
+    if cfg.type in ("http", "sse"):
+        if not cfg.url:
+            raise McpConfigError(f"服务器 {cfg.name!r} 的 url 为空，无法写入")
+    elif not cfg.command:
         raise McpConfigError(f"服务器 {cfg.name!r} 的命令为空，无法写入")
     path = project_config_path()
     data, error = _read_project_data(path)
@@ -365,14 +439,22 @@ def write_project_server(cfg: ServerConfig) -> Path:
     entry: dict = {}
     if not cfg.enabled:
         entry["enabled"] = False  # 启停字段放最前
-    entry["type"] = "stdio"
-    entry["command"] = cfg.command[0]
-    if len(cfg.command) > 1:
-        entry["args"] = list(cfg.command[1:])
-    if cfg.env:
-        entry["env"] = dict(cfg.env)
-    if cfg.cwd:
-        entry["cwd"] = cfg.cwd
+    if cfg.type in ("http", "sse"):
+        entry["type"] = cfg.type
+        entry["url"] = cfg.url
+        if cfg.oauth:
+            entry["oauth"] = True
+        if cfg.headers:
+            entry["headers"] = dict(cfg.headers)
+    else:
+        entry["type"] = "stdio"
+        entry["command"] = cfg.command[0]
+        if len(cfg.command) > 1:
+            entry["args"] = list(cfg.command[1:])
+        if cfg.env:
+            entry["env"] = dict(cfg.env)
+        if cfg.cwd:
+            entry["cwd"] = cfg.cwd
     if cfg.timeout != DEFAULT_TIMEOUT:
         entry["timeout"] = cfg.timeout
     servers[cfg.name] = entry
@@ -398,6 +480,14 @@ def remove_project_server(name: str) -> bool:
 
 
 # ---------- 内部工具 ----------
+
+def _inline_map(values: dict):
+    """把 dict 渲染为 tomlkit 内联表，保持服务器属性聚合在同一段。"""
+    inline = tomlkit.inline_table()
+    for key, value in values.items():
+        inline[str(key)] = value
+    return inline
+
 
 def _load_toml_document(path: Path):
     """读取 config.toml 为可编辑的 tomlkit 文档；缺失/损坏给出明确报错。"""

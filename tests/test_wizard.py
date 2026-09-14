@@ -1,4 +1,4 @@
-"""smithcode setup 向导测试：写盘内容、幂等保留、坏输入降级、非交互取消。"""
+"""smith setup 向导测试：写盘内容、幂等保留、坏输入降级、非交互取消。"""
 
 import json
 
@@ -114,7 +114,7 @@ def test_setup_eof_cancels_without_writing(home, monkeypatch):
 
 
 def test_cli_dispatch_setup(home, monkeypatch, capsys):
-    """`smithcode setup` 走向导并以向导退出码结束，不进入 Agent 构建。"""
+    """`smith setup` 走向导并以向导退出码结束，不进入 Agent 构建。"""
     _feed(monkeypatch, ["", "", "sk-cli", ""])
     from smithcode.cli import main
 

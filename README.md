@@ -14,7 +14,7 @@
 
 ### 全屏 TUI
 
-交互终端启动 `smithcode` 直接进入全屏聊天界面（Textual 实现）：
+交互终端启动 `smith` 直接进入全屏聊天界面（Textual 实现）：
 
 - **消息区**：助手回复无前缀纯文本流式输出；思考过程折叠成块（只显示字符计数，不刷屏，Enter / 空格展开）；工具调用折叠成块；连续的读取 / 搜索工具汇总成一个可折叠的「已探索」块；用户消息带面板底色与角色色竖线；每轮任务结束追加「▣ 模型 · 用时 Ns」页脚
 - **输入区**：多行输入框（Enter 发送，Shift+Enter / Ctrl+J 换行）；下方底行最左显示「权限模式 · 模型 · 思考强度」与运行状态，最右显示 git 分支与上下文占用
@@ -74,12 +74,12 @@
 
 通过 Model Context Protocol 接入外部工具服务器（官方文件系统、GitHub、Playwright 等）：
 
-- **添加**：`/mcp add` 打开交互向导（模板 / 手动命令、作用域、密钥、预览确认；TUI 为居中面板，REPL 为行式问答）；也可带参直通：`/mcp add <名称> -- <命令...> [-e KEY=VALUE] [--scope user|project]`
-- **双作用域**：用户级 `~/.smithcode/config.toml` 的 `[mcp.servers.<名称>]`；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，随仓库共享）。同名时项目条目整体覆盖用户条目；启停状态是服务器条目的 `enabled` 字段（写在定义它的文件里，默认启用时省略）
-- **密钥**：配置只写 `${VAR}` 引用；值存 `~/.smithcode/credentials.json` 的 `mcp.<服务器>.<变量>`（0600），或引用进程环境变量；密钥在终端与工具结果中全程脱敏
+- **添加**：`/mcp add` 打开交互向导（模板 / 手动命令 / 远程 URL、作用域、密钥、预览确认；TUI 为居中面板，REPL 为行式问答）；也可带参直通：`/mcp add <名称> -- <命令...> [-e KEY=VALUE]` 或 `/mcp add <名称> --url <地址> [--type http|sse] [--header K=V] [--oauth]`（`--scope user|project` 可选）
+- **双作用域**：用户级 `~/.smithcode/config.toml` 的 `[mcp.servers.<名称>]`；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，随仓库共享，兼容 Claude / Cursor / VS Code 写法）。同名时项目条目整体覆盖用户条目；启停状态是服务器条目的 `enabled` 字段（写在定义它的文件里，默认启用时省略）
+- **传输**：stdio（npx / uvx 生态）、Streamable HTTP（推荐远程）、SSE（旧版）；远程用 `url` + `headers`
+- **密钥与授权**：配置只写 `${VAR}` 引用；值存 `~/.smithcode/credentials.json` 的 `mcp.<服务器>.<变量>`（0600），或引用进程环境变量；OAuth 服务器配 `oauth = true`，token 存 `~/.smithcode/mcp_auth.json`（0600、自动刷新），首次用 `/mcp auth <名称>` 完成浏览器登录，之后静默复用；密钥与 token 全程脱敏
 - **工具**：连接成功后以 `mcp__<服务器>__<工具>` 注册，与内置工具共用权限（默认逐个确认）与串行调度；工具列表变化自动刷新
-- **管理**：`/mcp` 选择框（查看工具 / 重连 / 停用 / 日志 / 删除）、`/mcp list` 文本列表；启动时后台连接、失败隔离
-- 当前版本支持 stdio 传输（npx / uvx 生态），远程 HTTP / OAuth 后续支持
+- **管理**：`/mcp` 选择框（查看工具 / OAuth 授权 / 重连 / 停用 / 日志 / 删除）、`/mcp list` 文本列表；启动时后台连接、失败隔离，缺密钥或需授权时给出状态与操作提示
 
 ### 上下文管理
 
@@ -116,7 +116,7 @@
 
 ### 1. 安装
 
-要求 Python >= 3.9。
+要求 Python >= 3.10。
 
 ```bash
 pip install -e .
@@ -127,7 +127,7 @@ pip install -e .
 运行向导，按提示填入接口地址、模型名、API Key 与上下文预算（直接回车保留默认 / 已有值）：
 
 ```bash
-smithcode setup
+smith setup
 ```
 
 配置写入用户目录（所有平台同一位置）：
@@ -142,8 +142,8 @@ smithcode setup
 ### 3. 运行
 
 ```bash
-smithcode                        # 交互模式：交互终端进全屏 TUI，管道下走行式 REPL
-smithcode 帮我写个斐波那契函数    # 单次任务模式，完成即退出
+smith                            # 交互模式：交互终端进全屏 TUI，管道下走行式 REPL
+smith 帮我写个斐波那契函数        # 单次任务模式，完成即退出
 python -m smithcode              # 等价的另一种启动方式
 ```
 
@@ -225,7 +225,7 @@ TUI 中按 **Shift+Tab** 在三档权限模式间循环切换，输入框底行�
 
 ### 自定义权限规则（~/.smithcode/config.toml）
 
-在 `~/.smithcode/config.toml` 的 `[permissions]` 段配置（`smithcode setup` 首次生成时自带注释示例）。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：
+在 `~/.smithcode/config.toml` 的 `[permissions]` 段配置（`smith setup` 首次生成时自带注释示例）。动作支持 `allow` / `ask` / `deny`，通配符匹配（文件工具匹配路径、`run_command` 匹配命令串），**写在前面的先生效，精确规则请放在宽泛规则之后**：
 
 ```toml
 [permissions]
@@ -278,13 +278,13 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 
 ```bash
 # 修 bug：在当前项目里描述现象即可
-smithcode 运行 pytest 里有 3 个失败，帮我修掉
+smith 运行 pytest 里有 3 个失败，帮我修掉
 
 # 跨项目操作：主工作区之外再授权一个目录
-smithcode --add ../frontend 重构前端里所有调 /api/v1 的地方，改成 /api/v2
+smith --add ../frontend 重构前端里所有调 /api/v1 的地方，改成 /api/v2
 
 # CI / 脚本中无人值守运行并恢复最近会话
-smithcode -c -y 跑一遍测试并总结失败原因
+smith -c -y 跑一遍测试并总结失败原因
 ```
 
 ## 安全说明

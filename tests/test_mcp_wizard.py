@@ -135,6 +135,65 @@ def test_run_line_mode_cancel():
     assert plan is None
 
 
+def test_remote_flow_plan():
+    wizard = _wizard()
+    error = _drive(wizard, [
+        "remote", "https://mcp.linear.app/mcp", "http", "yes",
+        "Authorization=token123", "linear", "user", "finish",
+    ])
+    assert error is None
+    plan = wizard.to_plan()
+    assert plan.config.type == "http"
+    assert plan.config.url == "https://mcp.linear.app/mcp"
+    assert plan.config.oauth is True
+    assert plan.config.headers == {"Authorization": "${MCP_HEADER_AUTHORIZATION}"}
+    assert plan.secrets == [("MCP_HEADER_AUTHORIZATION", "token123")]
+
+
+def test_remote_header_reference_kept_and_sse():
+    wizard = _wizard()
+    _drive(wizard, [
+        "remote", "https://mcp.sentry.dev/mcp", "sse", "no",
+        "Authorization=Bearer ${SENTRY_TOKEN}", "sentry", "user", "finish",
+    ])
+    plan = wizard.to_plan()
+    assert plan.config.type == "sse"
+    assert plan.config.oauth is False
+    assert plan.config.headers == {"Authorization": "Bearer ${SENTRY_TOKEN}"}
+    assert plan.secrets == []
+
+
+def test_remote_url_validation():
+    wizard = _wizard()
+    assert _drive(wizard, ["remote", "mcp.linear.app"]) == (
+        "URL 需要以 http:// 或 https:// 开头"
+    )
+
+
+def test_remote_template_flow():
+    wizard = _wizard()
+    _drive(wizard, ["template", "linear"])
+    step = wizard.current()
+    assert step.key == "name"
+    assert step.default == "linear"
+    _drive(wizard, ["", "user", "finish"])
+    plan = wizard.to_plan()
+    assert plan.config.url == "https://mcp.linear.app/mcp"
+    assert plan.config.oauth is True
+
+
+def test_remote_preview_redacts_literal_header():
+    wizard = _wizard(workspace="/proj")
+    _drive(wizard, [
+        "remote", "https://mcp.linear.app/mcp", "http", "no",
+        "Authorization=token123", "linear", "project", "finish",
+    ])
+    preview = wizard.preview()
+    assert "token123" not in preview
+    assert "https://mcp.linear.app/mcp" in preview
+    assert "mcp.json" in preview
+
+
 def test_apply_plan_stores_secrets_then_adds(tmp_path, monkeypatch):
     from smithcode.mcp.config import ServerConfig
     from smithcode.mcp.wizard import WizardPlan, apply_plan

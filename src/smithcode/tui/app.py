@@ -115,7 +115,7 @@ class SmithTUI(App):
     #input-wrap {
         height: auto;
         margin: 0 2;
-        border-left: solid #23d18b;
+        /* 左侧竖线不再画在容器上：容器内还有运行动画行，画在这里会连动画行一起框住 */
     }
     #command-menu {
         /* 悬浮层：dock 到聊天列底部再上移 5 行（#bottom 2 + #input-wrap 3），
@@ -132,6 +132,10 @@ class SmithTUI(App):
         /* 隐藏滚动条：候选超出时仍可用滚轮 / 键盘滚动，只是不绘制（与聊天区一致） */
         scrollbar-size-vertical: 0;
     }
+    #command-menu.running {
+        /* 运行动画可见时输入框上方多占一行，锚点随之上移一行（否则弹菜单会盖住动画行） */
+        offset: 0 -6;
+    }
     #command-menu .menu-item {
         width: 1fr;  /* 拉满整行，选中项的高亮底色才贯通 */
         height: 1;
@@ -139,11 +143,14 @@ class SmithTUI(App):
     #input {
         height: 3;
         padding: 1 2 0 2;
+        /* 左竖线画在输入框自身：只框住输入框 3 行，上面的运行动画行不跟着被框 */
         border: none;
+        border-left: solid #23d18b;
         background: #1e1e1e;
     }
     #input:focus {
         border: none;
+        border-left: solid #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
     }
     #input .text-area--cursor-line {
         background: transparent;
@@ -158,10 +165,14 @@ class SmithTUI(App):
         width: auto;
         padding: 0 0 0 2;
     }
+    /* 运行动画：位于 #input-wrap 内、输入框上方，左竖线只画在输入框上；
+       宽度按文案自适应（_spin 用 layout=False，宽度恒定免重排）。
+       padding-left 3 = 输入框边框 1 + 输入框内缩进 2，与键入文字左对齐 */
     #running {
         color: #fab283;
         width: auto;
-        padding: 0 2;
+        height: 1;
+        padding: 0 3;
     }
     #status {
         width: 1fr;
@@ -324,15 +335,15 @@ class SmithTUI(App):
         with Horizontal(id="main"):
             with Vertical(id="chat-col"):
                 yield ChatView(id="chat")
-                # 输入框（左侧竖线）+ 底行（最左：权限模式·模型·思考·运行提示，最右：git/上下文）
+                # 输入框（自身带左侧竖线，框内上方为运行动画）+ 底行（最左：权限模式·模型·思考·目标，最右：git/上下文）
                 with Vertical(id="input-wrap"):
+                    yield RunningIndicator(id="running")
                     yield ChatInput(id="input")
                 with Horizontal(id="bottom"):
                     yield Static(id="composer-mode")
                     yield Static(id="composer-model")
                     yield Static(id="composer-thinking")
                     yield Static(id="composer-goal")
-                    yield RunningIndicator(id="running")
                     yield Static(id="status")
                 # 斜杠命令菜单：绝对定位悬浮层（锚在输入框正上方），不挤压聊天区布局
                 yield CommandMenu(id="command-menu")
@@ -784,6 +795,7 @@ class SmithTUI(App):
         running = self.query_one("#running", RunningIndicator)
         running.display = True
         running.start()
+        self._sync_command_menu_anchor(running=True)
         threading.Thread(target=self._run_task, args=(text,), daemon=True).start()
 
     def _run_task(self, text: str) -> None:
@@ -810,6 +822,16 @@ class SmithTUI(App):
             return
         found.first().stop()
         found.first().display = False
+        self._sync_command_menu_anchor(running=False)
+
+    def _sync_command_menu_anchor(self, running: bool) -> None:
+        """运行动画可见性变化时更新命令菜单锚点：动画占一行则整体上移一行。
+
+        仅切换 CSS 类（见 `#command-menu.running`），不改菜单自身的定位逻辑。
+        应用退出时组件可能已卸载，查不到菜单就忽略。"""
+        found = self.query(CommandMenu)
+        if found:
+            found.first().set_class(running, "running")
 
     def ui_running_stopping(self) -> None:
         """Esc 后让运行动画行尾显示「· 正在停止…」（组件已卸载则忽略）。"""
@@ -851,7 +873,7 @@ class SmithTUI(App):
         tokens = text.strip().split()
         mutating_mcp = (
             bool(tokens) and tokens[0].lower() == "/mcp" and len(tokens) > 1
-            and tokens[1].lower() in ("add", "remove", "enable", "disable", "reconnect")
+            and tokens[1].lower() in ("add", "remove", "enable", "disable", "reconnect", "auth")
         )
         if self._busy and (tokens and tokens[0].lower() in ("/new", "/sessions") or mutating_mcp):
             self.ui_notice(

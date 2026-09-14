@@ -15,6 +15,13 @@ import time
 
 MODE = os.environ.get("FAKE_MCP_MODE", "default")
 
+# MCP 规范要求 stdio 走 UTF-8；Windows 默认代码页（GBK）会让严格解码的客户端报错。
+try:
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+except (AttributeError, ValueError):
+    pass
+
 TOOLS = [
     {
         "name": "echo",
@@ -42,6 +49,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
+
+if MODE == "crash-tool":
+    TOOLS = TOOLS + [{
+        "name": "crash",
+        "description": "直接退出进程",
+        "inputSchema": {"type": "object", "properties": {}},
+    }]
 
 
 def send(message):
@@ -96,6 +110,9 @@ def handle(message):
                 "content": [{"type": "text", "text": "{\"ok\": true}"}],
                 "structuredContent": {"ok": True, "items": [1, 2]},
             })
+        elif name == "crash":
+            sys.stdout.flush()
+            os._exit(1)
         else:
             error(request_id, -32602, f"unknown tool: {name}")
         return

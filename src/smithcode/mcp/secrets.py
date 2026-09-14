@@ -37,6 +37,7 @@ class ResolvedServer:
 
     command: list = field(default_factory=list)
     env: dict = field(default_factory=dict)
+    headers: dict = field(default_factory=dict)
     cwd: str = ""
     missing: list = field(default_factory=list)
 
@@ -74,7 +75,7 @@ def expand_text(text: str, server: str, missing: list) -> str:
 
 
 def resolve(cfg: ServerConfig) -> ResolvedServer:
-    """展开一个服务器配置中的全部引用（command / env / cwd）。
+    """展开一个服务器配置中的全部引用（command / env / headers / cwd）。
 
     展开失败不抛异常：缺失的变量收集在 `ResolvedServer.missing` 里，
     调用方据此走交互补录或 fail-closed，而不是带着空值把 server 拉起来。
@@ -82,8 +83,14 @@ def resolve(cfg: ServerConfig) -> ResolvedServer:
     missing: list = []
     command = [expand_text(item, cfg.name, missing) for item in cfg.command]
     env = {key: expand_text(value, cfg.name, missing) for key, value in cfg.env.items()}
+    headers = {
+        key: expand_text(value, cfg.name, missing)
+        for key, value in cfg.headers.items()
+    }
     cwd = expand_text(cfg.cwd, cfg.name, missing) if cfg.cwd else ""
-    return ResolvedServer(command=command, env=env, cwd=cwd, missing=missing)
+    return ResolvedServer(
+        command=command, env=env, headers=headers, cwd=cwd, missing=missing
+    )
 
 
 def missing_refs(cfg: ServerConfig) -> list:

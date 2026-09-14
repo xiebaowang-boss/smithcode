@@ -16,9 +16,9 @@ from .wizard import run_setup
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="smithcode",
+        prog="smith",
         description="终端 AI 编程助手：让大模型调用工具帮你读写文件、执行命令。\n"
-        "首次使用先运行 `smithcode setup` 完成初始化。",
+        "首次使用先运行 `smith setup` 完成初始化。",
     )
     parser.add_argument(
         "task", nargs="*",

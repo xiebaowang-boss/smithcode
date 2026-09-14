@@ -236,6 +236,65 @@ def test_tui_stream_renders_markdown_incrementally(monkeypatch):
     _run(_run_case())
 
 
+def test_tui_assistant_text_rewraps_on_resize(monkeypatch):
+    """窗口缩放后助手正文按新宽度重排：折行不固化在旧宽度上。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(70, 30)) as pilot:
+            text = " ".join(f"w{i:03d}" for i in range(60))
+            app.ui_stream("content", text)
+            app.ui_stream_done()
+            await pilot.pause()
+            block = app.query_one(".assistant-stream")
+            narrow = block.content.plain.split("\n")
+
+            await pilot.resize_terminal(160, 30)
+            await pilot.pause()
+            wide = block.content.plain.split("\n")
+
+            def flat(lines):
+                return "".join("".join(line.split()) for line in lines)
+
+            # 变宽：可用列变多，折行更少（且首屏不再固定按回退宽度折行）
+            assert len(wide) < len(narrow)
+            assert flat(wide) == flat(narrow)  # 只改折行，内容一字不丢
+
+            # 再缩窄：折行重新变多，内容依然完整
+            await pilot.resize_terminal(70, 30)
+            await pilot.pause()
+            again = block.content.plain.split("\n")
+            assert len(again) == len(narrow)
+            assert flat(again) == flat(narrow)
+
+    _run(_run_case())
+
+
+def test_tui_streaming_block_rewraps_on_resize(monkeypatch):
+    """流式期间/结束后同样自适应：已定型的正文块随后缩放仍会重排。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(70, 30)) as pilot:
+            chat = app.query_one(ChatView)
+            chat.begin_stream("content")
+            for chunk in ["第一段", "内容", "比较长" * 8, "\n\n", "第二段" * 10]:
+                chat.append_stream("content", chunk)
+            chat.end_stream()
+            await pilot.pause()
+            block = chat.query_one(".assistant-stream")
+            narrow = len(block.content.split("\n"))
+
+            await pilot.resize_terminal(160, 30)
+            await pilot.pause()
+            assert len(block.content.split("\n")) < narrow
+            assert "第一段内容" in block.content.plain
+
+    _run(_run_case())
+
+
 def test_choice_modal_resolves(monkeypatch):
     """权限申请面板：替换输入框，字母键直选，答后恢复输入框。"""
     no_prompting(monkeypatch)
@@ -945,7 +1004,7 @@ def test_tui_status_bar(monkeypatch):
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
-            # 模型/思考/运行提示都在最底行 #bottom，最左侧依次排列
+            # 模型/思考在底行 #bottom 最左侧依次排列；运行动画在输入框框内上方
             bottom = app.query_one("#bottom")
             mode_w = app.query_one("#composer-mode")
             model_w = app.query_one("#composer-model")
@@ -953,10 +1012,10 @@ def test_tui_status_bar(monkeypatch):
             running = app.query_one("#running")
             assert model_w.parent is bottom
             assert think_w.parent is bottom
-            assert running.parent is bottom
             assert mode_w.parent is bottom
-            # 权限模式在最前，其后 模型 · 思考 · 运行提示
-            assert bottom.children.index(mode_w) < bottom.children.index(model_w) < bottom.children.index(think_w) < bottom.children.index(running)
+            assert running.parent is app.query_one("#input-wrap")
+            # 权限模式在最前，其后 模型 · 思考
+            assert bottom.children.index(mode_w) < bottom.children.index(model_w) < bottom.children.index(think_w)
             assert str(mode_w.content) == "Smith"  # 默认档展示名
             assert config.MODEL in str(model_w.content)
             assert not str(model_w.content).startswith("▣")  # 模型前无图标
@@ -1189,6 +1248,7 @@ def test_running_indicator_during_task(monkeypatch):
         app = SmithTUI(Agent(session=Session()))
         async with app.run_test() as pilot:
             running = app.query_one("#running")
+            menu = app.query_one(CommandMenu)
             assert running.display is False  # 初始隐藏
             inp = app.query_one(ChatInput)
             inp.focus()
@@ -1199,6 +1259,7 @@ def test_running_indicator_during_task(monkeypatch):
                     break
                 await pilot.pause(0.01)
             assert running.display is True  # 执行中显示动画
+            assert menu.has_class("running")  # 动画占一行：命令菜单锚点上移
             for _ in range(300):
                 if not app._busy:
                     break
@@ -1208,6 +1269,7 @@ def test_running_indicator_during_task(monkeypatch):
                     break
                 await pilot.pause(0.01)
             assert running.display is False  # 结束隐藏
+            assert not menu.has_class("running")  # 锚点归位
 
     _run(_run_case())
 
@@ -1327,19 +1389,24 @@ def test_turn_footer_shows_stopped_on_interrupt(monkeypatch):
     _run(_run_case())
 
 
-def test_bottom_line_same_row(monkeypatch):
-    """运行动画与状态信息在同一行：动画在最左，状态靠右。"""
+def test_running_indicator_above_input(monkeypatch):
+    """运行动画固定于输入框上方（同一容器内、排在输入框之前）；状态行仍在底行。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test():
-            bottom = app.query_one("#bottom")
+            input_wrap = app.query_one("#input-wrap")
             running = app.query_one("#running")
+            chat_input = app.query_one(ChatInput)
             status = app.query_one("#status")
-            assert running.parent is bottom
-            assert status.parent is bottom  # 同一行
-            assert running.display is False  # 空闲时动画隐藏，状态占满整行
+            assert running.parent is input_wrap  # 与输入框同一容器，紧邻输入框上方
+            assert input_wrap.children.index(running) < input_wrap.children.index(chat_input)
+            assert status.parent is app.query_one("#bottom")  # 上下文/git 仍在底行
+            assert running.display is False  # 空闲时动画隐藏
+            # 左侧竖线画在输入框自身：容器无边框，上方动画行不会被一起框住
+            assert input_wrap.styles.border_left[0] in ("", "none")
+            assert chat_input.styles.border_left[0] == "solid"
 
     _run(_run_case())
 

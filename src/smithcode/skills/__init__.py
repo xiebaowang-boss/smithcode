@@ -1,6 +1,6 @@
 """Agent Skills（技能）子系统：发现 / 披露 / 激活 / 会话状态的公共入口。
 
-设计文档见 docs/skills-architecture.md。当前扫描范围（P1）：项目级
+设计文档见 docs/architecture.md 的「技能（Skills）」节。当前扫描范围（P1）：项目级
 `<工作区>/.agents/skills/` 与用户级 `~/.smithcode/skills/`（外加 [skills].paths
 配置目录），暂不兼容其他客户端的技能目录。
 

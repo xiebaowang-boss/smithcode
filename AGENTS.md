@@ -6,7 +6,7 @@
 
 SmithCode 是一个终端 AI 编程助手（mini coding agent）：用户用自然语言描述任务，Agent 自主规划步骤、调用工具、根据结果继续推理，直到任务完成。核心是 **Agentic Loop**——模型要么返回纯文本（任务完成），要么返回工具调用，经权限确认后执行、结果回传，循环直至结束。
 
-- 语言：纯 Python，**>= 3.9**（不引入额外类型依赖，仅用标准库 typing；不用 3.10+ 语法糖）
+- 语言：纯 Python，**>= 3.10**（MCP 子系统依赖官方 `mcp` SDK，其余仍以标准库为主；注解与运行期均可用 `X | Y` 联合写法）
 - 布局：src 布局，包在 `src/smithcode/`，测试在 `tests/`，大体对应（如 `test_agent.py` 测 `agent.py`；集成类测试如 `test_display.py` / `test_agent_parallel.py` 不一一对端）
 - 接口：任何 OpenAI 兼容接口均可接入；LLM 请求带流式输出与自动重试
 - 跨平台：Windows / Linux / macOS 都要正常工作
@@ -14,18 +14,35 @@ SmithCode 是一个终端 AI 编程助手（mini coding agent）：用户用自�
 ## 常用命令
 
 ```bash
-pip install -e ".[dev]"   # 安装含测试与 lint 工具
-pytest                    # 运行全部测试（不依赖真实 API，可放心跑）
-pytest tests/test_agent.py  # 只跑一个测试文件
-ruff check src tests      # 代码检查
-smithcode setup           # 初始化配置（用户机器上才需要）
+uv run pytest                # 运行全部测试（不依赖真实 API，可放心跑）
+uv run pytest tests/test_agent.py  # 只跑一个测试文件
+uv run ruff check src tests  # 代码检查
+smith setup                   # 初始化配置（用户机器上才需要）
 ```
 
-本项目用 uv 管理（有 `uv.lock`），也可用 `uv run pytest` / `uv run ruff check src tests`。
+本项目用 uv 管理（有 `uv.lock`），**优先用 `uv run`**；没有 uv 的环境退回 `pip install -e ".[dev]"`，之后用裸命令 `pytest` / `ruff check src tests`。
+
+注意：`uv run` 每次会先同步虚拟环境。在 SmithCode 内开发本仓库时，正在运行的 `smith.exe` 会锁住待替换的入口脚本，同步失败（`os error 32`）——此时改用环境里已有的 `python -m pytest` / `python -m ruff check src tests` 即可。
 
 ## 改动后必须验证
 
-- 改了 `src/` 或 `tests/` 下任何代码：跑 `pytest`
+测试分两个节奏，别把全量测试插进每次编辑的内循环：
+
+- **内循环（改一处看一眼）**：只跑相关测试文件，可加 `-k` 缩小到具体用例，如 `uv run pytest tests/test_agent.py -k interrupt`
+- **交付前**：跑一次全量 `uv run pytest`，确认无回归
+
+**跑多大范围由改动的波及面决定**，先判断这个文件被多少地方依赖：
+
+- 判断方法：用 `grep` 工具搜模块名（如 `config`、`session`），看命中多少个 `src/` 与 `tests/` 文件；被十几处引用的按全量处理。这一步只要一两秒，远低于一次全量，拿不准就按宽处理
+- 波及面大的典型位置（示例，以实际依赖为准）：默认值与全局状态的 `config.py`、注册表与抽象基类 `tools/base.py`、跨切面的 `renderer.py` / `permission/`、状态聚合根 `session.py`、被大量测试反向依赖的 `goal.py` / `skills/` / `plan.py`
+- 波及面小的叶子（示例）：单个工具实现（如 `tools/websearch.py`）、纯函数渲染（`tui/render.py`）、子系统内部文件——改了跑同名测试文件即可
+- 涉及公共接口、默认值或协议语义的改动等于同时改了一片调用方，直接跑全量
+- 测试与源码不一一对端（`test_display.py` / `test_agent_parallel.py`），找不到同名测试文件时按引用面判断，不要因为「没有对应文件」就跳过验证
+
+其余约定：
+
+- 新增行为要配新测试（见「新增工具的流程」第 4 条），但新增测试通过 ≠ 无回归——新测试只覆盖新路径，跑既有套件才证明没弄坏老行为
+- 不为复述实现写无意义测试，只测真正可能失败的行为
 - 改了用户可见行为（新功能、命令、配置项、提示词调整）：同步更新 `CHANGELOG.md` 的 `[未发布]` 段落，中文条目，风格参照现有内容
 - 改了工具实现或权限语义：对照 `docs/architecture.md` 确认描述仍然准确
 
@@ -44,19 +61,19 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根：消息历史（追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
-| `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/session-architecture.md`） |
+| `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/architecture.md` 的「会话持久化与恢复」节） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
 | `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
-| `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/skills-architecture.md`）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
+| `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
-| `tools/*.py` | 各工具实现（files / search / shell / patch / web / ask / todo / goal / skills） |
-| `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、stdio 同步客户端、工具命名/动态注册、`/mcp` 命令与添加向导（设计见 `docs/architecture.md`「MCP」节）；MVP 仅 stdio |
+| `tools/*.py` | 各工具实现（files / search / shell / patch / web / websearch / ask / todo / goal / skills） |
+| `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、工具命名/动态注册、`/mcp` 命令与添加向导；客户端基于官方 `mcp` SDK（`runtime.py` 共享 loop 线程、`connection.py` 同步门面、`factory.py` 按传输构造）（完整设计见 `docs/mcp-architecture.md`，摘要见 `docs/architecture.md`「MCP」节）；支持 stdio / Streamable HTTP / SSE 与 OAuth2.1 |
 
 ## 关键约定
 
@@ -64,7 +81,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，解析后的真实路径必须在授权目录内；绕过沙箱的"捷径"一律不加
 - **保护路径**：`.env` 的内容不在变更预览/确认框中回显（防密钥泄露），读写仍按普通规则（读默认放行、写默认确认）；`.git` 只读（内置 deny 规则只拦写入/编辑，读取放行）
-- **MCP 配置与密钥**：MCP 配置只写 `${VAR}` 引用，值存 `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、0600）；展开值全链路脱敏；项目级 `.smithcode/mcp.json` 会拉起本机进程，启动时给出可见警示（不做信任门控）；MCP 工具默认 `ask` + 串行，描述与输出按不可信内容处理
+- **MCP 配置与密钥**：MCP 配置只写 `${VAR}` 引用，值存 `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、0600）；OAuth token / client_info 存独立 `mcp_auth.json`（原子写、0600），值与展开值全链路脱敏；后台连接遇授权需求只置 `needs_auth`、绝不弹浏览器，须用户显式 `/mcp auth`；项目级 `.smithcode/mcp.json` 会拉起本机进程，启动时给出可见警示（不做信任门控）；MCP 工具默认 `ask` + 串行，描述与输出按不可信内容处理
 - **技能目录只读**：技能根目录经 `config.read_roots()` 对读工具放行（免越界确认），写工具/`apply_patch` 只认授权目录（`_resolve(write=True)`）；技能 frontmatter 的 `allowed-tools` 不产生授权效果
 - **权限规则**：工具通过 schema 的 `pattern_arg` 声明权限模式来源；权限语义与既有工具一致时用 `family` 继承（如 `apply_patch` 继承 `edit_file`）；多路径工具用 `paths_from` 逐路径求值聚合
 - **安全命令免确认**：内置只读命令集（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在内置默认 `ask` 下自动放行，且**仅在无任何用户/会话规则命中时生效**——用户可用精确 `ask`/`deny` 收紧，宽泛 `ask` 即整体关闭。开发工具链仅放行版本查询/只读枚举/静态检查（`python --version`、`pip list`、`ruff check`），**真正运行代码的用法（`pytest`、`python x.py`、`npm run`、`uv run`、`cargo test`）不放行**。判定为纯函数 `permission/shell_policy.is_safe_command`，拿不准（解析失败、inline 环境变量前缀、路径限定 argv[0]、重定向、命令替换、危险标志、未加引号 glob）一律回退确认
@@ -78,7 +95,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 2. 敏感操作用 `pattern_arg` 声明权限模式来源，并在默认规则中给出合理的初始动作
 3. 用 `describe` 声明终端短摘要（格式「短名 + 目标」，如 `read src/a.py`）
 4. 新建 `tests/test_tools_<名字>.py` 补测试
-5. 系统提示词 `prompts.py` 中补充该工具的使用时机与注意事项（agent 不会读你的代码，只读提示词）
+5. 系统提示词 `llm/prompts.py` 中补充该工具的使用时机与注意事项（agent 不会读你的代码，只读提示词）
 
 ### 代码风格
 
@@ -90,19 +107,19 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 
 ### 兼容性红线
 
-- Python 3.9 兼容：不用 `match` 语句、不用仅 3.10+ 的标准库特性。**注解**里可用 `X | Y` 联合写法——凡用到它的模块都带 `from __future__ import annotations`（延迟求值，3.9 不会报错）；但**运行期即时求值**处禁用（如 `isinstance(x, int | str)`、模块级类型别名求值），那些地方改用 `typing.Union`
+- Python 3.10 兼容：不用 3.11+ 才有的标准库特性（内置 `tomllib` 仍走 `tomli`）。注解与运行期均可用 `X | Y` 联合写法（3.10 原生支持），不再需要为 3.9 做延迟求值规避
 - TOML 读取走 `tomli`（3.11+ 才有内置 `tomllib`），写走 `tomlkit`（保留用户注释）
 - 交互层依赖（prompt_toolkit / textual）仅交互模式加载，非交互 stdin 退回普通 `input()`，保证管道 / CI 可用
 
 ### 事件同步
 
 - 修改工具、权限、配置、TUI 行为时，同步更新 `prompts.py` 中对 agent 的描述——两处不一致会让 agent 行为错乱（如系统提示词承诺的能力实际已被删除）
-- `prompts.py` 的提示词是行为规则的核心：新增工具后不更新提示词 = agent 基本不会用这个工具
+- `llm/prompts.py` 的提示词是行为规则的核心：新增工具后不更新提示词 = agent 基本不会用这个工具
 
 ## 不要做
 
 - 不要提交（commit / push），除非用户明确要求
 - 不要动 `uv.lock`（由 uv 管理）
-- 不要在 `permission.py` / `tools/files.py` 的沙箱逻辑上"顺手优化"——安全边界改动需明确说明并跑全量测试
+- 不要在 `permission/` / `tools/files.py` 的沙箱逻辑上"顺手优化"——安全边界改动需明确说明并跑全量测试
 - 不要跳过测试直接交付：改坏已有行为比不实现更糟
 - 不要在非交互路径上引入对 TUI / prompt_toolkit 的硬依赖

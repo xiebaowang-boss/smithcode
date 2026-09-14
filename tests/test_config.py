@@ -11,7 +11,7 @@ def test_missing_key_raises_with_hint(monkeypatch):
     with pytest.raises(config.ConfigError) as excinfo:
         config.ensure_api_key()
     message = str(excinfo.value)
-    assert "smithcode setup" in message
+    assert "smith setup" in message
     assert "SMITHCODE_KEY" in message
 
 

@@ -90,7 +90,7 @@ def test_add_returns_wizard_intent():
 
 
 def test_parse_add_arguments():
-    name, scope, env, command = mcp_command._parse_add(
+    name, scope, env, command, remote = mcp_command._parse_add(
         ["github", "-e", "TOKEN=abc", "--scope", "project", "--",
          "npx", "-y", "@modelcontextprotocol/server-github"]
     )
@@ -98,15 +98,30 @@ def test_parse_add_arguments():
     assert scope == "project"
     assert env == {"TOKEN": "abc"}
     assert command == ["npx", "-y", "@modelcontextprotocol/server-github"]
+    assert remote == {"type": "", "url": "", "headers": {}, "oauth": False}
 
 
 def test_parse_add_without_separator():
-    name, scope, _env, command = mcp_command._parse_add(
+    name, scope, _env, command, _remote = mcp_command._parse_add(
         ["my", "npx", "-y", "pkg", "--flag"]
     )
     assert name == "my"
     assert scope == "user"
     assert command == ["npx", "-y", "pkg", "--flag"]
+
+
+def test_parse_add_remote():
+    name, _scope, env, command, remote = mcp_command._parse_add(
+        ["linear", "--url", "https://mcp.linear.app/mcp", "--type", "http",
+         "--header", "Authorization=Bearer token", "--oauth", "--scope", "user"]
+    )
+    assert name == "linear"
+    assert command == []
+    assert env == {}
+    assert remote["type"] == "http"
+    assert remote["url"] == "https://mcp.linear.app/mcp"
+    assert remote["headers"] == {"Authorization": "Bearer token"}
+    assert remote["oauth"] is True
 
 
 def test_add_args_path_writes_config_without_spawning(isolated, monkeypatch):
@@ -129,6 +144,28 @@ def test_add_args_path_writes_config_without_spawning(isolated, monkeypatch):
     assert scope == "user"
     # 值走凭据库，配置只留引用
     assert secrets.lookup("gh", "TOKEN") == "abc"
+
+
+def test_add_remote_url_stores_header_secret(isolated, monkeypatch):
+    service = McpService()
+    recorded = []
+
+    def fake_add(cfg, scope=None):
+        recorded.append((cfg, scope))
+
+    monkeypatch.setattr(service, "add", fake_add)
+    agent = SimpleNamespace(mcp=service)
+    outcome = commands.dispatch(
+        agent,
+        "/mcp add linear --url https://mcp.linear.app/mcp --header Authorization=token123",
+    )
+    assert outcome.style == "retry"
+    cfg, scope = recorded[0]
+    assert cfg.type == "http"
+    assert cfg.url == "https://mcp.linear.app/mcp"
+    assert scope == "user"
+    assert cfg.headers["Authorization"].startswith("${MCP_HEADER_")
+    assert secrets.lookup("linear", "MCP_HEADER_AUTHORIZATION") == "token123"
 
 
 def test_tools_unknown_server():

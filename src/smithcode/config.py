@@ -211,7 +211,7 @@ def ensure_api_key():
         "两种解决方式，任选其一：\n"
         "\n"
         "    1. 运行初始化向导（推荐，长期生效）：\n"
-        "           smithcode setup\n"
+        "           smith setup\n"
         "       key 将写入 ~/.smithcode/credentials.json\n"
         "\n"
         "    2. 只在当前终端临时设置环境变量，然后重新运行：\n"

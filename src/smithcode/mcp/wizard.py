@@ -5,7 +5,7 @@
 - REPL：`run_line_mode` 用编号菜单 + 掩码输入实现同一流程；
 - 非交互：命令层只接受带全参的 `/mcp add ...` 直通路径，不做提问。
 
-步骤按草稿动态生成（模板/手动分支、按需的密钥步骤），支持回退修改；
+步骤按草稿动态生成（模板/手动/远程分支、按需的密钥步骤），支持回退修改；
 Esc / q 取消时草稿直接丢弃，不产生任何副作用。
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .. import config
 from . import templates as template_mod
@@ -28,6 +29,7 @@ _SECRET_MODES = (
     ("暂不提供（连接时会失败，稍后可补）", "skip"),
 )
 _VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_REF_IN_TEXT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*")
 
 
 @dataclass
@@ -64,6 +66,10 @@ class McpWizard:
             "template": "",
             "command": "",
             "env_vars": [],
+            "url": "",
+            "transport": "http",
+            "oauth": "yes",
+            "headers": "",
             "name": "",
             "scope": "user",
             "secrets": {},  # var -> {"mode": "store|env|skip", "value": str}
@@ -79,7 +85,11 @@ class McpWizard:
     def steps(self) -> list:
         steps = [WizardStep(
             key="source", title="添加方式", kind="choice",
-            options=[("从模板选择（推荐）", "template"), ("手动输入启动命令", "manual")],
+            options=[
+                ("从模板选择（推荐）", "template"),
+                ("手动输入启动命令", "manual"),
+                ("远程服务器（HTTP / SSE URL）", "remote"),
+            ],
             default=self.draft["source"] or "template",
         )]
 
@@ -100,6 +110,30 @@ class McpWizard:
                 key="env_vars", title="需要的环境变量名（可选）", kind="text",
                 default=", ".join(self.draft["env_vars"]),
                 hint="逗号分隔；值的存放方式在后续步骤选择",
+            ))
+        if self.draft["source"] == "remote":
+            steps.append(WizardStep(
+                key="url", title="服务器 URL", kind="text",
+                default=self.draft["url"],
+                hint="例如: https://mcp.linear.app/mcp",
+            ))
+            steps.append(WizardStep(
+                key="transport", title="传输类型", kind="choice",
+                options=[("Streamable HTTP（推荐）", "http"), ("SSE（旧版）", "sse")],
+                default=self.draft["transport"],
+            ))
+            steps.append(WizardStep(
+                key="oauth", title="鉴权方式", kind="choice",
+                options=[
+                    ("OAuth 授权（浏览器登录，推荐）", "yes"),
+                    ("请求头（可引用 ${VAR} 或输入字面值）", "no"),
+                ],
+                default=self.draft["oauth"],
+            ))
+            steps.append(WizardStep(
+                key="headers", title="请求头（可选）", kind="text",
+                default=self.draft["headers"],
+                hint="K=V，逗号分隔；字面值会存入凭据库，配置只留引用",
             ))
 
         steps.append(WizardStep(
@@ -161,11 +195,12 @@ class McpWizard:
         key = step.key
 
         if key == "source":
-            if value not in ("template", "manual"):
+            if value not in ("template", "manual", "remote"):
                 return self._fail("请选择添加方式")
             if self.draft["source"] != value:
                 self.draft.update(
-                    source=value, template="", command="", env_vars=[], secrets={}
+                    source=value, template="", command="", env_vars=[], secrets={},
+                    url="", transport="http", oauth="yes", headers="",
                 )
                 self.draft["name"] = ""
 
@@ -174,12 +209,41 @@ class McpWizard:
             if template is None:
                 return self._fail("未知模板")
             self.draft["template"] = value
-            self.draft["command"] = " ".join(
-                template_mod.command_for(template, self.workspace)
-            )
-            self.draft["env_vars"] = list(template.env)
             self.draft["secrets"] = {}
             self.draft["name"] = template.key
+            if template.url:
+                self.draft.update(
+                    url=template.url, transport=template.transport,
+                    oauth="yes" if template.oauth else "no",
+                    command="", env_vars=[], headers="",
+                )
+            else:
+                self.draft["command"] = " ".join(
+                    template_mod.command_for(template, self.workspace)
+                )
+                self.draft["env_vars"] = list(template.env)
+
+        elif key == "url":
+            url = value.strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return self._fail("URL 需要以 http:// 或 https:// 开头")
+            self.draft["url"] = url
+
+        elif key == "transport":
+            if value not in ("http", "sse"):
+                return self._fail("请选择传输类型")
+            self.draft["transport"] = value
+
+        elif key == "oauth":
+            if value not in ("yes", "no"):
+                return self._fail("请选择鉴权方式")
+            self.draft["oauth"] = value
+
+        elif key == "headers":
+            error = _parse_headers(value)
+            if isinstance(error, str):
+                return self._fail(error)
+            self.draft["headers"] = value.strip()
 
         elif key == "command":
             argv = _split_command(value)
@@ -243,9 +307,14 @@ class McpWizard:
 
     # ---------- 产物 ----------
 
+    def _is_remote(self) -> bool:
+        return self.draft["source"] == "remote" or bool(self.draft["url"])
+
     def default_name(self) -> str:
         if self.draft["template"]:
             return self.draft["template"]
+        if self.draft["url"]:
+            return _name_from_url(self.draft["url"])
         argv = self._argv()
         if not argv:
             return ""
@@ -269,18 +338,43 @@ class McpWizard:
     def _argv(self) -> list:
         if self.draft["source"] == "template":
             template = template_mod.by_key(self.draft["template"])
-            if template is not None:
+            if template is not None and not template.url:
                 return template_mod.command_for(template, self.workspace)
+        if self._is_remote():
+            return []
         return _split_command(self.draft["command"])
 
+    def _remote_headers(self) -> list:
+        """返回 [(header, value_or_ref)] 与需存入凭据库的字面值。"""
+        headers = []
+        secrets = []
+        parsed = _parse_headers(self.draft["headers"])
+        if isinstance(parsed, str):  # 理论上前置校验已拦截；防御式处理
+            return headers, secrets
+        for key, value in parsed:
+            if _REF_IN_TEXT.search(value):
+                headers.append((key, value))
+            else:
+                var = _header_var(key)
+                headers.append((key, "${" + var + "}"))
+                secrets.append((var, value))
+        return headers, secrets
+
     def to_plan(self) -> WizardPlan:
+        name = self.draft["name"].strip() or self.default_name()
+        if self._is_remote():
+            headers, secrets = self._remote_headers()
+            cfg = ServerConfig(
+                name=name, type=self.draft["transport"], url=self.draft["url"],
+                headers=dict(headers), oauth=self.draft["oauth"] == "yes",
+                scope=self.draft["scope"],
+            )
+            return WizardPlan(config=cfg, scope=self.draft["scope"], secrets=secrets)
+
         argv = self._argv()
         env = {var: "${" + var + "}" for var in self.draft["env_vars"]}
         cfg = ServerConfig(
-            name=self.draft["name"].strip(),
-            command=argv,
-            env=env,
-            scope=self.draft["scope"],
+            name=name, command=argv, env=env, scope=self.draft["scope"],
         )
         secrets = []
         env_refs = []
@@ -298,8 +392,38 @@ class McpWizard:
     def preview(self) -> str:
         """确认页正文：脱敏后的配置片段 + 写入位置 + 风险提示。"""
         name = self.draft["name"] or self.default_name()
-        argv = self._argv()
         lines = []
+        if self._is_remote():
+            entry = {"type": self.draft["transport"], "url": self.draft["url"]}
+            if self.draft["oauth"] == "yes":
+                entry["oauth"] = True
+            headers, _ = self._remote_headers()
+            if headers:
+                entry["headers"] = dict(headers)
+            if self.draft["scope"] == "project":
+                path = Path(self.workspace) / ".smithcode" / "mcp.json"
+                lines.append(f"写入位置: {path}")
+                lines.append(json.dumps(
+                    {"mcpServers": {name: entry}}, ensure_ascii=False, indent=2
+                ))
+            else:
+                lines.append(f"写入位置: {config.config_path()}")
+                lines.append(f"[mcp.servers.{name}]")
+                lines.append(f"type = {json.dumps(entry['type'], ensure_ascii=False)}")
+                lines.append(f"url = {json.dumps(entry['url'], ensure_ascii=False)}")
+                if self.draft["oauth"] == "yes":
+                    lines.append("oauth = true")
+                if headers:
+                    lines.append(f"headers = {json.dumps(dict(headers), ensure_ascii=False)}")
+            lines.append("")
+            lines.append("提醒: 该服务器将以你的本机权限运行；远程内容按不可信处理。")
+            if self.draft["oauth"] == "yes":
+                lines.append("OAuth 授权：保存后运行 /mcp auth " + name + " 完成浏览器登录。")
+            if self.draft["scope"] == "project":
+                lines.append("项目配置会随仓库提交，密钥只保存为 ${VAR} 引用。")
+            return "\n".join(lines)
+
+        argv = self._argv()
         if self.draft["scope"] == "project":
             path = Path(self.workspace) / ".smithcode" / "mcp.json"
             lines.append(f"写入位置: {path}")
@@ -349,6 +473,38 @@ def apply_plan(service, plan: WizardPlan):
     for var, value in plan.secrets:
         store_secret(plan.config.name, var, value)
     return service.add(plan.config, plan.scope)
+
+
+def _parse_headers(text: str):
+    """解析向导里的请求头输入（`K=V, K2=V2`）；返回 pairs 或错误文案。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    pairs = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            return f"请求头需要 K=V 形式: {chunk!r}"
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        if not key:
+            return "请求头名称不能为空"
+        pairs.append((key, value.strip()))
+    return pairs
+
+
+def _header_var(key: str) -> str:
+    return "MCP_HEADER_" + re.sub(r"[^A-Za-z0-9_]", "_", key).upper()
+
+
+def _name_from_url(url: str) -> str:
+    """从 URL 推断默认服务器名：mcp.linear.app/mcp → linear。"""
+    host = (urlparse(url).hostname or "").lower()
+    host = host.removeprefix("mcp.")
+    label = host.split(".")[0]
+    return re.sub(r"[^A-Za-z0-9_-]", "-", label) or "mcp"
 
 
 def _split_command(text: str) -> list:

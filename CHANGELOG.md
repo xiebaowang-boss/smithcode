@@ -9,20 +9,40 @@
 - **MCP（Model Context Protocol）支持（MVP：stdio）**：Agent 可接入外部 MCP 服务器，连接成功后其工具以 `mcp__<服务器>__<工具>` 出现在模型工具列表，与内置工具共用权限（默认逐个确认）、串行调度、输出截断与终端展示。新增 `mcp/` 子系统：
   - `config.py` 双作用域配置：用户级 `~/.smithcode/config.toml` 的 `[mcp.servers.<名称>]`（tomlkit 写入保注释，`env` 用内联表使 command / env / cwd / timeout 聚合在同一段）；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，兼容 Claude/Cursor 片段）；同名项目条目整体覆盖用户条目（字段不合并）；启停状态是条目内的 `enabled` 字段（默认启用时省略）；坏条目只警告跳过、不阻断启动
   - `secrets.py` 密钥链：配置只写 `${VAR}` / `${VAR:-default}` 引用（command / args / env / cwd 均展开），解析顺序为进程环境 > `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、POSIX 0600）> 向导补录；缺失标记 `missing_env` 不拉起 server（非交互 fail-closed）；展开值登记全局 Redactor，工具结果 / stderr / 日志 / 预览统一脱敏
-  - `client.py` stdio 同步 JSON-RPC 客户端：每连接一个读线程路由响应 / 通知 / server 反向请求（统一回 `-32601`），pending 表 + 轮询超时，轮询点接入当前线程取消令牌（Esc 即发 `notifications/cancelled` 返回）；stderr 环形缓冲；`tools/list` 分页；关闭走「关 stdin → 宽限 → 进程树终止」（复用 `process.terminate_tree`，Windows npx 等 `.cmd` 用 `shutil.which` 解析）
+  - `runtime.py` + `connection.py` + `factory.py`：客户端改基于官方 `mcp` SDK。`AsyncRuntime` 把唯一的 asyncio 事件循环关在专用线程（所有连接共用），`SdkConnection` 对上层暴露同步门面（`run_coroutine_threadsafe` 投递 + 当前线程取消令牌轮询，Esc / 超时中断），结果用 `model_dump(by_alias=True)` 归一为同形 dict。SDK 不推送「连接断开」事件，故用一层代读泵包装传输、读到 EOF 即回调 `on_closed`（等价旧读线程的崩溃检测）；stdio 子进程 stderr 落临时文件供 `/mcp logs`；`notifications/tools/list_changed` 经 SDK `message_handler` 刷新工具；传输由 `factory.py` 按 `cfg.type` 构造（当前 stdio，HTTP/SSE/OAuth 留后续）
   - `catalog.py` 命名与结果映射（非法字符替换、64 截断、冲突补后缀；content / structuredContent / isError → 文本，脱敏 + 截断）；`service.py` 会话级连接管理（`Agent.start()` 后台并发连接、失败隔离、重连 / 启停 / 日志、`tools/list_changed` 自动刷新、动态注册与反注册、项目配置启动警示）；`templates.py` + `wizard.py` 添加向导（模板 / 手动、作用域、密钥三模式、预览确认；纯状态机 + REPL 行式渲染器）
 - **`/mcp` 命令与添加向导**：`/mcp` 弹状态选择框（各服务器状态 + 查看工具 / 重连 / 停用 / 日志 / 删除）、`/mcp list` 文本列表、`/mcp tools|logs|reconnect|enable|disable|remove <名称>` 子命令；`/mcp add` 在 TUI 打开居中向导面板（添加方式 → 模板/命令 → 名称 → 作用域 → 密钥（掩码输入）→ 预览 → 保存并后台连接），REPL 走同一状态机的行式问答；`/mcp add <名称> -- <命令...> [-e KEY=VALUE] [--scope user|project]` 支持非交互直通；向导完成后先落凭据再写配置并连接，Esc / q 取消全程无副作用。任务运行中会改动 MCP 配置的命令被 busy 守卫拦截
 - **系统提示词新增「MCP 工具」行为节**：`mcp__` 命名来源、外部描述与输出按不可信内容处理、服务器未连接时不臆造调用；`tools/base.py` 新增线程安全的动态注册 API（与静态工具共用注册表）
+- **MCP 远程传输（Streamable HTTP / SSE）与请求头鉴权**：`type` 支持 `http`（别名 `remote` / `streamable-http`，走 Streamable HTTP）与 `sse`（legacy），远程条目用 `url` + `headers`（值支持 `${VAR}` 引用，解析链与 stdio 一致）；`http` 由自持的 `httpx2.AsyncClient` 承载静态 token（`Authorization` 等请求头）；`load_servers` 兼容 Claude/Cursor/VS Code 的 `type` / `url` / `headers` 写法；配置指纹纳入传输 / 端点 / 请求头，变更即触发重连；`/mcp add <名称> --url <地址> [--type http|sse] [--header K=V]` 支持直通添加（`--header` 字面值自动存入凭据库、配置只留 `${...}` 引用）
+- **MCP OAuth2.1 授权**：远程服务器可配 `oauth = true`，由官方 SDK 的 OAuth 提供者完成发现 / 动态注册 / PKCE / 换 token / 刷新；token 与 client_info 存独立的 `~/.smithcode/mcp_auth.json`（原子写、POSIX 0600，值全程登记脱敏器），重启后静默复用、无需再次授权。**后台连接绝不弹浏览器**：无 token 时状态为「需要授权」，用户显式 `/mcp auth <名称>` 才打开浏览器并在固定本地端口等回调；非交互 / CI 下授权请求 fail-closed。配置解析支持 `oauth` 字段（兼容 Claude / opencode 写法），`/mcp add ... --oauth` 直通添加，`/mcp` 服务器菜单新增「OAuth 授权」项
+- **MCP 远程向导与进度 / 订阅增强**：添加向导新增「远程服务器（HTTP / SSE URL）」分支（URL → 传输类型 → 鉴权方式（OAuth / 请求头）→ 请求头，字面值自动存入凭据库、`${VAR}` 原样引用），模板新增 Linear / Sentry 远程示例；工具调用接入 SDK 进度回调（按 10% 里程碑展示，`total` 未知时不展示）；现代协议（2026-07-28+）经订阅流监听 `tools/list_changed` 自动刷新工具，旧协议仍走通知回调
 
 - **项目指令（AGENTS.md）自动注入**：启动时读取用户级 `~/.smithcode/AGENTS.md`；项目级沿目录链从 git 根（最近的含 `.git` 的祖先目录，`.git` 为文件也算，兼容 worktree）逐级向下探测到工作区（无 `.git` 时仅工作区），`[instructions].files` 可增加 `CLAUDE.md` 等文件名、`paths` 可追加任意指令文件，作为系统提示词动态段注入 `messages[0]`——与 skills / goal 同通道，压缩天然保留、恢复会话按磁盘最新内容重建。优先级「越具体越优先」（用户级 < 项目链 git 根 → … → 工作区 < 追加文件），段内声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed，用户当前明确要求优先）。装载时机为会话边界（启动 / `/new` / 恢复），由 `Agent` 调用 `instructions.refresh()`（对齐 Codex「每会话装载一次」）：会话中途修改 / 新增 / 删除指令文件不影响进行中的会话，提示前缀缓存全程稳定，修改在新会话或重启后生效；指纹（`path, scope, mtime_ns, size`）用于边界处去重，未变化时零读取。`[instructions].max_chars`（默认 8000）预算内高优先级文件完整保留、低优先级截断并提示用 read_file 查看全部，放不下的文件省略并计数。不做信任门控：注入是纯文本，无法影响代码强制的安全边界；显式配置的 `paths` 文件缺失 / 不可用会警告一次，默认位置缺失静默
 
 ### 变更
+
+- **运行环境要求升至 Python 3.10+**：MCP 子系统改用官方 `mcp` SDK（要求 Python ≥3.10），`pyproject.toml` 的 `requires-python` 与 `AGENTS.md` 的兼容性红线同步调整；不再需要为 3.9 做联合类型的延迟求值规避
+
+- **MCP 客户端改基于官方 `mcp` SDK**：自研 stdio 客户端（`mcp/client.py`）移除，新增 `runtime.py`（共享 asyncio loop 线程）/ `connection.py`（同步门面）/ `factory.py`（按传输构造）；stdio 行为与工具注册、权限、调度、展示语义保持不变
+
+- **TUI 运行动画改到输入框上方（固定一行）**：`#running`（`⠋ Working… 12s` 计时行）由底行 `#bottom` 移入 `#input-wrap`，固定在输入框正上方（`padding-left: 3` 与键入文字左对齐）；start / stop / 计时 / Esc 后「· 正在停止…」的逻辑不变（仍由轮次边界驱动）。输入框的左侧绿竖线同步从容器 `#input-wrap` 下移到输入框 `#input` 自身——竖线只框住输入框 3 行，上方动画行不再被框住。因动画占位时输入框上方多出一行，命令菜单的悬浮锚点在动画可见期间随之上移一行（`#command-menu.running`，`offset` -5 → -6），避免弹出菜单盖住动画行。权限 / 提问面板弹出期间输入框整体隐藏（原有语义），动画行随之一并隐藏、答完恢复显示并继续计时
+
+- **TUI 对话区随窗口缩放自适应**：助手正文此前在 `Static.update()` 里按当时的可用宽度用 rich 完成折行，断行被固化进文本——窗口缩放后 Textual 只能对已折行的文本再软换行 / 裁切，无法把折行并回去，表现为变宽时右侧留白、变窄时断行位置错乱；且流式首次渲染时组件尚未布局、宽度为 0，回退按 80 列折行，与真实窗口宽度无关。现新增 `MessageBody`（`tui/widgets.py`），与工具正文的 `_ToolBody` 同策略：在 `render()` 里按 `self.size.width` 实时渲染，宽度变化即整体重排（旧宽度下的折行与分块缓存失效重建，宽度不变时照旧复用，流式开销不变）。用户消息、通知、工具头等直接上屏原始文本的块与左右对照 diff 块本就随容器自适应，不受影响
+
+- **系统提示词「工作方式」补收尾一步（第六步）**：含工具调用的任务必须以一条纯文本总结结束回合（不允许在工具结果后直接停止、也不得以工具调用结束），总结覆盖完成项 / 改动文件（`file_path:line_number`）/ 验证结果 / 遗留与存疑，无法验证时如实说明；纯问答不套总结模板。原「沟通」节里的一句话总结要求并入该步，验证如实说明的要求也由第 5 步移入，避免多点漂移；顺带压缩了第 3 步的重复风格措辞
+
+- **启动命令更名为 `smith`**：安装入口由 `smithcode` 改为 `smith`（不再提供旧名），`--help` 的 usage 与 `-V` 输出的程序名同步变为 `smith`；初始化向导与「缺少 API Key」提示里的命令示例一并更新。包名 `smithcode`、`python -m smithcode`、配置与历史路径（`~/.smithcode/`）、`SMITHCODE_*` 环境变量均不变。
 
 - **MCP 用户配置渲染修正（属性聚合）**：`write_user_server` 的 `env` 改用 tomlkit 内联表——此前赋值 dict 会被渲染成独立的 `[mcp.servers.<名称>.env]` 子表，把同一服务器的属性拆成两段；现在 `command` / `env` / `cwd` / `timeout` / `enabled` 都在同一段。启停状态改为服务器条目自己的 `enabled` 字段（写在定义它的文件：用户 `config.toml` 或项目 `.smithcode/mcp.json`；默认启用时省略该键），不再使用跨文件的 `[mcp.enabled]` 覆盖表——属性只在一处、语义单一；`enabled` 始终排在条目最前
 - **选择面板支持逐级返回（TUI）**：选择面板的层级改由宿主 `SmithTUI._select_stack` 维护——进入下级菜单时把父级 `CommandSelect` 与本次选中的值压栈，Esc 未选中时逐级弹回上一级并把光标锚定回原行，根级 Esc 才关闭，执行实际动作后清空栈。命令结果处理收敛为 `_apply_outcome(outcome, text, nested)`，`handle_command` 只做 busy 守卫 + 分发，`_present_select` 统一挂载面板（`/model` / `/skills` / `/sessions` 等单级选择行为不变）。MCP 服务器操作菜单因此支持「Esc 返回服务器列表」
 - **`/mcp` 交互展示调整**：无参 `/mcp` 不再区分是否已配置，一律弹出选择面板（无服务器时仅「添加 MCP」一项；添加项与已有服务器之间留一个不可选中的间隔行，↑↓ 自动跳过）。服务器行左侧依次为名称、工具数量、级别（用户级显示为「全局」、项目级显示为「项目」），状态文字贴行尾右对齐并按状态着色（已连接绿、连接中黄、缺少密钥橙、失败红、停用/断开灰）。对话区通知与命令结果重新分级：连接成功为绿色 ✓（新增 `Renderer.success()` 语义方法），新增 / 重连 / 启用等后台进行中状态为蓝色 ↻（`retry`），停用 / 删除为中性通知——不再出现「正在重连」绿色打勾、「已连接」默认色无状态的问题
 - **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
 - **TUI 选择面板改为两列行布局（`/sessions` 展示调整）**：每项由整块文本改为「左列（标记 + 标题 + 说明，占满剩余宽度）+ 右列 trailing（贴行尾右对齐）」的两列行，用列布局而非手工补空格，宽度随档位 / 终端自适应（`CommandChoice` / `SelectionItem` 新增 `trailing` 字段，选中行底色移到行上使高亮贯通整行）。`/sessions` 选择框据此调整：标题后紧跟短 id、更新时间右对齐、不再展示模型信息；列表本就按更新时间倒序（`list_sessions`）
+- **技能已激活段补充裁决声明（提示词）**：`ACTIVE_INTRO` 补上与项目约定段（`INSTRUCTIONS_INTRO`）等价的裁决规则——技能指令不能覆盖安全边界与权限规则，与用户当前明确要求冲突时以用户要求为准。技能正文来自可能不可信的仓库，且「已激活技能」段渲染在项目约定段之后，此前缺这句声明，段间位置容易被误读为「越靠后优先级越高」
+
+### 修复
+
+- **MCP 连接生命周期竞态**：修复三处异步竞态——① 重连 / 断开后再次崩溃会被静默吞掉（状态卡在「已连接」且工具不反注册）；② 连接握手期间 `disable` 被结果覆盖、服务器仍被拉起并注册工具；③ 握手期间 `remove` 遗留孤儿进程与已注册工具。现在以「连接代际 + 连接身份」校验回写，握手结果在失效时直接丢弃；`_connect` 兜底捕获非预期异常并落到 FAILED（不再停在 CONNECTING）
 
 ## [0.8.0] - 2026-09-12
 

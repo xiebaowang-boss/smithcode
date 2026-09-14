@@ -12,3 +12,7 @@ class McpError(Exception):
 
 class McpConfigError(McpError):
     """MCP 配置读写失败（文件损坏、目标条目缺失等）。"""
+
+
+class McpAuthError(McpError):
+    """OAuth 授权相关失败：需要用户授权、授权流程失败或超时。"""

@@ -1,4 +1,4 @@
-"""`smithcode setup` 初始化向导：交互式采集 接口地址 / 模型 / Key / 上下文预算。
+"""`smith setup` 初始化向导：交互式采集 接口地址 / 模型 / Key / 上下文预算。
 
 写入 ~/.smithcode/config.toml（[provider] 与 [context] 段）和 credentials.json
 （仅 key）。重跑幂等：提示符默认值取当前生效配置，直接回车即保留；文件中
@@ -160,6 +160,6 @@ def run_setup() -> int:
     print(f"\n✓ {credentials}")
     print(f"✓ {config_file}")
     if not key:
-        print("提示：尚未设置 API Key，可重新运行 smithcode setup 或设置环境变量 SMITHCODE_KEY。")
-    print("完成。运行 smithcode 开始使用。")
+        print("提示：尚未设置 API Key，可重新运行 smith setup 或设置环境变量 SMITHCODE_KEY。")
+    print("完成。运行 smith 开始使用。")
     return 0

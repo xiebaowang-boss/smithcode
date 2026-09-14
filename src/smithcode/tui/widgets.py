@@ -61,6 +61,100 @@ class UiAction(Message):
 
 # ---------- 消息区 ----------
 
+# 正文渲染的回退宽度（组件尚未布局、拿不到真实宽度时）与流式重排节流间隔
+_BODY_FALLBACK_WIDTH = 80
+_BODY_REFRESH_INTERVAL = 0.016  # ≈ 一帧
+
+
+class MessageBody(Static):
+    """消息正文承载块：按当前可用宽度渲染，窗口缩放自动重排。
+
+    正文多为 markdown（经 rich 渲染成带样式的文本），但这里不假定具体格式——
+    rich 渲染会把折行**固化进 Text**，而 Textual 只能对已有文本做软换行 / 裁切，
+    无法把已折好的行并回去——正文因此不能在 update() 里一次定型。与工具正文的
+    `_ToolBody` 同策略：在 render() 里按 self.size.width 实时生成，窗口缩放时
+    Textual 重排即自动按新宽度重渲染。
+
+    源文本按块增量缓存（split_md_blocks）：宽度不变时复用已渲染结果，流式开销
+    与原实现一致；宽度一变则整体重排。
+    """
+
+    def __init__(self, text: str = "", **kwargs) -> None:
+        kwargs.setdefault("markup", False)
+        super().__init__("", **kwargs)
+        self._raw = text
+        self._rendered = Text()
+        self._width = 0  # 最近一次渲染所用的宽度
+        self._done_blocks: list[str] = []  # 已完结块原文（与 _prefix 对齐）
+        self._prefix: Text | None = None  # 已完结块的渲染缓存
+        self._dirty = True  # 源文本有更新、待重渲染
+        self._last_refresh = 0.0  # 上次触发重排的时刻（流式节流用）
+
+    @property
+    def content(self) -> Text:
+        """最近一次渲染出的文本（只读；动态渲染块不适用 Static.content）。"""
+        return self._rendered
+
+    def append(self, chunk: str) -> None:
+        """追加源文本（流式）；节流重排，密集 chunk 每帧最多重排一次。"""
+        self._raw += chunk
+        self._dirty = True
+        now = time.monotonic()
+        if now - self._last_refresh < _BODY_REFRESH_INTERVAL:
+            return
+        self._last_refresh = now
+        self.refresh(layout=True)
+
+    def finalize(self) -> None:
+        """流结束：绕过节流，确保最终态立即定型。"""
+        self._dirty = True
+        self._last_refresh = time.monotonic()
+        self.refresh(layout=True)
+
+    def render(self) -> Text:
+        width = self.size.width or self._width or _BODY_FALLBACK_WIDTH
+        if width != self._width:
+            # 宽度变了：旧宽度下的折行与分块缓存全部失效，整体重排
+            self._width = width
+            self._done_blocks = []
+            self._prefix = None
+            self._dirty = True
+        if self._dirty:
+            self._rendered = self._render_body(width)
+            self._dirty = False
+        return self._rendered
+
+    def _render_body(self, width: int) -> Text:
+        """按块增量渲染正文（markdown 源）：已完结块渲染一次缓存复用，尾部块整块重渲染。
+
+        完结块对齐按**内容**而非数量：流式 chunk 可能把"  "前导空格先送来
+        被误判成空行（块提前完结），下个 chunk 又让它缩回未完结——数量对齐
+        会漏渲后续块（内容丢失），逐块内容比对则能自动发现并重建前缀。
+        """
+        done, tail = split_md_blocks(self._raw)
+        # 与已渲染前缀逐块比对：找公共前缀长度；不同即从该块起重建
+        common = 0
+        for a, b in zip(self._done_blocks, done):
+            if a != b:
+                break
+            common += 1
+        if common < len(done) or common < len(self._done_blocks):
+            self._done_blocks = done[:common]
+            piece = render_markdown("\n\n".join(done[common:]), width)
+            if common == 0:
+                self._prefix = piece
+            else:
+                self._prefix = render_markdown("\n\n".join(done[:common]), width)
+                self._prefix.append("\n\n")
+                self._prefix.append_text(piece)
+        text = Text()
+        if self._prefix is not None:
+            text.append_text(self._prefix)
+            if tail:
+                text.append("\n\n")
+        text.append_text(render_markdown(tail, width))
+        return text
+
 
 class ChatView(VerticalScroll):
     """聊天消息区：普通消息为独立块；流式消息单块原地更新。"""
@@ -70,12 +164,9 @@ class ChatView(VerticalScroll):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._kind: str | None = None
-        self._text: Text | None = None
-        self._raw = ""  # 正文段落纯文本累积，按块增量转 markdown 渲染
-        self._block: Static | None = None
-        self._prefix: Text | None = None  # 已渲染完结块的缓存（与 _done_blocks 对齐）
-        self._done_blocks: list[str] = []  # 已渲染完结块的原文，内容对齐防计数漂移
-        self._last_render = 0.0  # 上次渲染时刻（尾部块重渲染节流用）
+        self._text: Text | None = None  # reasoning 等纯文本流的缓冲
+        self._block: Static | None = None  # 纯文本流承载块
+        self._body: MessageBody | None = None  # 正文承载块
         self._context_group: ContextGroup | None = None  # 当前进行中的「已探索」组
         self._context_groups: dict[int, ContextGroup] = {}  # 未出结果的上下文工具 → 所属组
         self._tool_widgets: dict[int, ToolCall] = {}  # tool_id → pending 中的工具行
@@ -270,6 +361,10 @@ class ChatView(VerticalScroll):
         self._context_groups.clear()
         self._tool_widgets.clear()
         self._thinking_block = None
+        self._kind = None
+        self._text = None
+        self._block = None
+        self._body = None
         self.remove_children()
 
     def _finalize_context(self) -> None:
@@ -280,13 +375,13 @@ class ChatView(VerticalScroll):
 
     def begin_stream(self, kind: str) -> None:
         self._kind = kind
-        self._text = Text()
-        self._raw = ""
-        self._prefix = None
-        self._done_blocks = []
-        self._last_render = 0.0
-        if kind == "reasoning":
-            self._text.append("[Thinking] ", style="grey50")
+        if kind == "content":
+            # 正文走 MessageBody：按当前宽度实时渲染，窗口缩放自动重排
+            self._body = MessageBody(classes="chat-item assistant-stream")
+            self._body.can_focus = False
+            self._mount_block(self._body)
+            return
+        self._text = Text("[Thinking] ", style="grey50") if kind == "reasoning" else Text()
         # 助手正文统一缩进 3（opencode 式：用户块 2 / 助手流 3，层次差产生交叉感）
         self._block = self._mk(self._text, classes="assistant-stream")
 
@@ -295,80 +390,43 @@ class ChatView(VerticalScroll):
             self.end_stream()
             self.begin_stream(kind)
         if kind == "content":
-            self._raw += chunk
-            self._refresh_markdown()
+            at_bottom = self._at_bottom()
+            if self._body is not None:
+                self._body.append(chunk)
+            self._follow(at_bottom)
             return
         at_bottom = self._at_bottom()
         self._text.append(chunk, style="grey50")
         self._block.update(self._text)
         self._follow(at_bottom)
 
-    def _refresh_markdown(self) -> None:
-        """按块增量渲染（Claude Code / opencode 式）：已完结块渲染一次缓存
-        复用，尾部未完结块整块重渲染并节流（16ms ≈ 一帧）。
-
-        完结块对齐按**内容**而非数量：流式 chunk 可能把"  "前导空格先送来
-        被误判成空行（块提前完结），下个 chunk 又让它缩回未完结——数量对齐
-        会漏渲后续块（内容丢失），逐块内容比对则能自动发现并重建前缀。
-        """
-        done, tail = split_md_blocks(self._raw)
-        # 与已渲染前缀逐块比对：找公共前缀长度；不同即从该块起重建
-        common = 0
-        for a, b in zip(self._done_blocks, done):
-            if a != b:
-                break
-            common += 1
-        if common < len(done) or common < len(self._done_blocks):
-            self._done_blocks = done[:common]
-            piece = render_markdown("\n\n".join(done[common:]), self._block.size.width or 80)
-            if common == 0:
-                self._prefix = piece
-            else:
-                self._prefix = render_markdown(
-                    "\n\n".join(done[:common]), self._block.size.width or 80
-                )
-                self._prefix.append("\n\n")
-                self._prefix.append_text(piece)
-            self._last_render = 0.0  # 块完结不受节流约束
-        if self._last_render and time.monotonic() - self._last_render < 0.016:
-            return
-        self._last_render = time.monotonic()
-        at_bottom = self._at_bottom()
-        self._text = Text()
-        if self._prefix is not None:
-            self._text.append_text(self._prefix)
-            if tail:
-                self._text.append("\n\n")
-        self._text.append_text(render_markdown(tail, self._block.size.width or 80))
-        self._block.update(self._text)
-        self._follow(at_bottom)
-
     def end_stream(self) -> None:
-        """流结束：走与流式期间相同的按块增量渲染路径，最后只剩尾部块的
-        一次定型，与中途渲染视觉连续（不再有"文本突然变漂亮"的整段跳变）。
+        """流结束：尾部块最后一次定型，与中途渲染视觉连续（不再有"文本突然
+        变漂亮"的整段跳变）。
 
         经 rich Console 渲染为带样式的 Text（而不是直接塞 Markdown 渲染对象），
-        Static 内容仍是文本——窄终端换行交给 Textual 处理，测试也能直接读文本。
+        正文块内容仍是文本——窄终端换行交给 Textual 处理，测试也能直接读文本。
         """
-        if self._kind == "content" and self._block is not None and self._raw.strip():
-            self._last_render = 0.0  # 结束时绕过节流，确保最终态立即定型
-            self._refresh_markdown()
+        if self._kind == "content" and self._body is not None:
+            self._body.finalize()
         self._kind = None
         self._text = None
-        self._raw = ""
-        self._prefix = None
-        self._done_blocks = []
         self._block = None
+        self._body = None
 
     def _mk(self, renderable, classes: str | None = None) -> Static:
-        self._finalize_context()
-        at_bottom = self._at_bottom()
         # 所有顶层消息统一带 chat-item：缩进 / 间距的唯一来源（见 app.py 的 CSS）
         block = Static(renderable, classes="chat-item" if not classes else f"chat-item {classes}")
         block.can_focus = False
+        self._mount_block(block)
+        return block
+
+    def _mount_block(self, block) -> None:
+        """挂载一个顶层消息组件（统一的锚定跟随与分组封口）。"""
+        self._finalize_context()
+        at_bottom = self._at_bottom()
         self.mount(block)
         self._follow(at_bottom)
-        return block
 
     # ----- 底部锚定跟随 -----
 
@@ -387,7 +445,7 @@ class ChatView(VerticalScroll):
 
 
 class RunningIndicator(Static):
-    """对话执行时的运行动画：显示在输入框下方，执行中可见、结束隐藏。
+    """对话执行时的运行动画：固定在输入框上方一行，执行中可见、结束隐藏。
 
     opencode 式：文案带实时已用秒数，start/stop 由轮次边界驱动。
     """

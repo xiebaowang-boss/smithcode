@@ -85,6 +85,25 @@ def test_clear_secret(isolated):
     assert mcp_secrets.lookup("github", "TOKEN") is None
 
 
+def test_expand_headers(isolated, monkeypatch):
+    monkeypatch.setenv("MCP_TEST_TOKEN", "env-value")
+    resolved = mcp_secrets.resolve(_server(
+        type="http", url="https://a/mcp",
+        headers={"Authorization": "Bearer ${MCP_TEST_TOKEN}"},
+    ))
+    assert resolved.headers == {"Authorization": "Bearer env-value"}
+    assert resolved.missing == []
+    assert "env-value" not in mcp_secrets.redactor().scrub("x env-value y")
+
+
+def test_header_missing_recorded(isolated):
+    resolved = mcp_secrets.resolve(_server(
+        command=[], headers={"X-Token": "${NOPE_HEADER_VAR}"}
+    ))
+    assert resolved.missing == ["NOPE_HEADER_VAR"]
+    assert resolved.headers == {"X-Token": "${NOPE_HEADER_VAR}"}
+
+
 def test_redactor_ignores_short_values():
     redactor = mcp_secrets.Redactor()
     redactor.add("ab")
