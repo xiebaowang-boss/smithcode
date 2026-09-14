@@ -82,6 +82,10 @@ class Renderer:
     def info(self, text: str) -> None:
         """状态/上下文等普通信息。"""
 
+    def success(self, text: str) -> None:
+        """成功级信息（连接成功、操作完成等）；默认降级为 info，子类可覆盖着色。"""
+        self.info(text)
+
     def warn(self, text: str) -> None:
         """警告级信息（重试、降级等）；默认降级为 info，子类可覆盖着色。"""
         self.info(text)
@@ -206,6 +210,9 @@ class ConsoleRenderer(Renderer):
 
     def info(self, text: str) -> None:
         print(text, flush=True)
+
+    def success(self, text: str) -> None:
+        print(f"✓ {text}", flush=True)
 
     def ask_text(self, question: str) -> str:
         flush_pending_input()  # 丢弃缓冲区内提前键入/粘贴的内容，防止被误当成回答

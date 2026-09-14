@@ -28,6 +28,7 @@ from .llm.models import (
     ModelCatalog,
     RemoteModelSource,
 )
+from .mcp import McpService
 from .permission import Permission
 from .plan import has_active, render_current, summary
 from .session import Session
@@ -222,6 +223,8 @@ class Agent:
         self.session = session or Session()
         self.permission = Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
+        # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
+        self.mcp = McpService()
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
         self.max_iterations = max_iterations or config.MAX_ITERATIONS
         # 进程级服务留在 Agent（不随会话存取）：llm / permission / models / 令牌
@@ -258,6 +261,7 @@ class Agent:
         self.models.bootstrap()
         self.refresh_skills()
         instructions.refresh()
+        self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
 
     def refresh_skills(self) -> list:
         """重新发现技能并同步 use_skill 工具 schema（启动与 /skills refresh 共用）。"""
@@ -430,7 +434,8 @@ class Agent:
         return True
 
     def close(self) -> None:
-        """进程退出前收尾：flush + 关闭转录句柄。"""
+        """进程退出前收尾：关闭 MCP 连接 + flush + 关闭转录句柄。"""
+        self.mcp.stop()
         if self.session.store is not None:
             self.session.store.close()
 

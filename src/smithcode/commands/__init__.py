@@ -4,7 +4,16 @@
 导入行加上模块名——分发、/help 文案、两端宿主渲染全部自动生效。
 """
 
-from . import base, effort, goal, info, model, session, skills  # noqa: F401  导入即注册
+from . import (  # noqa: F401  导入即注册
+    base,
+    effort,
+    goal,
+    info,
+    mcp,
+    model,
+    session,
+    skills,
+)
 from .base import (  # noqa: F401
     KIND_BLOCK,
     KIND_LINE,
@@ -13,6 +22,7 @@ from .base import (  # noqa: F401
     CommandContext,
     CommandResult,
     CommandSelect,
+    CommandWizard,
     all_commands,
     complete_commands,
     get_command,

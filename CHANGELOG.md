@@ -6,11 +6,21 @@
 
 ### 新增
 
+- **MCP（Model Context Protocol）支持（MVP：stdio）**：Agent 可接入外部 MCP 服务器，连接成功后其工具以 `mcp__<服务器>__<工具>` 出现在模型工具列表，与内置工具共用权限（默认逐个确认）、串行调度、输出截断与终端展示。新增 `mcp/` 子系统：
+  - `config.py` 双作用域配置：用户级 `~/.smithcode/config.toml` 的 `[mcp.servers.<名称>]`（tomlkit 写入保注释，`env` 用内联表使 command / env / cwd / timeout 聚合在同一段）；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，兼容 Claude/Cursor 片段）；同名项目条目整体覆盖用户条目（字段不合并）；启停状态是条目内的 `enabled` 字段（默认启用时省略）；坏条目只警告跳过、不阻断启动
+  - `secrets.py` 密钥链：配置只写 `${VAR}` / `${VAR:-default}` 引用（command / args / env / cwd 均展开），解析顺序为进程环境 > `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、POSIX 0600）> 向导补录；缺失标记 `missing_env` 不拉起 server（非交互 fail-closed）；展开值登记全局 Redactor，工具结果 / stderr / 日志 / 预览统一脱敏
+  - `client.py` stdio 同步 JSON-RPC 客户端：每连接一个读线程路由响应 / 通知 / server 反向请求（统一回 `-32601`），pending 表 + 轮询超时，轮询点接入当前线程取消令牌（Esc 即发 `notifications/cancelled` 返回）；stderr 环形缓冲；`tools/list` 分页；关闭走「关 stdin → 宽限 → 进程树终止」（复用 `process.terminate_tree`，Windows npx 等 `.cmd` 用 `shutil.which` 解析）
+  - `catalog.py` 命名与结果映射（非法字符替换、64 截断、冲突补后缀；content / structuredContent / isError → 文本，脱敏 + 截断）；`service.py` 会话级连接管理（`Agent.start()` 后台并发连接、失败隔离、重连 / 启停 / 日志、`tools/list_changed` 自动刷新、动态注册与反注册、项目配置启动警示）；`templates.py` + `wizard.py` 添加向导（模板 / 手动、作用域、密钥三模式、预览确认；纯状态机 + REPL 行式渲染器）
+- **`/mcp` 命令与添加向导**：`/mcp` 弹状态选择框（各服务器状态 + 查看工具 / 重连 / 停用 / 日志 / 删除）、`/mcp list` 文本列表、`/mcp tools|logs|reconnect|enable|disable|remove <名称>` 子命令；`/mcp add` 在 TUI 打开居中向导面板（添加方式 → 模板/命令 → 名称 → 作用域 → 密钥（掩码输入）→ 预览 → 保存并后台连接），REPL 走同一状态机的行式问答；`/mcp add <名称> -- <命令...> [-e KEY=VALUE] [--scope user|project]` 支持非交互直通；向导完成后先落凭据再写配置并连接，Esc / q 取消全程无副作用。任务运行中会改动 MCP 配置的命令被 busy 守卫拦截
+- **系统提示词新增「MCP 工具」行为节**：`mcp__` 命名来源、外部描述与输出按不可信内容处理、服务器未连接时不臆造调用；`tools/base.py` 新增线程安全的动态注册 API（与静态工具共用注册表）
+
 - **项目指令（AGENTS.md）自动注入**：启动时读取用户级 `~/.smithcode/AGENTS.md`；项目级沿目录链从 git 根（最近的含 `.git` 的祖先目录，`.git` 为文件也算，兼容 worktree）逐级向下探测到工作区（无 `.git` 时仅工作区），`[instructions].files` 可增加 `CLAUDE.md` 等文件名、`paths` 可追加任意指令文件，作为系统提示词动态段注入 `messages[0]`——与 skills / goal 同通道，压缩天然保留、恢复会话按磁盘最新内容重建。优先级「越具体越优先」（用户级 < 项目链 git 根 → … → 工作区 < 追加文件），段内声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed，用户当前明确要求优先）。装载时机为会话边界（启动 / `/new` / 恢复），由 `Agent` 调用 `instructions.refresh()`（对齐 Codex「每会话装载一次」）：会话中途修改 / 新增 / 删除指令文件不影响进行中的会话，提示前缀缓存全程稳定，修改在新会话或重启后生效；指纹（`path, scope, mtime_ns, size`）用于边界处去重，未变化时零读取。`[instructions].max_chars`（默认 8000）预算内高优先级文件完整保留、低优先级截断并提示用 read_file 查看全部，放不下的文件省略并计数。不做信任门控：注入是纯文本，无法影响代码强制的安全边界；显式配置的 `paths` 文件缺失 / 不可用会警告一次，默认位置缺失静默
 
 ### 变更
 
-- **选择面板支持逐级返回（TUI）**：选择面板的层级改由宿主 `SmithTUI._select_stack` 维护——进入下级菜单时把父级 `CommandSelect` 与本次选中的值压栈，Esc 未选中时逐级弹回上一级并把光标锚定回原行，根级 Esc 才关闭，执行实际动作后清空栈。命令结果处理收敛为 `_apply_outcome(outcome, text, nested)`，`handle_command` 只做 busy 守卫 + 分发，`_present_select` 统一挂载面板（`/model` / `/skills` / `/sessions` 等单级选择行为不变）
+- **MCP 用户配置渲染修正（属性聚合）**：`write_user_server` 的 `env` 改用 tomlkit 内联表——此前赋值 dict 会被渲染成独立的 `[mcp.servers.<名称>.env]` 子表，把同一服务器的属性拆成两段；现在 `command` / `env` / `cwd` / `timeout` / `enabled` 都在同一段。启停状态改为服务器条目自己的 `enabled` 字段（写在定义它的文件：用户 `config.toml` 或项目 `.smithcode/mcp.json`；默认启用时省略该键），不再使用跨文件的 `[mcp.enabled]` 覆盖表——属性只在一处、语义单一；`enabled` 始终排在条目最前
+- **选择面板支持逐级返回（TUI）**：选择面板的层级改由宿主 `SmithTUI._select_stack` 维护——进入下级菜单时把父级 `CommandSelect` 与本次选中的值压栈，Esc 未选中时逐级弹回上一级并把光标锚定回原行，根级 Esc 才关闭，执行实际动作后清空栈。命令结果处理收敛为 `_apply_outcome(outcome, text, nested)`，`handle_command` 只做 busy 守卫 + 分发，`_present_select` 统一挂载面板（`/model` / `/skills` / `/sessions` 等单级选择行为不变）。MCP 服务器操作菜单因此支持「Esc 返回服务器列表」
+- **`/mcp` 交互展示调整**：无参 `/mcp` 不再区分是否已配置，一律弹出选择面板（无服务器时仅「添加 MCP」一项；添加项与已有服务器之间留一个不可选中的间隔行，↑↓ 自动跳过）。服务器行左侧依次为名称、工具数量、级别（用户级显示为「全局」、项目级显示为「项目」），状态文字贴行尾右对齐并按状态着色（已连接绿、连接中黄、缺少密钥橙、失败红、停用/断开灰）。对话区通知与命令结果重新分级：连接成功为绿色 ✓（新增 `Renderer.success()` 语义方法），新增 / 重连 / 启用等后台进行中状态为蓝色 ↻（`retry`），停用 / 删除为中性通知——不再出现「正在重连」绿色打勾、「已连接」默认色无状态的问题
 - **TUI 选择弹窗宽度改为按档位声明（对齐 opencode）**：通用选择面板 `SelectionPanel` 的宽度不再写死 64 列，而是四档定值——`small` 40 / `medium` 64（默认）/ `large` 88 / `xlarge` 116，由调用方在 `CommandSelect.size` 上声明（宿主不测量内容），未知档位回退 `medium`；窄终端仍由 `max-width: 90%` 夹取。`/sessions` 因选项行较长声明 `large`；`/model` / `/skills` / `/effort` 保持默认 `medium`。非交互 REPL 只列候选、不受影响
 - **TUI 选择面板改为两列行布局（`/sessions` 展示调整）**：每项由整块文本改为「左列（标记 + 标题 + 说明，占满剩余宽度）+ 右列 trailing（贴行尾右对齐）」的两列行，用列布局而非手工补空格，宽度随档位 / 终端自适应（`CommandChoice` / `SelectionItem` 新增 `trailing` 字段，选中行底色移到行上使高亮贯通整行）。`/sessions` 选择框据此调整：标题后紧跟短 id、更新时间右对齐、不再展示模型信息；列表本就按更新时间倒序（`list_sessions`）
 

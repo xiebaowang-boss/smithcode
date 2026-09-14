@@ -166,7 +166,18 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
-**busy 守卫**（对齐 opencode）：任务运行中 `/new` 被 TUI 拦截，只提示「请等待完成或先按 Esc 中断」而不执行——后台线程仍在写消息历史，中途重置会撕裂进行中的轮次。命令执行时机被约束到 agent 空闲时，从机制上消灭竞态；REPL 为同步运行，命令天然只在空闲时执行，无需守卫。
+**busy 守卫**（对齐 opencode）：任务运行中 `/new` 被 TUI 拦截，只提示「请等待完成或先按 Esc 中断」而不执行——后台线程仍在写消息历史，中途重置会撕裂进行中的轮次。命令执行时机被约束到 agent 空闲时，从机制上消灭竞态；REPL 为同步运行，命令天然只在空闲时执行，无需守卫。同一守卫覆盖会改动 MCP 配置的操作（`/mcp add|remove|enable|disable|reconnect`）。
+
+## MCP（Model Context Protocol）
+
+通过 stdio 接入外部工具服务器（MVP 范围；HTTP/OAuth 留后续版本）。
+
+- **配置双作用域**：用户级 `config.toml` 的 `[mcp.servers.<名称>]`（tomlkit 写入保注释，`env` 用内联表使 command / env / cwd / timeout 聚合在同一段）；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，兼容 Claude/Cursor 片段写法）。同名服务器**项目条目整体覆盖**用户条目（字段不合并）；`enabled` 是服务器条目的普通字段，写在定义它的文件里（默认启用时省略），不做跨文件覆盖表。
+- **密钥链**：配置只写 `${VAR}` / `${VAR:-default}` 引用（command / args / env / cwd 均展开）；解析顺序为进程环境 > `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、POSIX 0600）> 向导交互补录；缺失即标记 `missing_env`、不带着空值拉起 server（非交互 fail-closed）。所有展开值登记全局 Redactor，工具结果 / stderr / 日志 / 预览统一过筛。
+- **stdio 客户端**（`mcp/client.py`）：同步线程模型——每个连接一个守护读线程把 JSON-RPC 路由到 pending 表（响应）、通知回调（`tools/list_changed` 触发工具刷新）或统一回 `-32601`（server 反向请求，MVP 不支持 elicitation）；请求用 Event 等待 + 轮询超时，轮询点读取当前线程取消令牌（Esc 时发 `notifications/cancelled` 立即返回）；stderr 环形缓冲供 `/mcp logs` 与失败诊断；关闭走「关 stdin → 宽限 → 进程树终止」（复用 `process.terminate_tree`）。
+- **工具接入**：连接成功后经 `tools/base.register_dynamic()` 进入同一注册表，与静态工具共用权限 / serial / describe / 展示机制；暴露名 `mcp__<服务器>__<工具>`（非 `[A-Za-z0-9_-]` 替换 `_`、64 截断、冲突补后缀），默认 `ask` + `serial=True`（外部服务器状态未知）；断开或工具列表变化时原子替换注册项。
+- **入口**：`/mcp`（状态与操作菜单，选择面板）、`/mcp add`（TUI 居中向导面板 / REPL 行式流程，命令层只返回 `CommandResult.wizard` 意图）、`/mcp add <名称> -- <命令...>` 直通；`mcp/templates.py` 提供常用模板（filesystem / github / playwright / memory / everything）。
+- **服务生命周期**：`Agent.start()` 后台并发连接（失败隔离、不阻塞启动）、`Agent.close()` 统一关闭；连接/刷新在专用线程池，注册表增删走 `tools/base` 的锁。
 
 ## 模块职责
 
@@ -198,7 +209,8 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 | `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
 | `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
-| `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
+| `mcp/` | MCP 子系统：`config.py` 双作用域配置（env 内联表、条目 `enabled`）、`secrets.py` 引用展开/凭据库/Redactor、`client.py` stdio 同步客户端、`catalog.py` 命名与结果映射、`service.py` 连接生命周期与动态注册、`wizard.py` + `templates.py` 添加向导（TUI/REPL 共用纯状态机）；`commands/mcp.py` 提供 `/mcp` 命令 |
+| `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择/MCP 向导）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
 
 ## 安全边界
 
@@ -207,6 +219,8 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **保护路径**：内置默认规则将 `.git` 目录设为只读（禁止写入与编辑），读取放行。
 - **技能目录只读**：`skills.refresh()` 把技能根目录写入只读白名单（`config.read_roots()`），读工具（read_file / list_dir / glob / grep）访问技能引用文件免越界确认；写工具与 `apply_patch` 仍只认授权目录（`_resolve(write=True)`），技能文件不可被静默改写。
 - **项目指令只读注入**：`AGENTS.md` 等指令文件仅作为文本进入系统提示词（`messages[0]` 动态段），不产生任何授权效果——权限 / 沙箱仍由代码强制，文件内容无法绕过（故不做信任门控）；显式配置的不可用路径警告一次，默认探测位置缺失静默。
+- **MCP 密钥与脱敏**：MCP 配置只保存 `${VAR}` 引用，值存 `credentials.json`（`mcp.<服务器>.<变量>`，原子写、POSIX 0600）；展开值登记全局 Redactor，工具结果 / stderr / 日志 / 向导预览统一脱敏；缺失密钥标记 `missing_env` 不拉起 server（非交互 fail-closed）。
+- **MCP 进程与不可信内容**：stdio server 以本机用户权限运行；项目级 `.smithcode/mcp.json` 随仓库分发，启动时对项目服务器给出一次可见警示（按项目决定不做信任门控，删除或停用见 `/mcp`）；MCP 工具默认 `ask` 且串行，工具描述 / annotations / 返回内容按「不可信内容」规则处理（系统提示词有专门行为节）。
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框只展示工具摘要（`describe`）与带说明的选项、不重复 diff；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。TUI 中该 diff 以**左右对照**渲染——旧/新两栏、各带真实行号，改动行带 `-`/`+` 前缀并红/绿配色，整块统一底色、上下各 1 行 padding、块内不展示文件名（`tui/render.py` 的 `side_by_side_diff`，宽度不足时回退逐行统一 diff），REPL 仍按 `+/-` 行着色打印。`.env` 等敏感文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。

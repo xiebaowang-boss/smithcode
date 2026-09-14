@@ -1,8 +1,8 @@
-"""TUI 弹窗/面板：权限确认、提问、通用选择。
+"""TUI 弹窗/面板：权限确认、提问、通用选择、MCP 添加向导。
 
-权限/提问面板原地替换输入框（composer 位三态）；选择面板走全屏半透明遮罩
-居中弹出（opencode 式），用于 `/model` 等命令的选择意图。面板自身不感知
-REPL/TUI 差异，完成动作经回调交回宿主。
+权限/提问面板原地替换输入框（composer 位三态）；选择面板与 MCP 向导走全屏
+半透明遮罩居中弹出（opencode 式），用于 `/model` 等命令的选择意图与 `/mcp add`
+向导。面板自身不感知 REPL/TUI 差异，完成动作经回调交回宿主。
 """
 from __future__ import annotations
 
@@ -785,50 +785,238 @@ class SelectionPanel(Vertical):
             )
 
     def _ensure_visible(self) -> None:
-        """把当前选中项滚动进可视区（每项占一行，行号即索引）。"""
+        """把当前选中项滚动进可视区（按行计划映射的真实行号）。"""
         scroll = self._scroll
         if scroll is None:
             return
+        row = self._row_of_item.get(self._selected)
+        if row is None:
+            return
         top = int(scroll.scroll_offset.y)
         height = scroll.size.height
-        if self._selected < top:
-            scroll.scroll_to(y=self._selected, animate=False)
-        elif self._selected >= top + height:
-            scroll.scroll_to(y=self._selected - height + 1, animate=False)
+        if row < top:
+            scroll.scroll_to(y=row, animate=False)
+        elif row >= top + height:
+            scroll.scroll_to(y=row - height + 1, animate=False)
 
     def action_move_prev(self) -> None:
-        if not self._items:
-            return
-        self._selected = (self._selected - 1) % len(self._items)
-        self._refresh()
-        self._ensure_visible()
+        self._move(-1)
 
     def action_move_next(self) -> None:
-        if not self._items:
+        self._move(1)
+
+    def _move(self, delta: int) -> None:
+        """在可选项之间循环移动（间隔行不参与）。"""
+        if not self._selectable:
             return
-        self._selected = (self._selected + 1) % len(self._items)
+        position = (
+            self._selectable.index(self._selected)
+            if self._selected in self._selectable else 0
+        )
+        self._selected = self._selectable[(position + delta) % len(self._selectable)]
         self._refresh()
         self._ensure_visible()
 
     def action_confirm(self) -> None:
-        if self._items:
-            self._finish(self._items[self._selected].value)
+        if not self._selectable:
+            return
+        item = self._items[self._selected]
+        if item.separator:
+            return
+        self._finish(item.value)
 
     def action_cancel(self) -> None:
         self._finish(None)
 
     def on_key(self, event) -> None:
-        """数字键快选（1-9 直接确认）；event.character 对特殊键为 None，先判空。"""
+        """数字键快选（1-9 直接确认，按可选项序号）；特殊键的 character 为 None。"""
         char = event.character or ""
         if not char.isdigit():
             return
         n = int(char)
-        if 1 <= n <= len(self._items):
+        if 1 <= n <= len(self._selectable):
             event.stop()
             event.prevent_default()
-            self._selected = n - 1
+            self._selected = self._selectable[n - 1]
             self._refresh()
             self.action_confirm()
 
     def _finish(self, value: str | None) -> None:
         self._on_done(value)
+
+
+# ---------- MCP 添加向导面板 ----------
+
+
+class McpWizardScreen(ModalScreen):
+    """向导的弹窗宿主屏（与 SelectionScreen 同款半透明遮罩语义）。"""
+
+    DEFAULT_CSS = """
+    McpWizardScreen {
+        align: center middle;
+        background: #000000 30%;
+    }
+    """
+
+    def __init__(self, panel, **kwargs):
+        super().__init__(**kwargs)
+        self._panel = panel
+
+    def compose(self):
+        yield self._panel
+
+
+class McpWizardPanel(Vertical):
+    """MCP 添加向导：单面板逐步推进，←/b 回退、esc 取消。
+
+    只认识 McpWizard 的步骤模型（纯数据），完成/取消经 on_done 回调交回宿主；
+    全程不写文件——落盘由宿主在向导完成后调用 mcp.wizard.apply_plan。
+    """
+
+    can_focus = True
+    BINDINGS: ClassVar = [
+        Binding("up", "move_prev", "上移", show=False),
+        Binding("down", "move_next", "下移", show=False),
+        Binding("k", "move_prev", "上移", show=False),
+        Binding("j", "move_next", "下移", show=False),
+        Binding("enter", "confirm", "确认", show=False),
+        Binding("escape", "cancel", "取消", show=False),
+        Binding("left", "back", "上一步", show=False),
+        Binding("b", "back", "上一步", show=False),
+    ]
+
+    def __init__(self, wizard, on_done, **kwargs):
+        super().__init__(**kwargs)
+        self._wizard = wizard
+        self._on_done = on_done
+        self._selected = 0
+        self._step_key = None  # 当前步骤键：仅步骤切换时按默认值重新对齐选中项
+        self._error = ""
+        self._title: Static | None = None
+        self._body: Static | None = None
+        self._hint: Static | None = None
+        self._input: Input | None = None
+
+    def compose(self):
+        self._title = Static("添加 MCP 服务器", classes="wizard-title", markup=False)
+        yield self._title
+        body = Static("", classes="wizard-body", markup=False)
+        self._body = body
+        with VerticalScroll(classes="wizard-scroll") as scroll:
+            scroll.can_focus = False
+            yield body
+        self._input = Input(id="wizard-input")
+        yield self._input
+        self._hint = Static("", classes="wizard-hint", markup=False)
+        yield self._hint
+
+    def on_mount(self) -> None:
+        self.focus()
+        self._render_step()
+
+    # ----- 渲染 -----
+
+    def _render_step(self) -> None:
+        step = self._wizard.current()
+        if step is None:
+            self._finish(None)
+            return
+        self._title.update(f"添加 MCP 服务器 · {step.title}")
+        if step.kind == "choice":
+            if self._step_key != step.key:
+                values = [value for _, value in step.options]
+                self._selected = values.index(step.default) if step.default in values else 0
+            self._step_key = step.key
+            self._input.display = False
+            self._body.update(self._choice_text(step))
+            self._hint.update("↑↓ 选择 · enter 确认 · ←/b 上一步 · esc 取消")
+            self.focus()
+        elif step.kind == "review":
+            self._step_key = step.key
+            self._input.display = False
+            self._body.update(self._with_error(step.body))
+            self._hint.update("enter 保存并连接 · ←/b 上一步 · esc 取消")
+            self.focus()
+        else:
+            self._step_key = step.key
+            self._input.display = True
+            self._input.password = step.masked
+            self._input.value = step.default or ""
+            self._input.placeholder = step.hint
+            self._body.update(self._with_error(""))
+            self._hint.update("enter 继续 · :b 回退 · esc 取消")
+            self._input.focus()
+
+    def _choice_text(self, step) -> Text:
+        text = Text()
+        if self._error:
+            text.append(f"! {self._error}\n\n", style="#f7768e")
+        for index, (label, _value) in enumerate(step.options):
+            selected = index == self._selected
+            text.append(("› " if selected else "  ") + label + "\n",
+                        style="bold #fab283" if selected else "#a9b1d6")
+        return text
+
+    def _with_error(self, body: str) -> Text:
+        text = Text()
+        if self._error:
+            text.append(f"! {self._error}\n\n", style="#f7768e")
+        if body:
+            text.append(body)
+        return text
+
+    # ----- 动作 -----
+
+    def action_move_prev(self) -> None:
+        step = self._wizard.current()
+        if step is not None and step.kind == "choice" and step.options:
+            self._selected = (self._selected - 1) % len(step.options)
+            self._render_step()
+
+    def action_move_next(self) -> None:
+        step = self._wizard.current()
+        if step is not None and step.kind == "choice" and step.options:
+            self._selected = (self._selected + 1) % len(step.options)
+            self._render_step()
+
+    def action_confirm(self) -> None:
+        step = self._wizard.current()
+        if step is None:
+            return
+        if step.kind == "choice":
+            value = step.options[self._selected][1]
+        elif step.kind == "review":
+            value = "finish"
+        else:
+            value = self._input.value
+            if value.strip() == ":b":
+                self.action_back()
+                return
+            if not value.strip():
+                value = step.default
+        error = self._wizard.submit(value)
+        if error:
+            self._error = error
+            self._render_step()
+            return
+        self._error = ""
+        if self._wizard.done:
+            self._finish(self._wizard.to_plan())
+            return
+        self._selected = 0
+        self._render_step()
+
+    def action_back(self) -> None:
+        if self._wizard.back():
+            self._error = ""
+            self._selected = 0
+            self._render_step()
+
+    def action_cancel(self) -> None:
+        self._finish(None)
+
+    def on_input_submitted(self, event) -> None:
+        self.action_confirm()
+
+    def _finish(self, plan) -> None:
+        self._on_done(plan)

@@ -56,6 +56,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
 | `tools/*.py` | 各工具实现（files / search / shell / patch / web / ask / todo / goal / skills） |
+| `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、stdio 同步客户端、工具命名/动态注册、`/mcp` 命令与添加向导（设计见 `docs/architecture.md`「MCP」节）；MVP 仅 stdio |
 
 ## 关键约定
 
@@ -63,6 +64,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 
 - **路径沙箱**：所有文件操作经 `_resolve()` 检查，解析后的真实路径必须在授权目录内；绕过沙箱的"捷径"一律不加
 - **保护路径**：`.env` 的内容不在变更预览/确认框中回显（防密钥泄露），读写仍按普通规则（读默认放行、写默认确认）；`.git` 只读（内置 deny 规则只拦写入/编辑，读取放行）
+- **MCP 配置与密钥**：MCP 配置只写 `${VAR}` 引用，值存 `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、0600）；展开值全链路脱敏；项目级 `.smithcode/mcp.json` 会拉起本机进程，启动时给出可见警示（不做信任门控）；MCP 工具默认 `ask` + 串行，描述与输出按不可信内容处理
 - **技能目录只读**：技能根目录经 `config.read_roots()` 对读工具放行（免越界确认），写工具/`apply_patch` 只认授权目录（`_resolve(write=True)`）；技能 frontmatter 的 `allowed-tools` 不产生授权效果
 - **权限规则**：工具通过 schema 的 `pattern_arg` 声明权限模式来源；权限语义与既有工具一致时用 `family` 继承（如 `apply_patch` 继承 `edit_file`）；多路径工具用 `paths_from` 逐路径求值聚合
 - **安全命令免确认**：内置只读命令集（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在内置默认 `ask` 下自动放行，且**仅在无任何用户/会话规则命中时生效**——用户可用精确 `ask`/`deny` 收紧，宽泛 `ask` 即整体关闭。开发工具链仅放行版本查询/只读枚举/静态检查（`python --version`、`pip list`、`ruff check`），**真正运行代码的用法（`pytest`、`python x.py`、`npm run`、`uv run`、`cargo test`）不放行**。判定为纯函数 `permission/shell_policy.is_safe_command`，拿不准（解析失败、inline 环境变量前缀、路径限定 argv[0]、重定向、命令替换、危险标志、未加引号 glob）一律回退确认

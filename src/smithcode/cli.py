@@ -126,6 +126,8 @@ def repl(agent: Agent):
                 print(outcome.text)
             if outcome.select is not None:
                 _print_select(outcome.select)
+            if outcome.wizard is not None:
+                _run_wizard(agent, outcome.wizard)
             if outcome.start_task is not None:
                 # /goal 设定/恢复后立即开跑，走与普通任务相同的后台线程 + 取消通道
                 task = threading.Thread(
@@ -149,6 +151,26 @@ def _print_select(select):
         mark = "（当前）" if choice.current else ""
         print(f"  {index}. {choice.label}{mark}")
     print(f"非交互模式无法弹出选择器，请用 /{select.command} <候选值> 指定。")
+
+
+def _run_wizard(agent, wizard) -> None:
+    """REPL 行式向导：完成计划后存密钥、写配置并触发后台连接。"""
+    from .mcp.errors import McpConfigError
+    from .mcp.wizard import apply_plan, run_line_mode
+
+    if getattr(wizard, "name", "") != "mcp.add":
+        print(f"不支持的向导: {getattr(wizard, 'name', '?')}")
+        return
+    plan = run_line_mode(wizard.payload)
+    if plan is None:
+        print("已取消。")
+        return
+    try:
+        apply_plan(agent.mcp, plan)
+    except McpConfigError as e:
+        print(f"添加失败: {e}")
+        return
+    print(f"已保存 MCP 服务器 {plan.config.name}，正在后台连接…用 /mcp 查看状态。")
 
 
 def run_once(agent: Agent, task: str):

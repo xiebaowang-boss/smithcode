@@ -1,5 +1,12 @@
 """工具注册表：新增工具只需在实现文件里用 @register 装饰器声明，
-无需再修改汇总处。"""
+无需再修改汇总处。
+
+动态工具（MCP 等运行时接入）：`register_dynamic` / `unregister_dynamic`
+写入同一批全局结构，复用权限 / 并行调度 / 终端展示的全套机制；所有
+增删与快照都在锁内进行，后台连接线程与 Agent 读取线程安全共存。
+"""
+
+import threading
 
 SCHEMAS: list = []
 FUNCTIONS: dict = {}
@@ -11,6 +18,11 @@ PREVIEWS: dict = {}  # (args)->str|None：ask 确认前生成的变更预览（�
 DISPLAY: dict = {}  # 终端展示形态：inline（一行式）/ block（可折叠结果块）
 SERIAL: dict = {}  # 是否禁止并行：True 的工具批量执行时在主线程串行运行
 HIDDEN: set = set()  # 不发送给 LLM 的工具（保留注册，如无可用技能时的 use_skill）
+
+# 动态注册的工具名（MCP）：unregister 时据此清理，不影响静态工具
+DYNAMIC: set = set()
+
+_LOCK = threading.RLock()
 
 # 只读文件类工具：目标落在技能目录只读白名单内时免越界确认（agent._preflight_path）
 READ_ONLY_TOOLS = frozenset({"read_file", "list_dir", "glob", "grep"})
@@ -56,12 +68,67 @@ def register(schema: dict):
 
 def set_hidden(name: str, hidden: bool = True) -> None:
     """隐藏/恢复一个已注册工具（不发送给 LLM，注册与执行能力保留）。"""
-    if hidden:
-        HIDDEN.add(name)
-    else:
-        HIDDEN.discard(name)
+    with _LOCK:
+        if hidden:
+            HIDDEN.add(name)
+        else:
+            HIDDEN.discard(name)
+
+
+def register_dynamic(schema: dict, func, *, serial: bool = True,
+                     describe=None, display: str = "inline") -> None:
+    """运行时注册一个工具（同名先移除），复用静态工具的全套机制。
+
+    MCP 工具经由本入口进入注册表：schema 形如静态工具，`func(**args) -> str`。
+    默认 serial=True——外部服务器的状态未知，批量执行时作为顺序屏障更安全。
+    """
+    name = schema["name"]
+    with _LOCK:
+        _remove_dynamic_locked(name)
+        PATTERN_ARGS[name] = None
+        PATTERN_FAMILIES[name] = name
+        PATHS_EXTRACTORS[name] = None
+        DESCRIBERS[name] = describe
+        PREVIEWS[name] = None
+        DISPLAY[name] = display
+        SERIAL[name] = bool(serial)
+        SCHEMAS.append(schema)
+        FUNCTIONS[name] = func
+        DYNAMIC.add(name)
+
+
+def unregister_dynamic(name: str) -> None:
+    """移除一个动态注册的工具；静态工具或不存在时静默返回。"""
+    with _LOCK:
+        _remove_dynamic_locked(name)
+
+
+def _remove_dynamic_locked(name: str) -> None:
+    if name not in DYNAMIC:
+        return
+    for index, schema in enumerate(SCHEMAS):
+        if schema.get("name") == name:
+            del SCHEMAS[index]
+            break
+    FUNCTIONS.pop(name, None)
+    PATTERN_ARGS.pop(name, None)
+    PATTERN_FAMILIES.pop(name, None)
+    PATHS_EXTRACTORS.pop(name, None)
+    DESCRIBERS.pop(name, None)
+    PREVIEWS.pop(name, None)
+    DISPLAY.pop(name, None)
+    SERIAL.pop(name, None)
+    HIDDEN.discard(name)
+    DYNAMIC.discard(name)
+
+
+def all_schemas() -> list:
+    """全部已注册 schema 的快照（含隐藏项），供展示/同步逻辑安全遍历。"""
+    with _LOCK:
+        return list(SCHEMAS)
 
 
 def visible_schemas() -> list:
     """发给 LLM 的工具 schema（过滤掉被隐藏的工具）。"""
-    return [s for s in SCHEMAS if s["name"] not in HIDDEN]
+    with _LOCK:
+        return [s for s in list(SCHEMAS) if s["name"] not in HIDDEN]

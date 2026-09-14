@@ -25,6 +25,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from .. import commands, config, context, goal, permission, plan, renderer, welcome
+from ..mcp.errors import McpConfigError
+from ..mcp.wizard import McpWizard, apply_plan
 from .bridge import TuiRenderer
 from .chat import (
     Assistant,
@@ -46,6 +48,8 @@ from .chat import (
     level_from_style,
 )
 from .panels import (
+    McpWizardPanel,
+    McpWizardScreen,
     PermissionPanel,
     QuestionPanel,
     SelectionItem,
@@ -253,6 +257,35 @@ class SmithTUI(App):
     SelectionPanel .selection-label { width: 1fr; height: 1; }
     SelectionPanel .selection-trailing { width: auto; height: 1; }
     SelectionPanel .selection-hint { color: #808080; dock: bottom; }
+    /* MCP 添加向导：居中卡片，选择步骤复用选择面板的配色语义 */
+    McpWizardPanel {
+        width: 88;
+        max-width: 90%;
+        height: auto;
+        max-height: 80%;
+        background: #1e1e1e;
+        padding: 1 2;
+    }
+    McpWizardPanel .wizard-title {
+        color: #fab283;
+        text-style: bold;
+        padding-left: 2;
+        margin-bottom: 1;
+    }
+    McpWizardPanel .wizard-scroll {
+        height: auto;
+        max-height: 22;
+        scrollbar-size-vertical: 0;  /* 同聊天区：不绘制滚动条 */
+    }
+    McpWizardPanel .wizard-body { color: #a9b1d6; }
+    McpWizardPanel Input {
+        border: none;
+        height: 1;
+        padding: 0 0 0 1;
+        background: #1e1e2e;
+        margin-top: 1;
+    }
+    McpWizardPanel .wizard-hint { color: #808080; margin-top: 1; }
     """
 
     BINDINGS: ClassVar = [
@@ -585,6 +618,27 @@ class SmithTUI(App):
         parent, anchor = self._select_stack.pop()
         self._present_select(parent, anchor=anchor)
 
+    # ----- MCP 添加向导 -----
+
+    def show_mcp_wizard(self, wizard_intent) -> None:
+        """按命令的向导意图弹出 MCP 添加面板；完成回调落盘并触发连接。"""
+        if getattr(wizard_intent, "name", "") != "mcp.add":
+            self.ui_notice(f"不支持的向导: {getattr(wizard_intent, 'name', '?')}", "warning")
+            return
+        wizard = McpWizard(workspace=config.WORKSPACE_ROOT)
+        panel = McpWizardPanel(wizard, lambda plan: self.screen.dismiss(plan))
+        self.push_screen(McpWizardScreen(panel), callback=self._after_mcp_wizard)
+
+    def _after_mcp_wizard(self, plan) -> None:
+        if plan is None:
+            self.ui_notice("已取消添加 MCP 服务器。", "info")
+            return
+        try:
+            apply_plan(self.agent.mcp, plan)
+        except McpConfigError as e:
+            self.ui_notice(f"添加 MCP 服务器失败: {e}", "error")
+            return
+        self.ui_notice(f"已保存 MCP 服务器 {plan.config.name}，正在连接…", "info")
 
     def ui_status(self) -> None:
         usage_title, usage_body = self._sidebar_usage()
@@ -792,16 +846,23 @@ class SmithTUI(App):
         """busy 守卫 + commands.dispatch；被拦截时提示并返回 None。
 
         对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
-        中途重置 / 切换会撕裂进行中的轮次，先行拦截。
+        中途重置 / 切换 / 改 MCP 配置会撕裂进行中的轮次，先行拦截。
         """
         tokens = text.strip().split()
-        if self._busy and tokens and tokens[0].lower() in ("/new", "/sessions"):
-            self.ui_notice("（任务运行中，不能切换会话；请等待完成或先按 Esc 中断）", "warning")
+        mutating_mcp = (
+            bool(tokens) and tokens[0].lower() == "/mcp" and len(tokens) > 1
+            and tokens[1].lower() in ("add", "remove", "enable", "disable", "reconnect")
+        )
+        if self._busy and (tokens and tokens[0].lower() in ("/new", "/sessions") or mutating_mcp):
+            self.ui_notice(
+                "（任务运行中，不能切换会话或修改 MCP 配置；请等待完成或先按 Esc 中断）",
+                "warning",
+            )
             return None
         return commands.dispatch(self.agent, text)
 
     def _apply_outcome(self, outcome, text: str = "", nested: bool = False) -> None:
-        """把 CommandResult 落到界面：会话重置 / 切换、文本、选择、任务。
+        """把 CommandResult 落到界面：会话重置 / 切换、文本、选择、向导、任务。
 
         `nested=True`（选择面板下钻）表示父级已由调用方压栈，此处只展示新
         一层选择、不重置层级栈。
@@ -830,6 +891,8 @@ class SmithTUI(App):
                     self._present_select(outcome.select)
                 else:
                     self.show_selection(outcome.select)
+            if outcome.wizard is not None:
+                self.show_mcp_wizard(outcome.wizard)
         if outcome.session_reset:
             self.query_one(Sidebar).update_plan("", has_active=False)
         if outcome.refresh_status:

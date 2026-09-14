@@ -53,11 +53,11 @@ def run(command: str, *, timeout: float, cwd=None, env=None,
             return ProcessResult(proc.returncode, stdout or "", stderr or "", "ok")
         except subprocess.TimeoutExpired:
             if token is not None and token.cancelled:
-                _terminate_tree(proc)
+                terminate_tree(proc)
                 out, err = _reap(proc)
                 return ProcessResult(proc.returncode, out, err, "interrupted")
             if time.monotonic() >= deadline:
-                _terminate_tree(proc)
+                terminate_tree(proc)
                 out, err = _reap(proc)
                 return ProcessResult(proc.returncode, out, err, "timeout")
 
@@ -77,8 +77,12 @@ def _spawn(command: str, cwd, env) -> subprocess.Popen:
     )
 
 
-def _terminate_tree(proc: subprocess.Popen) -> None:
-    """终止进程及其全部后代：Windows 用 taskkill /T，POSIX 用进程组信号升级。"""
+def terminate_tree(proc: subprocess.Popen) -> None:
+    """终止进程及其全部后代：Windows 用 taskkill /T，POSIX 用进程组信号升级。
+
+    公开给需要长驻双向管道的调用方（如 MCP stdio 连接）复用，保证进程
+    树终止逻辑全项目一处实现。
+    """
     if proc.poll() is not None:
         return  # 已退出，无需处理
     if os.name == "nt":

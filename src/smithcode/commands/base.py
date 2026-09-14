@@ -2,7 +2,7 @@
 无需再修改分发处（与 tools 注册表同款机制，导入即注册）。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 # 渲染形态：line=一行式提示（REPL 直接 print / TUI 着色单行）；
@@ -48,6 +48,18 @@ class CommandSelect:
 
 
 @dataclass
+class CommandWizard:
+    """命令要求宿主启动的向导意图（如 /mcp add）。
+
+    name 标识向导类型（宿主据此选择面板/行式流程），payload 为初始参数；
+    向导本身不产生副作用，完成后由宿主调用服务层写盘与连接。
+    """
+
+    name: str
+    payload: dict = field(default_factory=dict)
+
+
+@dataclass
 class CommandResult:
     """命令执行结果：宿主（REPL / TUI）据此渲染输出并做后续动作。"""
 
@@ -61,6 +73,7 @@ class CommandResult:
     select: CommandSelect | None = None  # 非空时宿主弹出选择器
     start_task: str | None = None  # 非空时宿主立即以此文本发起一次任务（如 /goal 开跑）
     echo_input: bool = False      # 与 start_task 搭配：宿主先把用户输入原文回显为消息
+    wizard: CommandWizard | None = None  # 非空时宿主启动向导（如 /mcp add）
 
 
 @dataclass

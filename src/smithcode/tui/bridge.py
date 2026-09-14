@@ -75,6 +75,9 @@ class TuiRenderer(renderer.Renderer):
     def info(self, text: str) -> None:
         self._post("notice", text, "info")
 
+    def success(self, text: str) -> None:
+        self._post("notice", text, "success")
+
     def warn(self, text: str) -> None:
         self._post("notice", text, "warning")
 

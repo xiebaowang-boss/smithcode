@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from .. import skills
-from .base import SCHEMAS, register, set_hidden
+from .base import all_schemas, register, set_hidden
 
 
 def sync_schema() -> None:
@@ -15,7 +15,7 @@ def sync_schema() -> None:
     无可用技能时隐藏工具（对齐 agentskills.io 指南：没有技能就不要注册空工具）。
     """
     names = [s.name for s in skills.model_skills()]
-    for schema in SCHEMAS:
+    for schema in all_schemas():
         if schema.get("name") == "use_skill":
             schema["parameters"]["properties"]["name"]["enum"] = names
             break
