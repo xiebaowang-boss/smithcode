@@ -93,7 +93,7 @@ def test_sync_system_includes_skills_section(tmp_path, monkeypatch):
 
 
 def test_sync_system_includes_instructions_section(tmp_path, monkeypatch):
-    """AGENTS.md 装载后进系统提示词；文件修改下一轮生效，删除后移除。"""
+    """AGENTS.md 装载后进系统提示词；会话中途修改不重载，边界 refresh 后才生效。"""
     from smithcode import instructions
 
     workspace = tmp_path / "ws"
@@ -111,14 +111,22 @@ def test_sync_system_includes_instructions_section(tmp_path, monkeypatch):
         assert "## 项目约定" in session.messages[0]["content"]
         assert "初始约定标记" in session.messages[0]["content"]
 
+        # 会话中途修改：不重载（保护提示前缀缓存）
         (workspace / "AGENTS.md").write_text("改后的约定标记", encoding="utf-8")
         stat = (workspace / "AGENTS.md").stat()
         os.utime(workspace / "AGENTS.md", (stat.st_atime + 5, stat.st_mtime + 5))
+        session.sync_system()
+        assert "初始约定标记" in session.messages[0]["content"]
+        assert "改后的约定标记" not in session.messages[0]["content"]
+
+        # 会话边界（模拟 Agent.start / new_session / resume 的 refresh）重新装载
+        assert instructions.refresh() is True
         session.sync_system()
         assert "改后的约定标记" in session.messages[0]["content"]
         assert "初始约定标记" not in session.messages[0]["content"]
 
         (workspace / "AGENTS.md").unlink()
+        instructions.refresh()
         session.sync_system()
         assert "## 项目约定" not in session.messages[0]["content"]
     finally:

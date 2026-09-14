@@ -47,7 +47,7 @@ smithcode setup           # 初始化配置（用户机器上才需要）
 | `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/session-architecture.md`） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
-| `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + 项目级 + `[instructions].paths`、指纹变更检测、预算截断，注入系统提示词动态段 |
+| `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
 | `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/skills-architecture.md`）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |

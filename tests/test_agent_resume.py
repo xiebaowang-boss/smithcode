@@ -1,10 +1,12 @@
 """Agent 会话恢复：持久化往返、崩溃修复、投影恢复与安全例外。"""
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
-from smithcode import config, goal, plan, skills
+from smithcode import config, goal, instructions, plan, skills
 from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.sessions import SessionStore, list_sessions, load, summary_from_path
@@ -37,12 +39,14 @@ def _isolated(tmp_path, monkeypatch):
     goal.reset()
     plan.reset()
     skills.clear()
+    instructions.reset()
     config.SESSION_EXTRA_ROOTS.clear()
     files_mod.READ_FILES.clear()
     yield
     goal.reset()
     plan.reset()
     skills.clear()
+    instructions.reset()
     config.SESSION_EXTRA_ROOTS.clear()
     files_mod.READ_FILES.clear()
 
@@ -160,3 +164,48 @@ def test_no_persistence_by_default(monkeypatch, tmp_path):
     assert agent.session.store is None
     projects = tmp_path / "home" / "projects"
     assert not projects.exists() or not any(projects.rglob("*.jsonl"))
+
+
+# ---------- 项目指令：会话边界装载 ----------
+
+
+def _rewrite(path, text):
+    """重写指令文件并前推 mtime，规避文件系统时间戳精度（等长内容也能触发重载）。"""
+    path.write_text(text, encoding="utf-8")
+    st = path.stat()
+    os.utime(path, (st.st_atime + 5, st.st_mtime + 5))
+
+
+def test_instructions_load_once_per_session_and_reload_on_new(monkeypatch):
+    """会话中途修改 AGENTS.md 不重载（保护提示前缀缓存）；/new 边界重新装载。"""
+    workspace = Path(config.WORKSPACE_ROOT)
+    (workspace / "AGENTS.md").write_text("约定 v1", encoding="utf-8")
+
+    agent = _make_agent(monkeypatch)
+    agent.run("你好")
+    assert "约定 v1" in agent.session.messages[0]["content"]
+
+    _rewrite(workspace / "AGENTS.md", "约定 v2")
+    agent.run("继续")
+    assert "约定 v2" not in agent.session.messages[0]["content"]
+
+    agent.new_session()
+    agent.session.sync_system()
+    assert "约定 v2" in agent.session.messages[0]["content"]
+
+
+def test_resume_reloads_instructions(monkeypatch):
+    """恢复即会话边界：system 段按磁盘最新内容重建项目约定。"""
+    workspace = Path(config.WORKSPACE_ROOT)
+    (workspace / "AGENTS.md").write_text("恢复前约定", encoding="utf-8")
+
+    agent = _make_agent(monkeypatch)
+    agent.run("你好")
+    store_id = agent.session.store.id
+    assert "恢复前约定" in agent.session.messages[0]["content"]
+
+    _rewrite(workspace / "AGENTS.md", "恢复后约定")
+    resumed = _make_agent(monkeypatch)
+    resumed.resume(store_id)
+    assert "恢复后约定" in resumed.session.messages[0]["content"]
+    assert "恢复前约定" not in resumed.session.messages[0]["content"]

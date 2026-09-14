@@ -252,8 +252,8 @@ class Agent:
         """启动期装载模型目录、技能目录与项目指令：模型未配置时后台拉取 `/models`。
 
         技能发现可能弹出项目级信任确认（渲染后端此时为 ConsoleRenderer，
-        TUI 尚未接管，交互行为一致）。项目指令在首次 `sync_system()` 前装载，
-        使首个请求即带上 AGENTS.md；读取失败只警告、不阻断启动。
+        TUI 尚未接管，交互行为一致）。项目指令在会话边界装载（此处 / `/new` /
+        恢复三处），会话中途不重载以保护提示前缀缓存；读取失败只警告、不阻断启动。
         """
         self.models.bootstrap()
         self.refresh_skills()
@@ -272,7 +272,8 @@ class Agent:
         上下文快照（压缩计数与真实 token 锚点）、工具侧「已读文件」记录、
         步骤清单、持久目标、技能激活集合，以及转录文件的轮换（旧会话保留
         在磁盘、仍可恢复）。新增会话级状态时注册进 `_state_registry`，
-        命令层（commands）不感知重置细节。
+        命令层（commands）不感知重置细节。项目指令不属会话状态，但在
+        `/new` 这一会话边界重新装载一次（读盘或去重，见 instructions.refresh）。
         """
         if self.session.store is not None:
             self.session.store.close()  # 旧转录闭合；从未物化则不产生文件
@@ -285,6 +286,7 @@ class Agent:
             part.reset()
         self._last_state = None
         self._title_attempted = False
+        instructions.refresh()  # 会话边界：重新装载项目约定（中途修改在此生效）
         if self._persist:
             self.session.bind_store(self._new_store())
         else:
@@ -336,6 +338,7 @@ class Agent:
                     part.restore(loaded.state[part.name])
         self._last_state = None
         self._title_attempted = False
+        instructions.refresh()  # 会话边界：恢复即按磁盘最新内容重建项目约定段
         self.session.sync_system()  # system 段按当前提示词立即重建
 
         return ResumeReport(

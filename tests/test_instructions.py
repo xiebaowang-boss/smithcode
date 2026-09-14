@@ -111,6 +111,61 @@ def test_disabled_renders_empty(_isolated):
     assert instructions.render_section() == ""
 
 
+# ---------- 项目链（向上到 git 根） ----------
+
+def test_project_chain_walks_up_to_git_root(tmp_path, monkeypatch):
+    """项目级从 git 根逐级向下探测到工作区，越深越靠后（更具体）。"""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    _write(root / "AGENTS.md", "仓库根约定")
+    _write(root / "packages" / "AGENTS.md", "中间层约定")
+    deep = root / "packages" / "web"
+    deep.mkdir(parents=True)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(deep))
+
+    instructions.reset()
+    instructions.refresh()
+    section = instructions.render_section()
+    assert "仓库根约定" in section
+    assert "中间层约定" in section
+    assert section.index("仓库根约定") < section.index("中间层约定")
+
+
+def test_git_file_marker_stops_ancestor_walk(tmp_path, monkeypatch):
+    """`.git` 为文件（worktree）同样视为仓库根，且不越过它继续向上。"""
+    outside = tmp_path / "outside"
+    _write(outside / "AGENTS.md", "仓库外约定")
+    repo = outside / "repo"
+    repo.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
+    workspace = repo / "sub"
+    workspace.mkdir()
+    _write(workspace / "AGENTS.md", "工作区约定")
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+
+    instructions.reset()
+    instructions.refresh()
+    section = instructions.render_section()
+    assert "工作区约定" in section
+    assert "仓库外约定" not in section
+
+
+def test_workspace_is_git_root_ignores_parents(tmp_path, monkeypatch):
+    """工作区自身是仓库根：父目录的指令文件不参与探测。"""
+    parent = tmp_path / "space"
+    _write(parent / "AGENTS.md", "父目录约定")
+    workspace = parent / "repo"
+    (workspace / ".git").mkdir(parents=True)
+    _write(workspace / "AGENTS.md", "工作区约定")
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+
+    instructions.reset()
+    instructions.refresh()
+    section = instructions.render_section()
+    assert "工作区约定" in section
+    assert "父目录约定" not in section
+
+
 # ---------- 指纹与刷新 ----------
 
 def test_refresh_detects_change_and_is_stable(_isolated):

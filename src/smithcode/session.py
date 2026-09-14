@@ -90,11 +90,12 @@ class Session:
         动态段依次为项目约定（AGENTS.md）、技能（可用目录 + 已激活正文）、
         持久目标（/goal）；对应段未装载时为空串。刷新只在内容确实不同时发生
         ——动态段只含稳定信息，普通回合间逐字节不变，避免每次请求都改前缀
-        破坏服务商的提示缓存。项目约定每轮做 stat 级变更检测：会话中途修改
-        文件后下一轮即生效，未修改时渲染结果保持不变。
+        破坏服务商的提示缓存。项目约定在会话边界（启动 / `/new` / 恢复）由
+        Agent 调用 `instructions.refresh()` 装载一次，会话中途修改文件不重载
+        （对齐 Codex「每会话装载一次」）；首个 render 前的兜底懒加载见
+        `instructions.render_section()`。
         兼容 load() 读回的旧历史：首段是 system 时同样按最新内容校准。
         """
-        instructions.refresh()
         content = build_system_prompt(
             instructions_section=instructions.render_section(),
             skills_section=skills.render_section(),

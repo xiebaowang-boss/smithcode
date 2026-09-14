@@ -135,11 +135,11 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 ## 项目指令（AGENTS.md）
 
-借鉴 Claude Code / Codex / opencode 的内存文件机制：启动时读取用户级 `~/.smithcode/AGENTS.md` 与项目级 `<工作区>/AGENTS.md`，外加 `[instructions].paths` 追加文件，把仓库的开发约定装进系统提示词，模型不必靠猜或反复读说明文件：
+借鉴 Claude Code / Codex / opencode 的内存文件机制：启动时读取用户级 `~/.smithcode/AGENTS.md`，项目级沿目录链从 git 根（最近的含 `.git` 的祖先目录，`.git` 为文件也算）逐级向下探测到工作区（无 `.git` 时仅工作区），外加 `[instructions].paths` 追加文件，把仓库的开发约定装进系统提示词，模型不必靠猜或反复读说明文件：
 
 - **注入通道**：`Session.sync_system()` 把 `instructions.render_section()` 作为动态段拼进 `messages[0]`（同 skills / goal 机制）——压缩天然保留、普通回合逐字节稳定、恢复会话按磁盘最新内容重建；不进 `t=state` 投影（指令与会话无关，无需持久化与重置）。
-- **优先级**：用户级 < 项目级 < `[instructions].paths`（越具体越靠后渲染）；段内 intro 声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed；与用户当前明确要求冲突时以用户为准）。
-- **变更检测**：`instructions.refresh()` 按 `(path, scope, mtime_ns, size)` 指纹判断，未变化时零读取；会话中途新增 / 修改 / 删除指令文件在下一轮 `sync_system()` 自动生效。`[instructions].enabled=false` 整体关闭；`files`（默认 `["AGENTS.md"]`）控制各根目录探测的文件名，显式空列表表示只加载 `paths`。
+- **优先级**：用户级 < 项目级 < `[instructions].paths`（越具体越靠后渲染）；项目级链内 git 根在前、工作区在后（越深越具体）。段内 intro 声明冲突裁决（靠后优先）与安全边界（不得覆盖权限 / 沙箱 / fail-closed；与用户当前明确要求冲突时以用户为准）。
+- **装载时机**：与 Codex「每会话装载一次」一致——仅在会话边界（`Agent.start()` / `new_session()`（`/new`）/ `resume()`）调用 `instructions.refresh()`；会话中途修改 / 新增 / 删除指令文件不影响进行中的会话，提示前缀缓存全程稳定，新会话或重启后生效；段内 intro 同步告知模型该语义。指纹（`path, scope, mtime_ns, size`）用于边界处去重，未变化时零读取。`[instructions].enabled=false` 整体关闭；`files`（默认 `["AGENTS.md"]`）控制各根目录探测的文件名，显式空列表表示只加载 `paths`。
 - **预算**：`[instructions].max_chars`（默认 8000）按优先级分配——高优先级文件保证完整，低优先级按剩余额度截头并附 read_file 指引，放不下的整体省略并计数。
 - **安全**：不做信任门控——注入是纯文本，无法影响代码强制的安全边界（权限引擎 / 路径沙箱 / 非交互 fail-closed）；显式配置的 `paths` 文件缺失 / 不可用警告一次，默认探测位置缺失静默。
 
