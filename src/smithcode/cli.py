@@ -6,6 +6,7 @@ from pathlib import Path
 from . import __version__, commands, config, sessions
 from .agent import INTERRUPTED_NOTE, Agent
 from .session import Session
+from .utils.proxy import normalize_proxy_env
 from .utils.terminal import (
     confirmations_available,
     read_user_input,
@@ -237,6 +238,9 @@ def _resume_session(agent: Agent, last: bool, target: str) -> None:
 
 
 def main(argv=None):
+    # 必须早于任何 OpenAI / httpx 客户端的构造：把系统代理写入的 socks://
+    # 归一化为 httpx 认的 socks5://，否则 FlClash 等一设代理就启动即崩。
+    normalize_proxy_env()
     setup_console_encoding()
 
     parser = build_parser()

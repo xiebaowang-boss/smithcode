@@ -22,6 +22,7 @@
 ### 修复
 
 - **LLM 流中途断连自动重试**：推理模型思考时对端（服务商 / 网关 / 代理）可能因空闲超时掐断长连接（`RemoteProtocolError: incomplete chunked read`），此前这类流中途的传输层错误不在重试范围内，会直接中断任务；现将 `RemoteProtocolError` / `ReadError` / `ReadTimeout` 纳入瞬时错误重试，每次重试前在终端打印错误详情，重试次数用尽仍失败则照常报错。已输出正文后不重试（重放会重复打印）；仅输出过思考内容时可安全重算（思考只展示、不写入会话）。
+- **系统代理写入 `socks://` 导致启动即崩**：Clash / FlClash / V2RayN 等设置系统代理时会往环境里写 `ALL_PROXY=socks://host:port`（少了版本号），而 httpx 只认 `socks5://` / `socks5h://`，在构造客户端时即抛 `Unknown scheme for proxy URL`，且该校验发生在 `NO_PROXY` 匹配之前——用户一开系统代理，SmithCode 启动就失败。新增 `utils/proxy.py` 的 `normalize_proxy_env()`，在 CLI 入口与 `LLMClient` 构造前把所有代理环境变量里的 `socks://` 就地归一化为 `socks5://`（幂等、失败不阻断启动，MCP 的 HTTP 传输共用同一份环境变量一并受益）；依赖新增 `httpx2[socks]` 以带上 `socksio`，真正支持 SOCKS 代理。
 
 ## [0.9.0] - 2026-09-14
 
