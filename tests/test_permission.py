@@ -425,7 +425,7 @@ def test_ask_reprompts_on_invalid_answer(make_perm, monkeypatch):
         return next(answers)
 
     monkeypatch.setattr("builtins.input", _input)
-    assert perm.check("run_command", {"command": "ls"}) is True
+    assert perm.check("run_command", {"command": "rm -rf build"}) is True
     assert len(prompts) == 3  # 前两次无效、第三次 y，共问三轮
 
 
@@ -433,7 +433,7 @@ def test_ask_still_accepts_valid_answers(make_perm, monkeypatch):
     perm = make_perm()
     for answer, expected in (("y", True), ("n", False)):
         monkeypatch.setattr("builtins.input", lambda _, a=answer: a)
-        assert perm.check("run_command", {"command": "ls"}) is expected
+        assert perm.check("run_command", {"command": "rm -rf build"}) is expected
 
 
 def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
@@ -572,7 +572,7 @@ def test_accept_edits_still_asks_run_command(make_perm, monkeypatch):
     perm = make_perm()
     perm.mode = "accept_edits"
     monkeypatch.setattr("builtins.input", lambda _: "n")
-    assert perm.check("run_command", {"command": "ls"}) is False
+    assert perm.check("run_command", {"command": "rm -rf build"}) is False
 
 
 def test_accept_edits_respects_deny(make_perm, monkeypatch):

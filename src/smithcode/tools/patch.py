@@ -18,6 +18,7 @@ Update 的每个块按"上下文 + 删除行"组成的原文在文件中唯一�
 """
 from __future__ import annotations
 
+from .. import textfile
 from .base import register
 from .files import _protected_path, _resolve, _unified
 
@@ -98,12 +99,12 @@ def _preview_patch(args: dict) -> str | None:
                 parts.append(_unified("", "\n".join(payload), path))
             elif action == "delete":
                 if p.exists():
-                    parts.append(_unified(p.read_text(encoding="utf-8"), "", path))
+                    parts.append(_unified(textfile.read(p)[0], "", path))
             else:  # update
                 if not p.exists():
                     parts.append(f"(无法预览 {path}: 文件不存在，执行时会报错)")
                     continue
-                text = p.read_text(encoding="utf-8")
+                text = textfile.read(p)[0]
                 blocks = _parse_update_blocks(payload)
                 new_text = _apply_blocks_to_text(text, blocks, path)
                 if new_text.startswith("错误"):
@@ -205,28 +206,35 @@ def apply_patch(patch: str) -> str:
         if action == "add":
             if p.exists():
                 return f"错误: {path} 已存在，请改用 Update File"
-            prepared.append(("write", p, "\n".join(payload)))
+            prepared.append(("write", p, "\n".join(payload), None))  # 新文件 → LF
         elif action == "delete":
             if not p.exists():
                 return f"错误: 要删除的文件不存在: {path}"
-            prepared.append(("delete", p, None))
+            prepared.append(("delete", p, None, None))
         else:  # update
             if not p.exists():
                 return f"错误: 要更新的文件不存在: {path}"
+            try:
+                text, fmt = textfile.read(p)
+            except textfile.TextFileError as e:
+                return f"错误: {path} {e}"
             blocks = _parse_update_blocks(payload)
-            new_text = _apply_blocks_to_text(p.read_text(encoding="utf-8"), blocks, path)
+            new_text = _apply_blocks_to_text(text, blocks, path)
             if isinstance(new_text, str) and new_text.startswith("错误"):
                 return new_text
-            prepared.append(("write", p, new_text))
+            prepared.append(("write", p, new_text, fmt))
 
-    # 阶段二：全部就绪才写盘
+    # 阶段二：全部就绪才写盘（逐文件沿用各自原文的换行风格与 BOM）
     lines = []
-    for action, p, content in prepared:
+    for action, p, content, fmt in prepared:
         if action == "delete":
             p.unlink()
             lines.append(f"- {p}")
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
+            try:
+                textfile.write(p, content, fmt)
+            except textfile.TextFileError as e:
+                return f"错误: {p} {e}"
             lines.append(f"+ {p}")
     return "已应用:\n" + "\n".join(lines)

@@ -64,8 +64,8 @@ def split_md_blocks(text: str):
 def git_branch(workspace: str) -> str | None:
     """当前工作区的 git 分支名；非 git 仓库或读取失败返回 None。
 
-    直接读 .git/HEAD（"ref: refs/heads/main" → main），不调 git 命令，
-    免依赖、速度快。子模块/worktree 的 .git 是指向实际 gitdir 的文本文件。
+    直接读 .git/HEAD（"ref: refs/heads/main" → main、"ref: refs/heads/feat/x" → feat/x），
+    不调 git 命令，免依赖、速度快。子模块/worktree 的 .git 是指向实际 gitdir 的文本文件。
     """
     root = Path(workspace)
     git = root / ".git"
@@ -81,7 +81,8 @@ def git_branch(workspace: str) -> str | None:
             return None
         text = head.read_text(encoding="utf-8").strip()
         if text.startswith("ref: "):
-            return text[5:].split("/")[-1]
+            # 只剥 "refs/heads/" 前缀，保留完整分支名（feat/x 不能截成 x）
+            return text[5:].removeprefix("refs/heads/")
         return text[:7]  # detached HEAD：显示短提交号
     except OSError:
         return None

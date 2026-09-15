@@ -149,6 +149,11 @@ class PermissionPanel(Vertical):
         self.app.close_composer_panel(self)
 
 
+# 多选题一道未勾选时提交的答案标记。空串在全局表示「取消」（见 bridge.ask_form），
+# 故用显式标记表示「作答了，但什么都没选」。
+_SKIPPED_ANSWER = "（未选择）"
+
+
 class QuestionPanel(Vertical):
     """opencode 式提问面板：一次承载 1-N 个问题，原地替换输入框，答完换回。
 
@@ -168,6 +173,10 @@ class QuestionPanel(Vertical):
     切题（←/→、Tab 或答完自动前进）一律不把焦点交给输入框，而是把选中项复位到**第一个
     选项**，方便继续 ←/→；有选项题落回列表态，末行固定「输入自定义回答…」（选项名不随
     答案变化），已填答案缩进显示在其下方。多次切题会重置选中项。
+
+    多选题允许不作选择：列表态未勾选任何选项时按 Enter 记为「（未选择）」并照常前进
+    （对齐 opencode 把空答案当合法答案、工具结果标 Unanswered 的语义），不会卡在原地；
+    空串在全局表示「取消」，故用该显式标记区分。输入框里的空文本回车仍只退回选项列表。
     """
 
     can_focus = True
@@ -270,7 +279,7 @@ class QuestionPanel(Vertical):
             else:
                 parts.append("enter 继续输入 · esc 取消")
         elif self._is_multiple(index):
-            parts.append("↑↓ 选择 · 空格 勾选 · enter 提交 · esc 取消")
+            parts.append("↑↓ 选择 · 空格 勾选 · enter 提交（未勾选=未选择） · esc 取消")
         else:
             parts.append("↑↓ 选择 · enter 确认 · esc 取消")
         return " · ".join(parts)
@@ -462,7 +471,8 @@ class QuestionPanel(Vertical):
 
     def _commit_and_advance(self, index: int) -> None:
         """输入框里回车：提交本题并进入下一题。多选=勾选项+自定义文本，单选=自定义文本；
-        答案为空则退回列表、不前进。"""
+        答案为空则退回列表、不前进（多选题的空答案只在列表态按 Enter 提交为「未选择」，
+        免得输入框里误按回车直接跳过本题）。"""
         if self._input is not None:
             self._custom[index] = self._input.value  # 以输入框实时内容为准
         if self._is_multiple(index):
@@ -477,10 +487,11 @@ class QuestionPanel(Vertical):
             self._end_editing()  # 空答案：回到列表，不提交
 
     def _submit_multiple(self, index: int) -> None:
+        """多选提交：勾选项与自定义文本合并；一道未勾选且无自定义文本时记为
+        「（未选择）」照常前进——多选题不作选择也是合法作答，不能因此卡住无法前进。"""
         answer = self._compose_answer(index)
-        if answer:
-            self._answers[index] = answer
-            self._advance()
+        self._answers[index] = answer or _SKIPPED_ANSWER
+        self._advance()
 
     def action_cancel(self) -> None:
         index = self._index

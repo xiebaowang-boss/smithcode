@@ -1,17 +1,20 @@
-"""websearch 工具：用 DuckDuckGo HTML 版检索网页，纯标准库实现。
+"""websearch 工具：用 DuckDuckGo HTML 版检索网页。
 
 与 webfetch 的分工：websearch 只给候选结果的标题 / 链接 / 摘要，需要正文时
-再对结果链接调用 webfetch。无 API key、无第三方依赖（webfetch 同款哲学）；
+再对结果链接调用 webfetch。无 API key；HTTP 层与 webfetch 共用 `utils/http.py`
+的客户端工厂（httpx2 + 环境代理，含 socks5），因此与 LLM 的代理语义一致。
 DuckDuckGo 返回的跳转链接（`//duckduckgo.com/l/?uddg=<真实地址>`）会被还原。
 """
 from __future__ import annotations
 
 import html
 import re
-import urllib.error
 import urllib.parse
-import urllib.request
 
+import httpx2
+
+from ..utils.http import client as http_client
+from ..utils.http import read_limited
 from .base import register
 from .web import _USER_AGENT, MAX_FETCH_BYTES
 
@@ -24,6 +27,10 @@ MAX_SNIPPET_LEN = 300  # 单条摘要展示上限
 _ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.IGNORECASE | re.DOTALL)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# DuckDuckGo 反爬验证页的稳定特征（页面里没有任何结果，只有"你是机器人吗"）。
+# 必须"无结果 + 命中标记"同时成立：正常结果页里也可能出现这些词（比如你搜的就是它们）。
+_CHALLENGE_MARKERS = ("bots use duckduckgo too", "anomaly-modal", "select all squares")
 
 
 def _clean(text: str) -> str:
@@ -70,15 +77,25 @@ def _parse_results(page: str, limit: int) -> list:
     return results[:limit]
 
 
+def _looks_like_challenge(page: str) -> bool:
+    """判断页面是 DuckDuckGo 的反爬验证页（而非"真的没有结果"）。
+
+    没有这条判定时，被拦截会伪装成「（无搜索结果）」——用户以为关键词不对，
+    实际是被判成机器人。命中条件：页面里没有任何结果锚点，且含特征文案。
+    """
+    low = page.lower()
+    return "result__a" not in low and any(mark in low for mark in _CHALLENGE_MARKERS)
+
+
 def _fetch(query: str) -> str:
     """POST 检索 DuckDuckGo HTML 版并返回解码后的页面文本。"""
-    data = urllib.parse.urlencode({"q": query}).encode("utf-8")
-    req = urllib.request.Request(
-        _ENDPOINT, data=data, headers={"User-Agent": _USER_AGENT}
-    )
-    with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read(MAX_FETCH_BYTES).decode(charset, errors="replace")
+    with http_client(timeout=SEARCH_TIMEOUT,
+                     headers={"User-Agent": _USER_AGENT}) as client, \
+            client.stream("POST", _ENDPOINT, data={"q": query}) as resp:
+        resp.raise_for_status()
+        charset = resp.charset_encoding or "utf-8"
+        raw = read_limited(resp, MAX_FETCH_BYTES)
+    return raw.decode(charset, errors="replace")
 
 
 def _describe(args: dict) -> str:
@@ -115,13 +132,20 @@ def websearch(query: str, max_results: int | None = None) -> str:
     )
     try:
         page = _fetch(query)
-    except urllib.error.HTTPError as e:
-        return f"错误: 搜索请求失败: HTTP {e.code} {e.reason}"
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        reason = getattr(e, "reason", None) or e
-        return f"错误: 搜索请求失败: {reason}"
+    except httpx2.HTTPStatusError as e:
+        return (
+            f"错误: 搜索请求失败: HTTP {e.response.status_code} "
+            f"{e.response.reason_phrase}"
+        )
+    except (httpx2.RequestError, httpx2.InvalidURL, OSError) as e:
+        return f"错误: 搜索请求失败: {e}"
     results = _parse_results(page, limit)
     if not results:
+        if _looks_like_challenge(page):
+            return (
+                "错误: DuckDuckGo 返回了反爬验证页，本次未取到结果。"
+                "可稍后重试；若持续出现，改用 webfetch 直接抓取已知网址"
+            )
         return "（无搜索结果）"
     lines = []
     for i, r in enumerate(results, 1):

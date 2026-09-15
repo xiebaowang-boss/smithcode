@@ -3,7 +3,7 @@ import sys
 import threading
 from pathlib import Path
 
-from . import __version__, commands, config, sessions
+from . import __version__, commands, config, renderer, sessions, title
 from .agent import INTERRUPTED_NOTE, Agent
 from .session import Session
 from .utils.proxy import normalize_proxy_env
@@ -273,6 +273,11 @@ def main(argv=None):
         agent.permission.approved_all = True
     agent.start()  # 启动模型目录：外部未配置时后台拉取 /models（不阻塞启动）
     _cleanup_old_sessions()
+    interactive = not args.task and confirmations_available()
+    if interactive:
+        # 尽早接管窗口标题：`--name` / 恢复会话的标题事件发生在宿主启动之前，
+        # 由 title.Relay 转给呈现器暂存，宿主首屏时统一写出（非 tty 自动失效）
+        renderer.set_renderer(title.attach(renderer.current()))
     if restoring:
         _resume_session(agent, args.continue_session, args.resume)
     if args.name:
@@ -281,7 +286,7 @@ def main(argv=None):
     try:
         if args.task:
             run_once(agent, " ".join(args.task))
-        elif confirmations_available():  # 交互终端：全屏 TUI（Textual）
+        elif interactive:  # 交互终端：全屏 TUI（Textual）
             from .tui import run_tui
 
             run_tui(agent)

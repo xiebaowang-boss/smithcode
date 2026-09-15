@@ -5,7 +5,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-from .. import config
+from .. import config, textfile
 from .base import register
 from .search import SKIP_DIRS
 
@@ -68,11 +68,13 @@ def _protected_path(p: Path) -> bool:
     return p.name == ".env" or ".git" in p.parts
 
 
-def _read_preview_text(p: Path) -> str | None:
-    """预览用读取：文件不存在返回 None 之外的空串语义由调用方处理；任何读取失败返回 None。"""
+def _existing_format(p: Path) -> textfile.FileFormat | None:
+    """已有文件的换行风格与 BOM；新文件或探测失败返回 None（写侧默认 LF、无 BOM）。"""
+    if not p.exists():
+        return None
     try:
-        return p.read_text(encoding="utf-8")
-    except (PermissionError, OSError, UnicodeDecodeError):
+        return textfile.format_of(p)
+    except textfile.TextFileError:
         return None
 
 
@@ -89,8 +91,8 @@ def _preview_write(args: dict) -> str | None:
         p = _resolve(path)
         if _protected_path(p):
             return None
-        old = p.read_text(encoding="utf-8") if p.exists() else ""
-    except (PermissionError, OSError, UnicodeDecodeError):
+        old = textfile.read(p)[0] if p.exists() else ""
+    except (PermissionError, textfile.TextFileError):
         return None
     new = str(args.get("content", ""))
     if old == new:
@@ -112,8 +114,8 @@ def _preview_edit(args: dict) -> str | None:
         p = _resolve(path)
         if not p.exists() or _protected_path(p):
             return None
-        text = p.read_text(encoding="utf-8")
-    except (PermissionError, OSError, UnicodeDecodeError):
+        text = textfile.read(p)[0]
+    except (PermissionError, textfile.TextFileError):
         return None
     if text.count(old_string) == 0:
         return None
@@ -162,9 +164,9 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
     if _is_binary(p):
         return f"错误: {path} 是二进制文件，无法以文本读取"
     try:
-        text = p.read_text(encoding="utf-8")
-    except UnicodeDecodeError as e:
-        return f"错误: 文件不是有效的 UTF-8 文本: {e}"
+        text = textfile.read(p)[0]
+    except textfile.TextFileError as e:
+        return f"错误: {e}"
     _remember(p)
 
     lines = text.splitlines()
@@ -215,7 +217,10 @@ def write_file(path: str, content: str) -> str:
             f"错误: {path} 已存在且本会话未读取过，先 read_file 查看现有内容后再覆盖"
         )
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
+    try:
+        textfile.write(p, content, _existing_format(p))
+    except textfile.TextFileError as e:
+        return f"错误: {e}"
     _remember(p)
     return f"已写入 {p} ({len(content)} 字符)"
 
@@ -255,7 +260,10 @@ def edit_file(path: str, old_string: str, new_string: str,
         return f"错误: {path} 本会话未读取过，先 read_file 查看内容后再编辑"
     if not old_string:
         return "错误: old_string 不能为空"
-    text = p.read_text(encoding="utf-8")
+    try:
+        text, fmt = textfile.read(p)
+    except textfile.TextFileError as e:
+        return f"错误: {e}"
     count = text.count(old_string)
     if count == 0:
         return ("错误: old_string 未找到，请先用 read_file 核对最新内容"
@@ -267,7 +275,7 @@ def edit_file(path: str, old_string: str, new_string: str,
         return (f"错误: old_string 匹配了 {count} 处（{shown}{more}），"
                 "补充更多上下文保证唯一，或用 replace_all=true 全部替换")
     new_text = text.replace(old_string, new_string)
-    p.write_text(new_text, encoding="utf-8")
+    textfile.write(p, new_text, fmt)
     _remember(p)
     return f"已编辑 {p}" + (f"（替换 {count} 处）" if count > 1 else "")
 

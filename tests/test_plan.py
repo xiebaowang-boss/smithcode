@@ -287,6 +287,12 @@ class _PlanRenderer:
     warn = info
     error = info
 
+    def turn_started(self):
+        pass
+
+    def turn_finished(self, status="ok"):
+        pass
+
 
 def test_agent_prints_plan_only_when_created(monkeypatch, capsys):
     """新建清单打印一次 [计划]；后续每步更新只静默刷新，不再往对话区重复打印。"""

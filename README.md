@@ -26,25 +26,24 @@
 
 ### 智能体与工具
 
-内置 17 个工具（`use_skill` 仅在发现可用技能时向模型开放，`task` 仅在有可用子代理类型时开放），模型自主决定调用哪些、调用几次（可配置单次任务最大迭代轮数，默认不限）：
+内置 16 个工具（`use_skill` 仅在发现可用技能时向模型开放），模型自主决定调用哪些、调用几次（可配置单次任务最大迭代轮数，默认不限）：
 
 | 工具 | 说明 |
 | ---- | ---- |
 | `read_file` | 读文件，返回带行号内容（`12│code`），支持 `offset` / `limit` 分段读取；拒绝二进制与目录 |
-| `write_file` | 创建 / 覆盖写入；覆盖已存在文件前强制先 `read_file` |
-| `edit_file` | 精确替换文本，`old_string` 须逐字符一致；支持 `replace_all` |
+| `write_file` | 创建 / 覆盖写入（覆盖已有文件时沿用其换行风格与 BOM；新建文件用 LF）；覆盖已存在文件前强制先 `read_file` |
+| `edit_file` | 精确替换文本，`old_string` 须逐字符一致；支持 `replace_all`；只改被编辑的行，保持文件原有换行风格与 BOM |
 | `apply_patch` | patch 信封格式的批量多文件修改（Add / Update / Delete），原子落盘 |
 | `list_dir` | 列目录（名称 / 大小 / 修改时间），跳过 `.git`、`.venv`、`node_modules` 等 |
 | `glob` | 按通配符搜文件名，支持 `**` 递归，结果按修改时间新→旧排序 |
 | `grep` | 按正则搜内容，支持忽略大小写、上下文行、只列文件 / 计数模式 |
 | `run_command` | 执行 shell 命令，默认 60 秒超时（可延长至 300 秒），跨平台终止进程树 |
-| `webfetch` | 抓取网页（仅 http/https）转纯文本，支持一次并行抓多个 URL |
+| `webfetch` | 抓取网页（仅 http/https）转结构化文本（保留标题 / 链接 / 代码块），支持一次并行抓多个 URL；默认拒访内网与本机地址 |
 | `websearch` | DuckDuckGo 网页检索，返回标题 / 链接 / 摘要 |
 | `ask_user` | 任务中途向你提问（一次可提 1-4 个，带候选项） |
 | `todo_write` / `todo_read` | 维护 / 读取任务步骤清单 |
 | `goal_update` / `goal_read` | 更新 / 读取持久目标状态 |
 | `use_skill` | 加载某个技能的完整指令 |
-| `task` | 派发隔离子代理执行开放式调查或独立子任务，只把最终报告回传（不占用主对话上下文） |
 
 多个工具调用**流式调度**：边预检边执行，可并行的只读 / 网络调用进线程池并发跑，有跨调用状态的工具（shell、写文件、交互确认）在主线程串行执行并作为顺序屏障，结果按提交顺序回传。
 
@@ -61,15 +60,6 @@
 - **发现位置**：项目 `.agents/skills/`、用户 `~/.smithcode/skills/`，以及 `[skills].paths` 追加的目录
 - **信任门控**：项目级技能来自可能不可信的仓库，默认首次发现时确认（可「始终信任」落盘）
 - **用户操作**：`/skills` 弹选择框（选中即加载）、`/skills list` 查看来源与诊断、`/skills refresh` 重扫磁盘；`/skill <名称> [任务]` 或 `/技能名 [任务]` 直达
-
-### 子代理（Subagents）
-
-模型可以把开放式多轮调查或可独立完成的子任务派发给**隔离子代理**执行：子代理拥有独立上下文与独立 Agentic Loop，只把最终报告回传给主对话，中间几十次工具调用不占用主上下文；同一回复里派发多个只读子代理会并发执行。
-
-- **内置类型**：`explore` 只读侦察（搜索、阅读、网络查证，只回结论与 `file:line`）；`general` 通用执行（可读写文件、运行命令，作为顺序屏障串行）
-- **自定义**：项目 `.smithcode/agents/*.md`、用户 `~/.smithcode/agents/*.md`，frontmatter 声明 `name` / `description` / `tools`（白名单）/ `model` / `max_turns`，正文为角色提示词；项目级定义复用技能的项目信任门控，`[subagents].paths` 追加目录，`[subagents].disabled` 按名禁用
-- **安全与权限**：子代理共享你的权限模式与会话规则，写 / 命令照常确认（确认框带 `[类型]` 前缀）；工具白名单双重强制，不能提问、不能再派子代理，MCP 工具默认关闭（`[subagents].allow_mcp`）
-- **用户操作**：`/agents` 查看类型目录，`/agents refresh` 重扫磁盘；Esc 中断会级联取消所有子代理
 
 ### 项目约定（AGENTS.md）
 
@@ -193,7 +183,6 @@ python -m smithcode              # 等价的另一种启动方式
 | `/skills [list\|refresh]` | 无参弹技能选择框（选中即加载）、`list` 查看列表与诊断、`refresh` 重扫磁盘 |
 | `/skill [名称] [任务]` | 加载技能；带任务时加载后立即开跑 |
 | `/技能名 [任务]` | 技能名直达（等价 `/skill`） |
-| `/agents [list\|refresh]` | 查看子代理类型目录；`refresh` 重扫用户 / 项目定义 |
 | `/exit` | 退出程序 |
 
 ### 命令行参数
@@ -281,15 +270,6 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[skills] project` | `ask` | 项目级技能信任策略：`ask` / `on` / `off` |
 | `[skills] max_catalog_chars` | 8000 | 技能目录注入系统提示词的字符预算 |
 | `[skills] disabled` | 空 | 按通配符禁用技能 |
-| `[subagents] enabled` | true | 子代理子系统总开关（关闭即隐藏 `task` 工具） |
-| `[subagents] max_concurrency` | 3 | 同时运行的子代理上限 |
-| `[subagents] max_turns` | 25 | 单个子代理默认迭代上限；0 = 继承主 Agent |
-| `[subagents] timeout` | 0 | 单个子代理墙钟超时（秒）；0 = 不限 |
-| `[subagents] parallel` | true | 只读子代理进并行波次；false 时全部串行 |
-| `[subagents] display` | `summary` | 子代理展示粒度：`summary` 只显示工具摘要与报告，`detail` 连流式一起显示 |
-| `[subagents] allow_mcp` | false | 子代理白名单是否允许 `mcp__` 工具 |
-| `[subagents] paths` | 空 | 追加的子代理定义目录（最高优先级） |
-| `[subagents] disabled` | 空 | 按通配符禁用子代理类型（内置亦可） |
 | `tool_display` | `summary` | 工具调用终端展示粒度：`summary` 只显示短摘要，`detail` 追加结果内容 |
 
 配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。`SMITHCODE_HOME` 可覆盖配置根目录。
@@ -315,7 +295,6 @@ smith -c -y 跑一遍测试并总结失败原因
 - shell 命令默认 60 秒超时；LLM 请求 120 秒超时，限流 / 断网自动重试
 - 单次工具输出超长时自动头尾截断，防止撑爆上下文
 - 技能根目录只读；技能的 `allowed-tools` 声明不产生任何授权效果
-- 子代理在独立会话中运行且不能再派子代理；共享权限引擎，写 / 命令照常确认，非交互环境同样拒绝
 
 ## 开发
 

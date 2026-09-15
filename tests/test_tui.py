@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+from textual.geometry import Region
 from textual.widgets import Static
 
 import smithcode.renderer as renderer_module
@@ -173,6 +174,40 @@ def test_tui_mounts_and_welcomes(monkeypatch):
         async with app.run_test() as pilot:
             assert pilot.app is app
             assert f"v{__version__}" in _chat_text(app)
+
+    _run(_run_case())
+
+
+def test_tui_mount_wires_terminal_title(monkeypatch):
+    """挂载时把标题 sink 接到 Textual 写入通道，标题事件据此真正上到终端。"""
+    no_prompting(monkeypatch)
+    from smithcode import title as title_module
+
+    monkeypatch.setattr(title_module.config, "load_terminal_title", lambda: True)
+    monkeypatch.setattr(title_module, "stdout_is_tty", lambda: True)
+
+    captured = {"writes": []}
+    real_attach = title_module.attach
+
+    def spy_attach(inner, sink=None, workspace=""):
+        captured["inner"] = inner
+        captured["sink"] = sink
+
+        def recording_sink(seq):
+            captured["writes"].append(seq)
+
+        return real_attach(inner, sink=recording_sink, workspace=workspace)
+
+    monkeypatch.setattr(title_module, "attach", spy_attach)
+
+    async def _run_case():
+        monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
+        app = SmithTUI(Agent(session=Session(), persist=False))
+        async with app.run_test():
+            assert isinstance(captured["inner"], TuiRenderer)
+            assert captured["sink"] == app._driver.write  # 走 Textual 写入队列
+            app.agent.rename_session("标题接线")
+            assert "\x1b]0;Smith · 标题接线\x07" in captured["writes"]
 
     _run(_run_case())
 
@@ -1405,8 +1440,9 @@ def test_running_indicator_above_input(monkeypatch):
             assert status.parent is app.query_one("#bottom")  # 上下文/git 仍在底行
             assert running.display is False  # 空闲时动画隐藏
             # 左侧竖线画在输入框自身：容器无边框，上方动画行不会被一起框住
+            # （只校验画在哪一层，不锁具体字形：thick / heavy / solid 都算通过）
             assert input_wrap.styles.border_left[0] in ("", "none")
-            assert chat_input.styles.border_left[0] == "solid"
+            assert chat_input.styles.border_left[0] not in ("", "none")
 
     _run(_run_case())
 
@@ -1431,11 +1467,15 @@ def test_user_message_panel(monkeypatch):
 
 
 def test_git_branch_detection(tmp_path):
-    """git 分支读取：常规仓库 / 无 .git / detached HEAD。"""
+    """git 分支读取：常规仓库 / 带斜杠的分支名 / 无 .git / detached HEAD。"""
     repo = tmp_path / "repo"
     (repo / ".git" / "refs" / "heads").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     assert git_branch(str(repo)) == "main"
+
+    # 带斜杠的分支名保留完整路径（曾误截成最后一段）
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/feat/tui-statusbar\n", encoding="utf-8")
+    assert git_branch(str(repo)) == "feat/tui-statusbar"
 
     assert git_branch(str(tmp_path)) is None  # 无 .git
 
@@ -1482,6 +1522,57 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
             await pilot.press("enter")   # 提交
             await pilot.pause()
             assert result.get("values") == ["红, 圆"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_choice_modal_multiple_empty_submits_skipped(monkeypatch):
+    """多选一道未勾选时 Enter 照常提交：记为「（未选择）」，不再毫无反应卡在原地。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel(
+                [{"question": "选特征", "options": ["红", "大", "圆"],
+                  "descriptions": [], "multiple": True}], result, evt)
+            await pilot.pause()
+            await pilot.press("enter")   # 一道未勾选直接提交
+            await pilot.pause()
+            assert result.get("values") == ["（未选择）"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_choice_modal_multiple_empty_advances(monkeypatch):
+    """多题中的多选题空提交：记为「（未选择）」并前进到下一题，最后一题答完进确认页。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "选特征", "options": ["红", "大"], "descriptions": [],
+                 "multiple": True},
+                {"question": "用哪个？", "options": ["甲", "乙"], "descriptions": [],
+                 "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("enter")   # Q1 未勾选提交 → 前进到 Q2
+            await pilot.pause()
+            assert panel._index == 1
+            assert panel._answers[0] == "（未选择）"
+            await pilot.press("2")       # 数字快选 Q2 的「乙」→ 进确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")   # 确认页提交整组
+            await pilot.pause()
+            assert result.get("values") == ["（未选择）", "乙"]
             assert evt.is_set()
 
     _run(_run_case())
@@ -2377,6 +2468,148 @@ def test_context_tools_grouped_with_counts(monkeypatch):
             assert "2 次搜索" in header  # grep + glob
             assert "列目录" not in header
             assert len(groups.first().query(ToolCall)) == 4
+
+    _run(_run_case())
+
+
+def test_context_group_pending_then_done_wording(monkeypatch):
+    """「已探索」汇总行两态文案：进行中「探索中」，全部出结果后「已探索」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "grep foo", "grep"),
+            ])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            pending_header = str(group.query_one(".group-header").content)
+            assert "探索中" in pending_header
+            assert "正在探索" not in pending_header
+            for tool_id in (1, 2):
+                app.ui_tool_result(tool_id, "结果", False, False)
+            await pilot.pause()
+            done_header = str(group.query_one(".group-header").content)
+            assert "已探索" in done_header
+            assert "探索中" not in done_header
+
+    _run(_run_case())
+
+
+def test_context_group_keeps_exploring_until_children_finish(monkeypatch):
+    """封口不等于跑完：混批里非上下文工具把组封口后，仍在跑的子工具仍显示「探索中」。
+
+    回归：此前封口会把文案无条件切成「已探索」（并停掉转轮），而 read/grep 与
+    命令混批很常见，导致「探索中」几乎永远看不到；现在状态只看组内是否还有
+    没出结果的子工具。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            assert "探索中" in str(group.query_one(".group-header").content)
+
+            # 同批的命令到来 → 汇总组封口（后续只读工具另起一组）
+            _start_tools(app, [(2, "command ls", "run_command")])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 1  # 命令不新建组
+            header = str(group.query_one(".group-header").content)
+            assert "探索中" in header  # 读取还没出结果，仍算探索中
+            assert group._spin_timer is not None  # 转轮继续转
+
+            app.ui_tool_result(1, "结果", False, False)
+            await pilot.pause()
+            header = str(group.query_one(".group-header").content)
+            assert "已探索" in header
+            assert group._spin_timer is None
+
+    _run(_run_case())
+
+
+def test_context_group_drained_at_turn_end(monkeypatch):
+    """轮次结束兜底：没等到结果的子工具被收尾，转轮停下、文案定格「已探索」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            assert group._spin_timer is not None
+
+            app._turn_start = time.monotonic()  # ui_turn_end 以轮次起点为前置条件
+            app.ui_turn_end("ok")  # 结果始终没来
+            await pilot.pause()
+            header = str(group.query_one(".group-header").content)
+            assert "已探索" in header
+            assert group._spin_timer is None
+
+    _run(_run_case())
+
+
+def test_context_group_spinner_repaints_third_cell(monkeypatch):
+    """「已探索」头的转轮在第 3 列（「▸ 」之后）：tick 只重绘那一格。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            header = group.query_one(".group-header")
+            before = str(header.content)
+            group._spin()
+            after = str(header.content)
+            assert after != before
+            assert after[:2] == before[:2] and after[3:] == before[3:]  # 只有第 3 列变化
+            assert header._repaint_regions == {Region(2, 0, 1, 1)}
+
+    _run(_run_case())
+
+
+def test_context_group_children_live_in_body_and_collapse(monkeypatch):
+    """明细必须挂在 .group-body 里（标题之下），且折叠真的能收起明细。
+
+    回归：缓冲列表曾与 Textual `Widget._pending_children` 同名串台——子控件被
+    排到标题之前，`on_mount` 补挂时列表已被 `_compose` 清空，导致 `.group-body`
+    恒为空、明细常驻可见、Enter / 点击折叠完全失效。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "ls src", "list_dir"),
+            ])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            header = group.query_one(".group-header")
+            body = group.query_one(".group-body")
+            tools = list(group.query(ToolCall))
+            assert len(tools) == 2
+            assert list(body.children) == tools  # 明细归位在正文容器内
+            assert not body.display  # 默认收起
+
+            group.action_toggle()
+            await pilot.pause()
+            assert body.display  # 展开可见
+            assert header.region.y < tools[0].region.y  # 标题在明细之上
+            assert tools[0].region.height > 0
+
+            group.action_toggle()
+            await pilot.pause()
+            assert not body.display  # 再收起
+            assert not tools[0].region  # 收起后明细不再占位
 
     _run(_run_case())
 

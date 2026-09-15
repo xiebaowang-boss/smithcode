@@ -355,6 +355,75 @@ def load_tool_display():
     return DEFAULT_TOOL_DISPLAY
 
 
+# ---------- 终端窗口标题 ----------
+
+_TERMINAL_TITLE_TRUTHY = ("1", "true", "yes", "on")
+_TERMINAL_TITLE_FALSY = ("0", "false", "no", "off")
+
+
+def load_terminal_title() -> bool:
+    """是否把会话标题写进终端窗口标题（TUI / REPL 交互模式）。
+
+    优先级：SMITHCODE_TERMINAL_TITLE > config.toml 顶层 terminal_title > 默认
+    True（对齐 KEY / MODEL / URL 的 env > 文件 > 默认，见「三项核心配置」）。空串
+    视为"没配"；非法值打印警告并降级为默认，不中断程序。非 tty 时由调用方
+    （title.TerminalTitlePresenter）整体关闭，无需用户额外配置。
+    """
+    env = os.getenv("SMITHCODE_TERMINAL_TITLE", "").strip().lower()
+    if env:
+        if env in _TERMINAL_TITLE_TRUTHY:
+            return True
+        if env in _TERMINAL_TITLE_FALSY:
+            return False
+        print(
+            f"[警告] SMITHCODE_TERMINAL_TITLE 的值 {env!r} 无效"
+            "（可选 1/0），已用默认值 True"
+        )
+        return True
+    value = _read_config_file().get("terminal_title", True)
+    if isinstance(value, bool):
+        return value
+    print(
+        f"[警告] config.toml 的 terminal_title = {value!r} 不是布尔值，已用默认值 True"
+    )
+    return True
+
+
+# ---------- 网络工具（webfetch / websearch） ----------
+
+_BOOL_TRUTHY = ("1", "true", "yes", "on")
+_BOOL_FALSY = ("0", "false", "no", "off")
+
+
+def load_allow_private_urls() -> bool:
+    """webfetch 是否允许访问内网 / 本机地址（默认 False，即拦截）。
+
+    优先级：SMITHCODE_ALLOW_PRIVATE_URLS > config.toml 顶层 allow_private_urls >
+    默认 False。默认拦截私网、回环、链路本地（含云元数据 169.254.169.254）、CGNAT
+    等非全局地址——webfetch 默认免确认放行，模型又可能被网页内容诱导，故按
+    「默认安全」处理；本地开发要抓 localhost 文档时可显式打开。空串视为"没配"；
+    非法值打印警告并降级为默认，不中断程序。
+    """
+    env = os.getenv("SMITHCODE_ALLOW_PRIVATE_URLS", "").strip().lower()
+    if env:
+        if env in _BOOL_TRUTHY:
+            return True
+        if env in _BOOL_FALSY:
+            return False
+        print(
+            f"[警告] SMITHCODE_ALLOW_PRIVATE_URLS 的值 {env!r} 无效"
+            "（可选 1/0），已用默认值 False"
+        )
+        return False
+    value = _read_config_file().get("allow_private_urls", False)
+    if isinstance(value, bool):
+        return value
+    print(
+        f"[警告] config.toml 的 allow_private_urls = {value!r} 不是布尔值，已用默认值 False"
+    )
+    return False
+
+
 # ---------- 技能（Skills） ----------
 
 SKILLS_PROJECT_MODES = ("ask", "on", "off")
@@ -555,105 +624,3 @@ def load_sessions_config() -> SessionsConfig:
         title_model=_file_str("sessions", "title_model") or "",
         title_max_chars=title_max_chars,
     )
-
-
-# ---------- 子代理（Subagents） ----------
-
-SUBAGENT_DISPLAY_MODES = ("summary", "detail")
-
-
-@dataclass(frozen=True)
-class SubagentsConfig:
-    """[subagents] 段的解析结果；非法项警告后回退默认值。"""
-
-    enabled: bool = True
-    max_concurrency: int = 3  # 同时运行的子代理上限（信号量；默认小于工具并发上限）
-    max_turns: int = 25  # 单个子代理默认迭代上限；0 = 继承主 Agent 的 max_iterations
-    timeout: float = 0  # 单个子代理墙钟超时秒数；0 = 不限
-    parallel: bool = True  # 只读子代理允许进并行波次；false 时全部串行
-    display: str = "summary"  # summary = 只显示子代理工具摘要与最终报告；detail = 连流式一起显示
-    allow_mcp: bool = False  # 子代理白名单是否允许 mcp__ 工具
-    paths: tuple = ()  # 追加的子代理定义目录（最高优先级）
-    disabled: tuple = ()  # 禁用的类型名（通配符，内置也可禁）
-
-
-def load_subagents_config() -> SubagentsConfig:
-    """读取 [subagents] 段：enabled / max_concurrency / max_turns / timeout /
-    parallel / display / allow_mcp / paths / disabled。
-
-    与 skills / sessions 配置同款风格：类型不对警告后回退默认值，不中断启动。
-    """
-    data = _read_config_file().get("subagents") or {}
-    if not isinstance(data, dict):
-        print("[警告] config.toml 的 [subagents] 段不是表，已忽略")
-        return SubagentsConfig()
-
-    enabled = data.get("enabled", True)
-    if not isinstance(enabled, bool):
-        print(
-            f"[警告] config.toml 的 subagents.enabled = {enabled!r}"
-            " 不是布尔值，已用默认值 True"
-        )
-        enabled = True
-
-    parallel = data.get("parallel", True)
-    if not isinstance(parallel, bool):
-        print(
-            f"[警告] config.toml 的 subagents.parallel = {parallel!r}"
-            " 不是布尔值，已用默认值 True"
-        )
-        parallel = True
-
-    allow_mcp = data.get("allow_mcp", False)
-    if not isinstance(allow_mcp, bool):
-        print(
-            f"[警告] config.toml 的 subagents.allow_mcp = {allow_mcp!r}"
-            " 不是布尔值，已用默认值 False"
-        )
-        allow_mcp = False
-
-    display = data.get("display", "summary")
-    if display not in SUBAGENT_DISPLAY_MODES:
-        print(
-            f"[警告] config.toml 的 subagents.display = {display!r} 无效"
-            f"（可选 {' / '.join(SUBAGENT_DISPLAY_MODES)}），已用默认值 summary"
-        )
-        display = "summary"
-
-    max_concurrency = int(_resolve_number("subagents", "max_concurrency", 3))
-    if max_concurrency <= 0:
-        print(
-            f"[警告] config.toml 的 subagents.max_concurrency = {max_concurrency!r} 无效"
-            "（应为正整数），已用默认值 3"
-        )
-        max_concurrency = 3
-
-    max_turns = int(_resolve_number("subagents", "max_turns", 25))
-    if max_turns < 0:
-        print(
-            f"[警告] config.toml 的 subagents.max_turns = {max_turns!r} 不能为负，已用默认值 25"
-        )
-        max_turns = 25
-
-    timeout = float(_resolve_number("subagents", "timeout", 0))
-    if timeout < 0:
-        print(
-            f"[警告] config.toml 的 subagents.timeout = {timeout!r} 不能为负，已用默认值 0"
-        )
-        timeout = 0
-
-    return SubagentsConfig(
-        enabled=enabled,
-        max_concurrency=max_concurrency,
-        max_turns=max_turns,
-        timeout=timeout,
-        parallel=parallel,
-        display=display,
-        allow_mcp=allow_mcp,
-        paths=_str_list(data.get("paths"), "subagents.paths"),
-        disabled=_str_list(data.get("disabled"), "subagents.disabled"),
-    )
-
-
-# 子代理配置是模块级常量：Agent 启动时 refresh() 会重新读取并生效（测试可 monkeypatch）
-SUBAGENTS = load_subagents_config()

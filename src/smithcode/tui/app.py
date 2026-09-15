@@ -24,9 +24,20 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .. import commands, config, context, goal, permission, plan, renderer, welcome
+from .. import (
+    commands,
+    config,
+    context,
+    goal,
+    permission,
+    plan,
+    renderer,
+    title,
+    welcome,
+)
 from ..mcp.errors import McpConfigError
 from ..mcp.wizard import McpWizard, apply_plan
+from . import clipboard
 from .bridge import TuiRenderer
 from .chat import (
     Assistant,
@@ -108,7 +119,7 @@ class SmithTUI(App):
     }
     #sidebar {
         height: 100%;
-        width: 46;
+        width: 40;
         padding: 1 2 1 2;
         background: #141414;
     }
@@ -143,14 +154,15 @@ class SmithTUI(App):
     #input {
         height: 3;
         padding: 1 2 0 2;
-        /* 左竖线画在输入框自身：只框住输入框 3 行，上面的运行动画行不跟着被框 */
+        /* 左竖线画在输入框自身：只框住输入框 3 行，上面的运行动画行不跟着被框。
+        heavy 用 ┃，比默认 solid 的细线 │ 粗一档（Textual 边框固定 1 格宽，只能改字形） */
         border: none;
-        border-left: solid #23d18b;
+        border-left: heavy #23d18b;
         background: #1e1e1e;
     }
     #input:focus {
         border: none;
-        border-left: solid #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
+        border-left: heavy #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
     }
     #input .text-area--cursor-line {
         background: transparent;
@@ -190,7 +202,8 @@ class SmithTUI(App):
     .chat-item.welcome { padding-left: 0; margin-top: 0; }
     .chat-item.user-msg {
         background: #141414;
-        border-left: solid #23d18b;
+        /* 与输入框左竖线同款同粗细（heavy 的 ┃），保持视觉一致 */
+        border-left: heavy #23d18b;
         padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
     }
     ToolCall { height: auto; }
@@ -206,16 +219,12 @@ class SmithTUI(App):
     ThinkingBlock { height: auto; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
-    /* 子代理 task 块：内部活动区（子工具行）随内容自适应，不占满高度 */
-    SubAgentBlock { height: auto; }
-    SubAgentBlock .subagent-activity { height: auto; margin-left: 3; }
-    SubAgentBlock .subagent-tool { padding-left: 0; margin-top: 0; }
     QuestionPanel {
         height: auto;
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
-        border-left: solid #fab283;
+        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
     }
     QuestionPanel .ask-title { color: #fab283; margin-bottom: 1; }
     QuestionPanel .ask-hint { color: #808080; }
@@ -233,7 +242,7 @@ class SmithTUI(App):
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
-        border-left: solid #fab283;
+        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
     }
     PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
     PermissionPanel .perm-detail { color: #a9b1d6; }
@@ -309,7 +318,7 @@ class SmithTUI(App):
         Binding("escape", "interrupt", "中断", show=False),
     ]
     SIDEBAR_BREAKPOINT: ClassVar[int] = 120
-    """终端宽度 >= 此值才显示侧边栏（46 列侧边栏 + 约 74 列聊天区）。"""
+    """终端宽度 >= 此值才显示侧边栏（40 列侧边栏 + 约 80 列聊天区）。"""
     CONTEXT_BAR_CELLS: ClassVar[int] = 10
     """底栏上下文占用条的格数：█ 填充 + ░ 空位，一格约 10%。"""
 
@@ -334,6 +343,19 @@ class SmithTUI(App):
         """对话区系统通知的统一出口（信息 / 警告 / 错误）。"""
         self._chat().apply(Notice(text, level))
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """复制到系统剪贴板：优先系统工具，失败退回 Textual 的 OSC 52。
+
+        Textual 默认只写 OSC 52 序列，VTE 系终端（GNOME Terminal / Console /
+        Tilix / xfce4-terminal）不支持该序列，复制会静默失败；改用 wl-copy /
+        xclip / xsel 等直接写系统剪贴板（见 tui/clipboard）。`_clipboard` 同时
+        更新，保持应用内粘贴语义与 Textual 一致。
+        """
+        self._clipboard = text
+        if clipboard.copy_to_system(text):
+            return
+        super().copy_to_clipboard(text)
+
     def compose(self) -> ComposeResult:
         # opencode 式布局：侧边栏通高居右；对话列（消息区 + 输入框 + 状态行）居左
         with Horizontal(id="main"):
@@ -354,7 +376,15 @@ class SmithTUI(App):
             yield Sidebar(id="sidebar")
 
     def on_mount(self) -> None:
-        renderer.set_renderer(TuiRenderer(self))
+        # 窗口标题：sink 换成 Textual 的写入队列（整条序列由 writer 线程落盘，
+        # 与帧输出不交错）；标题状态与压栈已在 cli.main 装配时接管
+        driver = self._driver
+        renderer.set_renderer(
+            title.attach(
+                TuiRenderer(self),
+                sink=driver.write if driver is not None else None,
+            )
+        )
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
@@ -477,9 +507,9 @@ class SmithTUI(App):
             return
         handler(*message.args)
 
-    def ui_notice(self, text: str, level: str = "info", scope=None) -> None:
+    def ui_notice(self, text: str, level: str = "info") -> None:
         """系统通知（信息 / 警告 / 错误）落对话区，级别决定颜色与图标。"""
-        self._chat().apply(Notice(text, coerce_level(level), scope))
+        self._chat().apply(Notice(text, coerce_level(level)))
 
     def ui_line(self, text: str, style: str | None = None) -> None:
         """兼容旧调用点：style 字符串映射为语义级别（新代码请用 ui_notice）。"""
@@ -494,38 +524,37 @@ class SmithTUI(App):
         字面字符进入渲染流（真实终端会打花整个界面）。"""
         self._chat().apply(Block(text, level_from_style(style)))
 
-    def ui_stream(self, kind: str, chunk: str, scope=None) -> None:
-        self._chat().apply(StreamDelta(kind, chunk, scope))
+    def ui_stream(self, kind: str, chunk: str) -> None:
+        self._chat().apply(StreamDelta(kind, chunk))
 
-    def ui_stream_done(self, scope=None) -> None:
-        self._chat().apply(StreamEnd(scope))
+    def ui_stream_done(self) -> None:
+        self._chat().apply(StreamEnd())
 
     def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
-                      name: str = "", scope=None) -> None:
-        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组；
-        带 scope 的子代理事件路由进对应 task 块（见 ChatView.apply）。
+                      name: str = "") -> None:
+        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。
 
         命令工具耗时不确定，pending 期显式标「执行中」；完成后统一转静态行。"""
         icon = _PLAN_ICON if name == "todo_write" else ""
         running = "执行中" if name == "run_command" else ""
-        self._chat().apply(ToolStart(tool_id, summary, display, name, icon, running, scope))
+        self._chat().apply(ToolStart(tool_id, summary, display, name, icon, running))
 
-    def ui_tool_preview(self, tool_id: int | None, detail: str, scope=None) -> None:
+    def ui_tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：更新对应 pending 工具块，审核时改动已可见。"""
-        self._chat().apply(ToolPreview(tool_id, detail, scope))
+        self._chat().apply(ToolPreview(tool_id, detail))
 
     def ui_tool_result(self, tool_id: int | None, result: str, expanded: bool,
-                       is_error: bool, scope=None) -> None:
-        self._chat().apply(ToolResult(tool_id, result, expanded, is_error, scope))
+                       is_error: bool) -> None:
+        self._chat().apply(ToolResult(tool_id, result, expanded, is_error))
 
-    def ui_thinking_start(self, scope=None) -> None:
-        self._chat().apply(ThinkingStart(scope))
+    def ui_thinking_start(self) -> None:
+        self._chat().apply(ThinkingStart())
 
-    def ui_thinking_tick(self, chunk: str, scope=None) -> None:
-        self._chat().apply(ThinkingDelta(chunk, scope))
+    def ui_thinking_tick(self, chunk: str) -> None:
+        self._chat().apply(ThinkingDelta(chunk))
 
-    def ui_thinking_done(self, scope=None) -> None:
-        self._chat().apply(ThinkingEnd(scope))
+    def ui_thinking_done(self) -> None:
+        self._chat().apply(ThinkingEnd())
 
     def ui_plan_sidebar(self, rendered: str) -> None:
         self.query_one(Sidebar).update_plan(rendered, plan.has_active())
@@ -855,6 +884,8 @@ class SmithTUI(App):
         self._turn_start = None
         found = self.query(ChatView)
         if found:
+            # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）
+            found.first().drain_context_groups()
             found.first().apply(Footer(
                 config.MODEL,
                 config.REASONING_EFFORT or config.DEFAULT_EFFORT,

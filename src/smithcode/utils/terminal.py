@@ -123,6 +123,40 @@ def setup_console_encoding():
                 pass
 
 
+def stdout_is_tty() -> bool:
+    """真实 stdout 是否连着终端。
+
+    用 sys.__stdout__ 而非 sys.stdout：Textual 启动后会替换后者（`_PrintCapture`，
+    isatty 恒为 True），拿它判断会在管道下误判。
+    """
+    stream = sys.__stdout__
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def write_terminal_control(seq: str) -> None:
+    """把控制序列直写真实终端（窗口标题等），失败静默。
+
+    同 stdout_is_tty：绕开 sys.stdout。sys.__stdout__ 在 TUI / REPL 下始终是
+    进程启动时的那个流；它写不进去（非 ASCII 标题撞上旧代码页、流已关闭）时
+    兜底 os.write(1, ...)——控制台此时已被 setup_console_encoding 切到 UTF-8。
+    """
+    stream = sys.__stdout__
+    try:
+        if stream is not None:
+            stream.write(seq)
+            stream.flush()
+            return
+    except (OSError, ValueError, UnicodeError):
+        pass
+    try:
+        os.write(1, seq.encode("utf-8"))
+    except OSError:
+        pass
+
+
 def flush_pending_input():
     """清空控制台输入缓冲区（尽力而为）。
 

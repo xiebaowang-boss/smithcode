@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from . import config, goal, instructions, plan, renderer, sessions, skills, subagents
+from . import config, goal, instructions, plan, renderer, sessions, skills
 from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
@@ -44,7 +44,6 @@ from .tools import (
     visible_schemas,
 )
 from .tools.skills import sync_schema
-from .tools.task import sync_schema as sync_task_schema
 
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
@@ -52,11 +51,14 @@ MAX_SUMMARY_LEN = 80
 # 变更预览（diff）最多展示的行数，超出截断
 MAX_PREVIEW_LINES = 40
 
+# 自动标题的最大尝试次数：单次失败（网络抖动、瞬时错误重试耗尽、模型输出不可用）
+# 不永久放弃——下一轮任务正常结束后补试，到顶后提示用户手动 /rename。
+TITLE_MAX_ATTEMPTS = 3
+
 # 结果详情默认展开的工具：写/编辑类的 diff 是本次改动的关键信息（apply_patch
-# 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体），task 的结果是
-# 子代理报告（主代理与本轮的唯一产出）；都直接可见、可收起。
+# 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体）；都直接可见、可收起。
 DEFAULT_EXPAND_TOOLS = frozenset({
-    "write_file", "edit_file", "apply_patch", "ask_user", "task",
+    "write_file", "edit_file", "apply_patch", "ask_user",
 })
 
 
@@ -231,15 +233,13 @@ class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None,
                  store=None, persist: bool = False, oneshot: bool = False,
                  llm=None, permission=None, mcp=None, models=None,
-                 tool_filter=None, model: str | None = None,
-                 depth: int = 0, reset_globals: bool = True):
+                 model: str | None = None, reset_globals: bool = True):
         """构造 Agent。
 
-        进程级服务（llm / permission / mcp / models）可注入：子代理复用父级实例
-        （共享权限模式与会话规则、连接与客户端），而不是各自新建。tool_filter
-        限制本实例可见且可执行的工具集合（子代理白名单）；model 覆盖模型；
-        depth 为子代理深度（>0 时禁用 task）；reset_globals=False 跳过
-        「已读文件」等进程级状态的初始化（子代理不得清空父级记录）。
+        进程级服务（llm / permission / mcp / models）可注入：复用已有实例
+        （共享权限模式与会话规则、连接与客户端），而不是各自新建。model 覆盖
+        模型；reset_globals=False 跳过「已读文件」等进程级状态的初始化
+        （复用实例不得清空既有记录）。
         """
         if reset_globals:
             reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
@@ -250,9 +250,7 @@ class Agent:
         # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
         self.mcp = mcp if mcp is not None else McpService()
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
-        self._tool_filter = tool_filter  # (name)->bool；None = 全部可用（主代理）
-        self._model = model  # 非空时覆盖 config.MODEL（子代理可挂不同模型）
-        self.depth = int(depth)  # 子代理深度：>0 的实例不能再派子代理
+        self._model = model  # 非空时覆盖 config.MODEL
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
         self.max_iterations = (
             config.MAX_ITERATIONS if max_iterations is None else int(max_iterations)
@@ -261,7 +259,7 @@ class Agent:
         self.sessions_config = config.load_sessions_config()
         self._persist = bool(persist) and self.sessions_config.enabled
         self._last_state = None  # 最近一次写盘的 state 快照（去重）
-        self._title_attempted = False  # 自动标题只触发一次
+        self._title_attempts = 0  # 自动标题已尝试次数（有限次补试，见 _maybe_generate_title）
         if store is not None:
             self.session.bind_store(store)
         elif self._persist:
@@ -282,16 +280,14 @@ class Agent:
         )
 
     def start(self) -> None:
-        """启动期装载模型目录、技能/子代理目录与项目指令：模型未配置时后台拉取 `/models`。
+        """启动期装载模型目录、技能目录与项目指令：模型未配置时后台拉取 `/models`。
 
-        技能与项目级子代理定义的发现可能弹出项目信任确认（渲染后端此时为
-        ConsoleRenderer，TUI 尚未接管，交互行为一致）。项目指令在会话边界装载
-        （此处 / `/new` / 恢复三处），会话中途不重载以保护提示前缀缓存；
-        读取失败只警告、不阻断启动。
+        技能发现可能弹出项目信任确认（渲染后端此时为 ConsoleRenderer，TUI
+        尚未接管，交互行为一致）。项目指令在会话边界装载（此处 / `/new` /
+        恢复三处），会话中途不重载以保护提示前缀缓存；读取失败只警告、不阻断启动。
         """
         self.models.bootstrap()
         self.refresh_skills() 
-        self.refresh_subagents()
         instructions.refresh()
         self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
 
@@ -299,12 +295,6 @@ class Agent:
         """重新发现技能并同步 use_skill 工具 schema（启动与 /skills refresh 共用）。"""
         diagnostics = skills.refresh()
         sync_schema()
-        return diagnostics
-
-    def refresh_subagents(self) -> list:
-        """重新发现子代理类型并同步 task 工具 schema（启动与 /agents refresh 共用）。"""
-        diagnostics = subagents.refresh()
-        sync_task_schema()
         return diagnostics
 
     def new_session(self) -> None:
@@ -327,12 +317,14 @@ class Agent:
         for part in self._state_registry():
             part.reset()
         self._last_state = None
-        self._title_attempted = False
+        self._title_attempts = 0
         instructions.refresh()  # 会话边界：重新装载项目约定（中途修改在此生效）
         if self._persist:
             self.session.bind_store(self._new_store())
         else:
             self.session.bind_store(None)
+        # 标题事件：Session.reset 已清空会话标题，宿主据此回退到默认标题
+        renderer.current().title_changed("")
 
     # ---------- 会话恢复（原地装载，不换对象） ----------
 
@@ -379,9 +371,10 @@ class Agent:
                 if part.name in loaded.state:
                     part.restore(loaded.state[part.name])
         self._last_state = None
-        self._title_attempted = False
+        self._title_attempts = 0
         instructions.refresh()  # 会话边界：恢复即按磁盘最新内容重建项目约定段
         self.session.sync_system()  # system 段按当前提示词立即重建
+        renderer.current().title_changed(self.session.title)  # 标题随恢复的会话同步
 
         return ResumeReport(
             path=loaded.path,
@@ -432,35 +425,56 @@ class Agent:
         self._last_state = payload
         self.session.store.append_state(payload)
 
-    # ---------- 自动标题（后台，失败静默） ----------
+    # ---------- 自动标题（后台，失败有限次补试） ----------
 
     def _maybe_generate_title(self) -> None:
-        """首轮正常结束后自动生成标题：仅一次，用户标题优先，失败保留 fallback。"""
-        if self._title_attempted or self.session.store is None:
+        """一轮正常结束后自动生成标题：用户标题优先，失败不永久放弃。
+
+        每次任务正常结束调用一次；标题请求本身失败（网络抖动、瞬时错误重试
+        耗尽、模型输出不可用）时保留计数，下一轮结束再试，最多
+        `TITLE_MAX_ATTEMPTS` 次——原来的"只试一次"会让一次抖动永久丢掉标题。
+        已生成标题或用户自行命名后不再发起（`should_generate` 判空）。
+        """
+        if self.session.store is None or not self.sessions_config.auto_title:
             return
-        if not self.sessions_config.auto_title:
+        if self._title_attempts >= TITLE_MAX_ATTEMPTS:
             return
-        self._title_attempted = True
         if not sessions.should_generate(self.session.title, self.session.title_source):
             return
+        self._title_attempts += 1
         # 在主线程取快照（后台线程不再读会话消息），再交给 daemon 线程
         request = sessions.build_title_request(self.session.messages)
         model = self.sessions_config.title_model or None
         threading.Thread(
-            target=self._title_worker, args=(request, model),
+            target=self._title_worker, args=(request, model, self._title_attempts),
             name="smithcode-title", daemon=True,
         ).start()
 
-    def _title_worker(self, request, model) -> None:
+    def _title_worker(self, request, model, attempt: int = 1) -> None:
+        """后台生成标题；失败只提示不抛，绝不影响主流程。"""
         try:
             text = self._complete(request, model=model)
-            title = sessions.clean_title(text, self.sessions_config.title_max_chars)
-            if not title:
-                return
-            self.session.set_title(title, source="auto")
-            renderer.current().title_changed(title)
-        except Exception:  # noqa: BLE001 标题失败静默，不影响主流程
+        except Exception as e:  # noqa: BLE001 标题失败不打断任务
+            self._note_title_failure(f"{type(e).__name__}: {e}", attempt)
             return
+        title = sessions.clean_title(text, self.sessions_config.title_max_chars)
+        if not title:
+            self._note_title_failure("模型未返回可用标题", attempt)
+            return
+        self.session.set_title(title, source="auto")
+        renderer.current().title_changed(title)
+
+    def _note_title_failure(self, reason: str, attempt: int) -> None:
+        """标题生成失败提示：说明是否还会补试，避免"静默失败"让人以为功能没生效。
+
+        瞬时错误在 `llm/client.py` 内已重试多次（重试过程本身也会打印），这里
+        只报最终结果；到顶后提示改用 /rename，避免继续无声等待。
+        """
+        if attempt < TITLE_MAX_ATTEMPTS:
+            hint = f"将在下一轮结束后重试（{attempt}/{TITLE_MAX_ATTEMPTS}）"
+        else:
+            hint = f"已停止重试（{TITLE_MAX_ATTEMPTS} 次均失败），可用 /rename 手动命名"
+        renderer.current().warn(f"[标题] 自动命名失败：{reason}；{hint}")
 
     def rename_session(self, title: str) -> bool:
         """用户命名当前会话（/rename / --name）：刷新标题记录，自动标题不再覆盖。"""
@@ -486,82 +500,34 @@ class Agent:
         if self._token is not None:
             self._token.cancel()
 
-    def run(self, user_input: str, token: CancellationToken | None = None) -> RunResult:
+    def run(self, user_input: str) -> RunResult:
         """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限）。
 
         每次调用激活一个取消令牌并经 ContextVar 沿调用链传播（llm 流层、
         工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消状态
-        影响。token 非空时使用调用方提供的令牌（子代理复用父级派生的令牌，
-        以便父级 Esc 能级联取消）。
+        影响。
         """
         self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
         self.session.add("user", user_input)
-        token = token or CancellationToken()
+        token = CancellationToken()
         self._token = token
         reset_token = activate_token(token)
+        view = renderer.current()
+        status = "error"
+        view.turn_started()
         try:
             result = self._run_loop(token)
+            status = result.status
         finally:
             self._token = None
             reset_token()
+            view.turn_finished(status)
         self._persist_turn()  # 状态投影缓存落盘（无变化不写）
         if result.status == "ok":
-            self._maybe_generate_title()  # 首轮结束后自动标题（后台、仅一次）
+            self._maybe_generate_title()  # 本轮结束后自动标题（后台，失败下轮补试）
         if result.status == "interrupted":
             self._note_interrupted()  # 回写上下文但不发请求，供下一轮模型看到
         return result
-
-    # ---------- 子代理派生 ----------
-
-    def fork_subagent(self, spec) -> Agent:
-        """按子代理类型派生一个隔离的 Agent（共享进程级服务，不共享会话状态）。
-
-        - 会话：全新 Session，系统提示词由 build_subagent_prompt 构造（不含
-          主代理的项目约定 / 技能 / 目标动态段）；
-        - 服务：llm / permission / mcp / models 复用父级实例（权限模式与会话
-          规则跨父子生效，MCP 连接生命周期仍归父级）；
-        - 工具：spec 白名单（schema 期 + 执行期双重生效），depth>0 时禁用 task；
-        - 状态：不持久化、不触发自动标题、不重置进程级「已读文件」记录。
-        """
-        from .llm.prompts import build_subagent_prompt
-
-        cfg = config.SUBAGENTS
-        return Agent(
-            session=Session(system_builder=lambda: build_subagent_prompt(spec)),
-            max_iterations=self._subagent_turns(spec),
-            llm=self.llm,
-            permission=self.permission,
-            mcp=self.mcp,
-            models=self.models,
-            tool_filter=spec.tool_filter(allow_mcp=cfg.allow_mcp),
-            model=spec.model,
-            depth=self.depth + 1,
-            reset_globals=False,
-        )
-
-    def _subagent_turns(self, spec) -> int:
-        """子代理迭代预算：类型定义 > [subagents].max_turns > 父级设置。"""
-        if spec.max_turns > 0:
-            return spec.max_turns
-        if config.SUBAGENTS.max_turns > 0:
-            return int(config.SUBAGENTS.max_turns)
-        return self.max_iterations
-
-    def _tool_schemas(self) -> list:
-        """发给模型的工具 schema：在全局可见集上应用本实例的 tool_filter。"""
-        schemas = visible_schemas()
-        if self._tool_filter is None:
-            return schemas
-        return [s for s in schemas if self._tool_filter(s["name"])]
-
-    def _tool_forbidden(self, name: str) -> bool:
-        """执行期硬校验：白名单之外（或子代理再派子代理）的工具一律拒绝。
-
-        schema 过滤是第一道（模型看不到），这里是兜底——陈旧 schema、伪造
-        调用或并发注册变化时也不能执行。"""
-        if self.depth > 0 and name == "task":
-            return True
-        return self._tool_filter is not None and not self._tool_filter(name)
 
     def _note_interrupted(self) -> None:
         """把「用户中断」事件作为 user 消息写进会话历史（不触发新请求）。
@@ -587,42 +553,50 @@ class Agent:
         goal_turn = goal.is_active()
         if goal_turn:
             goal.begin_turn()
-        result = self.run(user_input)
-        self._note_goal_run(result)
-        while goal.is_active():
-            if result.status != "ok":
-                if result.status in ("denied", "max_iterations") and goal.pause(
-                    "上一次任务未正常结束，已暂停自动推进"
-                ):
-                    renderer.current().warn("[目标] 已暂停自动推进（/goal resume 可继续）")
-                break
-            if not result.tools_used:
-                if goal.pause("本轮没有产生工具调用，已暂停自动推进以防空转"):
-                    renderer.current().warn(
-                        "[目标] 已暂停：本轮没有产生工具调用（/goal resume 可继续）"
-                    )
-                break
-            current = goal.current()
-            if current is None:  # 目标在本轮结束时被清除
-                break
-            if not current.unlimited and current.turns >= current.max_turns:
-                goal.budget_limited()
-                renderer.current().warn(
-                    f"[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
-                )
-                result = self.run(current.wrapup_prompt())
-                self._note_goal_run(result)
-                break
-            goal.begin_turn()
-            marker = goal.current()
-            if marker is None:  # 目标在本轮结束时被清除
-                break
-            renderer.current().info(
-                f"[目标] 继续推进 · 第 {marker.turn_label()} 回合"
-            )
-            result = self.run(marker.continuation_prompt())
+        # 外层再包一对忙闲事件：多回合续跑期间计数不归零（run() 内层各包一对），
+        # 标题不因回合切换的一瞬空闲而闪烁
+        view = renderer.current()
+        view.turn_started()
+        result = None
+        try:
+            result = self.run(user_input)
             self._note_goal_run(result)
-        return result
+            while goal.is_active():
+                if result.status != "ok":
+                    if result.status in ("denied", "max_iterations") and goal.pause(
+                        "上一次任务未正常结束，已暂停自动推进"
+                    ):
+                        renderer.current().warn("[目标] 已暂停自动推进（/goal resume 可继续）")
+                    break
+                if not result.tools_used:
+                    if goal.pause("本轮没有产生工具调用，已暂停自动推进以防空转"):
+                        renderer.current().warn(
+                            "[目标] 已暂停：本轮没有产生工具调用（/goal resume 可继续）"
+                        )
+                    break
+                current = goal.current()
+                if current is None:  # 目标在本轮结束时被清除
+                    break
+                if not current.unlimited and current.turns >= current.max_turns:
+                    goal.budget_limited()
+                    renderer.current().warn(
+                        f"[目标] 回合预算用尽（{current.max_turns} 回合），正在收尾…"
+                    )
+                    result = self.run(current.wrapup_prompt())
+                    self._note_goal_run(result)
+                    break
+                goal.begin_turn()
+                marker = goal.current()
+                if marker is None:  # 目标在本轮结束时被清除
+                    break
+                renderer.current().info(
+                    f"[目标] 继续推进 · 第 {marker.turn_label()} 回合"
+                )
+                result = self.run(marker.continuation_prompt())
+                self._note_goal_run(result)
+            return result
+        finally:
+            view.turn_finished(result.status if result is not None else "error")
 
     def _note_goal_run(self, result: RunResult) -> None:
         """把一轮结果同步给目标状态机：推进动作重置阻碍连击、累计 token 用量。"""
@@ -793,7 +767,7 @@ class Agent:
         usage = None
         parts: list[str] = []
         r = renderer.current()
-        schemas = self._tool_schemas() if use_tools else None
+        schemas = visible_schemas() if use_tools else None
         kwargs = {"model": self._model} if self._model else {}
         for kind, payload in self.llm.chat_stream(
             self.session.messages, tools=schemas, **kwargs
@@ -857,15 +831,6 @@ class Agent:
                 line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display, name
             )
         denied_plan = _ToolPlan(tc, name, tool_id, lambda: DENIED_RESULT)
-
-        # 子代理白名单的执行期硬校验（schema 过滤之外的兜底，见 _tool_forbidden）
-        if self._tool_forbidden(name):
-            text = f"错误: 当前不可调用工具 {name}（不在允许的工具范围内）。"
-            return _ToolPlan(tc, name, tool_id, lambda: text), False
-
-        # task 需要父 Agent 引用构造子代理，走专用预检分支（类似 todo_write 的特判）
-        if name == "task":
-            return self._preflight_task(tc, args, line, tool_id, denied_plan)
 
         # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
         extractor = PATHS_EXTRACTORS.get(name)
@@ -934,44 +899,6 @@ class Agent:
         return _ToolPlan(tc, name, tool_id,
                          self._make_runner(name, args, widen),
                          serial=bool(SERIAL.get(name)) or bool(widen)), False
-
-    def _preflight_task(self, tc: dict, args: dict, line: str,
-                        tool_id: int | None, denied_plan: _ToolPlan) -> tuple[_ToolPlan, bool]:
-        """task 工具的专用预检：解析类型、校验 prompt，并决定串行 / 并行。
-
-        只读子代理（白名单全部为只读工具且 [subagents].parallel）进并行波次，
-        写能力子代理作顺序屏障——避免并发写冲突，也符合调度器的副作用可见性
-        约定（见 tests/test_agent_parallel.py 的不变量）。"""
-        def error_plan(text: str) -> tuple[_ToolPlan, bool]:
-            return _ToolPlan(tc, "task", tool_id, lambda: text), False
-
-        if self.depth > 0:
-            return error_plan("错误: 子代理不能再派发子代理。")
-        if not config.SUBAGENTS.enabled:
-            return error_plan("错误: 子代理功能已禁用（[subagents].enabled=false）。")
-        if not self.permission.check("task", args, content=line):
-            return denied_plan, True
-        requested = args.get("subagent_type")
-        spec = subagents.get_spec(requested)
-        if spec is None:
-            available = "、".join(s.name for s in subagents.all_specs()) or "无"
-            return error_plan(
-                f"错误: 未知子代理类型 {requested!r}（可用：{available}）。"
-                "请改用可用类型重新调用。"
-            )
-        prompt = str(args.get("prompt") or "").strip()
-        if not prompt:
-            return error_plan(
-                "错误: prompt 不能为空。子代理看不到主对话，"
-                "请在 prompt 里写清目标、范围与期望的报告格式。"
-            )
-        label = str(args.get("description") or spec.name).strip()
-
-        def run_task() -> str:
-            return subagents.run_task(self, spec, prompt, label=label, tool_id=tool_id)
-
-        serial = not spec.read_only() or not config.SUBAGENTS.parallel
-        return _ToolPlan(tc, "task", tool_id, run_task, serial=serial), False
 
     @staticmethod
     def _make_runner(name: str, args: dict, widen: list[Path]) -> Callable[[], str]:

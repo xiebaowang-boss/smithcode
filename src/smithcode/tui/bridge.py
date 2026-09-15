@@ -18,8 +18,7 @@ if TYPE_CHECKING:
 class TuiRenderer(renderer.Renderer):
     """Agent 与 SmithTUI 之间唯一的线程侧通道（renderer 基类的 TUI 实现）。
 
-    子代理事件带 scope（renderer.Scope）：事件原样投递，由宿主路由进对应
-    task 块；子代理流式正文默认不上屏（[subagents].display=detail 才透传）。"""
+    Agent 事件经 post_message 投递到宿主，由主线程消费渲染。"""
 
     def __init__(self, app: SmithTUI):
         super().__init__()
@@ -29,52 +28,43 @@ class TuiRenderer(renderer.Renderer):
     def _post(self, action: str, *args) -> None:
         self.app.post_message(UiAction(action, *args))
 
-    def stream(self, kind: str, chunk: str, scope: renderer.Scope | None = None) -> None:
-        if scope is not None and config.SUBAGENTS.display != "detail":
-            return  # 子代理流式正文默认不上屏（子工具摘要与报告照常）
+    def stream(self, kind: str, chunk: str) -> None:
         if kind == "reasoning":
-            if scope is None:
-                if self._thinking is None:
-                    self._thinking = 0
-                    self._post("thinking_start")
-                self._thinking += len(chunk)
-            self._post("thinking_tick", chunk, scope)
+            if self._thinking is None:
+                self._thinking = 0
+                self._post("thinking_start")
+            self._thinking += len(chunk)
+            self._post("thinking_tick", chunk)
         else:
-            if scope is None and self._thinking is not None:
+            if self._thinking is not None:
                 self._post("thinking_done")
                 self._thinking = None
-            self._post("stream", kind, chunk, scope)
+            self._post("stream", kind, chunk)
 
-    def stream_done(self, scope: renderer.Scope | None = None) -> None:
-        if scope is not None:
-            if config.SUBAGENTS.display == "detail":
-                self._post("stream_done", scope)
-            return
+    def stream_done(self) -> None:
         if self._thinking is not None:
             self._post("thinking_done")
             self._thinking = None
         else:
             self._post("stream_done")
 
-    def tool_call(self, line: str, display: str = "inline", name: str = "",
-                  scope: renderer.Scope | None = None) -> int:
+    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
         """opencode 式 pending 行：摘要先上屏转轮，结果到了原地更新。
 
         name 供 TUI 判定是否归入「已探索」上下文汇总块（读取/搜索/列目录）。"""
         tool_id = self._next_tool_id()
-        self._post("tool_start", tool_id, line, display, name, scope)
+        self._post("tool_start", tool_id, line, display, name)
         return tool_id
 
-    def tool_preview(self, tool_id: int | None, detail: str,
-                     scope: renderer.Scope | None = None) -> None:
+    def tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：推给对应的 pending 工具块，审核时已可见。"""
-        self._post("tool_preview", tool_id, detail, scope)
+        self._post("tool_preview", tool_id, detail)
 
     def tool_result(self, result: str, tool_id: int | None = None,
-                    expand: bool = False, scope: renderer.Scope | None = None) -> None:
+                    expand: bool = False) -> None:
         is_error = result.startswith("错误:") or result == "用户拒绝了此操作"
         expanded = is_error or expand or config.load_tool_display() == "detail"
-        self._post("tool_result", tool_id, result, expanded, is_error, scope)
+        self._post("tool_result", tool_id, result, expanded, is_error)
 
     def plan(self, summary: str, rendered: str, *, created: bool = False,
              tool_id: int | None = None) -> None:
@@ -82,25 +72,25 @@ class TuiRenderer(renderer.Renderer):
         # 可展开/收起、默认展开；后续每步更新不再往对话区重复打印进度
         self._post("plan_sidebar", plan.render_titles(color=True))
         if created:
-            self._post("tool_result", tool_id, plan.render_current(), True, False, None)
+            self._post("tool_result", tool_id, plan.render_current(), True, False)
 
-    def info(self, text: str, scope: renderer.Scope | None = None) -> None:
-        self._post("notice", text, "info", scope)
+    def info(self, text: str) -> None:
+        self._post("notice", text, "info")
 
-    def success(self, text: str, scope: renderer.Scope | None = None) -> None:
-        self._post("notice", text, "success", scope)
+    def success(self, text: str) -> None:
+        self._post("notice", text, "success")
 
-    def warn(self, text: str, scope: renderer.Scope | None = None) -> None:
-        self._post("notice", text, "warning", scope)
+    def warn(self, text: str) -> None:
+        self._post("notice", text, "warning")
 
-    def error(self, text: str, scope: renderer.Scope | None = None) -> None:
-        self._post("notice", text, "error", scope)
+    def error(self, text: str) -> None:
+        self._post("notice", text, "error")
 
     def title_changed(self, title: str) -> None:
         """会话标题变化（/rename 或后台自动标题）：通知主线程刷新底栏。"""
         self._post("title", title)
 
-    def ask_form(self, questions: list[dict], scope: renderer.Scope | None = None) -> list[str]:
+    def ask_form(self, questions: list[dict]) -> list[str]:
         """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
         result, evt = {}, threading.Event()
         self.app.call_from_thread(self.app.show_question_panel, questions, result, evt)
@@ -110,13 +100,12 @@ class TuiRenderer(renderer.Renderer):
             return [""] * len(questions)  # 空串 = 用户取消
         return [str(value) for value in values]
 
-    def ask_text(self, question: str, scope: renderer.Scope | None = None) -> str:
+    def ask_text(self, question: str) -> str:
         answer = self.ask_form([{"question": question}])
         return answer[0] or "（用户未输入内容）"
 
     def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None,
-                   scope: renderer.Scope | None = None) -> str:
+                   descriptions: list[str] | None = None) -> str:
         answer = self.ask_form([{
             "question": question,
             "options": options,
@@ -128,8 +117,7 @@ class TuiRenderer(renderer.Renderer):
     def confirm_choice(self, prompt: str, valid: str, hint: str,
                        detail: list[str] | None = None,
                        descriptions: dict[str, str] | None = None,
-                       content: str | None = None,
-                       scope: renderer.Scope | None = None) -> str:
+                       content: str | None = None) -> str:
         result, evt = {}, threading.Event()
         self.app.call_from_thread(
             self.app.show_permission_panel, prompt, valid, hint, result, evt,

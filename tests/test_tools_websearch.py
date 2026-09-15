@@ -1,40 +1,34 @@
-"""websearch 工具测试：结果解析、跳转链接还原、条数限制与错误处理（不联网）。"""
-import urllib.error
+"""websearch 工具测试：结果解析、跳转链接还原、条数限制、错误处理与代理（不联网）。
+
+HTTP 层用 httpx2 的 MockTransport 打桩（替换工具的客户端工厂）；代理用例用
+`fake_http_proxy` 做真实回环验证（POST 表单经代理转发）。
+"""
+import httpx2
 
 from smithcode.tools import FUNCTIONS, SCHEMAS
 from smithcode.tools import websearch as ws
 
 
-def test_websearch_registered():
-    assert "websearch" in FUNCTIONS
-    assert any(s["name"] == "websearch" for s in SCHEMAS)
+def _patch_client(monkeypatch, handler):
+    """把工具的客户端工厂换成 MockTransport 版：签名与真实工厂一致。"""
+
+    def factory(*, timeout, headers=None, follow_redirects=True):
+        return httpx2.Client(
+            transport=httpx2.MockTransport(handler),
+            timeout=timeout,
+            headers=headers,
+            follow_redirects=follow_redirects,
+        )
+
+    monkeypatch.setattr(ws, "http_client", factory)
 
 
-class FakeHeaders:
-    """模拟 email.message.Message 的 get_content_charset。"""
-
-    def __init__(self, charset: str = "utf-8"):
-        self._charset = charset
-
-    def get_content_charset(self):
-        return self._charset
-
-
-class FakeResp:
-    """模拟 urlopen 的返回：上下文管理器 + headers + read。"""
-
-    def __init__(self, body: str, charset: str = "utf-8"):
-        self._body = body.encode(charset)
-        self.headers = FakeHeaders(charset)
-
-    def read(self, n=-1):
-        return self._body[:n]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+def _page(body: str, charset: str = "utf-8") -> httpx2.Response:
+    return httpx2.Response(
+        200,
+        headers={"Content-Type": f"text/html; charset={charset}"},
+        content=body.encode(charset),
+    )
 
 
 PAGE = """
@@ -56,8 +50,12 @@ PAGE = """
 """
 
 
-def _patch_page(monkeypatch, body: str):
-    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: FakeResp(body))
+def test_websearch_registered():
+    assert "websearch" in FUNCTIONS
+    assert any(s["name"] == "websearch" for s in SCHEMAS)
+
+
+# ---------- 纯逻辑：解析与格式化 ----------
 
 
 def test_parse_results_extracts_title_url_snippet():
@@ -82,7 +80,7 @@ def test_real_url_decodes_relative_redirect():
 
 
 def test_websearch_formats_numbered_results(monkeypatch):
-    _patch_page(monkeypatch, PAGE)
+    _patch_client(monkeypatch, lambda request: _page(PAGE))
     out = ws.websearch("python")
     assert "1. Example A" in out
     assert "https://example.com/a" in out
@@ -91,33 +89,94 @@ def test_websearch_formats_numbered_results(monkeypatch):
 
 
 def test_websearch_respects_max_results(monkeypatch):
-    _patch_page(monkeypatch, PAGE)
+    _patch_client(monkeypatch, lambda request: _page(PAGE))
     out = ws.websearch("python", max_results=1)
     assert "Example A" in out
     assert "Direct Title" not in out
 
 
 def test_websearch_no_results(monkeypatch):
-    _patch_page(monkeypatch, "<html><body>nothing here</body></html>")
+    _patch_client(monkeypatch, lambda request: _page("<html><body>nothing</body></html>"))
     assert "无搜索结果" in ws.websearch("zzz")
+
+
+def test_websearch_detects_challenge_page(monkeypatch):
+    """被反爬拦截要如实报错，不能伪装成「无搜索结果」（后者会误导关键词排查）。"""
+    challenge = (
+        "<html><body><h1>Unfortunately, bots use DuckDuckGo too.</h1>"
+        '<div class="anomaly-modal">Select all squares containing a duck</div>'
+        "</body></html>"
+    )
+    _patch_client(monkeypatch, lambda request: _page(challenge))
+    out = ws.websearch("python")
+    assert out.startswith("错误:") and "反爬" in out
+
+
+def test_websearch_challenge_words_in_results_are_not_blocked(monkeypatch):
+    """结果页里出现这些词（正好在搜它们）不算被拦——判定要求「无结果 + 命中标记」。"""
+    _patch_client(monkeypatch, lambda request: _page(
+        PAGE.replace("Example A", "bots use duckduckgo too")
+    ))
+    out = ws.websearch("bots use duckduckgo too")
+    assert not out.startswith("错误:")
+    assert "https://example.com/a" in out
 
 
 def test_websearch_empty_query():
     assert "错误" in ws.websearch("   ")
 
 
-def test_websearch_network_error(monkeypatch):
-    def raise_urlerror(req, timeout):
-        raise urllib.error.URLError("getaddrinfo failed")
+# ---------- 请求细节与错误处理 ----------
 
-    monkeypatch.setattr("urllib.request.urlopen", raise_urlerror)
+
+def test_websearch_posts_form_with_user_agent(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = request.content.decode("utf-8")
+        seen["ua"] = request.headers.get("User-Agent", "")
+        return _page(PAGE)
+
+    _patch_client(monkeypatch, handler)
+    ws.websearch("中文 查询")
+    assert seen["method"] == "POST"
+    assert seen["url"] == ws._ENDPOINT
+    assert "q=%E4%B8%AD%E6%96%87" in seen["body"]  # URL 编码的表单体
+    assert seen["ua"] == ws._USER_AGENT
+
+
+def test_websearch_network_error(monkeypatch):
+    def handler(request):
+        raise httpx2.ConnectError("getaddrinfo failed")
+
+    _patch_client(monkeypatch, handler)
     assert "错误" in ws.websearch("python")
 
 
 def test_websearch_http_error(monkeypatch):
-    def raise_http(req, timeout):
-        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", None, None)
-
-    monkeypatch.setattr("urllib.request.urlopen", raise_http)
+    _patch_client(monkeypatch, lambda request: httpx2.Response(429, content=b"slow down"))
     out = ws.websearch("python")
     assert "HTTP 429" in out
+
+
+def test_websearch_uses_environment_proxy(monkeypatch, fake_http_proxy):
+    """回归：检索必须走环境代理（.invalid 域名不走代理必然 DNS 失败）。
+
+    端点换成 http：https 目标经 HTTP 代理要先发 CONNECT 建隧道，本地假代理只
+    能中继明文请求，故用 http 才能验证"POST 表单确实经代理转发"。
+    """
+    for name in ("all_proxy", "ALL_PROXY", "https_proxy", "HTTPS_PROXY",
+                 "no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", fake_http_proxy.url)
+    monkeypatch.setenv("HTTP_PROXY", fake_http_proxy.url)
+    monkeypatch.setattr(ws, "_ENDPOINT", "http://search-proxy.invalid/html/")
+
+    out = ws.websearch("python")
+    assert "代理结果" in out  # 解析到了代理返回的结果页
+    forwarded = fake_http_proxy.requests[0]
+    assert forwarded["method"] == "POST"
+    assert forwarded["path"] == "http://search-proxy.invalid/html/"
+    assert "q=python" in forwarded["body"]  # 表单体确实经代理转发

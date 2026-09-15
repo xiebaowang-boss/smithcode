@@ -164,7 +164,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径；旧 `.json` 可导入），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
 
-恢复时：system 段按最新提示词重建（不入转录）；`compact` 检查点重置模型可见投影（旧消息保留供导出/审计）；尾部悬空 `tool_calls` 补「未执行：上次会话中断」占位（崩溃修复，中段损坏则截断）；goal/plan/技能激活集从 `t=state` 投影缓存恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在首轮正常结束后由后台模型自动生成（`[sessions].title_model`，失败静默），`/rename` 用户命名优先；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏）。完整设计见本文件「会话持久化与恢复」节。
+恢复时：system 段按最新提示词重建（不入转录）；`compact` 检查点重置模型可见投影（旧消息保留供导出/审计）；尾部悬空 `tool_calls` 补「未执行：上次会话中断」占位（崩溃修复，中段损坏则截断）；goal/plan/技能激活集从 `t=state` 投影缓存恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在每轮正常结束后由后台模型自动生成（`[sessions].title_model`，用户标题优先），单次请求失败不永久放弃——下一轮结束后补试，上限 `TITLE_MAX_ATTEMPTS`（3）次，失败经 renderer 提示并说明是否还会补试，到顶后提示 `/rename` 手动命名；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏）。完整设计见本文件「会话持久化与恢复」节。
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
@@ -182,17 +182,29 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **入口**：`/mcp`（状态与操作菜单，选择面板）、`/mcp auth <名称>`（OAuth 浏览器授权）、`/mcp add`（TUI 居中向导面板 / REPL 行式流程，命令层只返回 `CommandResult.wizard` 意图；向导支持模板 / 手动命令 / 远程 URL 三分支）、直通添加 `/mcp add <名称> -- <命令...>`（stdio）或 `--url <地址> [--type http|sse] [--header K=V] [--oauth]`（远程）；`mcp/templates.py` 提供常用模板（filesystem / github / playwright / memory / everything / Linear / Sentry）。
 - **服务生命周期**：`Agent.start()` 后台并发连接（失败隔离、不阻塞启动）、`Agent.close()` 统一关闭；连接/刷新在专用线程池，注册表增删走 `tools/base` 的锁。
 
-## 子代理（Subagents）
+## 终端窗口标题（title.py）
 
-子代理是主 Agent 通过 `task` 工具派生的、**拥有独立上下文与独立 Agentic Loop** 的执行单元：只把最终报告回传给主对话，中间的工具调用留在子会话历史里（上下文隔离是核心价值）。子系统位于 `subagents/`，设计要点：
+标题**由 agent 事件驱动，前端只提供写入通道**——为后续接 desktop 等新前端留出解耦：
 
-- **定义（类型目录）**：`SubAgentSpec`（名称 / 描述 / 角色提示词 / 工具白名单 / 模型 / 迭代预算）。内置 `explore`（只读侦察：六个只读/网络工具，可进并行波次）与 `general`（通用执行：全部工具，顺序屏障）；用户级 `~/.smithcode/agents/*.md`、项目级 `<工作区>/.smithcode/agents/*.md`（复用技能的项目信任门控与 `skills_trust.json` 信任库）、`[subagents].paths` 附加目录（最高优先级），frontmatter 复用技能的宽容解析器；`[subagents].disabled` 按名禁用（内置亦可）。`Agent.start()` / `/agents refresh` 触发 `refresh()` 并同步 task 工具 schema（enum 与类型说明，零类型时隐藏工具，对齐 `use_skill` 的手法）。
-- **执行（fork 隔离）**：`Agent._preflight` 特判 `task`（需要父级引用，类似 `todo_write` 分支），runner 在父级工具执行线程内同步跑完整子循环（复用 `_run_loop` 全套，不复制循环）。子 Agent 复用父级的 `llm` / `permission` / `mcp` / `models` 实例，但使用全新 `Session`（`system_builder=build_subagent_prompt`，不注入项目指令 / 技能 / 目标动态段）、独立 `ContextMeter`、`depth+1`（>0 时不可再派子代理）。并发上限由 `[subagents].max_concurrency` 信号量控制；`[subagents].timeout` 经看门狗定时器取消子令牌。
-- **工具控制**：白名单在 schema 期（`_tool_schemas` 过滤）与执行期（`_tool_forbidden` 硬校验）双重生效；所有类型强制排除 `task` / `ask_user` / `todo_*` / `goal_*` / `use_skill`（会话级单例状态不被污染），`mcp__*` 默认关闭。
-- **权限**：共享父 `Permission` 实例——模式（smith / accept_edits / auto）与会话规则跨父子生效，子代理内部写/命令照常确认；非交互 fail-closed 语义不变；`[permissions].task` 可按 `subagent_type` 允许/拒绝派生。子代理的 ask 经 scoped 渲染代理加来源前缀（`[explore] …`）并按进程级锁串行，同一时刻只弹一个面板。
-- **取消**：子令牌经 `CancellationToken.subscribe` 级联父令牌（含"订阅时父已取消"的补发），`run()` 激活子令牌后子循环 / LLM 流按既有检查点立即截停；收尾仍保证父历史每个 `tool_call_id` 配对（`_placeholder`）。
-- **渲染作用域**：`Renderer` 增加 `Scope` 维度——`scoped()` 返回代理后端，把事件打上 `task_id` / `agent` 后转发；runner 用 ContextVar `activate()` 绑定到子循环线程，`current()` 优先返回它，48 处 `renderer.current()` 调用点零改动。Console 下子代理流式正文默认抑制（`[subagents].display=summary`，`detail` 透传）并加打印锁；TUI 下事件经 `UiAction` 携 scope 路由进对应 `SubAgentBlock`（task 工具块，复用 `ToolCall` 生命周期 + 嵌套子工具活动区），并行子代理各自成块。工具 id 分配改为原子计数器，防并发重号。
-- **用量与入口**：子代理 token 用量在结束时并入父会话两个账本；`/agents` 查看类型目录（`refresh` 重扫 + 诊断）；系统提示词有「子代理（task 工具）」行为节约束派发时机与 prompt 写法。
+```
+Agent / 权限引擎（事件源，经 renderer.current()）
+  │  title_changed(title) / turn_started() / turn_finished(status)
+  │  turn_waiting_started() / turn_waiting_finished()（由 Relay 在 ask 方法进出时发射）
+  ▼
+title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其余原样透传）
+  ├─→ 内层后端（TuiRenderer / ConsoleRenderer / 未来 DesktopRenderer）：总线消费方
+  └─→ TerminalTitlePresenter（可选订阅者：状态机 + 合成 + 生命周期）
+            │  sink(seq): TUI = driver.write（Textual 写入队列，线程安全）
+            ▼            REPL = 真实 stdout 控制序列
+```
+
+- **装配入口（两个）**：终端宿主用 `attach()`——等价于 `bus()` + `enable_title()`，建总线并接管终端标题（REPL 与 TUI 现用此入口，参数与语义未变）；只想要事件、不要终端标题的 GUI 前端（desktop / web）用 `bus()`——不创建标题呈现器、不装退出钩子、不写任何控制序列。`Relay` 的订阅者可省略（`target=None`），此时它就是一条纯总线。注意**等待事件只由 `Relay` 发射**（ask 方法边界）：前端若绕过 `Relay` 直接 `set_renderer(...)`，`turn_waiting_*` 会收不到；忙闲与标题事件由 Agent 主动调用，不受此限。
+- **事件发射点**：`Agent.run()`（内层一对忙闲）、`Agent.run_with_goal()`（外层一对，多回合期间忙闲计数不归零、标题不闪烁）、`Agent.new_session()`（发 `title_changed("")`，标题回退到工作区目录名）、`Agent.resume()`（发恢复后的标题）、`_title_worker` / `rename_session`（原有）。
+- **等待用户输入（`Renderer` 总线事件）**：`turn_waiting_started` / `turn_waiting_finished` 是**基类协议的一部分**（默认空实现），发射点在 `Relay`：它在 ask 类方法（`ask_text` / `ask_choice` / `ask_form` / `confirm_choice`）进出时广播，覆盖权限确认、越界授权、技能信任确认与 `ask_user` 提问——调用点零改动。发射点只能是**最外层装饰器**而非基类实现：ask 方法在 4 个实现里都是整体覆盖、不调 `super()`，且 `Relay` 必须覆盖公开名才能转发，写在基类里会被装饰器绕过或重复发射。事件同时喂给呈现器与内层后端，因此任何前端覆盖这两个方法即可当消费方（当前只有终端标题消费，TUI 尚未接）。等待与忙闲分开计数（确认可能嵌套），标题前缀 `!` 优先于 `◐`。
+- **合成规则**：`Smith` / `Smith · <会话标题>` / 运行中 `◐ Smith · …` / 等待中 `! Smith · …`（优先于运行中）；空标题回退工作区目录名；写入前去控制字符（标题可能来自模型生成，须防"数据 → 转义序列"注入）并截断。
+- **写入与恢复**：`OSC 0`（`ESC ] 0 ; … BEL`）设窗口标题 + 图标名；退出用 xterm 窗口标题栈（`CSI 22;2t` 压栈 / `CSI 23;2t` 出栈）恢复用户原标题——**不写空标题**（那会把原标题抹掉），也不读回原标题（读回要抢 stdin 解析终端应答，而 stdin 归 prompt_toolkit / Textual 独占）。运行期改标题只写 OSC，不碰栈。
+- **退出钩子**：`atexit`（覆盖 `/exit` / EOF / 第二次 Ctrl+C 的 `SystemExit(130)` / 未捕获异常）+ `SIGTERM` / `SIGHUP`（链回原处理器，保持退出码语义）；**刻意不注册 SIGINT**——`cli._wait_for_task` 用它做「第一次取消任务、第二次退出」，抢占会破坏中断语义。钩子在主线程装载（`signal.signal` 限制）。
+- **开关与降级**：`SMITHCODE_TERMINAL_TITLE` > `config.toml` 的 `terminal_title` > 默认开；非 tty（管道 / CI）或开关关闭时整体空操作，一个字节都不写。tmux 等会拦截该栈序列的复用器下，退出后窗口名由下一个 shell 提示符覆盖。
 
 ## 模块职责
 
@@ -203,13 +215,15 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `agent.py` | Agent 循环编排；`run_with_goal()` 是 `/goal` 唯一的续跑驱动器（无目标等价 `run()`）；`new_session()` 集中承担 `/new` 的全部会话级重置（消息历史、会话用量、权限会话规则、信任目录、上下文快照、已读记录、步骤清单、持久目标） |
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
+| `textfile.py` | 文本文件读写的唯一出口：换行风格（LF / CRLF / CR）与 UTF-8 BOM 的探测、LF 归一化与写回还原、`TextFileError` 友好错误。文件工具（read_file / write_file / edit_file / apply_patch / grep）全部经此读写，保证**编辑不改动文件既有的换行风格与 BOM**（见「安全边界」的换行保真条目） |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根：消息历史（`MessageLog` 追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
 | `sessions/` | 会话持久化子系统：JSONL 转录（`paths` / `format` / `store`）、崩溃修复、项目级列表 / 查找 / 删除 / 导入 / 保留期清理、标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
+| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer`）与全局实例（`current()` / `set_renderer()`）：Agent 全部终端交互经此收口；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`） |
+| `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |
 | `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级激活集合、`render.py` 目录段与已激活段渲染（字符预算降级）；`/new` 时重置激活集合 |
-| `subagents/` | 子代理子系统（「子代理（Subagents）」节）：`defs.py` 类型目录（内置 explore/general、用户/项目文件发现与信任门控、禁用与动态 schema 同步）、`runner.py` 执行编排（并发信号量、取消级联、scoped 渲染、报告契约、用量合并） |
 | `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
@@ -217,17 +231,29 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
-| `tools/web.py` | webfetch 网页抓取转纯文本（仅 http/https，支持批量并行） |
-| `tools/websearch.py` | websearch 网页检索（DuckDuckGo HTML，纯标准库，返回标题/链接/摘要；默认放行） |
+| `tools/web.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
+| `tools/websearch.py` | websearch 网页检索（DuckDuckGo HTML，返回标题/链接/摘要；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂 |
+| `utils/http.py` | 网络工具的 HTTP 客户端工厂：统一代理语义（`normalize_proxy_env` 先归一化 `socks://`，`trust_env` 读 `ALL_PROXY`/`HTTP(S)_PROXY`，socks5 由 socksio 支持）+ 屏蔽 ALPN（DDG 反爬按 TLS 指纹判定）+ SSRF 地址判定（`is_public_address` / `private_target`，见「网络出网」节） |
+| `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/shell.py` | 命令执行，含超时保护 |
 | `tools/patch.py` | apply_patch 批量原子改文件 |
 | `tools/ask.py` | ask_user 任务中途向用户提问（复数入参：一个面板一次问 1-N 个问题，可手动切题） |
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 | `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
 | `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
-| `tools/task.py` | task 派发工具：schema 注册与动态同步（类型 enum / 描述 / 可见性），真实执行由 `Agent._preflight` 特判接管（需要父 Agent 引用构造子代理） |
 | `mcp/` | MCP 子系统：`config.py` 双作用域配置（env / headers 内联表、条目 `enabled` / `oauth`）、`secrets.py` 引用展开/凭据库/Redactor、`auth.py` OAuth token 持久化与浏览器回调、`runtime.py` 共享 asyncio loop 线程、`connection.py` 基于官方 SDK 的同步门面、`factory.py` 按传输构造连接、`catalog.py` 命名与结果映射、`service.py` 连接生命周期与动态注册、`wizard.py` + `templates.py` 添加向导（TUI/REPL 共用纯状态机）；`commands/mcp.py` 提供 `/mcp` 命令 |
 | `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择/MCP 向导）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
+
+## 网络出网（utils/http.py）
+
+webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂 `client()`，与 LLM 客户端（httpx2 + `provider.headers`）共用同一套代理语义：
+
+- **代理**：`trust_env=True` 读取 `ALL_PROXY` / `HTTP(S)_PROXY`，socks5 由 socksio 支持；构造前先跑 `utils.proxy.normalize_proxy_env()`——系统代理（Clash / FlClash 等）常写非标准的 `socks://`，httpx 在构造期即急切校验 scheme 并抛 `ValueError`。**改造前这两个工具走 urllib**，而 urllib 既不认 `ALL_PROXY` 也不支持 socks，于是「LLM 能连、搜索与抓取连不上」。
+- **ALPN 屏蔽**（`_NoAlpnContext`）：httpcore 握手时默认发送 ALPN 扩展 `["http/1.1"]`，DuckDuckGo 据此判定为机器人并返回反爬 challenge 页（实测：带 ALPN 被拦、不带则正常返回结果，与 UA / Accept 等请求头无关）。故显式屏蔽 ALPN，**证书校验照常**（`CERT_REQUIRED` + 主机名校验 + 系统 CA）；这也正是改造前 urllib 的既有行为（urllib 不发 ALPN）。回归测试用本地 TLS 服务器在握手层断言（`tests/test_utils_http.py`），不依赖外网。
+- **限额**：`read_limited()` 在 `client.stream(...)` 内读满上限即停（webfetch 2MB），超大页面不占满内存。
+- **SSRF 防护**：webfetch 默认可免确认放行，模型又可能被网页内容诱导，故默认**拒访非公网地址**（`utils/http.private_target` 判定：回环 / 私网 / 链路本地含云元数据 169.254.169.254 / CGNAT / 保留段 / 多播；域名按 DNS 全部解析结果判定，防「公网域名指向内网」）。**重定向逐跳校验**（`follow_redirects=False` 手动跟随，上限 5 跳），堵住「公网地址 302 到内网」的绕过；解析失败不拦（请求本就连不上，交网络层报常规错误）。开关：`config.toml` 的 `allow_private_urls = true` 或 `SMITHCODE_ALLOW_PRIVATE_URLS=1` 放行，供本地开发抓 localhost 文档。websearch 端点是固定的，无需防护。
+- **内容转换**：`utils/htmltext.to_markdown()` 用标准库 `HTMLParser` 把 HTML 转成结构化 Markdown（标题层级 / 链接地址 / 代码块与语言 / 列表 / 表格 / 引用，`<pre>` 公共缩进去除），替代原来的正则去标签——读文档时「链接去哪」「代码长什么样」往往正是重点，正则版会全部丢掉。刻意保守：脚本 / 样式 / `<head>` 一律丢弃，环形引用（畸形标签）不抛异常只降级。**已知局限**：不做正文提取，站点侧边栏 / ToC 等装饰元素会计入 `max_chars` 预算（实测 docs.python.org 的 pathlib 页正文起始于约 1.5 万字符处，改造前后同样如此）。
+- **反爬识别**：websearch 命中 DuckDuckGo 验证页（"无结果锚点 + 特征文案"双条件）时返回明确错误，而不是伪装成「（无搜索结果）」——后者会让用户以为关键词不对。
 
 ## 安全边界
 
@@ -238,8 +264,8 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **项目指令只读注入**：`AGENTS.md` 等指令文件仅作为文本进入系统提示词（`messages[0]` 动态段），不产生任何授权效果——权限 / 沙箱仍由代码强制，文件内容无法绕过（故不做信任门控）；显式配置的不可用路径警告一次，默认探测位置缺失静默。
 - **MCP 密钥与脱敏**：MCP 配置只保存 `${VAR}` 引用，值存 `credentials.json`（`mcp.<服务器>.<变量>`，原子写、POSIX 0600）；展开值登记全局 Redactor，工具结果 / stderr / 日志 / 向导预览统一脱敏；缺失密钥标记 `missing_env` 不拉起 server（非交互 fail-closed）。OAuth 的 token / client_info 存独立文件 `mcp_auth.json`（原子写、POSIX 0600），读写时值同样登记 Redactor，不进入 `config.toml` 与终端输出。
 - **MCP 进程与不可信内容**：stdio server 以本机用户权限运行；项目级 `.smithcode/mcp.json` 随仓库分发，启动时对项目服务器给出一次可见警示（按项目决定不做信任门控，删除或停用见 `/mcp`）；MCP 工具默认 `ask` 且串行，工具描述 / annotations / 返回内容按「不可信内容」规则处理（系统提示词有专门行为节）。
-- **子代理隔离**：`task` 派生的子代理在独立会话与渲染作用域中运行，深度上限 1（工具视图无 `task`）；强制排除 `ask_user` / `todo_*` / `goal_*` / `use_skill`（会话级单例状态不因并行子代理撕裂），`mcp__*` 默认关闭（`[subagents].allow_mcp` 打开）；共享父权限引擎，写/命令等敏感操作照常经过规则与确认，非交互同样 fail-closed；项目级子代理定义的发现复用技能的项目信任门控（随仓库分发，可能不可信），非交互未信任时跳过。
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框只展示工具摘要（`describe`）与带说明的选项、不重复 diff；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。TUI 中该 diff 以**左右对照**渲染——旧/新两栏、各带真实行号，改动行带 `-`/`+` 前缀并红/绿配色，整块统一底色、上下各 1 行 padding、块内不展示文件名（`tui/render.py` 的 `side_by_side_diff`，宽度不足时回退逐行统一 diff），REPL 仍按 `+/-` 行着色打印。`.env` 等敏感文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
+- **换行保真**：文件工具读写一律经 `textfile.py`——读时探测换行风格（LF / CRLF / CR）与 UTF-8 BOM 并**归一化为 LF** 交给模型，写时**按原文风格还原**（新建文件默认 LF，不随 `os.linesep` 漂移）。模型因此永远只看 LF 内容，既不会往 CRLF 文件里插 LF 行，也不会出现「只改一行却整个文件换行被重写」的全文件 diff——等价 Claude Code Edit 工具的 encoding/line-ending 策略。混合换行的文件统一为占多数的风格；`.editorconfig` / `.gitattributes` 尚未接入。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
 - **超时保护**：shell 命令默认 60 秒超时；超时或被中断时终止整个进程树（`process.py`）。

@@ -4,7 +4,7 @@ import re
 import pytest
 
 from smithcode import config
-from smithcode.tools import files
+from smithcode.tools import files, search
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +55,18 @@ def test_read_file_rejects_directory(workspace):
 def test_write_creates_parent_dirs(workspace):
     files.write_file("sub/dir/b.txt", "x")
     assert (workspace / "sub" / "dir" / "b.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_edit_file_accepts_multiline_anchor_copied_from_grep(workspace):
+    """回归：grep 输出曾被 strip 掉行首缩进，照抄成多行 old_string 会匹配不上文件。"""
+    files.write_file("a.py", "def m():\n    warn = log\n    error = log\n")
+    out = search.grep("warn = log|error = log", path="a.py")
+    # 「路径:行号: 内容」去掉前缀后应逐字等于原文（含缩进）
+    anchor = "\n".join(line.split(": ", 1)[1] for line in out.splitlines())
+    assert anchor == "    warn = log\n    error = log"
+
+    assert "已编辑" in files.edit_file("a.py", anchor, anchor + "\n    return 1")
+    assert "return 1" in (workspace / "a.py").read_text(encoding="utf-8")
 
 
 def test_edit_file_unique_match(workspace):
@@ -263,6 +275,50 @@ def test_preview_edit_replace_all(workspace):
 def test_preview_edit_not_found_none(workspace):
     files.write_file("e.txt", "abc")
     assert files._preview_edit({"path": "e.txt", "old_string": "zzz", "new_string": "q"}) is None
+
+
+# ---------- 换行风格与 BOM 保真 ----------
+
+def test_read_file_hides_line_endings(workspace):
+    """模型只看到 LF：无需知道目标文件是 CRLF，写回由工具还原原格式。"""
+    (workspace / "c.txt").write_bytes(b"a\r\nb\r\n")
+    assert files.read_file("c.txt") == "1│a\n2│b"
+
+
+def test_edit_file_preserves_crlf_bytes(workspace):
+    """回归：曾把整个 CRLF 文件的换行重写成 LF——只改一行却全文件 diff。"""
+    (workspace / "c.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+    files.read_file("c.txt")
+    assert "已编辑" in files.edit_file("c.txt", "b", "B")
+    assert (workspace / "c.txt").read_bytes() == b"a\r\nB\r\nc\r\n"
+
+
+def test_edit_file_preserves_bom(workspace):
+    (workspace / "b.txt").write_bytes(b"\xef\xbb\xbfhello\n")
+    assert "\ufeff" not in files.read_file("b.txt")  # BOM 不进正文
+    files.edit_file("b.txt", "hello", "hi")
+    assert (workspace / "b.txt").read_bytes() == b"\xef\xbb\xbfhi\n"
+
+
+def test_write_file_preserves_existing_crlf(workspace):
+    """覆盖已有 CRLF 文件时沿用原文风格，不按 os.linesep 翻译。"""
+    (workspace / "w.txt").write_bytes(b"x\r\ny\r\n")
+    files.read_file("w.txt")
+    files.write_file("w.txt", "x\nZ\n")
+    assert (workspace / "w.txt").read_bytes() == b"x\r\nZ\r\n"
+
+
+def test_write_file_new_file_uses_lf(workspace):
+    """新建文件默认 LF（平台无关），不随 os.linesep 漂移。"""
+    files.write_file("n.txt", "a\nb\n")
+    assert (workspace / "n.txt").read_bytes() == b"a\nb\n"
+
+
+def test_edit_file_non_utf8_returns_friendly_error(workspace):
+    """非 UTF-8 返回中文错误串，不抛裸 UnicodeDecodeError（会中断 agent 循环）。"""
+    files.write_file("latin.py", "x = 1\n")  # 先记录为已读
+    (workspace / "latin.py").write_bytes(b"# caf\xe9\nx = 1\n")  # 外部改成非 UTF-8
+    assert "UTF-8" in files.edit_file("latin.py", "x = 1", "x = 2")
 
 
 # ---------- 技能目录只读白名单 ----------

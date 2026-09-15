@@ -1,4 +1,6 @@
 """命令执行工具测试。"""
+import sys
+
 from smithcode.process import ProcessResult
 from smithcode.tools.shell import run_command
 
@@ -36,7 +38,8 @@ def test_run_command_timeout_clamped(monkeypatch):
 
 def test_run_command_timeout_expired():
     """超时返回带上限提示的错误，而不是抛异常。"""
-    output = run_command("ping -n 5 127.0.0.1 >nul", timeout=1)
+    blocking = f'"{sys.executable}" -c "import time; time.sleep(5)"'
+    output = run_command(blocking, timeout=1)
     assert "超时" in output
     assert "300" in output
 

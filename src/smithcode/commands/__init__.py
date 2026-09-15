@@ -5,7 +5,6 @@
 """
 
 from . import (  # noqa: F401  导入即注册
-    agents,
     base,
     effort,
     goal,

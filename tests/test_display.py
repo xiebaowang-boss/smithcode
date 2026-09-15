@@ -54,6 +54,46 @@ def test_tool_display_broken_toml_degrades(monkeypatch, tmp_path, capsys):
     assert "警告" in capsys.readouterr().out
 
 
+# ---------- 配置加载：terminal_title 字段 ----------
+
+def test_terminal_title_defaults_true(monkeypatch, tmp_path):
+    _write_home_config(monkeypatch, tmp_path, '[permissions]\nread_file = "allow"\n')
+    monkeypatch.delenv("SMITHCODE_TERMINAL_TITLE", raising=False)
+    assert config.load_terminal_title() is True
+
+
+def test_terminal_title_file_value_and_env_override(monkeypatch, tmp_path):
+    """env > 文件：文件关掉后，环境变量仍可临时打开（大小写不敏感）。"""
+    _write_home_config(monkeypatch, tmp_path, "terminal_title = false")
+    monkeypatch.delenv("SMITHCODE_TERMINAL_TITLE", raising=False)
+    assert config.load_terminal_title() is False
+    monkeypatch.setenv("SMITHCODE_TERMINAL_TITLE", "ON")
+    assert config.load_terminal_title() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+def test_terminal_title_env_falsy(monkeypatch, tmp_path, value):
+    _write_home_config(monkeypatch, tmp_path, "terminal_title = true")
+    monkeypatch.setenv("SMITHCODE_TERMINAL_TITLE", value)
+    assert config.load_terminal_title() is False
+
+
+def test_terminal_title_env_empty_falls_back_to_file(monkeypatch, tmp_path):
+    """空串视为"没配"，自动落到下一级（与 KEY / MODEL 的 or 链一致）。"""
+    _write_home_config(monkeypatch, tmp_path, "terminal_title = false")
+    monkeypatch.setenv("SMITHCODE_TERMINAL_TITLE", "")
+    assert config.load_terminal_title() is False
+
+
+def test_terminal_title_invalid_values_degrade(monkeypatch, tmp_path, capsys):
+    _write_home_config(monkeypatch, tmp_path, 'terminal_title = "yes"')
+    monkeypatch.delenv("SMITHCODE_TERMINAL_TITLE", raising=False)
+    assert config.load_terminal_title() is True  # 非布尔值 → 默认
+    monkeypatch.setenv("SMITHCODE_TERMINAL_TITLE", "maybe")
+    assert config.load_terminal_title() is True  # 非法 env → 默认
+    assert "警告" in capsys.readouterr().out
+
+
 # ---------- describe：短格式摘要 ----------
 
 def test_describe_file_tools():

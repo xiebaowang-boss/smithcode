@@ -58,20 +58,22 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `agent.py` | Agent 循环编排（`_BatchScheduler` 流式调度：边预检边执行、并行波次 + 串行屏障、结果按提交序；todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`）；`run_with_goal()` 是 `/goal` 的续跑驱动器 |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
-| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
+| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`），等待事件由 `title.Relay` 在 ask 方法进出时发射 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根：消息历史（追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
 | `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/architecture.md` 的「会话持久化与恢复」节） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
+| `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）与 Relay 在 ask 类方法上报的等待态，合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；装配入口两个：终端宿主 `attach()`（总线 + 接管标题）、GUI 前端 `bus()`（纯总线，不碰终端标题）（设计见 `docs/architecture.md` 的「终端窗口标题」节） |
 | `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
 | `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
-| `subagents/` | 子代理子系统：`defs.py` 类型目录（内置 explore/general、`~/.smithcode/agents` 与项目 `.smithcode/agents` 文件发现 + 信任门控、禁用、task schema 动态同步）、`runner.py` 执行编排（并发信号量、取消级联、scoped 渲染、报告契约、用量合并）；设计见 `docs/architecture.md` 的「子代理（Subagents）」节 |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
+| `utils/http.py` | 网络工具的 HTTP 客户端工厂（`client()` / `read_limited()` / `ssl_context()`）：统一代理语义（`normalize_proxy_env` + `trust_env`，含 socks5）并屏蔽 ALPN（DuckDuckGo 反爬按该指纹判定）；webfetch / websearch 共用 |
+| `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`，无新依赖）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
 | `tools/*.py` | 各工具实现（files / search / shell / patch / web / websearch / ask / todo / goal / skills / task） |
 | `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、工具命名/动态注册、`/mcp` 命令与添加向导；客户端基于官方 `mcp` SDK（`runtime.py` 共享 loop 线程、`connection.py` 同步门面、`factory.py` 按传输构造）（完整设计见 `docs/mcp-architecture.md`，摘要见 `docs/architecture.md`「MCP」节）；支持 stdio / Streamable HTTP / SSE 与 OAuth2.1 |
@@ -84,7 +86,6 @@ smith setup                   # 初始化配置（用户机器上才需要）
 - **保护路径**：`.env` 的内容不在变更预览/确认框中回显（防密钥泄露），读写仍按普通规则（读默认放行、写默认确认）；`.git` 只读（内置 deny 规则只拦写入/编辑，读取放行）
 - **MCP 配置与密钥**：MCP 配置只写 `${VAR}` 引用，值存 `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、0600）；OAuth token / client_info 存独立 `mcp_auth.json`（原子写、0600），值与展开值全链路脱敏；后台连接遇授权需求只置 `needs_auth`、绝不弹浏览器，须用户显式 `/mcp auth`；项目级 `.smithcode/mcp.json` 会拉起本机进程，启动时给出可见警示（不做信任门控）；MCP 工具默认 `ask` + 串行，描述与输出按不可信内容处理
 - **技能目录只读**：技能根目录经 `config.read_roots()` 对读工具放行（免越界确认），写工具/`apply_patch` 只认授权目录（`_resolve(write=True)`）；技能 frontmatter 的 `allowed-tools` 不产生授权效果
-- **子代理隔离**：`task` 派生的子代理在独立会话与渲染作用域中运行，深度上限 1（子代理工具视图无 `task`）；强制排除 `ask_user` / `todo_*` / `goal_*` / `use_skill`，MCP 默认关闭（`[subagents].allow_mcp`）；共享父权限引擎，写/命令照常经规则与确认，非交互同样 fail-closed；项目级子代理定义复用技能的项目信任门控（非交互未信任时跳过）
 - **权限规则**：工具通过 schema 的 `pattern_arg` 声明权限模式来源；权限语义与既有工具一致时用 `family` 继承（如 `apply_patch` 继承 `edit_file`）；多路径工具用 `paths_from` 逐路径求值聚合
 - **安全命令免确认**：内置只读命令集（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套）在内置默认 `ask` 下自动放行，且**仅在无任何用户/会话规则命中时生效**——用户可用精确 `ask`/`deny` 收紧，宽泛 `ask` 即整体关闭。开发工具链仅放行版本查询/只读枚举/静态检查（`python --version`、`pip list`、`ruff check`），**真正运行代码的用法（`pytest`、`python x.py`、`npm run`、`uv run`、`cargo test`）不放行**。判定为纯函数 `permission/shell_policy.is_safe_command`，拿不准（解析失败、inline 环境变量前缀、路径限定 argv[0]、重定向、命令替换、危险标志、未加引号 glob）一律回退确认
 - **命令前缀记忆**：`run_command` 的"总是允许"记 argv 前缀（`permission/shell_policy.derive_prefix`），不记整串；匹配用 `command_key` token 前缀比较，文件/参数变化仍命中。拿不准（未登记命令、标志截断、`python -c`、`bash -c`、含危险标志）一律退回精确记忆；`BANNED_PREFIXES` 兜底；`cd`+`git` 守卫不提供"总是允许"
@@ -104,7 +105,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 - 中文注释与中文文档字符串（项目惯例），用户可见文案一律中文
 - 错误信息用中文、面向用户友好（如「文件不存在」而非裸异常 traceback）
 - 工具返回字符串而非抛异常给模型看；对模型的报错要可操作（提示下一步怎么改参数）
-- 不引入重量级依赖；能标准库就标准库（webfetch 即标准库实现，无新依赖）
+- 不引入重量级依赖；能标准库就标准库。例外是已在核心依赖里的 httpx2：网络工具（webfetch / websearch）经 `utils/http.py` 走它，以复用 LLM 客户端同一套代理语义——标准库 urllib 不认 `ALL_PROXY` 也不支持 socks
 - Windows 下 shell 是 cmd.exe：涉及 shell 语法示例时用 Windows 兼容写法
 
 ### 兼容性红线

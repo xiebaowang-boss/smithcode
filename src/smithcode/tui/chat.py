@@ -12,8 +12,6 @@ from enum import Enum
 
 from rich.text import Text
 
-from ..renderer import Scope
-
 
 class Level(str, Enum):
     """消息级别：跨渲染后端统一的语义色。"""
@@ -96,7 +94,6 @@ class Notice(ChatItem):
 
     text: str
     level: Level = Level.INFO
-    scope: Scope | None = None
 
 
 @dataclass
@@ -126,14 +123,12 @@ class StreamDelta(ChatItem):
 
     kind: str
     text: str
-    scope: Scope | None = None
 
 
 @dataclass
 class StreamEnd(ChatItem):
     """一段流式输出结束。"""
 
-    scope: Scope | None = None
 
 
 # ---------- 思考折叠块（生命周期事件） ----------
@@ -143,20 +138,17 @@ class StreamEnd(ChatItem):
 class ThinkingStart(ChatItem):
     """思考开始（挂载折叠块）。"""
 
-    scope: Scope | None = None
 
 
 @dataclass
 class ThinkingDelta(ChatItem):
     text: str
-    scope: Scope | None = None
 
 
 @dataclass
 class ThinkingEnd(ChatItem):
     """思考结束（停转轮、定格耗时）。"""
 
-    scope: Scope | None = None
 
 
 # ---------- 工具调用折叠块（生命周期事件） ----------
@@ -170,14 +162,12 @@ class ToolStart(ChatItem):
     name: str = ""
     icon: str = ""
     running_label: str = ""
-    scope: Scope | None = None
 
 
 @dataclass
 class ToolPreview(ChatItem):
     tool_id: int | None
     detail: str
-    scope: Scope | None = None
 
 
 @dataclass
@@ -186,4 +176,3 @@ class ToolResult(ChatItem):
     result: str
     expand: bool = False
     is_error: bool = False
-    scope: Scope | None = None

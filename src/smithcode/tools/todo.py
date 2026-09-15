@@ -38,7 +38,7 @@ from .base import register
                             },
                             "title": {
                                 "type": "string",
-                                "description": "标题，创建后不可修改",
+                                "description": "标题，创建后不可修改，仅体现该步骤需要做的事情，5-10个字",
                             },
                             "description": {
                                 "type": "string",
