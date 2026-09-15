@@ -54,6 +54,7 @@ DEFAULT_RULES = [
     ("goal_update", "*", ALLOW),  # 更新持久目标状态本身不弹确认（确认一个"目标声明"是荒谬的）；可用 deny 禁止
     ("goal_read", "*", ALLOW),  # 只读持久目标快照，无副作用；同 goal_update 默认放行
     ("use_skill", "*", ALLOW),  # 加载技能指令本身不弹确认（项目级信任门控已在发现阶段完成）；可按技能名 deny
+    ("task", "*", ALLOW),  # 派生子代理本身不弹确认（子代理内部的敏感操作照常确认）；可按 subagent_type deny
 ]
 
 ACTIONS = (ALLOW, ASK, DENY)

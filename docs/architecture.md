@@ -182,6 +182,18 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **入口**：`/mcp`（状态与操作菜单，选择面板）、`/mcp auth <名称>`（OAuth 浏览器授权）、`/mcp add`（TUI 居中向导面板 / REPL 行式流程，命令层只返回 `CommandResult.wizard` 意图；向导支持模板 / 手动命令 / 远程 URL 三分支）、直通添加 `/mcp add <名称> -- <命令...>`（stdio）或 `--url <地址> [--type http|sse] [--header K=V] [--oauth]`（远程）；`mcp/templates.py` 提供常用模板（filesystem / github / playwright / memory / everything / Linear / Sentry）。
 - **服务生命周期**：`Agent.start()` 后台并发连接（失败隔离、不阻塞启动）、`Agent.close()` 统一关闭；连接/刷新在专用线程池，注册表增删走 `tools/base` 的锁。
 
+## 子代理（Subagents）
+
+子代理是主 Agent 通过 `task` 工具派生的、**拥有独立上下文与独立 Agentic Loop** 的执行单元：只把最终报告回传给主对话，中间的工具调用留在子会话历史里（上下文隔离是核心价值）。子系统位于 `subagents/`，设计要点：
+
+- **定义（类型目录）**：`SubAgentSpec`（名称 / 描述 / 角色提示词 / 工具白名单 / 模型 / 迭代预算）。内置 `explore`（只读侦察：六个只读/网络工具，可进并行波次）与 `general`（通用执行：全部工具，顺序屏障）；用户级 `~/.smithcode/agents/*.md`、项目级 `<工作区>/.smithcode/agents/*.md`（复用技能的项目信任门控与 `skills_trust.json` 信任库）、`[subagents].paths` 附加目录（最高优先级），frontmatter 复用技能的宽容解析器；`[subagents].disabled` 按名禁用（内置亦可）。`Agent.start()` / `/agents refresh` 触发 `refresh()` 并同步 task 工具 schema（enum 与类型说明，零类型时隐藏工具，对齐 `use_skill` 的手法）。
+- **执行（fork 隔离）**：`Agent._preflight` 特判 `task`（需要父级引用，类似 `todo_write` 分支），runner 在父级工具执行线程内同步跑完整子循环（复用 `_run_loop` 全套，不复制循环）。子 Agent 复用父级的 `llm` / `permission` / `mcp` / `models` 实例，但使用全新 `Session`（`system_builder=build_subagent_prompt`，不注入项目指令 / 技能 / 目标动态段）、独立 `ContextMeter`、`depth+1`（>0 时不可再派子代理）。并发上限由 `[subagents].max_concurrency` 信号量控制；`[subagents].timeout` 经看门狗定时器取消子令牌。
+- **工具控制**：白名单在 schema 期（`_tool_schemas` 过滤）与执行期（`_tool_forbidden` 硬校验）双重生效；所有类型强制排除 `task` / `ask_user` / `todo_*` / `goal_*` / `use_skill`（会话级单例状态不被污染），`mcp__*` 默认关闭。
+- **权限**：共享父 `Permission` 实例——模式（smith / accept_edits / auto）与会话规则跨父子生效，子代理内部写/命令照常确认；非交互 fail-closed 语义不变；`[permissions].task` 可按 `subagent_type` 允许/拒绝派生。子代理的 ask 经 scoped 渲染代理加来源前缀（`[explore] …`）并按进程级锁串行，同一时刻只弹一个面板。
+- **取消**：子令牌经 `CancellationToken.subscribe` 级联父令牌（含"订阅时父已取消"的补发），`run()` 激活子令牌后子循环 / LLM 流按既有检查点立即截停；收尾仍保证父历史每个 `tool_call_id` 配对（`_placeholder`）。
+- **渲染作用域**：`Renderer` 增加 `Scope` 维度——`scoped()` 返回代理后端，把事件打上 `task_id` / `agent` 后转发；runner 用 ContextVar `activate()` 绑定到子循环线程，`current()` 优先返回它，48 处 `renderer.current()` 调用点零改动。Console 下子代理流式正文默认抑制（`[subagents].display=summary`，`detail` 透传）并加打印锁；TUI 下事件经 `UiAction` 携 scope 路由进对应 `SubAgentBlock`（task 工具块，复用 `ToolCall` 生命周期 + 嵌套子工具活动区），并行子代理各自成块。工具 id 分配改为原子计数器，防并发重号。
+- **用量与入口**：子代理 token 用量在结束时并入父会话两个账本；`/agents` 查看类型目录（`refresh` 重扫 + 诊断）；系统提示词有「子代理（task 工具）」行为节约束派发时机与 prompt 写法。
+
 ## 模块职责
 
 | 模块 | 职责 |
@@ -197,6 +209,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
 | `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级激活集合、`render.py` 目录段与已激活段渲染（字符预算降级）；`/new` 时重置激活集合 |
+| `subagents/` | 子代理子系统（「子代理（Subagents）」节）：`defs.py` 类型目录（内置 explore/general、用户/项目文件发现与信任门控、禁用与动态 schema 同步）、`runner.py` 执行编排（并发信号量、取消级联、scoped 渲染、报告契约、用量合并） |
 | `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
@@ -212,6 +225,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 | `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
 | `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
+| `tools/task.py` | task 派发工具：schema 注册与动态同步（类型 enum / 描述 / 可见性），真实执行由 `Agent._preflight` 特判接管（需要父 Agent 引用构造子代理） |
 | `mcp/` | MCP 子系统：`config.py` 双作用域配置（env / headers 内联表、条目 `enabled` / `oauth`）、`secrets.py` 引用展开/凭据库/Redactor、`auth.py` OAuth token 持久化与浏览器回调、`runtime.py` 共享 asyncio loop 线程、`connection.py` 基于官方 SDK 的同步门面、`factory.py` 按传输构造连接、`catalog.py` 命名与结果映射、`service.py` 连接生命周期与动态注册、`wizard.py` + `templates.py` 添加向导（TUI/REPL 共用纯状态机）；`commands/mcp.py` 提供 `/mcp` 命令 |
 | `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择/MCP 向导）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
 
@@ -224,6 +238,7 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 - **项目指令只读注入**：`AGENTS.md` 等指令文件仅作为文本进入系统提示词（`messages[0]` 动态段），不产生任何授权效果——权限 / 沙箱仍由代码强制，文件内容无法绕过（故不做信任门控）；显式配置的不可用路径警告一次，默认探测位置缺失静默。
 - **MCP 密钥与脱敏**：MCP 配置只保存 `${VAR}` 引用，值存 `credentials.json`（`mcp.<服务器>.<变量>`，原子写、POSIX 0600）；展开值登记全局 Redactor，工具结果 / stderr / 日志 / 向导预览统一脱敏；缺失密钥标记 `missing_env` 不拉起 server（非交互 fail-closed）。OAuth 的 token / client_info 存独立文件 `mcp_auth.json`（原子写、POSIX 0600），读写时值同样登记 Redactor，不进入 `config.toml` 与终端输出。
 - **MCP 进程与不可信内容**：stdio server 以本机用户权限运行；项目级 `.smithcode/mcp.json` 随仓库分发，启动时对项目服务器给出一次可见警示（按项目决定不做信任门控，删除或停用见 `/mcp`）；MCP 工具默认 `ask` 且串行，工具描述 / annotations / 返回内容按「不可信内容」规则处理（系统提示词有专门行为节）。
+- **子代理隔离**：`task` 派生的子代理在独立会话与渲染作用域中运行，深度上限 1（工具视图无 `task`）；强制排除 `ask_user` / `todo_*` / `goal_*` / `use_skill`（会话级单例状态不因并行子代理撕裂），`mcp__*` 默认关闭（`[subagents].allow_mcp` 打开）；共享父权限引擎，写/命令等敏感操作照常经过规则与确认，非交互同样 fail-closed；项目级子代理定义的发现复用技能的项目信任门控（随仓库分发，可能不可信），非交互未信任时跳过。
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框只展示工具摘要（`describe`）与带说明的选项、不重复 diff；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。TUI 中该 diff 以**左右对照**渲染——旧/新两栏、各带真实行号，改动行带 `-`/`+` 前缀并红/绿配色，整块统一底色、上下各 1 行 padding、块内不展示文件名（`tui/render.py` 的 `side_by_side_diff`，宽度不足时回退逐行统一 diff），REPL 仍按 `+/-` 行着色打印。`.env` 等敏感文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。

@@ -2175,6 +2175,9 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
     no_prompting(monkeypatch)
 
     async def _run_case():
+        from smithcode import commands
+
+        expected = [cmd.name for cmd in commands.complete_commands("")]
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             inp = app.query_one(ChatInput)
@@ -2184,10 +2187,10 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
             await pilot.pause()
             await pilot.press("up")
             await pilot.pause()
-            assert menu.accept() == "usage"  # up 从首项回绕到最后一项
+            assert menu.accept() == expected[-1]  # up 从首项回绕到最后一项
             await pilot.press("down")
             await pilot.pause()
-            assert menu.accept() == "compact"  # down 回到首项（回绕）
+            assert menu.accept() == expected[0]  # down 回到首项（回绕）
             await pilot.press("escape")
             await pilot.pause()
             assert not menu.open

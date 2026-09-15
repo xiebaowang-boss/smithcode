@@ -65,6 +65,18 @@ class UiAction(Message):
 _BODY_FALLBACK_WIDTH = 80
 _BODY_REFRESH_INTERVAL = 0.016  # ≈ 一帧
 
+# 带 scope（子代理来源）的对话区事件：由 ChatView 路由进对应 task 块
+_SCOPED_ITEMS = (
+    StreamDelta,
+    StreamEnd,
+    ThinkingStart,
+    ThinkingDelta,
+    ThinkingEnd,
+    ToolStart,
+    ToolPreview,
+    ToolResult,
+)
+
 
 class MessageBody(Static):
     """消息正文承载块：按当前可用宽度渲染，窗口缩放自动重排。
@@ -170,6 +182,7 @@ class ChatView(VerticalScroll):
         self._context_group: ContextGroup | None = None  # 当前进行中的「已探索」组
         self._context_groups: dict[int, ContextGroup] = {}  # 未出结果的上下文工具 → 所属组
         self._tool_widgets: dict[int, ToolCall] = {}  # tool_id → pending 中的工具行
+        self._subagent_blocks: dict[int, SubAgentBlock] = {}  # task_id → 子代理块
         self._thinking_block: ThinkingBlock | None = None  # 进行中的思考块
 
     # ----- 唯一打印入口 -----
@@ -178,7 +191,16 @@ class ChatView(VerticalScroll):
         """把一条语义消息挂载 / 更新到对话区（所有内容输出的唯一入口）。
 
         生产者只构造 ``tui/chat.py`` 的语义消息；缩进、着色、图标、间距统一
-        由此分派到各私有方法 + 集中 CSS，调用点不再各自拼字符串 / 样式。"""
+        由此分派到各私有方法 + 集中 CSS，调用点不再各自拼字符串 / 样式。
+        带 scope 的事件路由进对应子代理块（task 工具块）。"""
+        scope = getattr(item, "scope", None)
+        if scope is not None and isinstance(item, _SCOPED_ITEMS):
+            block = self._subagent_blocks.get(scope.task_id)
+            if block is not None:
+                at_bottom = self._at_bottom()
+                block.handle_scoped(item)
+                self._follow(at_bottom)
+                return
         if isinstance(item, StreamDelta):
             self.append_stream(item.kind, item.text)
         elif isinstance(item, StreamEnd):
@@ -257,7 +279,15 @@ class ChatView(VerticalScroll):
     # ----- 工具 / 思考生命周期 -----
 
     def _tool_begin(self, item: ToolStart) -> None:
-        """pending 工具行：读取/搜索/列目录类归入「已探索」汇总组，其余独立成块。"""
+        """pending 工具行：读取/搜索/列目录类归入「已探索」汇总组，其余独立成块。
+
+        task 工具用 SubAgentBlock：子代理的嵌套事件按 scope 路由进该块。"""
+        if item.name == "task":
+            block = SubAgentBlock(item.summary, classes="chat-item subagent-block")
+            self._subagent_blocks[item.tool_id] = block
+            self._tool_widgets[item.tool_id] = block
+            self.add_widget(block)
+            return
         is_context = context_category(item.name) is not None
         widget = ToolCall(
             item.summary, pending=True, display=item.display, icon=item.icon,
@@ -360,6 +390,7 @@ class ChatView(VerticalScroll):
         self._finalize_context()
         self._context_groups.clear()
         self._tool_widgets.clear()
+        self._subagent_blocks.clear()
         self._thinking_block = None
         self._kind = None
         self._text = None
@@ -793,6 +824,88 @@ class ToolCall(Vertical):
     def on_click(self, event) -> None:
         event.stop()
         self.action_toggle()
+
+
+# ---------- 子代理 task 块 ----------
+
+
+class SubAgentBlock(ToolCall):
+    """task 工具块：承载子代理的嵌套活动（子工具行、流字符计数）与最终报告。
+
+    复用 ToolCall 的 header/body 生命周期：task 自身的 pending → result 由
+    父级事件驱动；带 scope 的子代理事件经 `handle_scoped` 挂进内部活动区。
+    子代理结束时仍未返回结果的子工具行统一收尾，不留 pending 转轮。
+    """
+
+    def __init__(self, summary: str, **kwargs):
+        super().__init__(summary, pending=True, display="block", **kwargs)
+        self._child_widgets: dict[int, ToolCall] = {}
+        self._pending_children: list[ToolCall] = []
+        self._activity: Vertical | None = None
+        self._child_count = 0
+        self._stream_chars = 0
+
+    def compose(self):
+        yield from super().compose()
+        self._activity = Vertical(classes="subagent-activity")
+        yield self._activity
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        if self._activity is not None:
+            for child in self._pending_children:
+                self._activity.mount(child)
+        self._pending_children = []
+
+    def handle_scoped(self, item) -> None:
+        """处理一个带 scope 的子代理事件（由 ChatView 路由）。"""
+        if isinstance(item, ToolStart):
+            child = ToolCall(
+                item.summary, pending=True, display=item.display,
+                icon=item.icon, running_label=item.running_label,
+                classes="subagent-tool",
+            )
+            self._child_widgets[item.tool_id] = child
+            self._child_count += 1
+            if self._activity is not None:
+                self._activity.mount(child)
+            else:
+                self._pending_children.append(child)
+        elif isinstance(item, ToolPreview):
+            child = self._child_widgets.get(item.tool_id)
+            if child is not None:
+                child.set_detail(item.detail)
+        elif isinstance(item, ToolResult):
+            child = self._child_widgets.get(item.tool_id)
+            if child is not None:
+                child.set_result(item.result, expanded=item.expand, is_error=item.is_error)
+                self._child_widgets.pop(item.tool_id, None)
+        elif isinstance(item, (ThinkingDelta, StreamDelta)):
+            self._stream_chars += len(item.text)
+        self._refresh_header()
+
+    def set_result(self, result: str, *, expanded: bool, is_error: bool) -> None:
+        """父级 task 结果到达：先收尾仍 pending 的子工具行，再走标准结果渲染。"""
+        for child in list(self._child_widgets.values()):
+            if child._pending:
+                child.set_result(
+                    "（子任务结束时未单独返回结果）", expanded=False, is_error=False
+                )
+        self._child_widgets.clear()
+        super().set_result(result, expanded=expanded, is_error=is_error)
+        self._refresh_header()
+
+    def _header_text(self) -> str:
+        text = super()._header_text()
+        if self._pending and self._child_count:
+            text += f" · {self._child_count} 个子调用"
+            if self._stream_chars:
+                text += f" · {self._stream_chars:,} 字符"
+        return text
+
+    def _refresh_header(self) -> None:
+        if self._header is not None:
+            self._header.update(self._header_text())
 
 
 # ---------- 上下文收集汇总块 ----------

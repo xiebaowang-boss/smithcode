@@ -40,10 +40,12 @@ class MessageLog(list):
 
 
 class Session:
-    def __init__(self, store=None):
+    def __init__(self, store=None, system_builder=None):
         config.new_session_id()  # 每次会话开始轮换会话 id，供 {$session} 请求头占位符使用
         self._store = None
         self._messages = MessageLog(on_append=self._hook)
+        # 系统提示词构造器：None 时用标准提示词（主代理）；子代理传入自己的构造器
+        self._system_builder = system_builder
         self.created_at = time.time()
         # 双口径用量账本：reset 只清会话口径，"应用启动以来"随进程存活
         self.usage = UsageTracker()
@@ -94,13 +96,17 @@ class Session:
         Agent 调用 `instructions.refresh()` 装载一次，会话中途修改文件不重载
         （对齐 Codex「每会话装载一次」）；首个 render 前的兜底懒加载见
         `instructions.render_section()`。
+        子代理会话传入自己的 system_builder（角色提示词），不经过上述动态段。
         兼容 load() 读回的旧历史：首段是 system 时同样按最新内容校准。
         """
-        content = build_system_prompt(
-            instructions_section=instructions.render_section(),
-            skills_section=skills.render_section(),
-            goal_section=goal.render_section(),
-        )
+        if self._system_builder is not None:
+            content = self._system_builder()
+        else:
+            content = build_system_prompt(
+                instructions_section=instructions.render_section(),
+                skills_section=skills.render_section(),
+                goal_section=goal.render_section(),
+            )
         if self._messages and self._messages[0].get("role") == "system":
             if self._messages[0].get("content") != content:
                 self._messages[0]["content"] = content

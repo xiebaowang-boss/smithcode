@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from . import config, goal, instructions, plan, renderer, sessions, skills
+from . import config, goal, instructions, plan, renderer, sessions, skills, subagents
 from .cancel import CancellationToken, RunResult, activate_token, current_token
 from .context import (
     ContextMeter,
@@ -44,6 +44,7 @@ from .tools import (
     visible_schemas,
 )
 from .tools.skills import sync_schema
+from .tools.task import sync_schema as sync_task_schema
 
 # 工具调用短摘要行（如 `read src/agent.py`）的最大显示宽度，超出截断
 MAX_SUMMARY_LEN = 80
@@ -52,8 +53,11 @@ MAX_SUMMARY_LEN = 80
 MAX_PREVIEW_LINES = 40
 
 # 结果详情默认展开的工具：写/编辑类的 diff 是本次改动的关键信息（apply_patch
-# 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体）；都直接可见、可收起。
-DEFAULT_EXPAND_TOOLS = frozenset({"write_file", "edit_file", "apply_patch", "ask_user"})
+# 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体），task 的结果是
+# 子代理报告（主代理与本轮的唯一产出）；都直接可见、可收起。
+DEFAULT_EXPAND_TOOLS = frozenset({
+    "write_file", "edit_file", "apply_patch", "ask_user", "task",
+})
 
 
 # 权限被拒时的统一工具结果文本（回传模型 + 终端展示共用）
@@ -225,15 +229,30 @@ class _BatchScheduler:
 
 class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None,
-                 store=None, persist: bool = False, oneshot: bool = False):
-        reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
-        self.llm = LLMClient()
+                 store=None, persist: bool = False, oneshot: bool = False,
+                 llm=None, permission=None, mcp=None, models=None,
+                 tool_filter=None, model: str | None = None,
+                 depth: int = 0, reset_globals: bool = True):
+        """构造 Agent。
+
+        进程级服务（llm / permission / mcp / models）可注入：子代理复用父级实例
+        （共享权限模式与会话规则、连接与客户端），而不是各自新建。tool_filter
+        限制本实例可见且可执行的工具集合（子代理白名单）；model 覆盖模型；
+        depth 为子代理深度（>0 时禁用 task）；reset_globals=False 跳过
+        「已读文件」等进程级状态的初始化（子代理不得清空父级记录）。
+        """
+        if reset_globals:
+            reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
+        self.llm = llm or LLMClient()
         self.session = session or Session()
-        self.permission = Permission()
+        self.permission = permission or Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
         # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
-        self.mcp = McpService()
+        self.mcp = mcp if mcp is not None else McpService()
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
+        self._tool_filter = tool_filter  # (name)->bool；None = 全部可用（主代理）
+        self._model = model  # 非空时覆盖 config.MODEL（子代理可挂不同模型）
+        self.depth = int(depth)  # 子代理深度：>0 的实例不能再派子代理
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
         self.max_iterations = (
             config.MAX_ITERATIONS if max_iterations is None else int(max_iterations)
@@ -249,7 +268,7 @@ class Agent:
             self.session.bind_store(self._new_store(oneshot=oneshot))
         # 候选模型目录：命令层只读 `agent.models.list()`，不关心来源与装载时机
         cache = ModelCache()
-        self.models = ModelCatalog(
+        self.models = models or ModelCatalog(
             configured=ConfiguredModelSource(),
             cached=CachedModelSource(cache),
             remote=RemoteModelSource(self.llm, cache),
@@ -263,14 +282,16 @@ class Agent:
         )
 
     def start(self) -> None:
-        """启动期装载模型目录、技能目录与项目指令：模型未配置时后台拉取 `/models`。
+        """启动期装载模型目录、技能/子代理目录与项目指令：模型未配置时后台拉取 `/models`。
 
-        技能发现可能弹出项目级信任确认（渲染后端此时为 ConsoleRenderer，
-        TUI 尚未接管，交互行为一致）。项目指令在会话边界装载（此处 / `/new` /
-        恢复三处），会话中途不重载以保护提示前缀缓存；读取失败只警告、不阻断启动。
+        技能与项目级子代理定义的发现可能弹出项目信任确认（渲染后端此时为
+        ConsoleRenderer，TUI 尚未接管，交互行为一致）。项目指令在会话边界装载
+        （此处 / `/new` / 恢复三处），会话中途不重载以保护提示前缀缓存；
+        读取失败只警告、不阻断启动。
         """
         self.models.bootstrap()
-        self.refresh_skills()
+        self.refresh_skills() 
+        self.refresh_subagents()
         instructions.refresh()
         self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
 
@@ -278,6 +299,12 @@ class Agent:
         """重新发现技能并同步 use_skill 工具 schema（启动与 /skills refresh 共用）。"""
         diagnostics = skills.refresh()
         sync_schema()
+        return diagnostics
+
+    def refresh_subagents(self) -> list:
+        """重新发现子代理类型并同步 task 工具 schema（启动与 /agents refresh 共用）。"""
+        diagnostics = subagents.refresh()
+        sync_task_schema()
         return diagnostics
 
     def new_session(self) -> None:
@@ -459,16 +486,17 @@ class Agent:
         if self._token is not None:
             self._token.cancel()
 
-    def run(self, user_input: str) -> RunResult:
+    def run(self, user_input: str, token: CancellationToken | None = None) -> RunResult:
         """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限）。
 
-        每次调用激活一个新令牌并经 ContextVar 沿调用链传播（llm 流层、
-        工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消
-        状态影响。
+        每次调用激活一个取消令牌并经 ContextVar 沿调用链传播（llm 流层、
+        工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消状态
+        影响。token 非空时使用调用方提供的令牌（子代理复用父级派生的令牌，
+        以便父级 Esc 能级联取消）。
         """
         self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
         self.session.add("user", user_input)
-        token = CancellationToken()
+        token = token or CancellationToken()
         self._token = token
         reset_token = activate_token(token)
         try:
@@ -482,6 +510,58 @@ class Agent:
         if result.status == "interrupted":
             self._note_interrupted()  # 回写上下文但不发请求，供下一轮模型看到
         return result
+
+    # ---------- 子代理派生 ----------
+
+    def fork_subagent(self, spec) -> Agent:
+        """按子代理类型派生一个隔离的 Agent（共享进程级服务，不共享会话状态）。
+
+        - 会话：全新 Session，系统提示词由 build_subagent_prompt 构造（不含
+          主代理的项目约定 / 技能 / 目标动态段）；
+        - 服务：llm / permission / mcp / models 复用父级实例（权限模式与会话
+          规则跨父子生效，MCP 连接生命周期仍归父级）；
+        - 工具：spec 白名单（schema 期 + 执行期双重生效），depth>0 时禁用 task；
+        - 状态：不持久化、不触发自动标题、不重置进程级「已读文件」记录。
+        """
+        from .llm.prompts import build_subagent_prompt
+
+        cfg = config.SUBAGENTS
+        return Agent(
+            session=Session(system_builder=lambda: build_subagent_prompt(spec)),
+            max_iterations=self._subagent_turns(spec),
+            llm=self.llm,
+            permission=self.permission,
+            mcp=self.mcp,
+            models=self.models,
+            tool_filter=spec.tool_filter(allow_mcp=cfg.allow_mcp),
+            model=spec.model,
+            depth=self.depth + 1,
+            reset_globals=False,
+        )
+
+    def _subagent_turns(self, spec) -> int:
+        """子代理迭代预算：类型定义 > [subagents].max_turns > 父级设置。"""
+        if spec.max_turns > 0:
+            return spec.max_turns
+        if config.SUBAGENTS.max_turns > 0:
+            return int(config.SUBAGENTS.max_turns)
+        return self.max_iterations
+
+    def _tool_schemas(self) -> list:
+        """发给模型的工具 schema：在全局可见集上应用本实例的 tool_filter。"""
+        schemas = visible_schemas()
+        if self._tool_filter is None:
+            return schemas
+        return [s for s in schemas if self._tool_filter(s["name"])]
+
+    def _tool_forbidden(self, name: str) -> bool:
+        """执行期硬校验：白名单之外（或子代理再派子代理）的工具一律拒绝。
+
+        schema 过滤是第一道（模型看不到），这里是兜底——陈旧 schema、伪造
+        调用或并发注册变化时也不能执行。"""
+        if self.depth > 0 and name == "task":
+            return True
+        return self._tool_filter is not None and not self._tool_filter(name)
 
     def _note_interrupted(self) -> None:
         """把「用户中断」事件作为 user 消息写进会话历史（不触发新请求）。
@@ -713,8 +793,11 @@ class Agent:
         usage = None
         parts: list[str] = []
         r = renderer.current()
-        schemas = visible_schemas() if use_tools else None
-        for kind, payload in self.llm.chat_stream(self.session.messages, tools=schemas):
+        schemas = self._tool_schemas() if use_tools else None
+        kwargs = {"model": self._model} if self._model else {}
+        for kind, payload in self.llm.chat_stream(
+            self.session.messages, tools=schemas, **kwargs
+        ):
             if kind == "message":
                 msg = payload
             elif kind == "usage":
@@ -774,6 +857,15 @@ class Agent:
                 line[:MAX_SUMMARY_LEN] + ("..." if len(line) > MAX_SUMMARY_LEN else ""), display, name
             )
         denied_plan = _ToolPlan(tc, name, tool_id, lambda: DENIED_RESULT)
+
+        # 子代理白名单的执行期硬校验（schema 过滤之外的兜底，见 _tool_forbidden）
+        if self._tool_forbidden(name):
+            text = f"错误: 当前不可调用工具 {name}（不在允许的工具范围内）。"
+            return _ToolPlan(tc, name, tool_id, lambda: text), False
+
+        # task 需要父 Agent 引用构造子代理，走专用预检分支（类似 todo_write 的特判）
+        if name == "task":
+            return self._preflight_task(tc, args, line, tool_id, denied_plan)
 
         # 多路径工具（如 apply_patch）：从参数提取目标路径，逐路径预检 + 聚合权限检查
         extractor = PATHS_EXTRACTORS.get(name)
@@ -842,6 +934,44 @@ class Agent:
         return _ToolPlan(tc, name, tool_id,
                          self._make_runner(name, args, widen),
                          serial=bool(SERIAL.get(name)) or bool(widen)), False
+
+    def _preflight_task(self, tc: dict, args: dict, line: str,
+                        tool_id: int | None, denied_plan: _ToolPlan) -> tuple[_ToolPlan, bool]:
+        """task 工具的专用预检：解析类型、校验 prompt，并决定串行 / 并行。
+
+        只读子代理（白名单全部为只读工具且 [subagents].parallel）进并行波次，
+        写能力子代理作顺序屏障——避免并发写冲突，也符合调度器的副作用可见性
+        约定（见 tests/test_agent_parallel.py 的不变量）。"""
+        def error_plan(text: str) -> tuple[_ToolPlan, bool]:
+            return _ToolPlan(tc, "task", tool_id, lambda: text), False
+
+        if self.depth > 0:
+            return error_plan("错误: 子代理不能再派发子代理。")
+        if not config.SUBAGENTS.enabled:
+            return error_plan("错误: 子代理功能已禁用（[subagents].enabled=false）。")
+        if not self.permission.check("task", args, content=line):
+            return denied_plan, True
+        requested = args.get("subagent_type")
+        spec = subagents.get_spec(requested)
+        if spec is None:
+            available = "、".join(s.name for s in subagents.all_specs()) or "无"
+            return error_plan(
+                f"错误: 未知子代理类型 {requested!r}（可用：{available}）。"
+                "请改用可用类型重新调用。"
+            )
+        prompt = str(args.get("prompt") or "").strip()
+        if not prompt:
+            return error_plan(
+                "错误: prompt 不能为空。子代理看不到主对话，"
+                "请在 prompt 里写清目标、范围与期望的报告格式。"
+            )
+        label = str(args.get("description") or spec.name).strip()
+
+        def run_task() -> str:
+            return subagents.run_task(self, spec, prompt, label=label, tool_id=tool_id)
+
+        serial = not spec.read_only() or not config.SUBAGENTS.parallel
+        return _ToolPlan(tc, "task", tool_id, run_task, serial=serial), False
 
     @staticmethod
     def _make_runner(name: str, args: dict, widen: list[Path]) -> Callable[[], str]:

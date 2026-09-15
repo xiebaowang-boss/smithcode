@@ -555,3 +555,105 @@ def load_sessions_config() -> SessionsConfig:
         title_model=_file_str("sessions", "title_model") or "",
         title_max_chars=title_max_chars,
     )
+
+
+# ---------- 子代理（Subagents） ----------
+
+SUBAGENT_DISPLAY_MODES = ("summary", "detail")
+
+
+@dataclass(frozen=True)
+class SubagentsConfig:
+    """[subagents] 段的解析结果；非法项警告后回退默认值。"""
+
+    enabled: bool = True
+    max_concurrency: int = 3  # 同时运行的子代理上限（信号量；默认小于工具并发上限）
+    max_turns: int = 25  # 单个子代理默认迭代上限；0 = 继承主 Agent 的 max_iterations
+    timeout: float = 0  # 单个子代理墙钟超时秒数；0 = 不限
+    parallel: bool = True  # 只读子代理允许进并行波次；false 时全部串行
+    display: str = "summary"  # summary = 只显示子代理工具摘要与最终报告；detail = 连流式一起显示
+    allow_mcp: bool = False  # 子代理白名单是否允许 mcp__ 工具
+    paths: tuple = ()  # 追加的子代理定义目录（最高优先级）
+    disabled: tuple = ()  # 禁用的类型名（通配符，内置也可禁）
+
+
+def load_subagents_config() -> SubagentsConfig:
+    """读取 [subagents] 段：enabled / max_concurrency / max_turns / timeout /
+    parallel / display / allow_mcp / paths / disabled。
+
+    与 skills / sessions 配置同款风格：类型不对警告后回退默认值，不中断启动。
+    """
+    data = _read_config_file().get("subagents") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [subagents] 段不是表，已忽略")
+        return SubagentsConfig()
+
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        print(
+            f"[警告] config.toml 的 subagents.enabled = {enabled!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        enabled = True
+
+    parallel = data.get("parallel", True)
+    if not isinstance(parallel, bool):
+        print(
+            f"[警告] config.toml 的 subagents.parallel = {parallel!r}"
+            " 不是布尔值，已用默认值 True"
+        )
+        parallel = True
+
+    allow_mcp = data.get("allow_mcp", False)
+    if not isinstance(allow_mcp, bool):
+        print(
+            f"[警告] config.toml 的 subagents.allow_mcp = {allow_mcp!r}"
+            " 不是布尔值，已用默认值 False"
+        )
+        allow_mcp = False
+
+    display = data.get("display", "summary")
+    if display not in SUBAGENT_DISPLAY_MODES:
+        print(
+            f"[警告] config.toml 的 subagents.display = {display!r} 无效"
+            f"（可选 {' / '.join(SUBAGENT_DISPLAY_MODES)}），已用默认值 summary"
+        )
+        display = "summary"
+
+    max_concurrency = int(_resolve_number("subagents", "max_concurrency", 3))
+    if max_concurrency <= 0:
+        print(
+            f"[警告] config.toml 的 subagents.max_concurrency = {max_concurrency!r} 无效"
+            "（应为正整数），已用默认值 3"
+        )
+        max_concurrency = 3
+
+    max_turns = int(_resolve_number("subagents", "max_turns", 25))
+    if max_turns < 0:
+        print(
+            f"[警告] config.toml 的 subagents.max_turns = {max_turns!r} 不能为负，已用默认值 25"
+        )
+        max_turns = 25
+
+    timeout = float(_resolve_number("subagents", "timeout", 0))
+    if timeout < 0:
+        print(
+            f"[警告] config.toml 的 subagents.timeout = {timeout!r} 不能为负，已用默认值 0"
+        )
+        timeout = 0
+
+    return SubagentsConfig(
+        enabled=enabled,
+        max_concurrency=max_concurrency,
+        max_turns=max_turns,
+        timeout=timeout,
+        parallel=parallel,
+        display=display,
+        allow_mcp=allow_mcp,
+        paths=_str_list(data.get("paths"), "subagents.paths"),
+        disabled=_str_list(data.get("disabled"), "subagents.disabled"),
+    )
+
+
+# 子代理配置是模块级常量：Agent 启动时 refresh() 会重新读取并生效（测试可 monkeypatch）
+SUBAGENTS = load_subagents_config()

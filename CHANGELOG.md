@@ -4,6 +4,15 @@
 
 ## [未发布]
 
+### 新增
+
+- **子代理（Subagents）与 `task` 工具**：主 Agent 可把开放式调查或可独立完成的子任务派发给隔离子代理执行——子代理拥有独立上下文与独立 Agentic Loop，只把最终报告回传给主对话，中间工具调用不占用主上下文。新增 `subagents/` 子系统（类型目录 + 执行编排）与 `tools/task.py`：
+  - **类型目录**：内置 `explore`（只读侦察，六个只读/网络工具，可进并行波次）与 `general`（通用执行，顺序屏障）；支持用户级 `~/.smithcode/agents/*.md`、项目级 `<工作区>/.smithcode/agents/*.md`（复用技能的项目信任门控与信任库）与 `[subagents].paths`（最高优先级），frontmatter 声明 name / description / tools / model / max_turns，`[subagents].disabled` 可按名禁用（内置亦可）；`/agents` 查看目录、`/agents refresh` 重扫并显示诊断。
+  - **执行隔离**：子 Agent 复用父级 LLM / 权限 / MCP 服务，但使用全新会话（子代理专用系统提示词，不注入项目指令 / 技能 / 目标段）与深度上限 1；白名单在 schema 与执行期双重强制，强制排除 task / ask_user / todo / goal / skill（会话级单例状态不被污染），MCP 默认关闭（`[subagents].allow_mcp`）。
+  - **权限与中断**：共享父权限引擎的规则、模式与会话"总是允许"；Esc 经令牌订阅级联取消子代理，父历史保持 tool_call 配对完整；子代理的权限确认带 `[类型]` 来源前缀并串行化，非交互仍 fail-closed。
+  - **渲染**：Renderer 新增 `Scope` 维度（ContextVar 绑定，既有 `renderer.current()` 调用点零改动）；Console 默认只显示子代理工具摘要与最终报告（`[subagents].display=detail` 可透传流式）；TUI 新增 `SubAgentBlock`，子工具调用嵌套进 task 块、并行子代理各自成块。
+  - **预算与配置**：`[subagents]` 新增 enabled / max_concurrency / max_turns / timeout / parallel / display / allow_mcp / paths / disabled；子代理 token 用量并入父会话账本；系统提示词新增「子代理（task 工具）」行为节约束派发时机与 prompt 写法。
+
 ### 变更
 
 - **`/goal` 回合预算改为可选（默认不限）**：`[limits].goal_max_turns` 默认值由 `50` 改为 `-1`（不限制）——目标持续自动推进，直到模型核验证据后声明完成/受阻、用户暂停/清除/中断，或空转刹车触发。配置为正整数时仍按预算收尾（`budget_limited` + 收尾提示词）；`/goal budget <N>` 设上限，新增支持 `/goal budget unlimited`（或 `off` / `none` / `-1`）取消上限。进度显示随之自适应：不限时底栏/侧边栏/状态块只显示回合数（如 `◎ 目标 3`），有预算时显示 `N/M`；续跑提示词区分「预算不限」与「剩余 N 回合」。新会话默认不限，恢复旧快照（含旧的 50）不受影响。

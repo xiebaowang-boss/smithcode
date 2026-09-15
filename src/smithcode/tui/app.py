@@ -206,6 +206,10 @@ class SmithTUI(App):
     ThinkingBlock { height: auto; }
     ThinkingBlock .think-header { color: #808080; }
     ThinkingBlock .think-body { color: #808080; margin-left: 2; }
+    /* 子代理 task 块：内部活动区（子工具行）随内容自适应，不占满高度 */
+    SubAgentBlock { height: auto; }
+    SubAgentBlock .subagent-activity { height: auto; margin-left: 3; }
+    SubAgentBlock .subagent-tool { padding-left: 0; margin-top: 0; }
     QuestionPanel {
         height: auto;
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
@@ -473,9 +477,9 @@ class SmithTUI(App):
             return
         handler(*message.args)
 
-    def ui_notice(self, text: str, level: str = "info") -> None:
+    def ui_notice(self, text: str, level: str = "info", scope=None) -> None:
         """系统通知（信息 / 警告 / 错误）落对话区，级别决定颜色与图标。"""
-        self._chat().apply(Notice(text, coerce_level(level)))
+        self._chat().apply(Notice(text, coerce_level(level), scope))
 
     def ui_line(self, text: str, style: str | None = None) -> None:
         """兼容旧调用点：style 字符串映射为语义级别（新代码请用 ui_notice）。"""
@@ -490,37 +494,38 @@ class SmithTUI(App):
         字面字符进入渲染流（真实终端会打花整个界面）。"""
         self._chat().apply(Block(text, level_from_style(style)))
 
-    def ui_stream(self, kind: str, chunk: str) -> None:
-        self._chat().apply(StreamDelta(kind, chunk))
+    def ui_stream(self, kind: str, chunk: str, scope=None) -> None:
+        self._chat().apply(StreamDelta(kind, chunk, scope))
 
-    def ui_stream_done(self) -> None:
-        self._chat().apply(StreamEnd())
+    def ui_stream_done(self, scope=None) -> None:
+        self._chat().apply(StreamEnd(scope))
 
     def ui_tool_start(self, tool_id: int, summary: str, display: str = "inline",
-                      name: str = "") -> None:
-        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组。
+                      name: str = "", scope=None) -> None:
+        """pending 工具行：转轮摘要先上屏；读取/搜索/列目录类归入「已探索」汇总组；
+        带 scope 的子代理事件路由进对应 task 块（见 ChatView.apply）。
 
         命令工具耗时不确定，pending 期显式标「执行中」；完成后统一转静态行。"""
         icon = _PLAN_ICON if name == "todo_write" else ""
         running = "执行中" if name == "run_command" else ""
-        self._chat().apply(ToolStart(tool_id, summary, display, name, icon, running))
+        self._chat().apply(ToolStart(tool_id, summary, display, name, icon, running, scope))
 
-    def ui_tool_preview(self, tool_id: int | None, detail: str) -> None:
+    def ui_tool_preview(self, tool_id: int | None, detail: str, scope=None) -> None:
         """执行前的变更预览（diff）：更新对应 pending 工具块，审核时改动已可见。"""
-        self._chat().apply(ToolPreview(tool_id, detail))
+        self._chat().apply(ToolPreview(tool_id, detail, scope))
 
     def ui_tool_result(self, tool_id: int | None, result: str, expanded: bool,
-                       is_error: bool) -> None:
-        self._chat().apply(ToolResult(tool_id, result, expanded, is_error))
+                       is_error: bool, scope=None) -> None:
+        self._chat().apply(ToolResult(tool_id, result, expanded, is_error, scope))
 
-    def ui_thinking_start(self) -> None:
-        self._chat().apply(ThinkingStart())
+    def ui_thinking_start(self, scope=None) -> None:
+        self._chat().apply(ThinkingStart(scope))
 
-    def ui_thinking_tick(self, chunk: str) -> None:
-        self._chat().apply(ThinkingDelta(chunk))
+    def ui_thinking_tick(self, chunk: str, scope=None) -> None:
+        self._chat().apply(ThinkingDelta(chunk, scope))
 
-    def ui_thinking_done(self) -> None:
-        self._chat().apply(ThinkingEnd())
+    def ui_thinking_done(self, scope=None) -> None:
+        self._chat().apply(ThinkingEnd(scope))
 
     def ui_plan_sidebar(self, rendered: str) -> None:
         self.query_one(Sidebar).update_plan(rendered, plan.has_active())
