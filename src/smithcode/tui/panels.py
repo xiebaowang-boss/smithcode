@@ -179,10 +179,11 @@ class QuestionPanel(Vertical):
 
     标题显示当前题号 `(i/n)`（n 为真实问题数，确认页不计数）；有选项时显示编号
     列表（↑↓/j/k/数字键选择），最后一项固定「输入自定义回答…」；无选项时直接进入
-    输入态。多问题时 ←/→（或 Tab / Shift+Tab）手动翻页，已答过的题可回跳修改；提交
-    一题后**按顺序进入下一题**（回改中间某题也一样，不会跳到确认页），答完最后一题
-    才进入**确认页**——交互与普通问题一致（←/→ 翻页、Enter 提交），只是把各题
-    答案列在其问题下方供核对，避免最后一题答完即提交、没有修改余地。
+    输入态。←/→（或 Tab / Shift+Tab）手动翻页，已答过的题可回跳修改；提交一题后
+    **按顺序进入下一题**（回改中间某题也一样，不会跳到确认页），答完最后一题才进入
+    **确认页**——交互与普通问题一致（←/→ 翻页、Enter 提交），只是把各题答案列在其
+    问题下方供核对，避免最后一题答完即提交、没有修改余地。**单问题同样经过确认页**
+    （1-N 题统一：答完先进确认页再 Enter 提交，不留「单问题直达提交」的特例）。
 
     输入框是**显式进入**的临时子状态：
     - 有选项题：光标在「输入自定义回答…」行按 Enter 进入输入（已填内容会回填便于修改），
@@ -286,7 +287,8 @@ class QuestionPanel(Vertical):
 
     def _hints(self) -> str:
         if self._review:
-            return "←→ 切换问题 · enter 提交 · esc 取消"
+            back = "←→ 切换问题" if self._total > 1 else "←→ 返回修改"
+            return f"{back} · enter 提交 · esc 取消"
         parts = []
         if self._total > 1:
             parts.append("←→ 切换问题")
@@ -309,7 +311,7 @@ class QuestionPanel(Vertical):
         选项说明以小字跟在下方；末行固定「输入自定义回答…」（选项名不随答案变化，
         已填答案缩进显示在其下一行）。无选项时返回空。
 
-        多问题全部答完后进入确认页（见 `_render_review`），此处不渲染。"""
+        全部答完后进入确认页（见 `_render_review`），此处不渲染。"""
         if self._review:
             return self._render_review()
         options = self._options_of(self._index)
@@ -342,7 +344,7 @@ class QuestionPanel(Vertical):
         return text
 
     def _render_review(self) -> Text:
-        """多问题确认页：逐题列出「问题」并在其**下方**缩进显示对应答案，
+        """确认页：逐题列出「问题」并在其**下方**缩进显示对应答案，
         enter 直接提交整组，←/→ 可返回任一题修改（无需选中）。"""
         text = Text()
         for i, item in enumerate(self._questions):
@@ -374,9 +376,7 @@ class QuestionPanel(Vertical):
         self._switch_question(1)
 
     def _switch_question(self, step: int) -> None:
-        if self._total <= 1:
-            return  # 单问题没有确认页，不存在切页
-        # 页面环：各题 + 确认页（最后一页）；多问题时才存在
+        # 页面环：各题 + 确认页（最后一页）；单问题也存在确认页（两页环）
         page = (self._total if self._review else self._index) + step
         page %= self._total + 1
         if page == self._total:
@@ -406,8 +406,7 @@ class QuestionPanel(Vertical):
 
     def _advance(self) -> None:
         """提交本题后前进：**按顺序进下一题**（回改中间某题也如此），只有已在最后一题
-        时才回头补前面漏答的题；都答完则提交——多问题先进确认页（留出修改余地），
-        单问题直接提交。
+        时才回头补前面漏答的题；都答完则进入**确认页**（留下修改余地，单问题同样如此）。
 
         早期实现是「跳到下一道未答题」（向后环绕扫描），回改中间某题时因后面都已答而
         直接落到确认页，与「改完接着看下一题」的预期不符，故改为顺序前进；漏答题只在
@@ -420,13 +419,10 @@ class QuestionPanel(Vertical):
             if not self._answers[candidate]:
                 self._goto(candidate)
                 return
-        if self._total > 1:
-            self._enter_review()
-        else:
-            self._finish()
+        self._enter_review()
 
     def _enter_review(self) -> None:
-        """切到确认页（多问题循环里的最后一页）：enter 直接提交，←/→ 返回修改。"""
+        """切到确认页（问题循环里的最后一页）：enter 直接提交，←/→ 返回修改。"""
         self._review = True
         self._refresh()
         self.focus()

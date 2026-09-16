@@ -34,6 +34,24 @@ MODE_LABELS = {"smith": "Smith", "accept_edits": "Accept Edits", "auto": "Auto"}
 # accept_edits 档自动放行的权限族：所有写/编辑路径（apply_patch 经 family 继承 edit_file）
 EDIT_FAMILIES = ("edit_file", "write_file")
 
+# 确认框内的展示上限：工具摘要（命令详情等）与选项小字统一截断，
+# 避免长命令 / 长路径 / 长记忆候选把弹窗与终端撑爆。
+CONFIRM_LIMIT = 80
+_ELLIPSIS = "..."
+
+
+def _clip(text: str) -> str:
+    """把确认框展示文本压成单行并截断到 CONFIRM_LIMIT（超出加 ...）。
+
+    换行会撑破确认框布局，先压平空白；截断保留头部——命令的工具名与子命令
+    都在开头，比尾部参数更有判断价值。
+    """
+    flat = " ".join(str(text).split())
+    if len(flat) <= CONFIRM_LIMIT:
+        return flat
+    return flat[: CONFIRM_LIMIT - len(_ELLIPSIS)] + _ELLIPSIS
+
+
 DEFAULT_RULES = [
     ("read_file", "*", ALLOW),
     ("list_dir", "*", ALLOW),
@@ -325,9 +343,9 @@ class Permission:
         r = renderer.current()
         title = f"允许访问授权目录之外的路径 {raw_path}?"
         descriptions = {
-            "y": f"仅本次访问 {target}",
-            "a": f"本会话信任目录: {root}",
-            "n": "拒绝本次访问",
+            "y": _clip(f"仅本次访问 {target}"),
+            "a": _clip(f"本会话信任目录: {root}"),
+            "n": _clip("拒绝本次访问"),
         }
         answer = r.confirm_choice(
             f"{title} [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
@@ -415,10 +433,12 @@ class Permission:
 
         标题统一为「允许执行 <工具名>?」，目标内容（工具摘要，如 `command git status`
         / `fetch <url>` / `write <path>`）由 Agent 作为 content 传入、渲染在标题下方，
-        保证每种工具的申请都带同样的内容行。选"总是允许"时按候选逐条记入会话规则：
-        命令工具记 argv 前缀（或精确串），其余工具记模式串，保证记忆能被后续命中。
-        remember=False 时只提供 y/n。变更预览（diff）不在这里展示——它由 Agent 在
-        确认前推送到工具调用块，与权限框解耦。"""
+        保证每种工具的申请都带同样的内容行；run_command 的描述（description 参数）
+        已由工具的 describe 拼在命令详情前。内容与选项小字统一经 `_clip` 截断到
+        CONFIRM_LIMIT，长命令 / 长记忆候选不再全量打印。选"总是允许"时按候选逐条
+        记入会话规则：命令工具记 argv 前缀（或精确串），其余工具记模式串，保证记忆
+        能被后续命中。remember=False 时只提供 y/n。变更预览（diff）不在这里展示——
+        它由 Agent 在确认前推送到工具调用块，与权限框解耦。"""
         if not confirmations_available():
             renderer.current().error(
                 f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）"
@@ -430,7 +450,7 @@ class Permission:
         descriptions = {"y": "仅本次执行", "n": "拒绝并跳过该操作"}
         if proposals:
             shown = "、".join(display for display, _ in proposals)
-            descriptions["a"] = f"本会话将记住: {shown}"
+            descriptions["a"] = _clip(f"本会话将记住: {shown}")
             prompt = f"{title} [y]本次 / [n]拒绝 / [a]总是允许: "
             options, hint = "yna", "y / n / a"
         else:
@@ -440,7 +460,7 @@ class Permission:
             prompt,
             options,
             hint,
-            content=content,
+            content=_clip(content) if content else content,
             descriptions=descriptions,
         )
         if answer == "a":

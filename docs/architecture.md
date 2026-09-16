@@ -232,7 +232,7 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
 | `tools/web.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取，用真实浏览器 UA 降低被按机器人 403 的概率；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
-| `tools/websearch.py` | websearch 网页检索（多后端：Brave / Bing / DuckDuckGo，`[search].backend` 可切换；默认 auto 依次回退；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂；各后端页面结构不同，各自一个解析函数 |
+| `tools/websearch.py` | websearch 网页检索（多后端：Tavily / Brave / Bing / DuckDuckGo，`[search].backend` 可切换；默认 auto 依次回退；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂；Tavily 走 JSON API（需 key），其余三个各一个 HTML 解析函数 |
 | `utils/http.py` | 网络工具的 HTTP 客户端工厂：统一代理语义（`normalize_proxy_env` 先归一化 `socks://`，`trust_env` 读 `ALL_PROXY`/`HTTP(S)_PROXY`，socks5 由 socksio 支持）+ 屏蔽 ALPN（历史遗留：DuckDuckGo 反爬按 TLS 指纹判定；Bing 不敏感）+ SSRF 地址判定（`is_public_address` / `private_target`，见「网络出网」节） |
 | `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/shell.py` | 命令执行，含超时保护 |
@@ -259,8 +259,9 @@ webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂
 
 免 key 的搜索引擎在可用性、反爬强度、结果质量上差异极大，且**随网络环境（是否走代理）整体翻转**，故不写死单一后端：
 
-- **后端**：`brave`（`search.brave.com`，结果质量最好，但有速率限制，连打约 6 次会 429）、`bing`（`www.bing.com`，可达性最广，但对部分查询会返回与查询完全无关的「软降级」结果，工具层无法识别）、`ddg`（`html.duckduckgo.com`，反爬最严，常返回 202 + 验证页）。三者的页面结构不同，各自一个解析函数（`_parse_brave` / `_parse_bing` / `_parse_ddg`）。
-- **选择**：`config.load_search_backend()` 读 `[search].backend`（env `SMITHCODE_SEARCH_BACKEND` 优先），可选 `auto` / `brave` / `bing` / `ddg`，默认 `auto`。`auto` 按 `brave → bing → ddg` 依次尝试，某后端报错或解析为空就试下一个，全失败时在错误里汇总各后端原因。
+- **Tavily**（`api.tavily.com/search`，JSON API，**需 key**）：免费 1000 次/月，专为 LLM 设计，结果最干净、不受反爬影响，故在 auto 里排第一。未配 key 时直接跳过（不算失败）。key 解析优先级：`SMITHCODE_TAVILY_KEY` > `config.toml` 的 `[search].tavily_key` > `credentials.json` 的 `search.tavily_key`（见 `config.load_tavily_key()`；`smith setup` 可选采集，写入凭据文件并与 LLM key 共存于不同字段）。key 绝不进入工具输出。
+- **免 key 后端**：`brave`（`search.brave.com`，结果质量最好，但有速率限制，连打约 6 次会 429）、`bing`（`www.bing.com`，可达性最广，但对部分查询会返回与查询完全无关的「软降级」结果，工具层无法识别）、`ddg`（`html.duckduckgo.com`，反爬最严，常返回 202 + 验证页）。三者页面结构不同，各自一个解析函数（`_parse_brave` / `_parse_bing` / `_parse_ddg`）。
+- **选择**：`config.load_search_backend()` 读 `[search].backend`（env `SMITHCODE_SEARCH_BACKEND` 优先），可选 `auto` / `tavily` / `brave` / `bing` / `ddg`，默认 `auto`。`auto` 按 `tavily → brave → bing → ddg` 依次尝试，某后端报错、解析为空或未配 key 就试下一个，全失败时在错误里汇总各后端原因。
 - **解析为空的二义性**：页面正常但确实没结果是「（无搜索结果）」；命中反爬特征才报错。两者靠各后端的特征区分（见上一条）。
 
 
@@ -289,7 +290,7 @@ webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂
 3. `deny` 不询问用户直接拒绝；`-y`（approved_all）跳过所有 `ask`（含越界访问确认），但显式声明的 `deny` 依然生效。
 4. **权限族（family）**：规则匹配同时看「工具名」与「family」。`apply_patch` 声明 `family="edit_file"`，因此自动继承 `edit_file` 全部规则（含 `.git` 保护路径），避免"换个工具绕过规则"；工具名精确规则排在 family 规则之后可单独收紧。
 5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次（逐条列出待确认路径），全部放行才执行；会话内"总是允许"按每个待确认路径的精确模式逐条记忆，同路径后续调用直接放行、新路径仍走确认。
-6. **审核前展示变更**：工具的变更预览（如 `write_file` / `edit_file` 的 unified diff）在权限确认与执行**之前**推送到工具调用块（pending 态就地展开）——审核时改动内容已可见；权限申请框则统一展示工具摘要（`describe`，如 `command git status` / `fetch <url>` / `write <path>`）与带说明的 y/n/a 选项。
+6. **审核前展示变更**：工具的变更预览（如 `write_file` / `edit_file` 的 unified diff）在权限确认与执行**之前**推送到工具调用块（pending 态就地展开）——审核时改动内容已可见；权限申请框则统一展示工具摘要（`describe`，如 `command git status` / `fetch <url>` / `write <path>`）与带说明的 y/n/a 选项；`run_command` 的 `description` 参数会排在命令摘要前，摘要与选项小字均截断到 80 字符，避免长命令 / 长路径撑满弹窗。
 7. **复合命令拆分求值**：`run_command` 的命令串按顶层操作符（`&&` / `||` / `;` / `|` / `&` / 换行）切分为子命令逐段匹配规则（引号内不切），聚合语义与多路径一致——任一段 `deny` → 拒绝，任一段 `ask` → 询问，全部放行才放行；含 `$()` 或反引号命令替换（双引号内仍算，单引号内不算）无法静态求值，强制 `ask`。防止"放行 A 后借 `&&` 偷渡 B"绕过规则。
 8. **安全只读命令免确认**：内置一批只读命令（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套安全集），在内置默认 `ask` 下自动放行以减少确认疲劳。安全层位于「内置默认规则」与「用户规则」之间——**任何用户/会话规则命中都优先**（无论 `ask` 还是 `deny`），因此可用精确 `ask`（如 `git push *`）在保留安全集的同时收紧个别命令，也可用宽泛 `ask` 整体关闭。判定是独立纯函数 `permission/shell_policy.is_safe_command`（按顶层段逐段求值，复用命令拆分），拿不准即回退 `ask`：解析失败、inline 环境变量前缀（`CI=true git commit`）、路径限定的 argv[0]（`./sed`、`/usr/bin/ls`）、写文件/读文件重定向（仅放行 `/dev/null`、`NUL`、`2>&1`）、命令替换、危险标志（`find -delete` / `sort -o` / `git -c` 等）、对有写/exec 能力命令的未加引号 glob、网络与 `env`/`awk`/`docker`/`sed` 等命令一律不纳入。开发工具链仅放行**版本查询 / 只读枚举 / 静态检查**（`python --version`、`pip list` / `show` / `freeze`、`npm ls`、`uv pip list`、`poetry show`、`ruff check` 等）；**真正运行代码的用法一律不放行**（`pytest`、`python x.py`、`node -e`、`npm run`、`uv run`、`cargo test` 等）——没有 OS 沙箱时默认放行任意执行等于放弃安全边界。`cd` 目标须落在授权目录内，同一复合命令里 `cd` 改变目录 + `git` 组合整体降级为询问（git 会执行新目录 hooks）。
 9. **"总是允许"命令前缀记忆**：`run_command` 选"总是允许"时不再记整条命令字符串，而是记 **argv 前缀**：`permission/shell_policy.derive_prefix` 把命令归一化成稳定 key（剥 inline 环境变量前缀与 `env`/`command` 包装器；解释器保留 `-m 模块` / 脚本名；其余取从头连续的非标志 token），再按命令规范表的 `arity` / `sub_arity` 切出前缀（`python -m pytest tests/a.py` → `("python","-m","pytest")`、`git commit -m x` → `("git","commit")`、`npm run test` → `("npm","run","test")`）。匹配时对段重新计算 `command_key` 做 token 前缀比较，因此文件/参数变化（`tests/b.py`、`-k foo`、`CI=1` 前缀）都能命中。**拿不准即精确**：未登记命令、标志截断 arity（`git --no-pager log`）、inline 解释器（`python -c`）、shell（`bash -c`）、含危险标志（`ruff check --fix`）一律退回整段精确记忆；`BANNED_PREFIXES`（`uv run` / `python` / `npm run` 裸前缀等）作为最后安全网。复合命令逐段各自记忆；`cd` 改变目录 + `git` 守卫场景不提供"总是允许"。配置文件的字符串规则仍按通配匹配，行为不变。

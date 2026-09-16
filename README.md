@@ -37,7 +37,7 @@
 | `list_dir` | 列目录（名称 / 大小 / 修改时间），跳过 `.git`、`.venv`、`node_modules` 等 |
 | `glob` | 按通配符搜文件名，支持 `**` 递归，结果按修改时间新→旧排序 |
 | `grep` | 按正则搜内容，支持忽略大小写、上下文行、只列文件 / 计数模式 |
-| `run_command` | 执行 shell 命令，默认 60 秒超时（可延长至 300 秒），跨平台终止进程树 |
+| `run_command` | 执行 shell 命令，默认 60 秒超时（可延长至 300 秒），跨平台终止进程树；推荐传 `description`（5-10 个字符）说明目的 |
 | `webfetch` | 抓取网页（仅 http/https）转结构化文本（保留标题 / 链接 / 代码块），支持一次并行抓多个 URL；默认拒访内网与本机地址 |
 | `websearch` | Bing 网页检索，返回标题 / 链接 / 摘要 |
 | `ask_user` | 任务中途向你提问（一次可提 1-4 个，带候选项） |
@@ -270,7 +270,8 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[skills] project` | `ask` | 项目级技能信任策略：`ask` / `on` / `off` |
 | `[skills] max_catalog_chars` | 8000 | 技能目录注入系统提示词的字符预算 |
 | `[skills] disabled` | 空 | 按通配符禁用技能 |
-| `[search] backend` | `auto` | websearch 检索后端：`auto`（按 Brave → Bing → DuckDuckGo 依次尝试）/ `brave` / `bing` / `ddg` |
+| `[search] backend` | `auto` | websearch 检索后端：`auto`（按 Tavily → Brave → Bing → DuckDuckGo 依次尝试）/ `tavily` / `brave` / `bing` / `ddg` |
+| `[search] tavily_key` | 空 | Tavily API key（仅 `tavily` 后端需要；建议存 credentials.json 的 `search.tavily_key` 或设 `SMITHCODE_TAVILY_KEY`） |
 | `tool_display` | `summary` | 工具调用终端展示粒度：`summary` 只显示短摘要，`detail` 追加结果内容 |
 
 配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。`SMITHCODE_HOME` 可覆盖配置根目录。

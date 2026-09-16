@@ -10,6 +10,7 @@ from smithcode.permission import (
     DEFAULT_RULES,
     DENY,
     Permission,
+    engine,
     evaluate,
     has_command_substitution,
     infer_trust_root,
@@ -160,6 +161,36 @@ def test_ask_renders_options_in_confirm_not_chat(make_perm, monkeypatch):
     assert valid == "yna"
     assert "仅本次执行" in descriptions["y"]
     assert "本会话将记住" in descriptions["a"]
+
+
+def test_ask_truncates_long_content_and_option_descriptions(make_perm, monkeypatch):
+    """确认框不再全量打印：工具摘要与「总是允许」小字都压平并截断到 CONFIRM_LIMIT。"""
+    cap = _CaptureRenderer()
+    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
+    perm = make_perm(permissions={"run_command": "ask"})
+    command = "mytool --flag " + "x" * 200  # 未登记命令 → 记忆候选退回整段（足够长）
+
+    assert perm.check("run_command", {"command": command},
+                      content="运行测试 · command " + command) is False
+    _prompt, _valid, _detail, descriptions, content = cap.calls[0]
+    assert content.endswith("...")
+    assert len(content) == engine.CONFIRM_LIMIT
+    assert descriptions["a"].endswith("...")
+    assert len(descriptions["a"]) <= engine.CONFIRM_LIMIT
+    # 截断只影响展示，权限模式（记忆候选的规则键）仍是完整命令
+    assert perm.session_rules == []
+
+
+def test_ask_clips_content_to_single_line(make_perm, monkeypatch):
+    """content 内含换行时压成单行，避免撑破确认框布局。"""
+    cap = _CaptureRenderer()
+    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
+    perm = make_perm(permissions={"write_file": "ask"})
+
+    assert perm.check("write_file", {"path": "a.txt"},
+                      content="write a.txt\n第二行") is False
+    _prompt, _valid, _detail, _descriptions, content = cap.calls[0]
+    assert content == "write a.txt 第二行"
 
 
 # ---------- check：模式级"总是允许" ----------
@@ -394,6 +425,22 @@ def test_ask_outside_access_renders_detail(tmp_path, monkeypatch):
     assert not detail and content is None
     assert "仅本次访问" in descriptions["y"]
     assert "信任目录" in descriptions["a"]
+
+
+def test_ask_outside_access_truncates_long_option_descriptions(tmp_path, monkeypatch):
+    """越界授权的选项小字含长路径时同样截断，不把整条路径铺满终端。"""
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    outside = tmp_path.parent / (tmp_path.name + "-" + "o" * 80)
+    outside.mkdir()
+    cap = _CaptureRenderer()
+    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
+
+    assert Permission().ask_outside_access("x.py", outside / "x.py") == ("deny", None)
+    _prompt, _valid, _detail, descriptions, _content = cap.calls[0]
+    assert descriptions["y"].endswith("...")
+    assert descriptions["a"].endswith("...")
+    assert len(descriptions["a"]) == engine.CONFIRM_LIMIT
 
 
 def test_widen_roots_is_temporary(tmp_path, monkeypatch):

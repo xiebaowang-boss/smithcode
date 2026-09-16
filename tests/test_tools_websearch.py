@@ -7,6 +7,7 @@ HTTP 层用 httpx2 的 MockTransport 打桩（替换工具的客户端工厂）�
 测试里 monkeypatch 设置即可，无需碰用户 config.toml。
 """
 import base64
+import json
 import urllib.parse
 
 import httpx2
@@ -18,8 +19,9 @@ from smithcode.tools import websearch as ws
 
 @pytest.fixture(autouse=True)
 def _fixed_backend(monkeypatch):
-    """默认固定 Brave，避免各用例隐式依赖 config.toml 的后端设置。"""
+    """默认固定 Brave 且清空 Tavily key，避免用例隐式依赖用户配置。"""
     monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "brave")
+    monkeypatch.delenv("SMITHCODE_TAVILY_KEY", raising=False)
 
 
 def _patch_client(monkeypatch, handler):
@@ -152,6 +154,97 @@ def test_parse_ddg_restores_redirect_and_snippet():
     assert results[0]["title"] == "Example A"
     assert results[0]["url"] == "https://example.com/a"
     assert results[0]["snippet"] == "First snippet text."
+
+
+# ---------- Tavily（JSON API，需 key）----------
+
+
+def _tavily_response(items):
+    return httpx2.Response(200, json={"results": items})
+
+
+def test_tavily_sends_bearer_and_parses_json(monkeypatch):
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "tavily")
+    monkeypatch.setenv("SMITHCODE_TAVILY_KEY", "tvly-test-key")
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["method"] = request.method
+        seen["auth"] = request.headers.get("Authorization", "")
+        seen["body"] = json.loads(request.content)
+        return _tavily_response([
+            {"title": "HTTPX", "url": "https://www.python-httpx.org/",
+             "content": "A next-generation HTTP client."},
+        ])
+
+    _patch_client(monkeypatch, handler)
+    out = ws.websearch("httpx", max_results=1)
+    assert "1. HTTPX" in out and "https://www.python-httpx.org/" in out
+    assert seen["method"] == "POST"
+    assert seen["url"] == ws._TAVILY
+    assert seen["auth"] == "Bearer tvly-test-key"
+    assert seen["body"]["query"] == "httpx" and seen["body"]["max_results"] == 1
+
+
+def test_tavily_key_never_leaks_into_output(monkeypatch):
+    """key 绝不能出现在工具返回里（会写进会话转录）。"""
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "tavily")
+    monkeypatch.setenv("SMITHCODE_TAVILY_KEY", "tvly-super-secret")
+    _patch_client(monkeypatch, lambda request: _tavily_response([
+        {"title": "T", "url": "https://example.com/", "content": "c"},
+    ]))
+    assert "tvly-super-secret" not in ws.websearch("x")
+
+
+def test_tavily_missing_key_reports_actionable_error(monkeypatch):
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "tavily")
+    _patch_client(monkeypatch, lambda request: _tavily_response([]))
+    out = ws.websearch("x")
+    assert out.startswith("错误") and "Tavily" in out and "SMITHCODE_TAVILY_KEY" in out
+
+
+def test_tavily_bad_key_reports_error(monkeypatch):
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "tavily")
+    monkeypatch.setenv("SMITHCODE_TAVILY_KEY", "bad")
+    _patch_client(monkeypatch, lambda request: httpx2.Response(401, json={"error": "unauthorized"}))
+    out = ws.websearch("x")
+    assert out.startswith("错误") and "Tavily" in out
+
+
+def test_auto_skips_tavily_without_key(monkeypatch):
+    """auto 且未配 Tavily key：跳过它（不算失败），直接走下一个后端。"""
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "auto")
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return _page(BRAVE_PAGE)
+
+    _patch_client(monkeypatch, handler)
+    out = ws.websearch("python")
+    assert "HTTPX" in out
+    assert not any("tavily" in u for u in calls)  # 没配 key，tavily 不该被请求
+
+
+def test_auto_prefers_tavily_when_key_present(monkeypatch):
+    """auto 且配了 key：Tavily 优先（第一个尝试且命中即停）。"""
+    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "auto")
+    monkeypatch.setenv("SMITHCODE_TAVILY_KEY", "tvly-test")
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if "tavily" in str(request.url):
+            return _tavily_response([
+                {"title": "Tavily 结果", "url": "https://example.com/t", "content": "c"},
+            ])
+        return _page(BRAVE_PAGE)
+
+    _patch_client(monkeypatch, handler)
+    out = ws.websearch("python")
+    assert "Tavily 结果" in out
+    assert len(calls) == 1  # 首选命中即停，不再试 brave
 
 
 # ---------- 统一入口与格式化 ----------
@@ -353,3 +446,47 @@ def test_load_search_backend_from_toml(monkeypatch, tmp_path):
 
     (home / "config.toml").write_text("[search]\nbackend = \"nope\"\n", encoding="utf-8")
     assert config.load_search_backend() == "auto"
+
+
+def test_load_tavily_key_priority(monkeypatch, tmp_path):
+    """Tavily key 优先级：env > [search].tavily_key > credentials.json > 空。"""
+    from smithcode import config
+
+    monkeypatch.delenv("SMITHCODE_TAVILY_KEY", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    assert config.load_tavily_key() == ""  # 都没配
+
+    # credentials.json 兜底
+    (home / "credentials.json").write_text(
+        json.dumps({"search": {"tavily_key": "from-cred"}}), encoding="utf-8"
+    )
+    assert config.load_tavily_key() == "from-cred"
+
+    # config.toml 覆盖凭据文件
+    (home / "config.toml").write_text(
+        '[search]\ntavily_key = "from-toml"\n', encoding="utf-8"
+    )
+    assert config.load_tavily_key() == "from-toml"
+
+    # 环境变量优先级最高
+    monkeypatch.setenv("SMITHCODE_TAVILY_KEY", "from-env")
+    assert config.load_tavily_key() == "from-env"
+
+
+def test_write_credentials_preserves_llm_key(tmp_path):
+    """setup 写 Tavily key 时不能冲掉已有的 LLM key（同一文件不同字段）。"""
+    from smithcode import wizard
+
+    path = tmp_path / "credentials.json"
+    wizard._write_credentials(path, "llm-key", "tavily-key")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["key"] == "llm-key"
+    assert data["search"]["tavily_key"] == "tavily-key"
+
+    # 再次只更新 Tavily key：LLM key 仍在
+    wizard._write_credentials(path, "", "tavily-key-2")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["key"] == "llm-key"
+    assert data["search"]["tavily_key"] == "tavily-key-2"

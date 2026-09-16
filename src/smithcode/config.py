@@ -424,10 +424,11 @@ def load_allow_private_urls() -> bool:
     return False
 
 
-# websearch 的检索后端：auto 按内置顺序逐个尝试（Brave → Bing → DuckDuckGo），
-# 命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如无代理时 Brave
-# 不可达、有代理时 Bing 会返回无关结果），故开放配置而不写死。
-SEARCH_BACKENDS = ("auto", "brave", "bing", "ddg")
+# websearch 的检索后端：auto 按内置顺序逐个尝试（Tavily → Brave → Bing →
+# DuckDuckGo），命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如
+# 无代理时 Brave 不可达、走代理时 Bing 会返回无关结果），故开放配置而不写死。
+# tavily 需要 key（见 load_tavily_key），无 key 时在 auto 里直接跳过。
+SEARCH_BACKENDS = ("auto", "tavily", "brave", "bing", "ddg")
 DEFAULT_SEARCH_BACKEND = "auto"
 
 
@@ -435,7 +436,7 @@ def load_search_backend() -> str:
     """websearch 使用哪个检索后端。
 
     优先级：SMITHCODE_SEARCH_BACKEND > config.toml 的 [search].backend > 默认 auto。
-    可选 auto / brave / bing / ddg；空串视为"没配"，非法值打印警告并降级为 auto。
+    可选 auto / tavily / brave / bing / ddg；空串视为"没配"，非法值打印警告并降级为 auto。
     """
     env = os.getenv("SMITHCODE_SEARCH_BACKEND", "").strip().lower()
     if env:
@@ -460,6 +461,30 @@ def load_search_backend() -> str:
         f"（可选 {'/'.join(SEARCH_BACKENDS)}），已用默认值 {DEFAULT_SEARCH_BACKEND}"
     )
     return DEFAULT_SEARCH_BACKEND
+
+
+def load_tavily_key() -> str:
+    """Tavily 搜索 API key（websearch 的 tavily 后端用）。
+
+    优先级：SMITHCODE_TAVILY_KEY > config.toml 的 [search].tavily_key >
+    credentials.json 的 search.tavily_key > 空。空串视为"没配"，未配时 tavily
+    后端不可用（auto 模式直接跳过它）。key 属秘密，正式存放位置是
+    credentials.json（与 LLM key 同文件，写入走 0600）。
+    """
+    env = os.getenv("SMITHCODE_TAVILY_KEY", "").strip()
+    if env:
+        return env
+    data = _read_config_file().get("search") or {}
+    if isinstance(data, dict):
+        value = data.get("tavily_key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    section = _read_credentials().get("search", {})
+    if isinstance(section, dict):
+        key = section.get("tavily_key")
+        if isinstance(key, str):
+            return key.strip()
+    return ""
 
 
 # ---------- 技能（Skills） ----------

@@ -477,7 +477,7 @@ def test_tool_preview_shown_in_pending_block_before_approval(monkeypatch):
 
 
 def test_question_panel_resolves(monkeypatch):
-    """无选项提问：输入框被提问面板替换，输入文本提交后恢复。"""
+    """无选项提问：输入框被提问面板替换，提交后进确认页，确认再提交并恢复。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -488,7 +488,12 @@ def test_question_panel_resolves(monkeypatch):
             await pilot.pause()
             assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("是")
-            await pilot.press("enter")
+            await pilot.press("enter")            # 纯输入题提交 → 进确认页
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            assert panel._review                  # 单问题同样先到确认页
+            assert not evt.is_set()
+            await pilot.press("enter")            # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["是"]
             assert evt.is_set()
@@ -1486,7 +1491,7 @@ def test_git_branch_detection(tmp_path):
     (detached / ".git" / "HEAD").write_text("1a2b3c4d5e6f\n", encoding="utf-8")
     assert git_branch(str(detached)) == "1a2b3c4"
 def test_question_choice_modal_single_pick(monkeypatch):
-    """选项提问弹窗：数字键快选，单选直接提交所选项。"""
+    """选项提问弹窗：数字键快选，单选先到确认页，Enter 确认后提交所选项。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1497,7 +1502,11 @@ def test_question_choice_modal_single_pick(monkeypatch):
                 [{"question": "用哪个？", "options": ["甲", "乙"],
                   "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
-            await pilot.press("2")  # 数字快选：直接提交
+            await pilot.press("2")  # 数字快选 → 进确认页（不直接提交）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            assert not evt.is_set()
+            await pilot.press("enter")  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["乙"]
             assert evt.is_set()
@@ -1506,7 +1515,7 @@ def test_question_choice_modal_single_pick(monkeypatch):
 
 
 def test_question_choice_modal_multiple_toggle(monkeypatch):
-    """多选：空格勾选两项，Enter 提交逗号拼接结果（单问题不进入确认页）。"""
+    """多选：空格勾选两项，Enter 进确认页，再 Enter 提交逗号拼接结果。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1521,7 +1530,10 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
             await pilot.press("down")
             await pilot.press("down")
             await pilot.press("space")   # 勾选 3（圆）
-            await pilot.press("enter")   # 提交
+            await pilot.press("enter")   # 提交 → 确认页
+            await pilot.pause()
+            assert app.query_one(QuestionPanel)._review
+            await pilot.press("enter")   # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["红, 圆"]
             assert evt.is_set()
@@ -1530,7 +1542,7 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
 
 
 def test_question_choice_modal_multiple_empty_submits_skipped(monkeypatch):
-    """多选一道未勾选时 Enter 照常提交：记为「（未选择）」，不再毫无反应卡在原地。"""
+    """多选一道未勾选时 Enter 照常提交：记为「（未选择）」，进确认页后可再确认。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1541,7 +1553,10 @@ def test_question_choice_modal_multiple_empty_submits_skipped(monkeypatch):
                 [{"question": "选特征", "options": ["红", "大", "圆"],
                   "descriptions": [], "multiple": True}], result, evt)
             await pilot.pause()
-            await pilot.press("enter")   # 一道未勾选直接提交
+            await pilot.press("enter")   # 一道未勾选直接提交 → 确认页
+            await pilot.pause()
+            assert app.query_one(QuestionPanel)._review
+            await pilot.press("enter")   # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["（未选择）"]
             assert evt.is_set()
@@ -1581,7 +1596,8 @@ def test_question_choice_modal_multiple_empty_advances(monkeypatch):
 
 
 def test_question_choice_modal_custom_answer(monkeypatch):
-    """自定义回答：光标在「输入自定义回答」行回车进入编辑，输入后回车提交并前进。"""
+    """自定义回答：光标在「输入自定义回答」行回车进入编辑，输入后回车进确认页，
+    确认页 Enter 再提交。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1599,7 +1615,10 @@ def test_question_choice_modal_custom_answer(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             await pilot.press("紫", "色")  # 向输入框键入
-            await pilot.press("enter")   # 提交并前进（单题 → 直接提交）
+            await pilot.press("enter")   # 提交 → 进确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")   # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["紫色"]
             assert evt.is_set()
@@ -1634,7 +1653,10 @@ def test_question_panel_custom_esc_exits_input_then_reenter(monkeypatch):
             assert panel._editing == [True]
             assert panel._input.has_focus
             assert panel._input.value == "紫"           # 已输入内容回填保留
-            await pilot.press("色", "enter")            # 追加，回车提交并前进
+            await pilot.press("色", "enter")            # 追加，回车提交 → 确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["紫色"]
             assert evt.is_set()
@@ -1667,7 +1689,9 @@ def test_question_panel_pure_input_esc_exits_not_cancel(monkeypatch):
             await pilot.press("enter")                  # Enter 重新聚焦
             await pilot.pause()
             assert panel._input.has_focus
-            await pilot.press("b", "enter")             # 追加并提交
+            await pilot.press("b", "enter")             # 追加并提交 → 确认页
+            await pilot.pause()
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["ab"]
             assert evt.is_set()
@@ -1694,7 +1718,9 @@ def test_question_panel_pure_input_typing_refocuses(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             assert panel._input.value == "x"
-            await pilot.press("enter")
+            await pilot.press("enter")                  # 提交 → 确认页
+            await pilot.pause()
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["x"]
 
@@ -1833,7 +1859,10 @@ def test_question_panel_multiple_with_custom_merges(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             await pilot.press("X", "Y")
-            await pilot.press("enter")                  # 提交：A, B + XY
+            await pilot.press("enter")                  # 提交：A, B + XY → 确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["A, B, XY"]
             assert evt.is_set()
