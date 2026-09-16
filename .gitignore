@@ -36,3 +36,6 @@ Thumbs.db
 
 # ZCode 会话工具产物
 .zcode/
+
+# CommandCode 工具数据
+.commandcode/
