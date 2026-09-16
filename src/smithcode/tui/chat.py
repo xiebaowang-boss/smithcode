@@ -125,15 +125,19 @@ class StreamDelta(ChatItem):
     text: str
 
 
+@dataclass
 class StreamEnd(ChatItem):
     """一段流式输出结束。"""
+
 
 
 # ---------- 思考折叠块（生命周期事件） ----------
 
 
+@dataclass
 class ThinkingStart(ChatItem):
     """思考开始（挂载折叠块）。"""
+
 
 
 @dataclass
@@ -141,8 +145,10 @@ class ThinkingDelta(ChatItem):
     text: str
 
 
+@dataclass
 class ThinkingEnd(ChatItem):
     """思考结束（停转轮、定格耗时）。"""
+
 
 
 # ---------- 工具调用折叠块（生命周期事件） ----------

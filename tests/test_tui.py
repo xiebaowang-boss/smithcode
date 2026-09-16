@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 
 import pytest
+from rich.color import ColorTriplet
+from textual.geometry import Region
 from textual.widgets import Static
 
 import smithcode.renderer as renderer_module
@@ -17,6 +19,7 @@ from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import (
     PermissionPanel,
     QuestionPanel,
+    SelectionItem,
     SelectionPanel,
     SelectionScreen,
 )
@@ -173,6 +176,40 @@ def test_tui_mounts_and_welcomes(monkeypatch):
         async with app.run_test() as pilot:
             assert pilot.app is app
             assert f"v{__version__}" in _chat_text(app)
+
+    _run(_run_case())
+
+
+def test_tui_mount_wires_terminal_title(monkeypatch):
+    """挂载时把标题 sink 接到 Textual 写入通道，标题事件据此真正上到终端。"""
+    no_prompting(monkeypatch)
+    from smithcode import title as title_module
+
+    monkeypatch.setattr(title_module.config, "load_terminal_title", lambda: True)
+    monkeypatch.setattr(title_module, "stdout_is_tty", lambda: True)
+
+    captured = {"writes": []}
+    real_attach = title_module.attach
+
+    def spy_attach(inner, sink=None, workspace=""):
+        captured["inner"] = inner
+        captured["sink"] = sink
+
+        def recording_sink(seq):
+            captured["writes"].append(seq)
+
+        return real_attach(inner, sink=recording_sink, workspace=workspace)
+
+    monkeypatch.setattr(title_module, "attach", spy_attach)
+
+    async def _run_case():
+        monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
+        app = SmithTUI(Agent(session=Session(), persist=False))
+        async with app.run_test():
+            assert isinstance(captured["inner"], TuiRenderer)
+            assert captured["sink"] == app._driver.write  # 走 Textual 写入队列
+            app.agent.rename_session("标题接线")
+            assert "\x1b]0;Smith · 标题接线\x07" in captured["writes"]
 
     _run(_run_case())
 
@@ -440,7 +477,7 @@ def test_tool_preview_shown_in_pending_block_before_approval(monkeypatch):
 
 
 def test_question_panel_resolves(monkeypatch):
-    """无选项提问：输入框被提问面板替换，输入文本提交后恢复。"""
+    """无选项提问：输入框被提问面板替换，提交后进确认页，确认再提交并恢复。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -451,7 +488,12 @@ def test_question_panel_resolves(monkeypatch):
             await pilot.pause()
             assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("是")
-            await pilot.press("enter")
+            await pilot.press("enter")            # 纯输入题提交 → 进确认页
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            assert panel._review                  # 单问题同样先到确认页
+            assert not evt.is_set()
+            await pilot.press("enter")            # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["是"]
             assert evt.is_set()
@@ -1405,8 +1447,9 @@ def test_running_indicator_above_input(monkeypatch):
             assert status.parent is app.query_one("#bottom")  # 上下文/git 仍在底行
             assert running.display is False  # 空闲时动画隐藏
             # 左侧竖线画在输入框自身：容器无边框，上方动画行不会被一起框住
+            # （只校验画在哪一层，不锁具体字形：thick / heavy / solid 都算通过）
             assert input_wrap.styles.border_left[0] in ("", "none")
-            assert chat_input.styles.border_left[0] == "solid"
+            assert chat_input.styles.border_left[0] not in ("", "none")
 
     _run(_run_case())
 
@@ -1431,11 +1474,15 @@ def test_user_message_panel(monkeypatch):
 
 
 def test_git_branch_detection(tmp_path):
-    """git 分支读取：常规仓库 / 无 .git / detached HEAD。"""
+    """git 分支读取：常规仓库 / 带斜杠的分支名 / 无 .git / detached HEAD。"""
     repo = tmp_path / "repo"
     (repo / ".git" / "refs" / "heads").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     assert git_branch(str(repo)) == "main"
+
+    # 带斜杠的分支名保留完整路径（曾误截成最后一段）
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/feat/tui-statusbar\n", encoding="utf-8")
+    assert git_branch(str(repo)) == "feat/tui-statusbar"
 
     assert git_branch(str(tmp_path)) is None  # 无 .git
 
@@ -1444,7 +1491,7 @@ def test_git_branch_detection(tmp_path):
     (detached / ".git" / "HEAD").write_text("1a2b3c4d5e6f\n", encoding="utf-8")
     assert git_branch(str(detached)) == "1a2b3c4"
 def test_question_choice_modal_single_pick(monkeypatch):
-    """选项提问弹窗：数字键快选，单选直接提交所选项。"""
+    """选项提问弹窗：数字键快选，单选先到确认页，Enter 确认后提交所选项。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1455,7 +1502,11 @@ def test_question_choice_modal_single_pick(monkeypatch):
                 [{"question": "用哪个？", "options": ["甲", "乙"],
                   "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
-            await pilot.press("2")  # 数字快选：直接提交
+            await pilot.press("2")  # 数字快选 → 进确认页（不直接提交）
+            await pilot.pause()
+            assert str(app.query_one(".ask-title").content) == "确认提交"
+            assert not evt.is_set()
+            await pilot.press("enter")  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["乙"]
             assert evt.is_set()
@@ -1464,7 +1515,7 @@ def test_question_choice_modal_single_pick(monkeypatch):
 
 
 def test_question_choice_modal_multiple_toggle(monkeypatch):
-    """多选：空格勾选两项，Enter 提交逗号拼接结果（单问题不进入确认页）。"""
+    """多选：空格勾选两项，Enter 进确认页，再 Enter 提交逗号拼接结果。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1479,7 +1530,10 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
             await pilot.press("down")
             await pilot.press("down")
             await pilot.press("space")   # 勾选 3（圆）
-            await pilot.press("enter")   # 提交
+            await pilot.press("enter")   # 提交 → 确认页
+            await pilot.pause()
+            assert app.query_one(QuestionPanel)._review
+            await pilot.press("enter")   # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["红, 圆"]
             assert evt.is_set()
@@ -1487,8 +1541,63 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
     _run(_run_case())
 
 
+def test_question_choice_modal_multiple_empty_submits_skipped(monkeypatch):
+    """多选一道未勾选时 Enter 照常提交：记为「（未选择）」，进确认页后可再确认。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel(
+                [{"question": "选特征", "options": ["红", "大", "圆"],
+                  "descriptions": [], "multiple": True}], result, evt)
+            await pilot.pause()
+            await pilot.press("enter")   # 一道未勾选直接提交 → 确认页
+            await pilot.pause()
+            assert app.query_one(QuestionPanel)._review
+            await pilot.press("enter")   # 确认页提交
+            await pilot.pause()
+            assert result.get("values") == ["（未选择）"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
+def test_question_choice_modal_multiple_empty_advances(monkeypatch):
+    """多题中的多选题空提交：记为「（未选择）」并前进到下一题，最后一题答完进确认页。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            result, evt = {}, threading.Event()
+            app.show_question_panel([
+                {"question": "选特征", "options": ["红", "大"], "descriptions": [],
+                 "multiple": True},
+                {"question": "用哪个？", "options": ["甲", "乙"], "descriptions": [],
+                 "multiple": False},
+            ], result, evt)
+            await pilot.pause()
+            panel = app.query_one(QuestionPanel)
+            await pilot.press("enter")   # Q1 未勾选提交 → 前进到 Q2
+            await pilot.pause()
+            assert panel._index == 1
+            assert panel._answers[0] == "（未选择）"
+            await pilot.press("2")       # 数字快选 Q2 的「乙」→ 进确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")   # 确认页提交整组
+            await pilot.pause()
+            assert result.get("values") == ["（未选择）", "乙"]
+            assert evt.is_set()
+
+    _run(_run_case())
+
+
 def test_question_choice_modal_custom_answer(monkeypatch):
-    """自定义回答：光标在「输入自定义回答」行回车进入编辑，输入后回车提交并前进。"""
+    """自定义回答：光标在「输入自定义回答」行回车进入编辑，输入后回车进确认页，
+    确认页 Enter 再提交。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -1506,7 +1615,10 @@ def test_question_choice_modal_custom_answer(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             await pilot.press("紫", "色")  # 向输入框键入
-            await pilot.press("enter")   # 提交并前进（单题 → 直接提交）
+            await pilot.press("enter")   # 提交 → 进确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")   # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["紫色"]
             assert evt.is_set()
@@ -1541,7 +1653,10 @@ def test_question_panel_custom_esc_exits_input_then_reenter(monkeypatch):
             assert panel._editing == [True]
             assert panel._input.has_focus
             assert panel._input.value == "紫"           # 已输入内容回填保留
-            await pilot.press("色", "enter")            # 追加，回车提交并前进
+            await pilot.press("色", "enter")            # 追加，回车提交 → 确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["紫色"]
             assert evt.is_set()
@@ -1574,7 +1689,9 @@ def test_question_panel_pure_input_esc_exits_not_cancel(monkeypatch):
             await pilot.press("enter")                  # Enter 重新聚焦
             await pilot.pause()
             assert panel._input.has_focus
-            await pilot.press("b", "enter")             # 追加并提交
+            await pilot.press("b", "enter")             # 追加并提交 → 确认页
+            await pilot.pause()
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["ab"]
             assert evt.is_set()
@@ -1601,7 +1718,9 @@ def test_question_panel_pure_input_typing_refocuses(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             assert panel._input.value == "x"
-            await pilot.press("enter")
+            await pilot.press("enter")                  # 提交 → 确认页
+            await pilot.pause()
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["x"]
 
@@ -1740,7 +1859,10 @@ def test_question_panel_multiple_with_custom_merges(monkeypatch):
             await pilot.pause()
             assert panel._input.has_focus
             await pilot.press("X", "Y")
-            await pilot.press("enter")                  # 提交：A, B + XY
+            await pilot.press("enter")                  # 提交：A, B + XY → 确认页
+            await pilot.pause()
+            assert panel._review
+            await pilot.press("enter")                  # 确认页提交
             await pilot.pause()
             assert result.get("values") == ["A, B, XY"]
             assert evt.is_set()
@@ -2066,12 +2188,13 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
             panel = app.screen.query_one("SelectionPanel")
             assert panel.has_class("size-large")
             assert panel.styles.width.value == 88
-            # 时间列（trailing）贴行尾右对齐，标题后跟短 id
-            row = panel.query(".selection-row").first()
-            trailing = row.query_one(".selection-trailing", Static)
-            assert trailing.region.right == row.region.right
-            assert str(trailing.content).strip()  # 时间为非空
-            assert store.id[:8] in str(row.query_one(".selection-label", Static).content)
+            # 行由行区控件自渲染（无逐行子控件）：trailing 贴行尾右对齐 = 该行
+            # 文本单元格数等于可视宽度，且尾部无补白（空隙在中间）、内容含短 id
+            view = panel._rows_view
+            line = view.row_strip(panel._row_of_item[0])
+            assert line.cell_length == view.scrollable_content_region.width
+            assert not line.text.endswith(" ")  # 时间贴行尾，行尾不留补白
+            assert store.id[:8] in line.text
 
             await pilot.press("enter")  # 选中唯一会话 → 切换
             await pilot.pause()
@@ -2175,6 +2298,9 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
     no_prompting(monkeypatch)
 
     async def _run_case():
+        from smithcode import commands
+
+        expected = [cmd.name for cmd in commands.complete_commands("")]
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             inp = app.query_one(ChatInput)
@@ -2184,10 +2310,10 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
             await pilot.pause()
             await pilot.press("up")
             await pilot.pause()
-            assert menu.accept() == "usage"  # up 从首项回绕到最后一项
+            assert menu.accept() == expected[-1]  # up 从首项回绕到最后一项
             await pilot.press("down")
             await pilot.pause()
-            assert menu.accept() == "compact"  # down 回到首项（回绕）
+            assert menu.accept() == expected[0]  # down 回到首项（回绕）
             await pilot.press("escape")
             await pilot.pause()
             assert not menu.open
@@ -2197,6 +2323,215 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
 
 
 # ---------- 通用选择面板（居中弹窗） ----------
+
+def test_selection_panel_rerenders_once_per_move(monkeypatch):
+    """大列表逐键移动只触发一次行区刷新，且行区无逐行子控件。
+
+    回归背景：早先每行是一个子控件，滚动时「行刷新 + 滚动」分属两次刷新周期，
+    每键要连续两次把内容写往终端，两次之间的中间态被渲染出来 → 逐键闪烁
+    （600 项实测 2 次/键）。自渲染行区（SelectionRows）把两者收进同一次刷新
+    （实测 1 次/键），这里锁定「无逐行子控件」与「每键只刷一次」两项。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label=f"model-{i}", value=f"m{i}", current=(i == 2))
+                for i in range(200)
+            ]
+            panel = SelectionPanel("选择模型", items, lambda value: None, size="large")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+            panel.focus()
+
+            assert panel._selected == 2  # 当前项
+            view = panel._rows_view
+            # 行区是单个自渲染控件：没有逐行子控件（200 项也只有一个控件）
+            assert len(view.children) == 0
+            assert "›" in view.line_text(panel._row_of_item[2])
+
+            # 记录行区 refresh 次数：每键移动只应刷新一次
+            calls = []
+            orig_refresh = type(view).refresh
+
+            def spy(self, *args, **kwargs):
+                if self is view:
+                    calls.append(1)
+                return orig_refresh(self, *args, **kwargs)
+
+            type(view).refresh = spy
+            try:
+                await pilot.press("down")
+                await pilot.pause()
+            finally:
+                type(view).refresh = orig_refresh
+
+            assert panel._selected == 3
+            assert len(calls) == 1  # 每键一次刷新，不再有第二次写入
+
+            # 旧行还原、新行高亮
+            assert "›" not in view.line_text(panel._row_of_item[2])
+            assert "(当前)" in view.line_text(panel._row_of_item[2])
+            assert "›" in view.line_text(panel._row_of_item[3])
+
+    _run(_run_case())
+
+
+def test_selection_panel_scroll_renders_without_extra_pass(monkeypatch):
+    """跨屏滚动时每键仍只渲染一次（自渲染行区的核心收益）。
+
+    隔离滚动因素：先滚到列表中部（此时每次移动都会改变 scroll_offset），
+    再统计移动若干次产生的渲染次数——应等于移动次数，而非其两倍。
+    """
+    from textual._compositor import Compositor
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label=f"model-{i}", value=f"m{i}", current=(i == 0))
+                for i in range(300)
+            ]
+            panel = SelectionPanel("选择模型", items, lambda value: None, size="large")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+            panel.focus()
+            for _ in range(40):  # 滚到中部，确保后续每次移动都跨屏
+                await pilot.press("down")
+            await pilot.pause()
+            assert panel._rows_view.scroll_offset.y > 0
+
+            renders = []
+            orig = Compositor.render_update
+
+            def spy(self, *args, **kwargs):
+                renders.append(1)
+                return orig(self, *args, **kwargs)
+
+            Compositor.render_update = spy
+            try:
+                for _ in range(10):
+                    await pilot.press("down")
+                    await pilot.pause()
+            finally:
+                Compositor.render_update = orig
+
+            # 每次移动至多一次渲染（不再出现「行刷新 + 滚动」的两次写入）
+            assert len(renders) <= 10, f"每键渲染次数过多: {len(renders)} 次/10 键"
+
+    _run(_run_case())
+
+
+def test_selection_panel_rows_share_panel_background(monkeypatch):
+    """行区每个单元格都带底色（含表头 / 间隔行与行计划之外的留白）。
+
+    回归背景：①自渲染行区若把非选中行的空白段留成「无背景」，这部分会透出
+    半透明遮罩与下层界面，看起来就是选择框中间的颜色与外部不一致（旧结构
+    里每行是子控件、背景自动继承面板，不存在该问题）；②列表短于可视区时，
+    行计划之外的留白曾以 style=None 的 Segment 产出——那是 NO_COLOR 下崩溃的
+    源头（见 test_selection_panel_renders_with_no_color）。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label="a", value="a", category="组"),
+                SelectionItem(label="", value="", separator=True),
+                SelectionItem(label="b", value="b", trailing="12:00"),
+            ]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+
+            view = panel._rows_view
+            panel_bg = panel.rich_style.bgcolor
+            assert panel_bg is not None  # 面板有底色可继承
+            assert view.size.height > len(panel._rows)  # 存在行计划之外的留白
+
+            # 视口每一行的每个单元格都必须有背景（表头行 / 间隔行 / 越界留白一并覆盖）
+            for y in range(view.size.height):
+                strip = view.render_line(y)
+                assert strip._segments, f"视口第 {y} 行没有段"
+                for seg in strip._segments:
+                    assert seg.style is not None and seg.style.bgcolor is not None, (
+                        f"视口第 {y} 行有未着色的段，会透出下层背景或让 NO_COLOR 滤镜崩溃"
+                    )
+                row_index = int(view.scroll_offset.y) + y
+                if row_index != panel._row_of_item[0]:
+                    assert strip._segments[0].style.bgcolor == panel_bg
+
+            # 选中行整行反白，非选中行用面板底色
+            selected_strip = view.row_strip(panel._row_of_item[0])
+            assert (
+                selected_strip._segments[0].style.bgcolor.get_truecolor()
+                == ColorTriplet(250, 178, 131)  # #fab283
+            )
+
+    _run(_run_case())
+
+
+def test_selection_panel_keeps_trailing_when_label_overflows(monkeypatch):
+    """label 超长时截断 label、保住 trailing（时间 / 状态列不被挤掉）。
+
+    回归背景：自渲染行区若先按 label 铺满整行，`Strip.adjust_cell_length` 会从
+    行尾把 trailing 整段裁掉——而 /sessions 的时间、/mcp 的状态正是靠 trailing
+    常驻，旧结构（label `1fr` / trailing `auto`）始终给它留位。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label="长标题" * 40, value="a", trailing="12:00"),
+                SelectionItem(label="短的", value="b", trailing="12:00"),
+            ]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+
+            view = panel._rows_view
+            overflow = view.row_strip(panel._row_of_item[0])
+            assert overflow.cell_length == view.scrollable_content_region.width
+            assert overflow.text.endswith("12:00")  # trailing 常驻行尾
+            assert "…" in overflow.text             # 超长 label 以省略号收尾
+
+            short = view.row_strip(panel._row_of_item[1])
+            assert short.text.endswith("12:00")
+            assert "…" not in short.text
+
+    _run(_run_case())
+
+
+def test_selection_panel_renders_with_no_color(monkeypatch):
+    """NO_COLOR 下行区渲染不崩：行计划之外的留白也必须带样式。
+
+    回归背景：Textual 在 NO_COLOR + 默认主题（ansi=False）下挂 Monochrome 滤镜，
+    它直接对每个 Segment 的 style 解引用（`style.color`）——行区越界留白曾以
+    style=None 的段产出，于是只要列表短于可视区（min-height 16 下几乎总是），
+    一开选择面板就 AttributeError、整个 TUI 崩掉。
+    """
+    monkeypatch.setenv("NO_COLOR", "1")
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        assert app.no_color  # 环境确实让 Textual 进了无色模式
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [SelectionItem(label="a", value="a")]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()  # 首次渲染即经过 Monochrome 滤镜
+
+            view = panel._rows_view
+            assert view.size.height > len(panel._rows)  # 确认存在越界留白
+            for y in range(view.size.height):
+                strip = view.render_line(y)
+                assert all(seg.style is not None for seg in strip._segments)
+
+            await pilot.press("escape")  # 面板仍可正常交互（没有在渲染里崩掉）
+            await pilot.pause()
+
+    _run(_run_case())
+
 
 def test_selection_panel_size_tiers_and_fallback():
     """size 档位落到 CSS 类（宽度值在 SmithTUI.CSS）；未知档位回退默认 medium。"""
@@ -2378,6 +2713,148 @@ def test_context_tools_grouped_with_counts(monkeypatch):
     _run(_run_case())
 
 
+def test_context_group_pending_then_done_wording(monkeypatch):
+    """「已探索」汇总行两态文案：进行中「探索中」，全部出结果后「已探索」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "grep foo", "grep"),
+            ])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            pending_header = str(group.query_one(".group-header").content)
+            assert "探索中" in pending_header
+            assert "正在探索" not in pending_header
+            for tool_id in (1, 2):
+                app.ui_tool_result(tool_id, "结果", False, False)
+            await pilot.pause()
+            done_header = str(group.query_one(".group-header").content)
+            assert "已探索" in done_header
+            assert "探索中" not in done_header
+
+    _run(_run_case())
+
+
+def test_context_group_keeps_exploring_until_children_finish(monkeypatch):
+    """封口不等于跑完：混批里非上下文工具把组封口后，仍在跑的子工具仍显示「探索中」。
+
+    回归：此前封口会把文案无条件切成「已探索」（并停掉转轮），而 read/grep 与
+    命令混批很常见，导致「探索中」几乎永远看不到；现在状态只看组内是否还有
+    没出结果的子工具。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            assert "探索中" in str(group.query_one(".group-header").content)
+
+            # 同批的命令到来 → 汇总组封口（后续只读工具另起一组）
+            _start_tools(app, [(2, "command ls", "run_command")])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 1  # 命令不新建组
+            header = str(group.query_one(".group-header").content)
+            assert "探索中" in header  # 读取还没出结果，仍算探索中
+            assert group._spin_timer is not None  # 转轮继续转
+
+            app.ui_tool_result(1, "结果", False, False)
+            await pilot.pause()
+            header = str(group.query_one(".group-header").content)
+            assert "已探索" in header
+            assert group._spin_timer is None
+
+    _run(_run_case())
+
+
+def test_context_group_drained_at_turn_end(monkeypatch):
+    """轮次结束兜底：没等到结果的子工具被收尾，转轮停下、文案定格「已探索」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            assert group._spin_timer is not None
+
+            app._turn_start = time.monotonic()  # ui_turn_end 以轮次起点为前置条件
+            app.ui_turn_end("ok")  # 结果始终没来
+            await pilot.pause()
+            header = str(group.query_one(".group-header").content)
+            assert "已探索" in header
+            assert group._spin_timer is None
+
+    _run(_run_case())
+
+
+def test_context_group_spinner_repaints_third_cell(monkeypatch):
+    """「已探索」头的转轮在第 3 列（「▸ 」之后）：tick 只重绘那一格。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            header = group.query_one(".group-header")
+            before = str(header.content)
+            group._spin()
+            after = str(header.content)
+            assert after != before
+            assert after[:2] == before[:2] and after[3:] == before[3:]  # 只有第 3 列变化
+            assert header._repaint_regions == {Region(2, 0, 1, 1)}
+
+    _run(_run_case())
+
+
+def test_context_group_children_live_in_body_and_collapse(monkeypatch):
+    """明细必须挂在 .group-body 里（标题之下），且折叠真的能收起明细。
+
+    回归：缓冲列表曾与 Textual `Widget._pending_children` 同名串台——子控件被
+    排到标题之前，`on_mount` 补挂时列表已被 `_compose` 清空，导致 `.group-body`
+    恒为空、明细常驻可见、Enter / 点击折叠完全失效。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [
+                (1, "read a.py", "read_file"),
+                (2, "ls src", "list_dir"),
+            ])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            header = group.query_one(".group-header")
+            body = group.query_one(".group-body")
+            tools = list(group.query(ToolCall))
+            assert len(tools) == 2
+            assert list(body.children) == tools  # 明细归位在正文容器内
+            assert not body.display  # 默认收起
+
+            group.action_toggle()
+            await pilot.pause()
+            assert body.display  # 展开可见
+            assert header.region.y < tools[0].region.y  # 标题在明细之上
+            assert tools[0].region.height > 0
+
+            group.action_toggle()
+            await pilot.pause()
+            assert not body.display  # 再收起
+            assert not tools[0].region  # 收起后明细不再占位
+
+    _run(_run_case())
+
+
 def test_non_context_tool_breaks_group(monkeypatch):
     """非上下文工具（如命令执行）把上下文组切断：前后各自成组。"""
     no_prompting(monkeypatch)
@@ -2518,11 +2995,168 @@ def test_selection_panel_scrolls_to_selected(monkeypatch):
             inp.insert("/model")
             await pilot.press("enter")
             await pilot.pause()
-            scroll = app.screen.query_one(".selection-scroll")
-            assert scroll.show_vertical_scrollbar  # 内容超出：出现滚动条
+            view = app.screen.query_one(".selection-rows")
+            assert view.max_scroll_y > 0  # 内容超出可视区：可滚动
             for _ in range(39):  # 移到最后一个（可视区之外）
                 await pilot.press("down")
             await pilot.pause()
-            assert scroll.scroll_offset.y > 0  # 已自动滚到选中项
+            assert view.scroll_offset.y > 0  # 已自动滚到选中项
+
+    _run(_run_case())
+
+
+def test_input_has_no_scrollbar(monkeypatch):
+    """输入框不绘制滚动条（与聊天区 / 命令菜单 / 选择面板一致）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.text = "\n".join(f"行{i}" for i in range(30))  # 远超 max-height
+            await pilot.pause()
+            assert inp.scrollbar_size_vertical == 0  # 不绘制
+            assert inp.max_scroll_y > 0  # 但滚动功能不受影响
+
+    _run(_run_case())
+
+
+def test_input_grows_with_lines_and_caps(monkeypatch):
+    """输入框随内容行数向上长高，封顶 max-height 后不再变高。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 32)) as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            await pilot.pause()
+            baseline = inp.region.height
+
+            inp.text = "一行"
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == baseline  # 单行：保持原高度（min-height）
+
+            inp.text = "\n".join(f"行{i}" for i in range(6))
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height > baseline  # 多行：变高
+
+            inp.text = "\n".join(f"行{i}" for i in range(13))
+            await pilot.pause()
+            await pilot.pause()
+            capped = inp.region.height
+            assert capped == 13  # 到 max-height
+
+            inp.text = "\n".join(f"行{i}" for i in range(20))
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == capped  # 封顶后不再变高
+
+            inp.text = ""
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == baseline  # 清空回落
+
+    _run(_run_case())
+
+
+def test_command_menu_anchors_above_input_at_any_height(monkeypatch):
+    """输入框长高后命令菜单仍贴住输入区顶部（锚点随实时几何重算）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        from smithcode import commands
+
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 32)) as pilot:
+            inp = app.query_one(ChatInput)
+            menu = app.query_one(CommandMenu)
+            wrap = app.query_one("#input-wrap")
+            inp.focus()
+            await pilot.pause()
+
+            for rows, running in ((1, False), (5, False), (10, False), (5, True)):
+                inp.text = "\n" * (rows - 1)
+                app.query_one("#running").display = running
+                await pilot.pause()
+                menu.show_candidates(commands.complete_commands(""))
+                await pilot.pause()
+                app.anchor_command_menu()
+                await pilot.pause()
+                assert menu.region.bottom == wrap.region.y  # 贴住输入区顶部
+
+    _run(_run_case())
+
+
+def test_input_keeps_bottom_padding_when_multiline(monkeypatch):
+    """换行后底部留白不消失：输入框上下 padding 各占 1 行，不靠 min-height 撑。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 34)) as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            await pilot.pause()
+
+            for rows in (1, 2, 3, 5):
+                inp.text = "\n".join(f"L{i}" for i in range(rows))
+                await pilot.pause()
+                await pilot.pause()
+                # 内容区高度 == 文本行数，说明多出的行是 padding 而非空内容行
+                assert inp.content_size.height == rows
+                # 盒高 = 内容 + 上下 padding(各 1)
+                assert inp.region.height == rows + 2
+
+    _run(_run_case())
+
+
+def test_shift_enter_inserts_newline_and_enter_sends(monkeypatch):
+    """Shift+Enter 插入换行不发送，Enter 发送且多行内容完整送达。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("第一行")
+            await pilot.press("shift+enter")
+            await pilot.pause()
+            inp.insert("第二行")
+            await pilot.pause()
+            assert inp.text == "第一行\n第二行"  # 换行已插入、未发送
+            assert app._busy is False
+
+            await pilot.press("enter")
+            for _ in range(200):
+                if not app._busy:
+                    break
+                await pilot.pause(0.02)
+            await pilot.pause()
+            assert inp.text == ""  # 已发送并清空
+            text = _chat_text(app)
+            assert "第一行" in text and "第二行" in text  # 两行都进了对话区
+
+    _run(_run_case())
+
+
+def test_input_placeholder_hints_newline_keys(monkeypatch):
+    """空输入时占位提示给出换行键（含不支持 kitty 协议终端的 Ctrl+J 兜底）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            assert "Shift+Enter" in inp.placeholder
+            assert "Ctrl+J" in inp.placeholder  # 终端不支持时的可靠替代
+            inp.focus()
+            inp.insert("x")
+            await pilot.pause()
+            assert inp.text == "x"  # placeholder 只是提示，不干扰输入
 
     _run(_run_case())

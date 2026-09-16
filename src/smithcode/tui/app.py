@@ -24,9 +24,20 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .. import commands, config, context, goal, permission, plan, renderer, welcome
+from .. import (
+    commands,
+    config,
+    context,
+    goal,
+    permission,
+    plan,
+    renderer,
+    title,
+    welcome,
+)
 from ..mcp.errors import McpConfigError
 from ..mcp.wizard import McpWizard, apply_plan
+from . import clipboard
 from .bridge import TuiRenderer
 from .chat import (
     Assistant,
@@ -108,7 +119,7 @@ class SmithTUI(App):
     }
     #sidebar {
         height: 100%;
-        width: 46;
+        width: 40;
         padding: 1 2 1 2;
         background: #141414;
     }
@@ -118,8 +129,10 @@ class SmithTUI(App):
         /* 左侧竖线不再画在容器上：容器内还有运行动画行，画在这里会连动画行一起框住 */
     }
     #command-menu {
-        /* 悬浮层：dock 到聊天列底部再上移 5 行（#bottom 2 + #input-wrap 3），
-           锚在输入框正上方、向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小 */
+        /* 悬浮层：dock 到聊天列底部，再上移「输入区高 + 底行高」，锚在输入框正上方、
+           向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小。
+           offset 只是初始值：输入框高度随内容自适应（1-12 行），实际锚点由
+           _anchor_command_menu 按实时几何计算，写死行数会随高度变化错位 */
         dock: bottom;
         offset: 0 -5;
         layer: command-menu;
@@ -133,7 +146,9 @@ class SmithTUI(App):
         scrollbar-size-vertical: 0;
     }
     #command-menu.running {
-        /* 运行动画可见时输入框上方多占一行，锚点随之上移一行（否则弹菜单会盖住动画行） */
+        /* 兜底锚点：运行动画可见时输入框上方多占一行。
+           实际 offset 由 _anchor_command_menu 按实时几何内联设置（输入框高度可变），
+           此处仅在尚未计算过时兜底 */
         offset: 0 -6;
     }
     #command-menu .menu-item {
@@ -141,16 +156,26 @@ class SmithTUI(App):
         height: 1;
     }
     #input {
-        height: 3;
-        padding: 1 2 0 2;
-        /* 左竖线画在输入框自身：只框住输入框 3 行，上面的运行动画行不跟着被框 */
+        /* 高度随内容自适应：1 行时间距与原来一致（min-height 3），多行时向上长高，
+           封顶 max-height 后不再变高、改为内部滚动。
+           padding 上下对称（1 2 1 2）：此前底部为 0，单行时靠 min-height 撑出的空行
+           看着像底部留白，内容一到 2 行就被填满、留白"消失"；显式给底部 padding 后
+           每行都有稳定留白 */
+        height: auto;
+        min-height: 3;
+        max-height: 13;
+        padding: 1 2 1 2;
+        /* 左竖线画在输入框自身：只框住输入框自身的行，上面的运行动画行不跟着被框。
+        heavy 用 ┃，比默认 solid 的细线 │ 粗一档（Textual 边框固定 1 格宽，只能改字形） */
         border: none;
-        border-left: solid #23d18b;
+        border-left: heavy #23d18b;
         background: #1e1e1e;
+        /* 与聊天区 / 命令菜单一致：不绘制滚动条，滚动功能不受影响 */
+        scrollbar-size-vertical: 0;
     }
     #input:focus {
         border: none;
-        border-left: solid #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
+        border-left: heavy #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
     }
     #input .text-area--cursor-line {
         background: transparent;
@@ -190,7 +215,8 @@ class SmithTUI(App):
     .chat-item.welcome { padding-left: 0; margin-top: 0; }
     .chat-item.user-msg {
         background: #141414;
-        border-left: solid #23d18b;
+        /* 与输入框左竖线同款同粗细（heavy 的 ┃），保持视觉一致 */
+        border-left: heavy #23d18b;
         padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
     }
     ToolCall { height: auto; }
@@ -211,7 +237,7 @@ class SmithTUI(App):
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
-        border-left: solid #fab283;
+        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
     }
     QuestionPanel .ask-title { color: #fab283; margin-bottom: 1; }
     QuestionPanel .ask-hint { color: #808080; }
@@ -229,7 +255,7 @@ class SmithTUI(App):
         margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
         padding: 1 2 1 2;
         background: #141414;
-        border-left: solid #fab283;
+        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
     }
     PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
     PermissionPanel .perm-detail { color: #a9b1d6; }
@@ -256,17 +282,15 @@ class SmithTUI(App):
         padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
         margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
     }
-    SelectionPanel .selection-scroll {
+    /* 行区：单个自渲染控件（SelectionRows，定义在 panels.py），每行内容由
+       render_line 直接产出，故不再有 .selection-row/.selection-label/.selection-trailing
+       等逐行规则；选中反白 / 表头蓝等配色见 panels.py 顶部的 _ACCENT / _HEADER_FG
+       （Python 侧样式无法从 CSS 取值，两处需同步改）。滚动条与聊天区一致
+       不绘制——它只影响滚动快慢路径的观感，与逐键渲染次数无关 */
+    SelectionPanel .selection-rows {
         height: 1fr;
-        /* 与聊天区/命令菜单一致：不绘制滚动条，滚动功能不受影响 */
         scrollbar-size-vertical: 0;
     }
-    /* 每项一行：左侧占满剩余宽度，trailing（时间等）贴行尾右对齐；
-       选中行整行反白——底色由行承担，子项只设前景色，高亮才能贯通到行尾 */
-    SelectionPanel .selection-row { height: 1; width: 1fr; }
-    SelectionPanel .selection-row.selected { background: #fab283; }
-    SelectionPanel .selection-label { width: 1fr; height: 1; }
-    SelectionPanel .selection-trailing { width: auto; height: 1; }
     SelectionPanel .selection-hint { color: #808080; dock: bottom; }
     /* MCP 添加向导：居中卡片，选择步骤复用选择面板的配色语义 */
     McpWizardPanel {
@@ -305,7 +329,7 @@ class SmithTUI(App):
         Binding("escape", "interrupt", "中断", show=False),
     ]
     SIDEBAR_BREAKPOINT: ClassVar[int] = 120
-    """终端宽度 >= 此值才显示侧边栏（46 列侧边栏 + 约 74 列聊天区）。"""
+    """终端宽度 >= 此值才显示侧边栏（40 列侧边栏 + 约 80 列聊天区）。"""
     CONTEXT_BAR_CELLS: ClassVar[int] = 10
     """底栏上下文占用条的格数：█ 填充 + ░ 空位，一格约 10%。"""
 
@@ -330,6 +354,19 @@ class SmithTUI(App):
         """对话区系统通知的统一出口（信息 / 警告 / 错误）。"""
         self._chat().apply(Notice(text, level))
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """复制到系统剪贴板：优先系统工具，失败退回 Textual 的 OSC 52。
+
+        Textual 默认只写 OSC 52 序列，VTE 系终端（GNOME Terminal / Console /
+        Tilix / xfce4-terminal）不支持该序列，复制会静默失败；改用 wl-copy /
+        xclip / xsel 等直接写系统剪贴板（见 tui/clipboard）。`_clipboard` 同时
+        更新，保持应用内粘贴语义与 Textual 一致。
+        """
+        self._clipboard = text
+        if clipboard.copy_to_system(text):
+            return
+        super().copy_to_clipboard(text)
+
     def compose(self) -> ComposeResult:
         # opencode 式布局：侧边栏通高居右；对话列（消息区 + 输入框 + 状态行）居左
         with Horizontal(id="main"):
@@ -350,7 +387,15 @@ class SmithTUI(App):
             yield Sidebar(id="sidebar")
 
     def on_mount(self) -> None:
-        renderer.set_renderer(TuiRenderer(self))
+        # 窗口标题：sink 换成 Textual 的写入队列（整条序列由 writer 线程落盘，
+        # 与帧输出不交错）；标题状态与压栈已在 cli.main 装配时接管
+        driver = self._driver
+        renderer.set_renderer(
+            title.attach(
+                TuiRenderer(self),
+                sink=driver.write if driver is not None else None,
+            )
+        )
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
@@ -827,11 +872,27 @@ class SmithTUI(App):
     def _sync_command_menu_anchor(self, running: bool) -> None:
         """运行动画可见性变化时更新命令菜单锚点：动画占一行则整体上移一行。
 
-        仅切换 CSS 类（见 `#command-menu.running`），不改菜单自身的定位逻辑。
+        切换 CSS 类（见 `#command-menu.running`）并在下一帧按实时几何重算 offset——
+        动画行会让输入区高一格，而输入框自身尺寸没变（不触发 resize），须显式重算。
         应用退出时组件可能已卸载，查不到菜单就忽略。"""
         found = self.query(CommandMenu)
         if found:
             found.first().set_class(running, "running")
+        self.call_after_refresh(self.anchor_command_menu)
+
+    def anchor_command_menu(self) -> None:
+        """按输入区实时几何重新锚定命令菜单：底部贴住输入区顶部。
+
+        输入框高度随内容自适应（1-12 行），写死行数的 offset 会随高度变化错位，
+        故每次输入区几何变化都重算（含上方运行动画行与下方底行的高度）。
+        应用退出 / 组件未挂载时查不到容器就忽略。"""
+        menu = self.query(CommandMenu)
+        wrap = self.query("#input-wrap")
+        bottom = self.query("#bottom")
+        if not (menu and wrap and bottom):
+            return
+        offset_y = -(wrap.first().region.height + bottom.first().region.height)
+        menu.first().styles.offset = (0, offset_y)
 
     def ui_running_stopping(self) -> None:
         """Esc 后让运行动画行尾显示「· 正在停止…」（组件已卸载则忽略）。"""
@@ -850,6 +911,8 @@ class SmithTUI(App):
         self._turn_start = None
         found = self.query(ChatView)
         if found:
+            # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）
+            found.first().drain_context_groups()
             found.first().apply(Footer(
                 config.MODEL,
                 config.REASONING_EFFORT or config.DEFAULT_EFFORT,

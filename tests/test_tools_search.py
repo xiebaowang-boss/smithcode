@@ -123,6 +123,25 @@ def test_grep_context_lines(workspace):
     assert "five" not in out          # 窗口外不出现
 
 
+def test_grep_keeps_line_indentation(workspace):
+    """匹配行按文件原文输出缩进：内容会被直接复制成 old_string，去缩进必然匹配失败。"""
+    (workspace / "a.py").write_text(
+        "class A:\n    def m(self):\n        return 1\n", encoding="utf-8"
+    )
+    out = search.grep("return 1")
+    assert "a.py:3:         return 1" in out
+
+
+def test_grep_context_keeps_line_indentation(workspace):
+    """context 模式下匹配行与上下文行同样保留缩进。"""
+    (workspace / "a.py").write_text(
+        "def m():\n    x = 1\n    return 2\n", encoding="utf-8"
+    )
+    out = search.grep("x = 1", path="a.py", context=1)
+    assert "a.py:2:     x = 1" in out      # 匹配行用 : 分隔
+    assert "a.py-3-     return 2" in out   # 上下文行用 - 分隔
+
+
 def test_grep_invalid_output_mode(workspace):
     assert "output_mode" in search.grep("x", output_mode="bogus")
 

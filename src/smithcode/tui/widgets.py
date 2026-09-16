@@ -12,6 +12,7 @@ from typing import ClassVar
 from rich.text import Text
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.geometry import Region
 from textual.message import Message
 from textual.widgets import Static, TextArea
 
@@ -247,7 +248,7 @@ class ChatView(VerticalScroll):
 
         status 非空时追加在行尾——中断收尾时显示「· 已停止」，不再另起一行。"""
         text = Text()
-        text.append("▣ ", style="#fab283")
+        text.append("▣ ", style="#23d18b")  # 与输入框左竖线同色
         text.append(item.model, style="#eeeeee")
         text.append(f" · {item.effort} · {item.elapsed}", style="#808080")
         if item.status:
@@ -368,10 +369,23 @@ class ChatView(VerticalScroll):
         self.remove_children()
 
     def _finalize_context(self) -> None:
-        """封口当前「已探索」组（幂等）；后续上下文工具将另起一组。"""
+        """封口当前「已探索」组（幂等）；后续上下文工具将另起一组。
+
+        封口只决定分组边界：组内仍在跑的子工具继续显示「探索中」+ 转轮，
+        直到各自出结果为止（状态完全由未完成的子工具决定）。"""
+        self._context_group = None
+
+    def drain_context_groups(self) -> None:
+        """轮次结束：收尾所有没等到结果的子工具（见 ContextGroup.drain_pending）。
+
+        轮次已经结束，任何残留的进行中标记都不可能还在跑；不清掉会让转轮
+        永远转下去。正常路径上每个已上屏的工具都会收到结果（含被拒 / 中断
+        的占位结果），这里只是兜底。"""
+        groups = {id(g): g for g in self._context_groups.values()}
         if self._context_group is not None:
-            self._context_group.finalize()
-            self._context_group = None
+            groups[id(self._context_group)] = self._context_group
+        for group in groups.values():
+            group.drain_pending()
 
     def begin_stream(self, kind: str) -> None:
         self._kind = kind
@@ -497,6 +511,30 @@ class RunningIndicator(Static):
         # 配合 layout=False 全程免布局重排（避免输入框竖线抖动）
         text = f"{self.FRAMES[self._frame]} Working… {format_duration(elapsed):<11}"
         return text + " · 正在停止…" if self._stopping else text
+
+
+def _tick_spinner(widget: Static, text: str, *, column: int = 0) -> None:
+    """原地更新转轮行文案，但只把转轮那一格标脏。
+
+    转轮行以 10 次/秒刷新（各控件的 `_spin`），而 `Static.update()` 的脏区是
+    整个控件——工具行带上 URL 摘要后是整行宽，终端因此每 100ms 整行重写。
+    短工具毫秒级结束看不出来，webfetch 这类网络工具 pending 可持续数十秒，
+    慢终端（SSH / tmux / 大字号）上整行反复重写会表现为闪烁。
+
+    转轮行每 tick 只有转轮字符在变，所以只重绘它所在的那一格：终端写入量从
+    整行降到 1 格，画面完全一致。**仅适用于行内其他字段静止的行**（如
+    RunningIndicator 的秒数每 tick 都在变，用整控件 update 才对）。
+
+    这里直接写 `Static` 内部的「内容 + 惰性 visual」字段（等价 `update()` 的
+    赋值，但不触发整控件重绘），`refresh(region)` 只标脏转轮那一格；Textual
+    内部字段若改名则退回 `update()`，退化为整行重绘但行为不受影响。
+    """
+    if not hasattr(widget, "_Static__content"):
+        widget.update(text, layout=False)  # 兜底：Textual 内部字段改名
+        return
+    widget._Static__content = text
+    widget._Static__visual = None  # 交给 visual 属性按需重算
+    widget.refresh(Region(column, 0, 1, 1))
 
 
 # ---------- 思考折叠块 ----------
@@ -737,8 +775,8 @@ class ToolCall(Vertical):
     def _spin(self) -> None:
         self._spin_frame = (self._spin_frame + 1) % len(self.SPINNER)
         if self._header is not None:
-            # pending 期间文案宽度恒定（frame 单宽、summary 不变），免布局防输入框竖线抖动
-            self._header.update(self._header_text(), layout=False)
+            # 只有转轮字符在变：只重绘那一格，避免整行重写（见 _tick_spinner）
+            _tick_spinner(self._header, self._header_text())
 
     def _apply_state_style(self) -> None:
         """按成功 / 失败着色：失败行红色，成功行灰色（opencode 的状态色语义）。"""
@@ -801,9 +839,13 @@ class ToolCall(Vertical):
 class ContextGroup(Vertical):
     """连续的读取 / 搜索 / 列目录工具汇总块（opencode 式「已探索」）。
 
-    头行汇总各类计数：进行中 `⠋ ⚙ 正在探索 · 3 次读取，2 次搜索`，完成后
+    头行汇总各类计数：进行中 `⠋ ⚙ 探索中 · 3 次读取，2 次搜索`，完成后
     `▸ ⚙ 已探索 · …`；逐条明细是隐藏的子 ToolCall，展开可见。分组边界由
     ChatView 控制（遇到非上下文工具、正文/思考流、回合结束时封口）。
+
+    状态只看「组内还有没有没出结果的子工具」：封口只决定分组边界，不代表
+    跑完——因此混批（如 read + 命令）里封口后仍在跑的那次读取，头行依旧是
+    「探索中」，直到它出结果；轮次结束由 ChatView 兜底收尾（drain_pending）。
     """
 
     can_focus = True
@@ -818,8 +860,10 @@ class ContextGroup(Vertical):
         self._expanded = False
         self._items: list[tuple[str, ToolCall]] = []  # (工具名, 子控件)
         self._pending: set[int] = set()  # 未出结果的 tool_id
-        self._pending_children: list[ToolCall] = []  # compose 前挂载缓冲
-        self._finalized = False
+        # 不能叫 _pending_children：那是 Textual Widget 的内部属性（compose 前注册
+        # 子节点的缓冲），同名会串台——子控件被排到标题之前，且 on_mount 时已被
+        # _compose 清空，永远补挂不进 .group-body（明细常驻可见、折叠失效）
+        self._buffered_children: list[ToolCall] = []  # compose 前挂载缓冲
         self._spin_frame = 0
         self._spin_timer = None
         self._header: Static | None = None
@@ -833,9 +877,9 @@ class ContextGroup(Vertical):
         yield self._body
 
     def on_mount(self) -> None:
-        for child in self._pending_children:
+        for child in self._buffered_children:
             self._body.mount(child)
-        self._pending_children = []
+        self._buffered_children = []
         self._sync_spinner()
 
     def add_tool(self, tool_id: int, name: str, widget: ToolCall) -> None:
@@ -845,7 +889,7 @@ class ContextGroup(Vertical):
         if self._body is not None:
             self._body.mount(widget)
         else:
-            self._pending_children.append(widget)
+            self._buffered_children.append(widget)
         self._sync_spinner()
         self._refresh_header()
 
@@ -855,13 +899,16 @@ class ContextGroup(Vertical):
         self._sync_spinner()
         self._refresh_header()
 
-    def finalize(self) -> None:
-        """封口：不再接收新工具，停掉转轮（幂等）。"""
-        self._finalized = True
-        if self._spin_timer is not None:
-            self._spin_timer.stop()
-            self._spin_timer = None
-        self._refresh_header()
+    def drain_pending(self) -> None:
+        """轮次结束兜底：清掉没等到结果的子工具，避免转轮一直转。
+
+        正常路径上每个已上屏的工具都会收到结果（含被拒 / 中断的占位结果），
+        这里是保险——轮次已经结束，残留的进行中标记不可能还在跑。
+        """
+        if self._pending:
+            self._pending.clear()
+            self._sync_spinner()
+            self._refresh_header()
 
     def _counts(self) -> dict:
         counts = {"read": 0, "search": 0}
@@ -874,12 +921,14 @@ class ContextGroup(Vertical):
     def _header_text(self) -> str:
         arrow = "▾" if self._expanded else "▸"
         summary = context_summary(self._counts())
-        if self._pending and not self._finalized:
-            return f"{arrow} {self.SPINNER[self._spin_frame]} ⚙ 正在探索 · {summary}"
+        # 只要还有子工具在跑就是「探索中」（封口不等于跑完）：本地工具毫秒级结束、
+        # 混批时非上下文工具又会立刻封口，一旦按 _finalized 判定，这个状态几乎看不到
+        if self._pending:
+            return f"{arrow} {self.SPINNER[self._spin_frame]} ⚙ 探索中 · {summary}"
         return f"{arrow} ⚙ 已探索 · {summary}"
 
     def _sync_spinner(self) -> None:
-        running = self._pending and not self._finalized
+        running = bool(self._pending)
         if running and self._spin_timer is None and self._header is not None:
             self._spin_timer = self.set_interval(0.1, self._spin)
         elif not running and self._spin_timer is not None:
@@ -889,7 +938,8 @@ class ContextGroup(Vertical):
     def _spin(self) -> None:
         self._spin_frame = (self._spin_frame + 1) % len(self.SPINNER)
         if self._header is not None:
-            self._header.update(self._header_text(), layout=False)
+            # 转轮在第 3 列（「▸ 」之后），只有它在变：只重绘那一格（见 _tick_spinner）
+            _tick_spinner(self._header, self._header_text(), column=2)
 
     def _refresh_header(self) -> None:
         if self._header is not None:
@@ -929,7 +979,10 @@ class Sidebar(Vertical):
     Sidebar #sidebar-top { height: 1fr; }
     Sidebar #sidebar-goal-section { height: auto; display: none; margin-bottom: 1; }
     Sidebar #sidebar-plan-section { height: 1fr; display: none; }
-    Sidebar #sidebar-plan { height: 1fr; scrollbar-gutter: stable; }
+    /* 不绘制滚动条：与聊天区 / 命令菜单 / 选择面板一致，滚动功能不受影响。
+       注意不能同时配 scrollbar-gutter: stable——两者同用会让 virtual_size 塌缩、滚动失效
+       （原为修分界残影加的 stable 槽道，现已不画滚动条，残影不再出现） */
+    Sidebar #sidebar-plan { height: 1fr; scrollbar-size-vertical: 0; }
     Sidebar .sidebar-version { color: #808080; height: 1; }
     Sidebar .sidebar-workspace {
         color: #808080;
@@ -1109,14 +1162,32 @@ class CommandMenu(VerticalScroll):
 class ChatInput(TextArea):
     """多行输入：Enter 发送，Shift+Enter / Ctrl+J 换行。
 
+    Shift+Enter 依赖终端上报（kitty 键盘协议）才能与 Enter 区分：Ghostty / kitty /
+    WezTerm / foot 等支持，传统 xterm 等不支持时 Shift+Enter 与 Enter 发出同一字节
+    （无法区分，会直接发送），此时用 Ctrl+J 换行——它发的是 LF，所有终端都可靠。
+    空输入时的 placeholder 概括这两种换行键，免得用户以为换行没生效。
+
     命令菜单弹出期间按键让位菜单：↑↓ 移动高亮、Enter/Tab 接受补全
     （填入命令名，不发送）、Esc 关菜单；菜单关闭时行为不变。
     """
+
+    PLACEHOLDER = "输入消息 · Enter 发送 · Shift+Enter 换行（不支持的终端用 Ctrl+J）"
 
     class Submitted(Message):
         def __init__(self, value: str):
             super().__init__()
             self.value = value
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("placeholder", self.PLACEHOLDER)
+        super().__init__(*args, **kwargs)
+
+    def on_resize(self, event) -> None:
+        """输入框高度变化（随内容自适应）时重锚命令菜单。
+
+        高度变化不触发 _on_key，也不改变输入区里的其它行，须显式通知宿主重算；
+        否则菜单会停在旧位置、盖住输入框或与输入框之间留空。"""
+        self.app.anchor_command_menu()
 
     def on_key(self, event) -> None:
         menu_open = self.app.command_menu_open

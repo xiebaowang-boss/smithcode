@@ -203,3 +203,69 @@ def test_wait_for_task_second_interrupt_exits(capsys):
     out = capsys.readouterr().out
     assert "再按一次 Ctrl+C 退出" in out
     assert "再见" in out
+
+
+# ---------- 控制序列直写真实终端（窗口标题用） ----------
+
+def test_write_terminal_control_prefers_real_stdout(monkeypatch):
+    """写 sys.__stdout__ 而非 sys.stdout：Textual 会替换后者。"""
+    from smithcode.utils import terminal as terminal_utils
+
+    class FakeStream:
+        def __init__(self):
+            self.data = ""
+            self.flushed = False
+
+        def write(self, text):
+            self.data += text
+
+        def flush(self):
+            self.flushed = True
+
+    stream = FakeStream()
+    monkeypatch.setattr(terminal_utils.sys, "__stdout__", stream)
+    terminal_utils.write_terminal_control("\x1b]0;X\x07")
+    assert stream.data == "\x1b]0;X\x07"
+    assert stream.flushed is True
+
+
+def test_write_terminal_control_falls_back_to_fd(monkeypatch):
+    """流写不进去（旧代码页编码失败等）时兜底 os.write(1, utf-8)。"""
+    from smithcode.utils import terminal as terminal_utils
+
+    class BrokenStream:
+        def write(self, text):
+            raise UnicodeEncodeError("ascii", text, 0, 1, "cannot encode")
+
+        def flush(self):
+            pass
+
+    written = []
+    monkeypatch.setattr(terminal_utils.sys, "__stdout__", BrokenStream())
+    monkeypatch.setattr(
+        terminal_utils.os, "write", lambda fd, data: written.append((fd, data))
+    )
+    terminal_utils.write_terminal_control("\x1b]0;铁匠铺\x07")
+    assert written[0][0] == 1
+    assert written[0][1].decode("utf-8") == "\x1b]0;铁匠铺\x07"
+
+
+def test_stdout_is_tty_handles_missing_or_broken_stream(monkeypatch):
+    from smithcode.utils import terminal as terminal_utils
+
+    monkeypatch.setattr(terminal_utils.sys, "__stdout__", None)
+    assert terminal_utils.stdout_is_tty() is False
+
+    class NotATty:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(terminal_utils.sys, "__stdout__", NotATty())
+    assert terminal_utils.stdout_is_tty() is False
+
+    class Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(terminal_utils.sys, "__stdout__", Tty())
+    assert terminal_utils.stdout_is_tty() is True

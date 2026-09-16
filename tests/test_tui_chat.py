@@ -3,6 +3,7 @@ import asyncio
 
 import pytest
 from rich.text import Text
+from textual.geometry import Region
 
 import smithcode.renderer as renderer_module
 from smithcode.agent import Agent
@@ -219,5 +220,29 @@ def test_non_command_tool_keeps_gear_spinner(monkeypatch):
             header = block._header_text()
             assert "执行中" not in header
             assert "⚙ read a.py" in header
+
+    _run(_run_case())
+
+
+def test_spinner_tick_repaints_only_spinner_cell(monkeypatch):
+    """转轮 tick 只把转轮那一格标脏。
+
+    脏区是整个控件时终端每 100ms 整行重写：webfetch 这类网络工具 pending
+    可持续数十秒，慢终端上会表现为闪烁。这里断言文案照常推进到下一帧，
+    且重绘范围仍只有转轮那一格。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app.ui_tool_start(1, "fetch https://example.com/docs", "inline", "webfetch")
+            await pilot.pause()
+            block = app.query_one(ToolCall)
+            header = block.query_one(".tool-header")
+            before = str(header.content)
+            block._spin()
+            after = str(header.content)
+            assert after != before
+            assert after[1:] == before[1:]  # 只有首格（转轮字符）变化
+            assert header._repaint_regions == {Region(0, 0, 1, 1)}
 
     _run(_run_case())

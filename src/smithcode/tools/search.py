@@ -10,7 +10,7 @@ import os
 import re
 from pathlib import Path
 
-from .. import config
+from .. import config, textfile
 from .base import register
 
 # 检索时跳过的目录：依赖、缓存、版本控制等对定位代码没有价值
@@ -22,6 +22,9 @@ SKIP_DIRS = {
 MAX_RESULTS = 100  # 单次最多返回的文件数 / 匹配行数
 MAX_FILE_SIZE = 1_000_000  # 超过 1MB 的文件跳过（多为构建产物或数据文件）
 MAX_LINE_LEN = 200  # 单行匹配内容展示的最大长度
+# 匹配内容一律按原文输出（不去缩进）：Agent 会直接复制到 edit_file 的 old_string，
+# 行首缩进一旦被吃掉，多行锚点就与文件内容对不上、必然报「old_string 未找到」。
+
 OUTPUT_MODES = ("content", "files_with_matches", "count")
 
 
@@ -122,7 +125,9 @@ def _describe_grep(args: dict) -> str:
         "description": "在工作区文件内容中按正则表达式搜索。"
         "默认返回「路径:行号: 内容」；output_mode=files_with_matches 只列包含匹配的文件，"
         "output_mode=count 返回「路径:匹配数」。ignore_case 忽略大小写，"
-        "context=N 显示每个匹配的上下文 N 行。可用 include 按文件名过滤（如 *.py）。",
+        "context=N 显示每个匹配的上下文 N 行。可用 include 按文件名过滤（如 *.py）。"
+        "匹配内容按文件原文输出、保留行首缩进，去掉「路径:行号: 」前缀后可直接用作 "
+        "edit_file 的 old_string（多行锚点每行缩进都要照原样）。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -175,8 +180,8 @@ def grep(pattern: str, path: str = ".", include: str | None = None,
             if fpath.stat().st_size > MAX_FILE_SIZE:
                 continue
             # errors="replace"：GBK 等非 UTF-8 文件也能搜到 ASCII 内容
-            text = fpath.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            text, _fmt = textfile.read(fpath, errors="replace")
+        except (OSError, textfile.TextFileError):
             continue
         if "\x00" in text:  # 含空字节，视为二进制文件
             continue
@@ -200,7 +205,7 @@ def grep(pattern: str, path: str = ".", include: str | None = None,
             if context:
                 matches.extend(_render_context(rel, lines, matched, max(0, int(context))))
             else:
-                matches.extend(f"{rel}:{i + 1}: {line.strip()[:MAX_LINE_LEN]}"
+                matches.extend(f"{rel}:{i + 1}: {line[:MAX_LINE_LEN]}"
                                for i, line in matched)
             if len(matches) >= MAX_RESULTS:
                 truncated = True
@@ -215,7 +220,11 @@ def grep(pattern: str, path: str = ".", include: str | None = None,
 
 
 def _render_context(rel: str, lines: list[str], matched: list, width: int) -> list[str]:
-    """渲染匹配行及其上下文窗口：匹配行用 : 分隔，上下文行用 -，组间以 -- 隔开。"""
+    """渲染匹配行及其上下文窗口：匹配行用 : 分隔，上下文行用 -，组间以 -- 隔开。
+
+    内容按文件原文输出（保留行首缩进）：Agent 会把其中内容复制成 edit_file 的
+    old_string，去缩进会让多行锚点匹配失败。
+    """
     matched_idx = {i for i, _ in matched}
     ranges = []
     for i, _ in matched:
@@ -231,7 +240,7 @@ def _render_context(rel: str, lines: list[str], matched: list, width: int) -> li
             out.append("--")
         for i in range(start, end):
             sep = ":" if i in matched_idx else "-"
-            out.append(f"{rel}{sep}{i + 1}{sep} {lines[i].strip()[:MAX_LINE_LEN]}")
+            out.append(f"{rel}{sep}{i + 1}{sep} {lines[i][:MAX_LINE_LEN]}")
             if len(out) >= MAX_RESULTS:
                 return out
     return out

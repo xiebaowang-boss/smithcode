@@ -18,8 +18,14 @@ def render_markdown(text: str, width: int) -> Text:
 
     直接消费 rich 的 render_lines 段（pad=False，无整行填充），样式随段
     附加；宽度用组件实际宽度，由 rich 负责换行。
+
+    height 必须与 width 一起显式给出：rich 的 `Console.size` 只在**两个维度都
+    显式**时才直接返回给定尺寸，否则先走终端探测——`TERM=dumb`（Emacs shell、
+    部分 CI / 极简终端）会短路成固定 (80, 25)，把传入的 width 整个丢掉，正文
+    于是永远按 80 列折行、窗口缩放不再重排。显式 height 与换行无关，只为锁住
+    宽度；真正的换行宽度始终是调用方给的 width。
     """
-    console = Console(width=width, force_terminal=True, color_system="standard")
+    console = Console(width=width, height=25, force_terminal=True, color_system="standard")
     result = Text()
     for index, line in enumerate(console.render_lines(RichMarkdown(text), options=console.options, pad=False)):
         if index:
@@ -64,8 +70,8 @@ def split_md_blocks(text: str):
 def git_branch(workspace: str) -> str | None:
     """当前工作区的 git 分支名；非 git 仓库或读取失败返回 None。
 
-    直接读 .git/HEAD（"ref: refs/heads/main" → main），不调 git 命令，
-    免依赖、速度快。子模块/worktree 的 .git 是指向实际 gitdir 的文本文件。
+    直接读 .git/HEAD（"ref: refs/heads/main" → main、"ref: refs/heads/feat/x" → feat/x），
+    不调 git 命令，免依赖、速度快。子模块/worktree 的 .git 是指向实际 gitdir 的文本文件。
     """
     root = Path(workspace)
     git = root / ".git"
@@ -81,7 +87,8 @@ def git_branch(workspace: str) -> str | None:
             return None
         text = head.read_text(encoding="utf-8").strip()
         if text.startswith("ref: "):
-            return text[5:].split("/")[-1]
+            # 只剥 "refs/heads/" 前缀，保留完整分支名（feat/x 不能截成 x）
+            return text[5:].removeprefix("refs/heads/")
         return text[:7]  # detached HEAD：显示短提交号
     except OSError:
         return None

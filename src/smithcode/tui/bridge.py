@@ -16,11 +16,13 @@ if TYPE_CHECKING:
 
 
 class TuiRenderer(renderer.Renderer):
-    """Agent 与 SmithTUI 之间唯一的线程侧通道（renderer 基类的 TUI 实现）。"""
+    """Agent 与 SmithTUI 之间唯一的线程侧通道（renderer 基类的 TUI 实现）。
+
+    Agent 事件经 post_message 投递到宿主，由主线程消费渲染。"""
 
     def __init__(self, app: SmithTUI):
+        super().__init__()
         self.app = app
-        self._tool_seq = 0  # tool_call → tool_result 的配对 id（renderer 基类约定）
         self._thinking: int | None = None  # 正在思考时累计的字符数
 
     def _post(self, action: str, *args) -> None:
@@ -50,9 +52,9 @@ class TuiRenderer(renderer.Renderer):
         """opencode 式 pending 行：摘要先上屏转轮，结果到了原地更新。
 
         name 供 TUI 判定是否归入「已探索」上下文汇总块（读取/搜索/列目录）。"""
-        self._tool_seq += 1
-        self._post("tool_start", self._tool_seq, line, display, name)
-        return self._tool_seq
+        tool_id = self._next_tool_id()
+        self._post("tool_start", tool_id, line, display, name)
+        return tool_id
 
     def tool_preview(self, tool_id: int | None, detail: str) -> None:
         """执行前的变更预览（diff）：推给对应的 pending 工具块，审核时已可见。"""

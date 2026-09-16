@@ -17,6 +17,7 @@ from openai import (
 
 from .. import config, renderer
 from ..cancel import current_token
+from ..utils.proxy import normalize_proxy_env
 
 # 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
 # 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。
@@ -36,6 +37,7 @@ RETRYABLE_ERRORS = (
 class LLMClient:
     def __init__(self):
         config.ensure_api_key()  # 凭证缺失时给出人话指引，别让 OpenAI SDK 抛裸异常
+        normalize_proxy_env()  # 库被直接使用时（无 CLI 入口）同样兜底一次
         self.client = OpenAI(
             api_key=config.KEY,
             base_url=config.URL,

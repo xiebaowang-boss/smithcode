@@ -58,12 +58,13 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `agent.py` | Agent 循环编排（`_BatchScheduler` 流式调度：边预检边执行、并行波次 + 串行屏障、结果按提交序；todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`）；`run_with_goal()` 是 `/goal` 的续跑驱动器 |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
-| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端 |
+| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`），等待事件由 `title.Relay` 在 ask 方法进出时发射 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根：消息历史（追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
 | `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/architecture.md` 的「会话持久化与恢复」节） |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
+| `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）与 Relay 在 ask 类方法上报的等待态，合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；装配入口两个：终端宿主 `attach()`（总线 + 接管标题）、GUI 前端 `bus()`（纯总线，不碰终端标题）（设计见 `docs/architecture.md` 的「终端窗口标题」节） |
 | `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
 | `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
@@ -71,8 +72,10 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
+| `utils/http.py` | 网络工具的 HTTP 客户端工厂（`client()` / `read_limited()` / `ssl_context()`）：统一代理语义（`normalize_proxy_env` + `trust_env`，含 socks5）并屏蔽 ALPN（历史遗留的 DDG 反爬指纹对策，多后端下保留无害）；webfetch / websearch 共用 |
+| `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`，无新依赖）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
-| `tools/*.py` | 各工具实现（files / search / shell / patch / web / websearch / ask / todo / goal / skills） |
+| `tools/*.py` | 各工具实现（files / search / shell / patch / web / websearch / ask / todo / goal / skills / task） |
 | `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、工具命名/动态注册、`/mcp` 命令与添加向导；客户端基于官方 `mcp` SDK（`runtime.py` 共享 loop 线程、`connection.py` 同步门面、`factory.py` 按传输构造）（完整设计见 `docs/mcp-architecture.md`，摘要见 `docs/architecture.md`「MCP」节）；支持 stdio / Streamable HTTP / SSE 与 OAuth2.1 |
 
 ## 关键约定
@@ -102,7 +105,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 - 中文注释与中文文档字符串（项目惯例），用户可见文案一律中文
 - 错误信息用中文、面向用户友好（如「文件不存在」而非裸异常 traceback）
 - 工具返回字符串而非抛异常给模型看；对模型的报错要可操作（提示下一步怎么改参数）
-- 不引入重量级依赖；能标准库就标准库（webfetch 即标准库实现，无新依赖）
+- 不引入重量级依赖；能标准库就标准库。例外是已在核心依赖里的 httpx2：网络工具（webfetch / websearch）经 `utils/http.py` 走它，以复用 LLM 客户端同一套代理语义——标准库 urllib 不认 `ALL_PROXY` 也不支持 socks
 - Windows 下 shell 是 cmd.exe：涉及 shell 语法示例时用 Windows 兼容写法
 
 ### 兼容性红线

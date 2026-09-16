@@ -355,6 +355,138 @@ def load_tool_display():
     return DEFAULT_TOOL_DISPLAY
 
 
+# ---------- 终端窗口标题 ----------
+
+_TERMINAL_TITLE_TRUTHY = ("1", "true", "yes", "on")
+_TERMINAL_TITLE_FALSY = ("0", "false", "no", "off")
+
+
+def load_terminal_title() -> bool:
+    """是否把会话标题写进终端窗口标题（TUI / REPL 交互模式）。
+
+    优先级：SMITHCODE_TERMINAL_TITLE > config.toml 顶层 terminal_title > 默认
+    True（对齐 KEY / MODEL / URL 的 env > 文件 > 默认，见「三项核心配置」）。空串
+    视为"没配"；非法值打印警告并降级为默认，不中断程序。非 tty 时由调用方
+    （title.TerminalTitlePresenter）整体关闭，无需用户额外配置。
+    """
+    env = os.getenv("SMITHCODE_TERMINAL_TITLE", "").strip().lower()
+    if env:
+        if env in _TERMINAL_TITLE_TRUTHY:
+            return True
+        if env in _TERMINAL_TITLE_FALSY:
+            return False
+        print(
+            f"[警告] SMITHCODE_TERMINAL_TITLE 的值 {env!r} 无效"
+            "（可选 1/0），已用默认值 True"
+        )
+        return True
+    value = _read_config_file().get("terminal_title", True)
+    if isinstance(value, bool):
+        return value
+    print(
+        f"[警告] config.toml 的 terminal_title = {value!r} 不是布尔值，已用默认值 True"
+    )
+    return True
+
+
+# ---------- 网络工具（webfetch / websearch） ----------
+
+_BOOL_TRUTHY = ("1", "true", "yes", "on")
+_BOOL_FALSY = ("0", "false", "no", "off")
+
+
+def load_allow_private_urls() -> bool:
+    """webfetch 是否允许访问内网 / 本机地址（默认 False，即拦截）。
+
+    优先级：SMITHCODE_ALLOW_PRIVATE_URLS > config.toml 顶层 allow_private_urls >
+    默认 False。默认拦截私网、回环、链路本地（含云元数据 169.254.169.254）、CGNAT
+    等非全局地址——webfetch 默认免确认放行，模型又可能被网页内容诱导，故按
+    「默认安全」处理；本地开发要抓 localhost 文档时可显式打开。空串视为"没配"；
+    非法值打印警告并降级为默认，不中断程序。
+    """
+    env = os.getenv("SMITHCODE_ALLOW_PRIVATE_URLS", "").strip().lower()
+    if env:
+        if env in _BOOL_TRUTHY:
+            return True
+        if env in _BOOL_FALSY:
+            return False
+        print(
+            f"[警告] SMITHCODE_ALLOW_PRIVATE_URLS 的值 {env!r} 无效"
+            "（可选 1/0），已用默认值 False"
+        )
+        return False
+    value = _read_config_file().get("allow_private_urls", False)
+    if isinstance(value, bool):
+        return value
+    print(
+        f"[警告] config.toml 的 allow_private_urls = {value!r} 不是布尔值，已用默认值 False"
+    )
+    return False
+
+
+# websearch 的检索后端：auto 按内置顺序逐个尝试（Tavily → Brave → Bing →
+# DuckDuckGo），命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如
+# 无代理时 Brave 不可达、走代理时 Bing 会返回无关结果），故开放配置而不写死。
+# tavily 需要 key（见 load_tavily_key），无 key 时在 auto 里直接跳过。
+SEARCH_BACKENDS = ("auto", "tavily", "brave", "bing", "ddg")
+DEFAULT_SEARCH_BACKEND = "auto"
+
+
+def load_search_backend() -> str:
+    """websearch 使用哪个检索后端。
+
+    优先级：SMITHCODE_SEARCH_BACKEND > config.toml 的 [search].backend > 默认 auto。
+    可选 auto / tavily / brave / bing / ddg；空串视为"没配"，非法值打印警告并降级为 auto。
+    """
+    env = os.getenv("SMITHCODE_SEARCH_BACKEND", "").strip().lower()
+    if env:
+        if env in SEARCH_BACKENDS:
+            return env
+        print(
+            f"[警告] SMITHCODE_SEARCH_BACKEND 的值 {env!r} 无效"
+            f"（可选 {'/'.join(SEARCH_BACKENDS)}），已用默认值 {DEFAULT_SEARCH_BACKEND}"
+        )
+        return DEFAULT_SEARCH_BACKEND
+    data = _read_config_file().get("search") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [search] 段不是表，已忽略")
+        return DEFAULT_SEARCH_BACKEND
+    value = data.get("backend")
+    if value is None:
+        return DEFAULT_SEARCH_BACKEND
+    if isinstance(value, str) and value.strip().lower() in SEARCH_BACKENDS:
+        return value.strip().lower()
+    print(
+        f"[警告] config.toml 的 [search].backend = {value!r} 无效"
+        f"（可选 {'/'.join(SEARCH_BACKENDS)}），已用默认值 {DEFAULT_SEARCH_BACKEND}"
+    )
+    return DEFAULT_SEARCH_BACKEND
+
+
+def load_tavily_key() -> str:
+    """Tavily 搜索 API key（websearch 的 tavily 后端用）。
+
+    优先级：SMITHCODE_TAVILY_KEY > config.toml 的 [search].tavily_key >
+    credentials.json 的 search.tavily_key > 空。空串视为"没配"，未配时 tavily
+    后端不可用（auto 模式直接跳过它）。key 属秘密，正式存放位置是
+    credentials.json（与 LLM key 同文件，写入走 0600）。
+    """
+    env = os.getenv("SMITHCODE_TAVILY_KEY", "").strip()
+    if env:
+        return env
+    data = _read_config_file().get("search") or {}
+    if isinstance(data, dict):
+        value = data.get("tavily_key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    section = _read_credentials().get("search", {})
+    if isinstance(section, dict):
+        key = section.get("tavily_key")
+        if isinstance(key, str):
+            return key.strip()
+    return ""
+
+
 # ---------- 技能（Skills） ----------
 
 SKILLS_PROJECT_MODES = ("ask", "on", "off")

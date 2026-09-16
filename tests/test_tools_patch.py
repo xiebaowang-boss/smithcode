@@ -100,3 +100,24 @@ def test_extract_patch_paths():
 def test_invalid_patch_no_section(workspace):
     out = apply_patch("随便一行\n")
     assert "无法解析" in out
+
+
+def test_update_preserves_crlf(workspace):
+    """回归：update 曾把整个 CRLF 文件的换行重写成 LF。"""
+    (workspace / "c.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+    apply_patch("*** Begin Patch\n*** Update File: c.txt\n@@\n-b\n+B\n*** End Patch")
+    assert (workspace / "c.txt").read_bytes() == b"a\r\nB\r\nc\r\n"
+
+
+def test_add_uses_lf(workspace):
+    """新建文件（无原格式可保留）默认 LF，与平台无关。"""
+    apply_patch("*** Begin Patch\n*** Add File: n.txt\n+x\n+y\n*** End Patch")
+    assert (workspace / "n.txt").read_bytes() == b"x\ny"
+
+
+def test_update_non_utf8_returns_error_not_crash(workspace):
+    """apply_patch 无「先读」前置：非 UTF-8 曾直接抛裸 UnicodeDecodeError。"""
+    (workspace / "latin.py").write_bytes(b"# caf\xe9\nx = 1\n")
+    out = apply_patch("*** Begin Patch\n*** Update File: latin.py\n@@\n-x = 1\n+x = 2\n*** End Patch")
+    assert "错误" in out and "UTF-8" in out
+    assert (workspace / "latin.py").read_bytes() == b"# caf\xe9\nx = 1\n"  # 未改动
