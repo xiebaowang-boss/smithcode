@@ -231,9 +231,9 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/search.py` | 文件名与内容检索（glob / grep） |
-| `tools/web.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
-| `tools/websearch.py` | websearch 网页检索（DuckDuckGo HTML，返回标题/链接/摘要；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂 |
-| `utils/http.py` | 网络工具的 HTTP 客户端工厂：统一代理语义（`normalize_proxy_env` 先归一化 `socks://`，`trust_env` 读 `ALL_PROXY`/`HTTP(S)_PROXY`，socks5 由 socksio 支持）+ 屏蔽 ALPN（DDG 反爬按 TLS 指纹判定）+ SSRF 地址判定（`is_public_address` / `private_target`，见「网络出网」节） |
+| `tools/web.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取，用真实浏览器 UA 降低被按机器人 403 的概率；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
+| `tools/websearch.py` | websearch 网页检索（多后端：Brave / Bing / DuckDuckGo，`[search].backend` 可切换；默认 auto 依次回退；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂；各后端页面结构不同，各自一个解析函数 |
+| `utils/http.py` | 网络工具的 HTTP 客户端工厂：统一代理语义（`normalize_proxy_env` 先归一化 `socks://`，`trust_env` 读 `ALL_PROXY`/`HTTP(S)_PROXY`，socks5 由 socksio 支持）+ 屏蔽 ALPN（历史遗留：DuckDuckGo 反爬按 TLS 指纹判定；Bing 不敏感）+ SSRF 地址判定（`is_public_address` / `private_target`，见「网络出网」节） |
 | `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/shell.py` | 命令执行，含超时保护 |
 | `tools/patch.py` | apply_patch 批量原子改文件 |
@@ -249,11 +249,20 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂 `client()`，与 LLM 客户端（httpx2 + `provider.headers`）共用同一套代理语义：
 
 - **代理**：`trust_env=True` 读取 `ALL_PROXY` / `HTTP(S)_PROXY`，socks5 由 socksio 支持；构造前先跑 `utils.proxy.normalize_proxy_env()`——系统代理（Clash / FlClash 等）常写非标准的 `socks://`，httpx 在构造期即急切校验 scheme 并抛 `ValueError`。**改造前这两个工具走 urllib**，而 urllib 既不认 `ALL_PROXY` 也不支持 socks，于是「LLM 能连、搜索与抓取连不上」。
-- **ALPN 屏蔽**（`_NoAlpnContext`）：httpcore 握手时默认发送 ALPN 扩展 `["http/1.1"]`，DuckDuckGo 据此判定为机器人并返回反爬 challenge 页（实测：带 ALPN 被拦、不带则正常返回结果，与 UA / Accept 等请求头无关）。故显式屏蔽 ALPN，**证书校验照常**（`CERT_REQUIRED` + 主机名校验 + 系统 CA）；这也正是改造前 urllib 的既有行为（urllib 不发 ALPN）。回归测试用本地 TLS 服务器在握手层断言（`tests/test_utils_http.py`），不依赖外网。
+- **ALPN 屏蔽**（`_NoAlpnContext`）：httpcore 握手时默认发送 ALPN 扩展 `["http/1.1"]`。这是为 DuckDuckGo 时代修的——它据此判定为机器人并返回反爬 challenge 页（实测：带 ALPN 被拦、不带则正常返回结果，与 UA / Accept 等请求头无关）；现 websearch 是多后端（Brave / Bing / DuckDuckGo），屏蔽对各目标无害，保留。屏蔽时**证书校验照常**（`CERT_REQUIRED` + 主机名校验 + 系统 CA），这也正是改造前 urllib 的既有行为（urllib 不发 ALPN）。回归测试用本地 TLS 服务器在握手层断言（`tests/test_utils_http.py`），不依赖外网。
 - **限额**：`read_limited()` 在 `client.stream(...)` 内读满上限即停（webfetch 2MB），超大页面不占满内存。
 - **SSRF 防护**：webfetch 默认可免确认放行，模型又可能被网页内容诱导，故默认**拒访非公网地址**（`utils/http.private_target` 判定：回环 / 私网 / 链路本地含云元数据 169.254.169.254 / CGNAT / 保留段 / 多播；域名按 DNS 全部解析结果判定，防「公网域名指向内网」）。**重定向逐跳校验**（`follow_redirects=False` 手动跟随，上限 5 跳），堵住「公网地址 302 到内网」的绕过；解析失败不拦（请求本就连不上，交网络层报常规错误）。开关：`config.toml` 的 `allow_private_urls = true` 或 `SMITHCODE_ALLOW_PRIVATE_URLS=1` 放行，供本地开发抓 localhost 文档。websearch 端点是固定的，无需防护。
 - **内容转换**：`utils/htmltext.to_markdown()` 用标准库 `HTMLParser` 把 HTML 转成结构化 Markdown（标题层级 / 链接地址 / 代码块与语言 / 列表 / 表格 / 引用，`<pre>` 公共缩进去除），替代原来的正则去标签——读文档时「链接去哪」「代码长什么样」往往正是重点，正则版会全部丢掉。刻意保守：脚本 / 样式 / `<head>` 一律丢弃，环形引用（畸形标签）不抛异常只降级。**已知局限**：不做正文提取，站点侧边栏 / ToC 等装饰元素会计入 `max_chars` 预算（实测 docs.python.org 的 pathlib 页正文起始于约 1.5 万字符处，改造前后同样如此）。
-- **反爬识别**：websearch 命中 DuckDuckGo 验证页（"无结果锚点 + 特征文案"双条件）时返回明确错误，而不是伪装成「（无搜索结果）」——后者会让用户以为关键词不对。
+- **反爬识别**：websearch 未解析出结果且页面符合各后端的反爬特征时（Bing 缺结果容器 `id="b_results"`、DuckDuckGo 命中验证页文案、HTTP 202/401/403/429），判定为被拦截并返回明确错误，而不是伪装成「（无搜索结果）」——后者会让用户以为关键词不对。webfetch 对 403/429 也在错误文案里说明是被反爬拦截、重试无效并给出替代手段。
+
+## websearch 多后端（tools/websearch.py）
+
+免 key 的搜索引擎在可用性、反爬强度、结果质量上差异极大，且**随网络环境（是否走代理）整体翻转**，故不写死单一后端：
+
+- **后端**：`brave`（`search.brave.com`，结果质量最好，但有速率限制，连打约 6 次会 429）、`bing`（`www.bing.com`，可达性最广，但对部分查询会返回与查询完全无关的「软降级」结果，工具层无法识别）、`ddg`（`html.duckduckgo.com`，反爬最严，常返回 202 + 验证页）。三者的页面结构不同，各自一个解析函数（`_parse_brave` / `_parse_bing` / `_parse_ddg`）。
+- **选择**：`config.load_search_backend()` 读 `[search].backend`（env `SMITHCODE_SEARCH_BACKEND` 优先），可选 `auto` / `brave` / `bing` / `ddg`，默认 `auto`。`auto` 按 `brave → bing → ddg` 依次尝试，某后端报错或解析为空就试下一个，全失败时在错误里汇总各后端原因。
+- **解析为空的二义性**：页面正常但确实没结果是「（无搜索结果）」；命中反爬特征才报错。两者靠各后端的特征区分（见上一条）。
+
 
 ## 安全边界
 

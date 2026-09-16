@@ -65,6 +65,79 @@ def test_table_rows_joined_with_separator():
     assert "1 | 2" in out
 
 
+def test_table_emits_gfm_header_and_divider():
+    """GFM 表格必须有分隔行，否则渲染器认不出这是表格。"""
+    out = htmltext.to_markdown(
+        "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+    )
+    assert "| A | B |" in out
+    assert "| --- | --- |" in out
+    assert "| 1 | 2 |" in out
+
+
+def test_table_without_th_promotes_first_row():
+    """无 <th> 的表格把首行当表头（GFM 必须有个表头行）。"""
+    out = htmltext.to_markdown(
+        "<table><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></table>"
+    )
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert lines[0] == "| 1 | 2 |"
+    assert lines[1] == "| --- | --- |"
+    assert lines[2] == "| 3 | 4 |"
+
+
+def test_table_reads_thead_and_tbody():
+    """真实页面普遍包 thead/tbody，分隔行仍须落在表头之后。"""
+    out = htmltext.to_markdown(
+        "<table><thead><tr><th>A</th><th>B</th></tr></thead>"
+        "<tbody><tr><td>1</td><td>2</td></tr></tbody></table>"
+    )
+    assert "| A | B |" in out and "| --- | --- |" in out and "| 1 | 2 |" in out
+
+
+def test_table_block_inside_cell_stays_on_one_row():
+    """格内的块级标签（如 <p>）不能把一行拆成多行——那会破坏表格结构。"""
+    out = htmltext.to_markdown(
+        "<table><tr><th>H</th></tr><tr><td><p>x</p></td></tr></table>"
+    )
+    assert "| x |" in out
+    assert "x\n" not in out  # 不得单独成行
+
+
+def test_table_alignment_markers():
+    out = htmltext.to_markdown(
+        '<table><tr><th align="left">L</th><th align="right">R</th>'
+        '<th style="text-align: center">C</th></tr>'
+        "<tr><td>1</td><td>2</td><td>3</td></tr></table>"
+    )
+    assert "| :--- | ---: | :---: |" in out
+
+
+def test_table_escapes_pipe_in_cell():
+    out = htmltext.to_markdown(
+        "<table><tr><th>a|b</th></tr><tr><td>1</td></tr></table>"
+    )
+    assert "a\\|b" in out
+
+
+def test_table_pads_short_rows():
+    """列数不齐的行补齐空单元格，避免渲染时错位。"""
+    out = htmltext.to_markdown(
+        "<table><tr><th>A</th><th>B</th><th>C</th></tr>"
+        "<tr><td>1</td><td>2</td></tr></table>"
+    )
+    assert "| 1 | 2 |  |" in out
+
+
+def test_table_keeps_inline_markup_in_cells():
+    out = htmltext.to_markdown(
+        '<table><tr><th>链接</th><th>强调</th></tr>'
+        '<tr><td><a href="https://x.com">X</a></td><td><b>粗</b></td></tr></table>'
+    )
+    assert "[X](https://x.com)" in out
+    assert "**粗**" in out
+
+
 def test_blockquote_gets_prefix():
     assert "> 引用" in htmltext.to_markdown("<blockquote><p>引用</p></blockquote>")
 

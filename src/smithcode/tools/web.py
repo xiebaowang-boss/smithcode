@@ -6,9 +6,15 @@ HTTP 层走 httpx2（见 `utils/http.py`），与 LLM 客户端共用同一套�
 仅放行 http/https，拒绝其他协议（防止 file:// 等变相读本地文件）。
 默认拒访内网 / 本机地址（SSRF 防护，见 `_blocked_reason`），并对每一跳重定向
 重新校验，防止「公网地址 302 到内网」。
+
+请求头用真实浏览器 UA：不少站点（Stack Overflow、Cloudflare 前置的站点等）
+按 UA 判定机器人，`compatible; SmithCode/...` 这种自曝身份的 UA 会被直接 403，
+换成常见浏览器 UA 能拿下一部分。但仍非万能——强风控站点（凭 TLS 指纹 / JS
+挑战判定）依旧会拒，这类失败在 403 文案里如实提示，不假装成普通网络错误。
 """
 from __future__ import annotations
 
+import codecs
 import re
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -26,8 +32,12 @@ MAX_FETCH_CHARS = 20_000  # 默认返回的最大字符数（超出截断）
 MAX_FETCH_BYTES = 2_000_000  # 响应体最多读取的字节数
 MAX_URLS = 5  # 单次调用最多并行抓取的 URL 数（更多请分多次调用）
 MAX_REDIRECTS = 5  # 手动跟随重定向的上限（每跳都要过 SSRF 校验）
-
-_USER_AGENT = "Mozilla/5.0 (compatible; SmithCode/1.0; +terminal coding agent)"
+# 真实浏览器 UA：自曝身份的 "SmithCode/1.0" 会被不少站点按机器人 403（见模块 docstring）。
+# 与 websearch 共用同一 UA（Bing 搜索页同样偏好浏览器 UA）。
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 def _blocked_reason(url: str) -> str | None:
@@ -102,6 +112,23 @@ def webfetch(url: str | list[str], max_chars: int | None = None) -> str:
     )
 
 
+def _decode_body(raw: bytes, charset: str) -> str:
+    """按声明编码解码响应体；编码标签非法时回落 UTF-8 而非抛错。
+
+    `resp.charset_encoding` 直接来自响应头，畸形站点可能给出 `x-bogus` 这类
+    非法标签，`bytes.decode` 会抛 `LookupError`——它不在 `_fetch_one` 的异常
+    捕获范围内（那些是网络类异常），于是抓取会以未处理异常结束。宁可回落
+    UTF-8 拿到可读内容，也不让一个坏标签毁掉整次抓取。
+
+    `errors="replace"` 保留原行为：编码正确但字节有残缺时用替换字符，不中断。
+    """
+    try:
+        codecs.lookup(charset)
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+    return raw.decode(charset, errors="replace")
+
+
 def _fetch_one(url: str, max_chars: int | None = None) -> str:
     if not re.match(r"^https?://", url, re.IGNORECASE):
         return f"错误: 仅支持 http/https URL，收到: {url[:100]}"
@@ -132,7 +159,15 @@ def _fetch_one(url: str, max_chars: int | None = None) -> str:
             else:
                 return f"错误: 重定向次数过多（超过 {MAX_REDIRECTS} 次）({url[:100]})"
     except httpx2.HTTPStatusError as e:
-        return f"错误: HTTP {e.response.status_code} {e.response.reason_phrase} ({url[:100]})"
+        code = e.response.status_code
+        if code in (401, 403, 429):
+            return (
+                f"错误: HTTP {code} {e.response.reason_phrase} ({url[:100]})——"
+                "目标站点按反爬规则拒绝了本次请求（常见于需要浏览器 / JS 挑战的站点），"
+                "重试通常无效；可改用 websearch 找其他镜像站或缓存，"
+                "或对同内容的其他来源地址再抓一次"
+            )
+        return f"错误: HTTP {code} {e.response.reason_phrase} ({url[:100]})"
     except (httpx2.RequestError, httpx2.InvalidURL, OSError) as e:
         return f"错误: 抓取失败: {e} ({url[:100]})"
-    return htmltext.to_markdown(raw.decode(charset, errors="replace"))[:limit]
+    return htmltext.to_markdown(_decode_body(raw, charset))[:limit]

@@ -72,7 +72,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |
 | `wizard.py` / `welcome.py` | `setup` 初始化向导 / 启动欢迎横幅 |
 | `utils/terminal.py` | 终端交互底层（输入读取、确认可用性判断） |
-| `utils/http.py` | 网络工具的 HTTP 客户端工厂（`client()` / `read_limited()` / `ssl_context()`）：统一代理语义（`normalize_proxy_env` + `trust_env`，含 socks5）并屏蔽 ALPN（DuckDuckGo 反爬按该指纹判定）；webfetch / websearch 共用 |
+| `utils/http.py` | 网络工具的 HTTP 客户端工厂（`client()` / `read_limited()` / `ssl_context()`）：统一代理语义（`normalize_proxy_env` + `trust_env`，含 socks5）并屏蔽 ALPN（历史遗留的 DDG 反爬指纹对策，多后端下保留无害）；webfetch / websearch 共用 |
 | `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`，无新依赖）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器） |
 | `tools/*.py` | 各工具实现（files / search / shell / patch / web / websearch / ask / todo / goal / skills / task） |

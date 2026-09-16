@@ -85,6 +85,40 @@ def test_webfetch_honors_response_charset(monkeypatch):
     assert "中文编码测试" in web.webfetch("https://example.com/gbk")
 
 
+def test_webfetch_tolerates_bogus_charset(monkeypatch):
+    """回归：非法的 charset 标签回落 UTF-8，不能让抓取以未处理异常结束。
+
+    `decode` 抛的 `LookupError` 不在 `_fetch_one` 的网络异常捕获范围内，此前会
+    直接冒泡成未处理异常。响应体手工构造（`_html` 辅助函数按 charset 编码，
+    非法标签在那一步就会失败）。
+    """
+    response = httpx2.Response(
+        200,
+        headers={"Content-Type": "text/html; charset=x-bogus"},
+        content="<p>回落后仍可读</p>".encode(),
+    )
+    _patch_client(monkeypatch, lambda request: response)
+    out = web.webfetch("https://example.com/bogus")
+    assert "回落后仍可读" in out
+    assert not out.startswith("错误:")
+
+
+def test_decode_body_falls_back_on_unknown_encoding():
+    """畸形标签（含把整个 Content-Type 当标签的写法）都回落 UTF-8。"""
+    raw = "内容".encode()
+    for bogus in ("x-bogus", "charset=utf-8", "", "unknown-charset-xyz"):
+        assert web._decode_body(raw, bogus) == "内容"
+
+
+def test_decode_body_keeps_declared_encoding():
+    assert web._decode_body("中文".encode("gbk"), "gbk") == "中文"
+
+
+def test_decode_body_replaces_invalid_bytes():
+    """编码合法但字节残缺时用替换字符，不抛异常。"""
+    assert "\ufffd" in web._decode_body(b"\xff\xfe\x00bad", "utf-8")
+
+
 def test_webfetch_limits_response_bytes(monkeypatch):
     """超大响应体按 MAX_FETCH_BYTES 截断读取，不会整份读进内存。"""
     monkeypatch.setattr(web, "MAX_FETCH_BYTES", 1000)
@@ -93,7 +127,8 @@ def test_webfetch_limits_response_bytes(monkeypatch):
     assert out and len(out) <= 1000
 
 
-def test_webfetch_sends_user_agent(monkeypatch):
+def test_webfetch_sends_browser_user_agent(monkeypatch):
+    """抓取用真实浏览器 UA：自曝身份的 "SmithCode/..." 会被不少站点按机器人 403。"""
     seen = {}
 
     def handler(request):
@@ -103,12 +138,20 @@ def test_webfetch_sends_user_agent(monkeypatch):
     _patch_client(monkeypatch, handler)
     web.webfetch("https://example.com/x")
     assert seen["ua"] == web._USER_AGENT
+    assert "Mozilla/5.0" in seen["ua"]
 
 
 def test_webfetch_http_error(monkeypatch):
     _patch_client(monkeypatch, lambda request: httpx2.Response(404, content=b"gone"))
     out = web.webfetch("https://example.com/missing")
     assert "404" in out and "Not Found" in out
+
+
+def test_webfetch_antibot_status_mentions_alternatives(monkeypatch):
+    """403/429 是被反爬拦截，不是普通网络故障：文案要提示重试无效与替代手段。"""
+    _patch_client(monkeypatch, lambda request: httpx2.Response(403, content=b"blocked"))
+    out = web.webfetch("https://stackoverflow.com/questions/1")
+    assert "403" in out and "反爬" in out and "websearch" in out
 
 
 def test_webfetch_network_error(monkeypatch):

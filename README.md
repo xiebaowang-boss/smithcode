@@ -17,7 +17,7 @@
 交互终端启动 `smith` 直接进入全屏聊天界面（Textual 实现）：
 
 - **消息区**：助手回复无前缀纯文本流式输出；思考过程折叠成块（只显示字符计数，不刷屏，Enter / 空格展开）；工具调用折叠成块；连续的读取 / 搜索工具汇总成一个可折叠的「已探索」块；用户消息带面板底色与角色色竖线；每轮任务结束追加「▣ 模型 · 用时 Ns」页脚
-- **输入区**：多行输入框（Enter 发送，Shift+Enter / Ctrl+J 换行）；下方底行最左显示「权限模式 · 模型 · 思考强度」与运行状态，最右显示 git 分支与上下文占用
+- **输入区**：多行输入框（Enter 发送，Shift+Enter / Ctrl+J 换行；高度随内容 1-11 行自适应，上下留白对称，超出后内部滚动，不绘制滚动条）；空输入时给出换行键提示；下方底行最左显示「权限模式 · 模型 · 思考强度」与运行状态，最右显示 git 分支与上下文占用
 - **侧边栏**（终端宽 ≥ 120 列时出现）：会话标题、token 用量 / 上下文占用 / 压缩次数、持久目标卡片、任务计划清单、版本号与工作区路径
 - **弹窗**：权限确认与 `ask_user` 提问以模态弹窗呈现，↑↓ 选择、Enter 确认、Esc 取消
 - **中断**：任务运行时按 Esc 即时中断（正在进行的长命令会被终止进程树），空闲时按 Esc 清空输入框
@@ -39,7 +39,7 @@
 | `grep` | 按正则搜内容，支持忽略大小写、上下文行、只列文件 / 计数模式 |
 | `run_command` | 执行 shell 命令，默认 60 秒超时（可延长至 300 秒），跨平台终止进程树 |
 | `webfetch` | 抓取网页（仅 http/https）转结构化文本（保留标题 / 链接 / 代码块），支持一次并行抓多个 URL；默认拒访内网与本机地址 |
-| `websearch` | DuckDuckGo 网页检索，返回标题 / 链接 / 摘要 |
+| `websearch` | Bing 网页检索，返回标题 / 链接 / 摘要 |
 | `ask_user` | 任务中途向你提问（一次可提 1-4 个，带候选项） |
 | `todo_write` / `todo_read` | 维护 / 读取任务步骤清单 |
 | `goal_update` / `goal_read` | 更新 / 读取持久目标状态 |
@@ -154,7 +154,7 @@ python -m smithcode              # 等价的另一种启动方式
 | 按键 | 作用 |
 | ---- | ---- |
 | `Enter` | 发送消息 |
-| `Shift+Enter` / `Ctrl+J` | 输入换行 |
+| `Shift+Enter` / `Ctrl+J` | 输入换行（`Shift+Enter` 需终端支持 kitty 键盘协议，如 Ghostty / kitty / WezTerm / foot；不支持的终端请用 `Ctrl+J`） |
 | `↑` / `↓` | 翻输入历史（命令菜单弹出时为移动高亮） |
 | `Ctrl+W` | 删除前一个词 |
 | `/` | 唤出命令 / 技能补全菜单，↑↓ 选择后回车 |
@@ -270,6 +270,7 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[skills] project` | `ask` | 项目级技能信任策略：`ask` / `on` / `off` |
 | `[skills] max_catalog_chars` | 8000 | 技能目录注入系统提示词的字符预算 |
 | `[skills] disabled` | 空 | 按通配符禁用技能 |
+| `[search] backend` | `auto` | websearch 检索后端：`auto`（按 Brave → Bing → DuckDuckGo 依次尝试）/ `brave` / `bing` / `ddg` |
 | `tool_display` | `summary` | 工具调用终端展示粒度：`summary` 只显示短摘要，`detail` 追加结果内容 |
 
 配置优先级：**代码内置默认 < `~/.smithcode/config.toml` < 环境变量（`SMITHCODE_KEY` / `SMITHCODE_MODEL` / `SMITHCODE_URL`）< CLI 参数**。`SMITHCODE_HOME` 可覆盖配置根目录。

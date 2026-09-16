@@ -9,10 +9,10 @@ LLM 能连、搜索与抓取却连不上。
 在**构造客户端时**就急切校验 scheme 并抛 `ValueError: Unknown scheme for proxy
 URL`，故构造前必须先跑 `utils.proxy.normalize_proxy_env()`。
 
-另有一处与代理无关的坑：TLS 握手默认会带 ALPN 扩展 `["http/1.1"]`，而
-DuckDuckGo 把这种 ClientHello 判定为机器人，直接返回反爬 challenge 页
-（实测：带 ALPN 被拦、不带则正常返回结果；改造前的 urllib 本就不发 ALPN）。
-故这里显式屏蔽 ALPN，证书校验照常。
+另有一处与代理无关的坑：TLS 握手默认会带 ALPN 扩展 `["http/1.1"]`。此前
+websearch 走 DuckDuckGo 时，该指纹会被判定为机器人、直接返回反爬 challenge 页
+（实测：带 ALPN 被拦、不带则正常返回结果；改造前的 urllib 本就不发 ALPN），
+故这里统一屏蔽 ALPN，证书校验照常——Bing 对 ALPN 不敏感，屏蔽无害。
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class _NoAlpnContext(ssl.SSLContext):
     """屏蔽 ALPN 扩展的 TLS 上下文（httpcore 会调用 set_alpn_protocols，这里吞掉）。"""
 
     def set_alpn_protocols(self, protocols) -> None:
-        """有意屏蔽：见模块 docstring（DDG 反爬按 ALPN 指纹判定）。"""
+        """有意屏蔽：见模块 docstring（避免 ALPN 指纹被反爬判定）。"""
         return
 
 
@@ -82,6 +82,32 @@ def read_limited(response: httpx2.Response, limit: int) -> bytes:
 
 # ---------- SSRF：非公网地址判定 ----------
 
+# 末 32 位承载一个 IPv4 地址的 IPv6 前缀：这类地址的"真实目的地"是那个 IPv4，
+# 只按 IPv6 自身判定会漏（见 _embedded_ipv4）。
+#   ::ffff:0:0/96      IPv4-mapped（RFC 4291）—— CPython 的 is_global 已按嵌入
+#                      IPv4 判定，列在这里是为了不依赖版本行为
+#   ::ffff:0:0:0/96    IPv4-translated（RFC 2765）—— is_global 会误判为 True
+#   64:ff9b::/96       NAT64 well-known 前缀（RFC 6052）—— is_global 会误判为 True，
+#                      在 DNS64 网络里实际连到嵌入的 IPv4
+_IPV4_EMBEDDING_PREFIXES = (
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),
+    ipaddress.ip_network("64:ff9b::/96"),
+)
+
+
+def _embedded_ipv4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """地址若把 IPv4 嵌在末 32 位则返回该 IPv4，否则 None。
+
+    只认 `_IPV4_EMBEDDING_PREFIXES` 里的固定布局，不做 RFC 6052 那种可变前缀长度
+    的推算：布局不固定就没法可靠判断"嵌入的是哪个地址"，与其猜错不如交给
+    下一层判定（6to4 / Teredo / NAT64 local-use 等前缀 CPython 已判为非全局）。
+    """
+    for prefix in _IPV4_EMBEDDING_PREFIXES:
+        if addr in prefix:
+            return ipaddress.IPv4Address(addr.packed[12:16])
+    return None
+
 
 def is_public_address(ip: str) -> bool:
     """IP 字面量是否为可全局路由的地址（webfetch 的 SSRF 判定基础）。
@@ -90,13 +116,23 @@ def is_public_address(ip: str) -> bool:
     （169.254/fe80::，含云元数据 169.254.169.254）、CGNAT（100.64/10）、
     保留与文档段（0.0.0.0、192.0.2.0/24、2001:db8::）、多播与未指定地址等。
     解析失败按"不可信"处理（返回 False）。
+
+    嵌入 IPv4 的过渡 / 转换地址（如 `64:ff9b::7f00:1` → 127.0.0.1）按嵌入的
+    IPv4 判定：`is_global` 只看 IPv6 本身，这类地址会被误判为可访问，而实际
+    目的地是内网。
     """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
     # is_multicast 的 is_global 为 True（如 224.0.0.1），需显式排除
-    return addr.is_global and not addr.is_multicast
+    if not addr.is_global or addr.is_multicast:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(addr)
+        if embedded is not None:
+            return embedded.is_global and not embedded.is_multicast
+    return True
 
 
 def resolve_host(host: str) -> list[str]:
@@ -126,7 +162,8 @@ def private_target(host: str) -> str | None:
     - 解析失败返回 None——请求本就连不上，交给网络层报常规错误即可。
 
     局限：不做连接期地址固定，理论上存在 DNS rebinding（校验后解析结果变化），
-    对本场景（终端里的只读抓取）按可接受处理。
+    对本场景（终端里的只读抓取）按可接受处理。嵌入 IPv4 的地址（IPv4-mapped /
+    IPv4-translated / NAT64 well-known）由 is_public_address 按嵌入的 IPv4 判定。
     """
     if not host:
         return None

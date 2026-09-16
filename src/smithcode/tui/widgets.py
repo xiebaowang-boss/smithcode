@@ -1162,14 +1162,32 @@ class CommandMenu(VerticalScroll):
 class ChatInput(TextArea):
     """多行输入：Enter 发送，Shift+Enter / Ctrl+J 换行。
 
+    Shift+Enter 依赖终端上报（kitty 键盘协议）才能与 Enter 区分：Ghostty / kitty /
+    WezTerm / foot 等支持，传统 xterm 等不支持时 Shift+Enter 与 Enter 发出同一字节
+    （无法区分，会直接发送），此时用 Ctrl+J 换行——它发的是 LF，所有终端都可靠。
+    空输入时的 placeholder 概括这两种换行键，免得用户以为换行没生效。
+
     命令菜单弹出期间按键让位菜单：↑↓ 移动高亮、Enter/Tab 接受补全
     （填入命令名，不发送）、Esc 关菜单；菜单关闭时行为不变。
     """
+
+    PLACEHOLDER = "输入消息 · Enter 发送 · Shift+Enter 换行（不支持的终端用 Ctrl+J）"
 
     class Submitted(Message):
         def __init__(self, value: str):
             super().__init__()
             self.value = value
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("placeholder", self.PLACEHOLDER)
+        super().__init__(*args, **kwargs)
+
+    def on_resize(self, event) -> None:
+        """输入框高度变化（随内容自适应）时重锚命令菜单。
+
+        高度变化不触发 _on_key，也不改变输入区里的其它行，须显式通知宿主重算；
+        否则菜单会停在旧位置、盖住输入框或与输入框之间留空。"""
+        self.app.anchor_command_menu()
 
     def on_key(self, event) -> None:
         menu_open = self.app.command_menu_open

@@ -129,8 +129,10 @@ class SmithTUI(App):
         /* 左侧竖线不再画在容器上：容器内还有运行动画行，画在这里会连动画行一起框住 */
     }
     #command-menu {
-        /* 悬浮层：dock 到聊天列底部再上移 5 行（#bottom 2 + #input-wrap 3），
-           锚在输入框正上方、向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小 */
+        /* 悬浮层：dock 到聊天列底部，再上移「输入区高 + 底行高」，锚在输入框正上方、
+           向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小。
+           offset 只是初始值：输入框高度随内容自适应（1-12 行），实际锚点由
+           _anchor_command_menu 按实时几何计算，写死行数会随高度变化错位 */
         dock: bottom;
         offset: 0 -5;
         layer: command-menu;
@@ -144,7 +146,9 @@ class SmithTUI(App):
         scrollbar-size-vertical: 0;
     }
     #command-menu.running {
-        /* 运行动画可见时输入框上方多占一行，锚点随之上移一行（否则弹菜单会盖住动画行） */
+        /* 兜底锚点：运行动画可见时输入框上方多占一行。
+           实际 offset 由 _anchor_command_menu 按实时几何内联设置（输入框高度可变），
+           此处仅在尚未计算过时兜底 */
         offset: 0 -6;
     }
     #command-menu .menu-item {
@@ -152,13 +156,22 @@ class SmithTUI(App):
         height: 1;
     }
     #input {
-        height: 3;
-        padding: 1 2 0 2;
-        /* 左竖线画在输入框自身：只框住输入框 3 行，上面的运行动画行不跟着被框。
+        /* 高度随内容自适应：1 行时间距与原来一致（min-height 3），多行时向上长高，
+           封顶 max-height 后不再变高、改为内部滚动。
+           padding 上下对称（1 2 1 2）：此前底部为 0，单行时靠 min-height 撑出的空行
+           看着像底部留白，内容一到 2 行就被填满、留白"消失"；显式给底部 padding 后
+           每行都有稳定留白 */
+        height: auto;
+        min-height: 3;
+        max-height: 13;
+        padding: 1 2 1 2;
+        /* 左竖线画在输入框自身：只框住输入框自身的行，上面的运行动画行不跟着被框。
         heavy 用 ┃，比默认 solid 的细线 │ 粗一档（Textual 边框固定 1 格宽，只能改字形） */
         border: none;
         border-left: heavy #23d18b;
         background: #1e1e1e;
+        /* 与聊天区 / 命令菜单一致：不绘制滚动条，滚动功能不受影响 */
+        scrollbar-size-vertical: 0;
     }
     #input:focus {
         border: none;
@@ -269,17 +282,15 @@ class SmithTUI(App):
         padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
         margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
     }
-    SelectionPanel .selection-scroll {
+    /* 行区：单个自渲染控件（SelectionRows，定义在 panels.py），每行内容由
+       render_line 直接产出，故不再有 .selection-row/.selection-label/.selection-trailing
+       等逐行规则；选中反白 / 表头蓝等配色见 panels.py 顶部的 _ACCENT / _HEADER_FG
+       （Python 侧样式无法从 CSS 取值，两处需同步改）。滚动条与聊天区一致
+       不绘制——它只影响滚动快慢路径的观感，与逐键渲染次数无关 */
+    SelectionPanel .selection-rows {
         height: 1fr;
-        /* 与聊天区/命令菜单一致：不绘制滚动条，滚动功能不受影响 */
         scrollbar-size-vertical: 0;
     }
-    /* 每项一行：左侧占满剩余宽度，trailing（时间等）贴行尾右对齐；
-       选中行整行反白——底色由行承担，子项只设前景色，高亮才能贯通到行尾 */
-    SelectionPanel .selection-row { height: 1; width: 1fr; }
-    SelectionPanel .selection-row.selected { background: #fab283; }
-    SelectionPanel .selection-label { width: 1fr; height: 1; }
-    SelectionPanel .selection-trailing { width: auto; height: 1; }
     SelectionPanel .selection-hint { color: #808080; dock: bottom; }
     /* MCP 添加向导：居中卡片，选择步骤复用选择面板的配色语义 */
     McpWizardPanel {
@@ -861,11 +872,27 @@ class SmithTUI(App):
     def _sync_command_menu_anchor(self, running: bool) -> None:
         """运行动画可见性变化时更新命令菜单锚点：动画占一行则整体上移一行。
 
-        仅切换 CSS 类（见 `#command-menu.running`），不改菜单自身的定位逻辑。
+        切换 CSS 类（见 `#command-menu.running`）并在下一帧按实时几何重算 offset——
+        动画行会让输入区高一格，而输入框自身尺寸没变（不触发 resize），须显式重算。
         应用退出时组件可能已卸载，查不到菜单就忽略。"""
         found = self.query(CommandMenu)
         if found:
             found.first().set_class(running, "running")
+        self.call_after_refresh(self.anchor_command_menu)
+
+    def anchor_command_menu(self) -> None:
+        """按输入区实时几何重新锚定命令菜单：底部贴住输入区顶部。
+
+        输入框高度随内容自适应（1-12 行），写死行数的 offset 会随高度变化错位，
+        故每次输入区几何变化都重算（含上方运行动画行与下方底行的高度）。
+        应用退出 / 组件未挂载时查不到容器就忽略。"""
+        menu = self.query(CommandMenu)
+        wrap = self.query("#input-wrap")
+        bottom = self.query("#bottom")
+        if not (menu and wrap and bottom):
+            return
+        offset_y = -(wrap.first().region.height + bottom.first().region.height)
+        menu.first().styles.offset = (0, offset_y)
 
     def ui_running_stopping(self) -> None:
         """Esc 后让运行动画行尾显示「· 正在停止…」（组件已卸载则忽略）。"""

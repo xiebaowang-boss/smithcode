@@ -32,6 +32,30 @@ _CODE_FENCE = "```"
 _MAX_INDENT_TRIM = 12  # <pre> 整体缩进超过此值就不再判定为"统一缩进"（可能是列表内代码）
 
 
+def _cell_alignment(attrs) -> str | None:
+    """读单元格的对齐声明（`align` 属性或 `style` 里的 `text-align`），无则 None。"""
+    align = _attr(attrs, "align").lower()
+    if not align:
+        match = re.search(r"text-align\s*:\s*(left|right|center)", _attr(attrs, "style").lower())
+        align = match.group(1) if match else ""
+    return align if align in ("left", "right", "center") else None
+
+
+def _align_marker(align: str | None) -> str:
+    """对齐 → GFM 分隔行标记。"""
+    return {"left": ":---", "right": "---:", "center": ":---:"}.get(align or "", "---")
+
+
+def _escape_cell(text: str) -> str:
+    """转义单元格内容：竖线会破坏表格分列，换行在 GFM 表格里用 `<br>` 表示。"""
+    return text.replace("|", "\\|").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _table_row(cells: list[str]) -> str:
+    """渲染一行 GFM 表格（含首尾竖线）。"""
+    return "| " + " | ".join(_escape_cell(cell) for cell in cells) + " |"
+
+
 class _Converter(HTMLParser):
     """HTML → Markdown 的流式转换器（单次遍历，遇块即落行）。"""
 
@@ -49,6 +73,11 @@ class _Converter(HTMLParser):
         self._links: list[tuple[int, str]] = []  # (行内缓冲下标, href)
         self._marks: list[str] = []         # 待闭合的行内标记栈（** / * / `）
         self._quote_depth = 0               # 引用层数（落行时加 "> " 前缀）
+        self._rows: list[list[str]] | None = None  # 表格已收的行（None = 不在表格内）
+        self._row: list[str] = []           # 当前行已收的单元格
+        self._row_aligns: list[str | None] = []    # 当前行各列的对齐
+        self._aligns: list[str | None] = []        # 表头行的对齐（决定分隔行）
+        self._cell_start: int | None = None  # 当前单元格在 _buf 中的起点（None = 不在格内）
 
     # ---------- 对外 ----------
 
@@ -78,6 +107,63 @@ class _Converter(HTMLParser):
         self._flush()
         self._blank()
 
+    # ---------- 表格 ----------
+
+    @property
+    def _in_cell(self) -> bool:
+        """是否正处于某个单元格内。"""
+        return self._cell_start is not None
+
+    def _start_cell(self, attrs) -> None:
+        """开始一个单元格：记下起点，并把格子内的块级结构降级为行内。"""
+        self._end_cell()
+        if "".join(self._buf).strip():
+            # 畸形页面里 <td> 前挂着游离文本：先落行，避免混进单元格
+            self._flush()
+        self._cell_start = len(self._buf)
+        self._row_aligns.append(_cell_alignment(attrs))
+
+    def _end_cell(self) -> None:
+        """收尾当前单元格：取出行内缓冲内容作为一格。"""
+        if self._cell_start is None:
+            return
+        start = min(self._cell_start, len(self._buf))
+        text = re.sub(r"\s+", " ", "".join(self._buf[start:])).strip()
+        del self._buf[start:]
+        # 缓冲被裁短，指向格内的未闭合链接标记一并丢弃
+        self._links = [link for link in self._links if link[0] < start]
+        self._row.append(text)
+        self._cell_start = None
+
+    def _end_row(self) -> None:
+        """收尾当前行：有单元格才计入；表头行的对齐决定分隔行。"""
+        self._end_cell()
+        if not self._row or self._rows is None:
+            self._row, self._row_aligns = [], []
+            return
+        if not self._rows:
+            self._aligns = list(self._row_aligns)
+        self._rows.append(self._row)
+        self._row, self._row_aligns = [], []
+
+    def _emit_table(self) -> None:
+        """把已收的行渲染成 GFM 表格；列数按最宽行对齐补齐。"""
+        self._end_row()
+        rows = [row for row in (self._rows or []) if any(cell for cell in row)]
+        aligns = list(self._aligns)
+        self._rows, self._aligns, self._row, self._row_aligns = None, [], [], []
+        if not rows:
+            return
+        width = max(len(row) for row in rows)
+        rows = [row + [""] * (width - len(row)) for row in rows]
+        aligns = (aligns + [None] * width)[:width]
+        # GFM 表格必须有表头与分隔行：无 <th> 时把首行当表头
+        self.lines.append(_table_row(rows[0]))
+        self.lines.append("| " + " | ".join(_align_marker(a) for a in aligns) + " |")
+        for row in rows[1:]:
+            self.lines.append(_table_row(row))
+        self._blank()
+
     # ---------- 标签处理 ----------
 
     def handle_starttag(self, tag: str, attrs) -> None:
@@ -90,6 +176,22 @@ class _Converter(HTMLParser):
         if self._pre is not None:  # <pre> 内只关心代码语言
             if tag == "code":
                 self._pre_lang = _code_language(attrs)
+            return
+
+        # 表格结构优先于"格内忽略"判定：td/th/tr 自身必须被处理
+        if tag == "table":
+            if self._in_cell:
+                return  # 嵌套表格不展开，格内只当普通文本流
+            self._block()
+            self._rows, self._aligns = [], []
+            return
+        if tag in ("td", "th"):
+            if self._rows is not None:
+                self._start_cell(attrs)
+            return
+        if tag == "tr":
+            if self._rows is not None:
+                self._end_row()
             return
 
         if tag in _INLINE_MARKS:
@@ -109,6 +211,12 @@ class _Converter(HTMLParser):
             if src:
                 self._buf.append(f"![{_attr(attrs, 'alt')}]({src})")
             return
+
+        # 格内的结构性标签一律降级为行内：GFM 表格一格一行，
+        # 任何落行都会把一行拆成多行、破坏表格
+        if self._in_cell:
+            return
+
         if tag == "br":
             self._flush()
             return
@@ -139,13 +247,6 @@ class _Converter(HTMLParser):
             self._flush()
             self._list_stack.append(tag)
             return
-        if tag in ("td", "th"):
-            if "".join(self._buf).strip():
-                self._buf.append(" | ")
-            return
-        if tag == "tr":
-            self._flush()
-            return
         if tag == "dt":
             self._flush()
             return
@@ -165,7 +266,23 @@ class _Converter(HTMLParser):
             return
         if self._skip_depth:
             return
+
+        if tag == "table":
+            if self._rows is not None:
+                self._emit_table()
+            return
+        if tag in ("td", "th"):
+            if self._rows is not None:
+                self._end_cell()
+            return
+        if tag == "tr":
+            if self._rows is not None:
+                self._end_row()
+            return
+
         if tag == "pre":
+            if self._in_cell:
+                return  # 格内的 <pre> 已被降级为行内文本，无代码块可收
             self._emit_code()
             return
         if self._pre is not None:
@@ -180,6 +297,10 @@ class _Converter(HTMLParser):
         if tag == "a":
             self._close_link()
             return
+
+        if self._in_cell:
+            return  # 同 handle_starttag：格内不落行
+
         if tag == "li":
             self._flush()
             self._li_depth = max(0, self._li_depth - 1)
@@ -199,9 +320,6 @@ class _Converter(HTMLParser):
             self._flush(prefix="#" * self._heading + " ")
             self._heading = 0
             self._blank()
-            return
-        if tag == "tr":
-            self._flush()
             return
         if tag in _BLOCK_TAGS:
             if self._li_depth:

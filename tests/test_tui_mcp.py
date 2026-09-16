@@ -2,7 +2,7 @@
 
 import asyncio
 
-from textual.widgets import Input, Static
+from textual.widgets import Input
 
 from smithcode import config
 from smithcode.agent import Agent
@@ -199,8 +199,13 @@ def test_mcp_second_level_escape_returns_to_overview(monkeypatch, tmp_path):
             anchored = parent._items[parent._selected]
             assert anchored.value == "fake"
             assert anchored.current is False
-            row = parent.query(".selection-row")[parent._selected]
-            assert "当前" not in str(row.query_one(".selection-label", Static).content)
+            # 行由行区自渲染：直接看渲染出的那一行文本（先确认该行确实在可视区内，
+            # 否则 line_text 对滚出视口的行返回空串、断言会空转通过）
+            anchored_line = parent._rows_view.line_text(
+                parent._row_of_item[parent._selected]
+            )
+            assert anchored_line.strip()  # 非空 = 该行可见
+            assert "当前" not in anchored_line
 
             await pilot.press("escape")  # 根级 Esc：关闭
             await pilot.pause()
@@ -245,8 +250,7 @@ def test_selection_panel_hides_scrollbar(monkeypatch, tmp_path):
             panel = SelectionPanel("test", items, lambda value: app.screen.dismiss(value))
             app.push_screen(SelectionScreen(panel), callback=lambda value: None)
             await pilot.pause()
-            scroller = panel.query_one(".selection-scroll")
-            assert scroller.styles.scrollbar_size_vertical == 0
+            assert panel._rows_view.styles.scrollbar_size_vertical == 0
 
     asyncio.run(_case())
 
@@ -268,7 +272,13 @@ def test_selection_panel_grouping_headers(monkeypatch, tmp_path):
             app.push_screen(SelectionScreen(panel), callback=results.append)
             await pilot.pause()
 
-            headers = [str(w.content) for w in panel.query(".selection-header")]
+            # 表头由行区自渲染：按行计划找出 header 行，取其渲染文本
+            view = panel._rows_view
+            headers = [
+                view.line_text(row_index)
+                for row_index, row in enumerate(panel._rows)
+                if row[0] == "header"
+            ]
             assert len(headers) == 2
             assert any("Favorites" in text for text in headers)
             assert any("Provider A" in text for text in headers)

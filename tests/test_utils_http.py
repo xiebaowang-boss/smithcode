@@ -168,6 +168,37 @@ def test_is_public_address_blocks_non_global():
         assert http_util.is_public_address(ip) is False, ip
 
 
+def test_is_public_address_blocks_embedded_private_ipv4():
+    """回归：末 32 位嵌着内网 IPv4 的地址按嵌入的 IPv4 判定。
+
+    `64:ff9b::/96`（NAT64 well-known 前缀）与 `::ffff:0:0:0/96`
+    （IPv4-translated）的 `is_global` 都为 True——只看 IPv6 本身会放行，
+    而在 DNS64 网络里它们实际连到嵌入的那个（内网）IPv4。
+    """
+    for ip in (
+        "64:ff9b::7f00:1",          # NAT64 → 127.0.0.1
+        "64:ff9b::a00:1",           # NAT64 → 10.0.0.1
+        "64:ff9b::a9fe:a9fe",       # NAT64 → 169.254.169.254（云元数据）
+        "::ffff:0:127.0.0.1",       # IPv4-translated
+        "::ffff:0:10.0.0.1",
+    ):
+        assert http_util.is_public_address(ip) is False, ip
+
+
+def test_is_public_address_allows_embedded_public_ipv4():
+    """嵌入公网 IPv4 的过渡地址仍放行（不能连坐）。"""
+    for ip in ("64:ff9b::5db8:d822", "::ffff:93.184.216.34", "::ffff:8.8.8.8"):
+        assert http_util.is_public_address(ip) is True, ip
+
+
+def test_private_target_blocks_embedded_private_ipv4(monkeypatch):
+    """字面量与域名解析结果两条路径都要拦住嵌入内网的地址。"""
+    assert http_util.private_target("64:ff9b::a9fe:a9fe") == "64:ff9b::a9fe:a9fe"
+
+    monkeypatch.setattr(http_util, "resolve_host", lambda host: ["64:ff9b::7f00:1"])
+    assert http_util.private_target("rebind.example.com") == "64:ff9b::7f00:1"
+
+
 def test_is_public_address_treats_garbage_as_untrusted():
     assert http_util.is_public_address("not-an-ip") is False
 

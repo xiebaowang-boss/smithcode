@@ -11,11 +11,31 @@ import threading
 from dataclasses import dataclass
 from typing import ClassVar
 
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
+from textual.geometry import Size
 from textual.screen import ModalScreen
+from textual.scroll_view import ScrollView
+from textual.strip import Strip
 from textual.widgets import Input, Static
+
+# 面板配色：这些颜色在 Python 侧直接落成 rich 样式，需要一份定义。取不到 CSS 的
+# 值——`SmithTUI.CSS` 在 app.py，而 app.py 反向依赖本模块（成环），CSS 字符串满是
+# 花括号也不能用 f-string 插值。故取值与 `SmithTUI.CSS` 中同语义的规则保持一致
+# （`_MUTED` / `_CURSOR_BG` 为本模块专用），改色时两处一起改；遮罩底色等只出现在
+# 面板 DEFAULT_CSS 里的样式仍留在原处。
+_ACCENT = "#fab283"      # 强调：面板标题、选中行反白、向导选中项
+_TEXT = "#a9b1d6"        # 正文
+_MUTED = "#565f89"       # 次要说明、trailing 默认色
+_SUCCESS = "#23d18b"     # 成功（如「(当前)」标记）
+_ERROR = "#f7768e"       # 错误
+_CURSOR_BG = "#292e42"   # 选项列表的选中行底色
+_HEADER_FG = "#7aa2f7"   # 分组表头
+_SELECTED_STYLE = Style(bgcolor=_ACCENT)
+_HEADER_STYLE = Style(color=_HEADER_FG, bold=True)
 
 
 def _parse_choice_options(prompt: str, valid: str) -> list[tuple[str, str]]:
@@ -67,10 +87,10 @@ class PermissionPanel(Vertical):
 
     def _title_renderable(self) -> Text:
         """标题行的富文本：标题用标题色，工具摘要（content）同排跟在后面、保持灰色。"""
-        text = Text(self._title, style="#fab283")
+        text = Text(self._title, style=_ACCENT)
         if self._content:
             text.append("  ")  # 标题与内容之间留间隔
-            text.append(self._content, style="#a9b1d6")
+            text.append(self._content, style=_TEXT)
         return text
 
     def compose(self):
@@ -93,12 +113,12 @@ class PermissionPanel(Vertical):
         text = Text()
         for i, (key, label) in enumerate(self._options):
             if i == self._selected:
-                text.append(f" {i + 1}. {label} \n", style="on #292e42")
+                text.append(f" {i + 1}. {label} \n", style=f"on {_CURSOR_BG}")
             else:
-                text.append(f" {i + 1}. {label}\n", style="#a9b1d6")
+                text.append(f" {i + 1}. {label}\n", style=_TEXT)
             desc = self._descriptions.get(key)
             if desc:
-                text.append(f"    {desc}\n", style="#565f89")
+                text.append(f"    {desc}\n", style=_MUTED)
         return text
 
     def _refresh(self) -> None:
@@ -305,20 +325,20 @@ class QuestionPanel(Vertical):
             mark = f"[{'✓' if picked else ' '}] " if multiple else ""
             suffix = " ✓" if picked and not multiple else ""
             if i == selected:
-                text.append(f" {i + 1}. {mark}{opt}{suffix} \n", style="on #292e42")
+                text.append(f" {i + 1}. {mark}{opt}{suffix} \n", style=f"on {_CURSOR_BG}")
             else:
-                text.append(f" {i + 1}. {mark}{opt}{suffix}\n", style="#a9b1d6" if picked else "")
+                text.append(f" {i + 1}. {mark}{opt}{suffix}\n", style=_TEXT if picked else "")
             desc = descriptions[i] if i < len(descriptions) else ""
             if desc:
-                text.append(f"    {desc}\n", style="#565f89")
-        cursor_style = "on #292e42" if selected == len(options) else ""
+                text.append(f"    {desc}\n", style=_MUTED)
+        cursor_style = f"on {_CURSOR_BG}" if selected == len(options) else ""
         # 末行选项名固定为「输入自定义回答…」不随答案变化；已填答案缩进显示在其下方
         # （即输入框出现的位置）。编辑中内容在输入框里，此处不重复显示。
         text.append(f" {len(options) + 1}. 输入自定义回答… ", style=cursor_style)
         if not self._editing[self._index]:
             custom = self._custom[self._index].strip()
             if custom:
-                text.append(f"\n    {custom}", style="#565f89")
+                text.append(f"\n    {custom}", style=_MUTED)
         return text
 
     def _render_review(self) -> Text:
@@ -326,8 +346,8 @@ class QuestionPanel(Vertical):
         enter 直接提交整组，←/→ 可返回任一题修改（无需选中）。"""
         text = Text()
         for i, item in enumerate(self._questions):
-            text.append(f" {i + 1}. {item['question']}\n", style="#a9b1d6")
-            text.append(f"    {self._answers[i] or '（未答）'}\n", style="#565f89")
+            text.append(f" {i + 1}. {item['question']}\n", style=_TEXT)
+            text.append(f"    {self._answers[i] or '（未答）'}\n", style=_MUTED)
         return text
 
     def _refresh(self) -> None:
@@ -621,6 +641,139 @@ class SelectionItem:
     category: str = ""
 
 
+@dataclass(frozen=True)
+class SelectionRowSpec:
+    """行区渲染一行所需的全部信息（面板解算，行区只负责画）。
+
+    面板持有行计划与选中态，行区不该反过来读它的私有属性——两者的契约就是这个
+    对象：kind 决定画法（header 组标题 / blank 分组空行 / separator 条目间隔行 /
+    item 可选项），label 与 trailing 是已带好前景色的文本，selected 决定是否反白。
+    """
+
+    kind: str
+    label: Text | None = None
+    trailing: Text | None = None
+    selected: bool = False
+
+
+class SelectionRows(ScrollView):
+    """选择面板的行区：单个控件自渲染可见行（ScrollView + render_line）。
+
+    为什么不用「每行一个子控件」：那种结构下滚动与行刷新分属 Textual 的两次
+    刷新周期，会连续两次把内容写往终端，两次之间的中间态（新滚动位置仍配旧行
+    内容）被真实渲染出来，表现为逐键闪烁；渲染次数与写入量还随列表长度增长。
+    自渲染把滚动与行内容收进同一个控件、同一次刷新，每键只写一次终端
+    （600 项实测：2 次/键 → 1 次/键，写入字符数约为原来的 1/3）。
+    这也是 Textual 自带 OptionList 的做法（virtual_size + render_line）。
+
+    与面板的契约只有两个入参：行数，以及「行号 → SelectionRowSpec」的解算函数；
+    行区不碰面板的私有状态，因此不需要行 widget 缓存，也不受列表长度影响。
+    """
+
+    def __init__(self, row_count: int, row_spec, **kwargs):
+        """row_spec: 行计划行号（绝对）→ SelectionRowSpec 的解算函数。"""
+        super().__init__(**kwargs)
+        self._row_count = row_count
+        self._row_spec = row_spec
+        self.can_focus = False  # 按键归面板，行区只作展示与滚动
+
+    def on_mount(self) -> None:
+        super().on_mount()  # ScrollView 在此初始化滚动条，别吞掉
+        self._sync_virtual_size()
+
+    def on_resize(self) -> None:
+        self._sync_virtual_size()
+
+    def _sync_virtual_size(self) -> None:
+        """用「行数」撑出滚动空间；内容高度即行计划长度。"""
+        size = Size(max(self.size.width, 1), self._row_count)
+        if self.virtual_size != size:
+            self.virtual_size = size
+
+    def row_strip(self, row_index: int) -> Strip:
+        """按行计划**绝对行号**取该行渲染结果（滚出视口时返回空 Strip）。
+
+        与 render_line 的区别：render_line 的入参是**视口** y，这里收的是行计划
+        里的绝对行号，内部按当前 scroll_offset 换算——调用方（含测试）用这个，
+        不要自己算偏移。
+        """
+        y = row_index - int(self.scroll_offset.y)
+        if y < 0 or y >= self.size.height:
+            return Strip.blank(0, self._row_bg())
+        return self.render_line(y)
+
+    def line_text(self, row_index: int) -> str:
+        """row_strip 的纯文本形式（不含补白，供测试 / 调试查看）。"""
+        return self.row_strip(row_index).text
+
+    def render_line(self, y: int) -> Strip:
+        """画视口第 y 行：真实行号 = scroll_offset.y + y。"""
+        width = self.scrollable_content_region.width or self.size.width
+        base = self._row_bg()
+        if width <= 0:
+            return Strip.blank(0, base)
+        row_index = int(self.scroll_offset.y) + y
+        if row_index >= self._row_count:
+            # 行计划之外的留白也必须带样式：style=None 的 Segment 会让 Textual 的
+            # Monochrome 滤镜（NO_COLOR + 默认主题）解引用崩溃，而列表短于可视区时
+            # 这些行每次渲染都会产出（Textual 的 OptionList 在越界分支上同样带样式）。
+            return Strip.blank(width, base)
+
+        spec = self._row_spec(row_index)
+        if spec.kind in ("blank", "separator"):
+            return Strip.blank(width, base)
+        if spec.kind == "header":
+            return self._line(spec.label, None, width, base + _HEADER_STYLE)
+        row_base = base + _SELECTED_STYLE if spec.selected else base
+        return self._line(spec.label, spec.trailing, width, row_base)
+
+    def _row_bg(self) -> Style:
+        """非选中行的底色。
+
+        必须显式给出行底色：旧结构里每行是一个子控件，背景自动继承面板的
+        `background`（#1e1e1e）；自渲染后若把空白段留成「无背景」，这部分
+        会透出底下的遮罩/下层界面，看起来就是行区中间颜色与外部不一致。
+        `rich_style` 是行区解析后的有效样式，取它即与面板底色一致
+        （不写死颜色，跟随 CSS / 主题变化）。
+        """
+        return Style(bgcolor=self.rich_style.bgcolor)
+
+    def _line(self, label: Text, trailing: Text | None, width: int, base: Style) -> Strip:
+        """拼一行：左侧文本 + 空隙 + 右侧 trailing（贴行尾右对齐）。
+
+        底色一律由 base 承担（非选中行 = 行区背景，选中行 = 反白色），文字只设
+        前景色 —— 与旧结构里「底色在行上、子项只设前景色」的语义一致，故文本
+        之间的空隙也按 base 着色，整行底色贯通到行尾。
+
+        溢出优先级与旧结构（label `1fr` / trailing `auto`）一致：**先给 trailing
+        留位**，label 超出可用宽度才截断（加省略号）。反过来先保 label 会把时间 /
+        状态列整段挤出可视区——`/sessions`、`/mcp` 的 trailing 正是靠它常驻。
+
+        注意：底色不能用 `Text.style = base` 施加 —— rich 的 `Text` 在构造时
+        就把样式落到各 span 上，事后赋值 `style` 不会传播（实测渲染出的段
+        `style` 仍为 None，即无背景）。故统一在 `Strip` 层用 `apply_style`
+        叠加，它是 Textual 内部处理底色的同一手段。
+        """
+        console = self.app.console
+        trailing_cells = trailing.cell_len if trailing is not None else 0
+        available = max(width - trailing_cells, 0)
+        if available <= 0:
+            label = Text()  # 连 trailing 都放不下：label 整段让位（不留省略号，避免挤出 trailing）
+        elif label.cell_len > available:
+            label.truncate(available, overflow="ellipsis")  # 原地裁剪，保留各段前景色
+
+        segments = list(label.render(console))
+        used = label.cell_len
+        gap = width - used - trailing_cells
+        if gap > 0:
+            segments.append(Segment(" " * gap, Style()))
+        if trailing_cells:
+            segments.extend(trailing.render(console))
+        # 正常路径 gap 已把行补到 width；adjust 只作兜底（trailing 比整行还宽时裁尾）
+        strip = Strip(segments).adjust_cell_length(width)
+        return strip.apply_style(base)
+
+
 class SelectionScreen(ModalScreen):
     """居中选择弹窗的宿主屏。
 
@@ -690,7 +843,7 @@ class SelectionPanel(Vertical):
         self._row_of_item: dict = {}   # item 索引 → 行号（滚动定位用）
         self._build_rows()
         self._selected = self._resolve_initial(initial)
-        self._scroll: VerticalScroll | None = None
+        self._rows_view: SelectionRows | None = None
 
     def _build_rows(self) -> None:
         """按 category 变化插入分组表头（非首组前留一个空行），记录 item→行号。"""
@@ -717,43 +870,38 @@ class SelectionPanel(Vertical):
 
     def compose(self):
         yield Static(self._title, classes="selection-title", markup=False)
-        # 每项一行两列：左侧（标记 + 标题 + 说明）占满剩余宽度，右侧 trailing 贴行尾
-        # （时间等）——用列布局而非手工补空格，宽度随档位 / 终端自适应。
-        # 滚动容器本身不抢焦点（按键归面板）
-        with VerticalScroll(classes="selection-scroll") as scroll:
-            scroll.can_focus = False
-            self._scroll = scroll
-            for kind, *payload in self._rows:
-                yield self._row(kind, payload[0] if payload else None)
+        # 行区为单个自渲染控件（见 SelectionRows）：整块滚动 + 行内容由同一次
+        # 刷新产出，避免逐行子控件结构下滚动与行刷新各写一次终端造成的闪烁。
+        self._rows_view = SelectionRows(
+            len(self._rows), self.row_spec, classes="selection-rows"
+        )
+        yield self._rows_view
         yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint", markup=False)
 
     def on_mount(self) -> None:
         self.focus()  # 不聚焦，按键会落进隐藏的输入框
 
-    def _row(self, kind: str, payload):
-        """按行计划产出一行：分组表头 / 空行 / 普通条目（含间隔行）。"""
+    def row_spec(self, row_index: int) -> SelectionRowSpec:
+        """把行计划的一行解算成行区可画的数据（选中态在此落定）。
+
+        行区渲染所需的一切都从这个对象取，面板因此可以自由改行计划 / 选中态语义，
+        只要这里跟着改——行区不读面板的私有状态。
+        """
+        kind, *payload = self._rows[row_index]
         if kind == "header":
-            return Static(
-                Text(f"  {payload}", style="bold #7aa2f7"),
-                classes="selection-row selection-header", markup=False,
-            )
+            return SelectionRowSpec("header", label=Text(f"  {payload[0]}"))
         if kind == "blank":
-            return Static("", classes="selection-row selection-separator")
-        item = self._items[payload]
+            return SelectionRowSpec("blank")
+        item = self._items[payload[0]]
         if item.separator:
-            # 间隔行：占位一行、不可选中，仅用于分组留白
-            return Horizontal(classes="selection-row selection-separator")
-        selected = payload == self._selected
-        row = Horizontal(
-            Static(self._label_text(item, selected), classes="selection-label",
-                   markup=False),
-            Static(self._trailing_text(item, selected), classes="selection-trailing",
-                   markup=False),
-            classes="selection-row",
+            return SelectionRowSpec("separator")  # 间隔行：占位留白，不可选中
+        selected = payload[0] == self._selected
+        return SelectionRowSpec(
+            "item",
+            label=self._label_text(item, selected),
+            trailing=self._trailing_text(item, selected),
+            selected=selected,
         )
-        if selected:
-            row.add_class("selected")
-        return row
 
     def _label_text(self, item, selected: bool) -> Text:
         """左侧文本：选中行整行反白，底色由行承担，这里只设前景色。"""
@@ -765,50 +913,43 @@ class SelectionPanel(Vertical):
             if item.current:
                 text.append("  (当前)", style="black")
         else:
-            text.append(f"  {item.label}", style="#a9b1d6")
+            text.append(f"  {item.label}", style=_TEXT)
             if item.description:
-                text.append(f"  {item.description}", style="#565f89")
+                text.append(f"  {item.description}", style=_MUTED)
             if item.current:
-                text.append("  (当前)", style="#23d18b")
+                text.append("  (当前)", style=_SUCCESS)
         return text
 
     def _trailing_text(self, item, selected: bool) -> Text:
         if not item.trailing:
             return Text()
-        style = "black" if selected else (item.trailing_style or "#565f89")
+        style = "black" if selected else (item.trailing_style or _MUTED)
         return Text(item.trailing, style=style)
 
     def _refresh(self) -> None:
-        for row, (kind, *payload) in zip(self.query(".selection-row"), self._rows):
-            if kind != "item":
-                continue  # 表头 / 空行不更新内容
-            index = payload[0]
-            item = self._items[index]
-            if item.separator:
-                continue
-            selected = index == self._selected
-            row.set_class(selected, "selected")
-            row.query_one(".selection-label", Static).update(
-                self._label_text(item, selected)
-            )
-            row.query_one(".selection-trailing", Static).update(
-                self._trailing_text(item, selected)
-            )
+        """按当前选中状态重绘行区。
+
+        行区是单个自渲染控件，重绘即整块按 scroll_offset 重新渲染可见行；
+        无需（也没有）逐行 widget 可缓存，成本与可见行数相关，与列表总长度无关。
+        配合 _ensure_visible 先滚动、后刷新，滚动与内容落在同一次刷新里。
+        """
+        if self._rows_view is not None:
+            self._rows_view.refresh()
 
     def _ensure_visible(self) -> None:
         """把当前选中项滚动进可视区（按行计划映射的真实行号）。"""
-        scroll = self._scroll
-        if scroll is None:
+        view = self._rows_view
+        if view is None:
             return
         row = self._row_of_item.get(self._selected)
         if row is None:
             return
-        top = int(scroll.scroll_offset.y)
-        height = scroll.size.height
+        top = int(view.scroll_offset.y)
+        height = view.size.height
         if row < top:
-            scroll.scroll_to(y=row, animate=False)
+            view.scroll_to(y=row, animate=False)
         elif row >= top + height:
-            scroll.scroll_to(y=row - height + 1, animate=False)
+            view.scroll_to(y=row - height + 1, animate=False)
 
     def action_move_prev(self) -> None:
         self._move(-1)
@@ -825,8 +966,8 @@ class SelectionPanel(Vertical):
             if self._selected in self._selectable else 0
         )
         self._selected = self._selectable[(position + delta) % len(self._selectable)]
-        self._refresh()
-        self._ensure_visible()
+        self._ensure_visible()   # 先滚动（改 scroll_offset）
+        self._refresh()          # 再置脏：两者在同一次刷新里产出，无中间态
 
     def action_confirm(self) -> None:
         if not self._selectable:
@@ -961,17 +1102,17 @@ class McpWizardPanel(Vertical):
     def _choice_text(self, step) -> Text:
         text = Text()
         if self._error:
-            text.append(f"! {self._error}\n\n", style="#f7768e")
+            text.append(f"! {self._error}\n\n", style=_ERROR)
         for index, (label, _value) in enumerate(step.options):
             selected = index == self._selected
             text.append(("› " if selected else "  ") + label + "\n",
-                        style="bold #fab283" if selected else "#a9b1d6")
+                        style=f"bold {_ACCENT}" if selected else _TEXT)
         return text
 
     def _with_error(self, body: str) -> Text:
         text = Text()
         if self._error:
-            text.append(f"! {self._error}\n\n", style="#f7768e")
+            text.append(f"! {self._error}\n\n", style=_ERROR)
         if body:
             text.append(body)
         return text

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+from rich.color import ColorTriplet
 from textual.geometry import Region
 from textual.widgets import Static
 
@@ -18,6 +19,7 @@ from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import (
     PermissionPanel,
     QuestionPanel,
+    SelectionItem,
     SelectionPanel,
     SelectionScreen,
 )
@@ -2157,12 +2159,13 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
             panel = app.screen.query_one("SelectionPanel")
             assert panel.has_class("size-large")
             assert panel.styles.width.value == 88
-            # 时间列（trailing）贴行尾右对齐，标题后跟短 id
-            row = panel.query(".selection-row").first()
-            trailing = row.query_one(".selection-trailing", Static)
-            assert trailing.region.right == row.region.right
-            assert str(trailing.content).strip()  # 时间为非空
-            assert store.id[:8] in str(row.query_one(".selection-label", Static).content)
+            # 行由行区控件自渲染（无逐行子控件）：trailing 贴行尾右对齐 = 该行
+            # 文本单元格数等于可视宽度，且尾部无补白（空隙在中间）、内容含短 id
+            view = panel._rows_view
+            line = view.row_strip(panel._row_of_item[0])
+            assert line.cell_length == view.scrollable_content_region.width
+            assert not line.text.endswith(" ")  # 时间贴行尾，行尾不留补白
+            assert store.id[:8] in line.text
 
             await pilot.press("enter")  # 选中唯一会话 → 切换
             await pilot.pause()
@@ -2291,6 +2294,215 @@ def test_command_menu_escape_closes_and_arrows_move(monkeypatch):
 
 
 # ---------- 通用选择面板（居中弹窗） ----------
+
+def test_selection_panel_rerenders_once_per_move(monkeypatch):
+    """大列表逐键移动只触发一次行区刷新，且行区无逐行子控件。
+
+    回归背景：早先每行是一个子控件，滚动时「行刷新 + 滚动」分属两次刷新周期，
+    每键要连续两次把内容写往终端，两次之间的中间态被渲染出来 → 逐键闪烁
+    （600 项实测 2 次/键）。自渲染行区（SelectionRows）把两者收进同一次刷新
+    （实测 1 次/键），这里锁定「无逐行子控件」与「每键只刷一次」两项。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label=f"model-{i}", value=f"m{i}", current=(i == 2))
+                for i in range(200)
+            ]
+            panel = SelectionPanel("选择模型", items, lambda value: None, size="large")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+            panel.focus()
+
+            assert panel._selected == 2  # 当前项
+            view = panel._rows_view
+            # 行区是单个自渲染控件：没有逐行子控件（200 项也只有一个控件）
+            assert len(view.children) == 0
+            assert "›" in view.line_text(panel._row_of_item[2])
+
+            # 记录行区 refresh 次数：每键移动只应刷新一次
+            calls = []
+            orig_refresh = type(view).refresh
+
+            def spy(self, *args, **kwargs):
+                if self is view:
+                    calls.append(1)
+                return orig_refresh(self, *args, **kwargs)
+
+            type(view).refresh = spy
+            try:
+                await pilot.press("down")
+                await pilot.pause()
+            finally:
+                type(view).refresh = orig_refresh
+
+            assert panel._selected == 3
+            assert len(calls) == 1  # 每键一次刷新，不再有第二次写入
+
+            # 旧行还原、新行高亮
+            assert "›" not in view.line_text(panel._row_of_item[2])
+            assert "(当前)" in view.line_text(panel._row_of_item[2])
+            assert "›" in view.line_text(panel._row_of_item[3])
+
+    _run(_run_case())
+
+
+def test_selection_panel_scroll_renders_without_extra_pass(monkeypatch):
+    """跨屏滚动时每键仍只渲染一次（自渲染行区的核心收益）。
+
+    隔离滚动因素：先滚到列表中部（此时每次移动都会改变 scroll_offset），
+    再统计移动若干次产生的渲染次数——应等于移动次数，而非其两倍。
+    """
+    from textual._compositor import Compositor
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label=f"model-{i}", value=f"m{i}", current=(i == 0))
+                for i in range(300)
+            ]
+            panel = SelectionPanel("选择模型", items, lambda value: None, size="large")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+            panel.focus()
+            for _ in range(40):  # 滚到中部，确保后续每次移动都跨屏
+                await pilot.press("down")
+            await pilot.pause()
+            assert panel._rows_view.scroll_offset.y > 0
+
+            renders = []
+            orig = Compositor.render_update
+
+            def spy(self, *args, **kwargs):
+                renders.append(1)
+                return orig(self, *args, **kwargs)
+
+            Compositor.render_update = spy
+            try:
+                for _ in range(10):
+                    await pilot.press("down")
+                    await pilot.pause()
+            finally:
+                Compositor.render_update = orig
+
+            # 每次移动至多一次渲染（不再出现「行刷新 + 滚动」的两次写入）
+            assert len(renders) <= 10, f"每键渲染次数过多: {len(renders)} 次/10 键"
+
+    _run(_run_case())
+
+
+def test_selection_panel_rows_share_panel_background(monkeypatch):
+    """行区每个单元格都带底色（含表头 / 间隔行与行计划之外的留白）。
+
+    回归背景：①自渲染行区若把非选中行的空白段留成「无背景」，这部分会透出
+    半透明遮罩与下层界面，看起来就是选择框中间的颜色与外部不一致（旧结构
+    里每行是子控件、背景自动继承面板，不存在该问题）；②列表短于可视区时，
+    行计划之外的留白曾以 style=None 的 Segment 产出——那是 NO_COLOR 下崩溃的
+    源头（见 test_selection_panel_renders_with_no_color）。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label="a", value="a", category="组"),
+                SelectionItem(label="", value="", separator=True),
+                SelectionItem(label="b", value="b", trailing="12:00"),
+            ]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+
+            view = panel._rows_view
+            panel_bg = panel.rich_style.bgcolor
+            assert panel_bg is not None  # 面板有底色可继承
+            assert view.size.height > len(panel._rows)  # 存在行计划之外的留白
+
+            # 视口每一行的每个单元格都必须有背景（表头行 / 间隔行 / 越界留白一并覆盖）
+            for y in range(view.size.height):
+                strip = view.render_line(y)
+                assert strip._segments, f"视口第 {y} 行没有段"
+                for seg in strip._segments:
+                    assert seg.style is not None and seg.style.bgcolor is not None, (
+                        f"视口第 {y} 行有未着色的段，会透出下层背景或让 NO_COLOR 滤镜崩溃"
+                    )
+                row_index = int(view.scroll_offset.y) + y
+                if row_index != panel._row_of_item[0]:
+                    assert strip._segments[0].style.bgcolor == panel_bg
+
+            # 选中行整行反白，非选中行用面板底色
+            selected_strip = view.row_strip(panel._row_of_item[0])
+            assert (
+                selected_strip._segments[0].style.bgcolor.get_truecolor()
+                == ColorTriplet(250, 178, 131)  # #fab283
+            )
+
+    _run(_run_case())
+
+
+def test_selection_panel_keeps_trailing_when_label_overflows(monkeypatch):
+    """label 超长时截断 label、保住 trailing（时间 / 状态列不被挤掉）。
+
+    回归背景：自渲染行区若先按 label 铺满整行，`Strip.adjust_cell_length` 会从
+    行尾把 trailing 整段裁掉——而 /sessions 的时间、/mcp 的状态正是靠 trailing
+    常驻，旧结构（label `1fr` / trailing `auto`）始终给它留位。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [
+                SelectionItem(label="长标题" * 40, value="a", trailing="12:00"),
+                SelectionItem(label="短的", value="b", trailing="12:00"),
+            ]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()
+
+            view = panel._rows_view
+            overflow = view.row_strip(panel._row_of_item[0])
+            assert overflow.cell_length == view.scrollable_content_region.width
+            assert overflow.text.endswith("12:00")  # trailing 常驻行尾
+            assert "…" in overflow.text             # 超长 label 以省略号收尾
+
+            short = view.row_strip(panel._row_of_item[1])
+            assert short.text.endswith("12:00")
+            assert "…" not in short.text
+
+    _run(_run_case())
+
+
+def test_selection_panel_renders_with_no_color(monkeypatch):
+    """NO_COLOR 下行区渲染不崩：行计划之外的留白也必须带样式。
+
+    回归背景：Textual 在 NO_COLOR + 默认主题（ansi=False）下挂 Monochrome 滤镜，
+    它直接对每个 Segment 的 style 解引用（`style.color`）——行区越界留白曾以
+    style=None 的段产出，于是只要列表短于可视区（min-height 16 下几乎总是），
+    一开选择面板就 AttributeError、整个 TUI 崩掉。
+    """
+    monkeypatch.setenv("NO_COLOR", "1")
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        assert app.no_color  # 环境确实让 Textual 进了无色模式
+        async with app.run_test(size=(120, 40)) as pilot:
+            items = [SelectionItem(label="a", value="a")]
+            panel = SelectionPanel("标题", items, lambda value: None, size="medium")
+            app.push_screen(SelectionScreen(panel))
+            await pilot.pause()  # 首次渲染即经过 Monochrome 滤镜
+
+            view = panel._rows_view
+            assert view.size.height > len(panel._rows)  # 确认存在越界留白
+            for y in range(view.size.height):
+                strip = view.render_line(y)
+                assert all(seg.style is not None for seg in strip._segments)
+
+            await pilot.press("escape")  # 面板仍可正常交互（没有在渲染里崩掉）
+            await pilot.pause()
+
+    _run(_run_case())
+
 
 def test_selection_panel_size_tiers_and_fallback():
     """size 档位落到 CSS 类（宽度值在 SmithTUI.CSS）；未知档位回退默认 medium。"""
@@ -2754,11 +2966,168 @@ def test_selection_panel_scrolls_to_selected(monkeypatch):
             inp.insert("/model")
             await pilot.press("enter")
             await pilot.pause()
-            scroll = app.screen.query_one(".selection-scroll")
-            assert scroll.show_vertical_scrollbar  # 内容超出：出现滚动条
+            view = app.screen.query_one(".selection-rows")
+            assert view.max_scroll_y > 0  # 内容超出可视区：可滚动
             for _ in range(39):  # 移到最后一个（可视区之外）
                 await pilot.press("down")
             await pilot.pause()
-            assert scroll.scroll_offset.y > 0  # 已自动滚到选中项
+            assert view.scroll_offset.y > 0  # 已自动滚到选中项
+
+    _run(_run_case())
+
+
+def test_input_has_no_scrollbar(monkeypatch):
+    """输入框不绘制滚动条（与聊天区 / 命令菜单 / 选择面板一致）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.text = "\n".join(f"行{i}" for i in range(30))  # 远超 max-height
+            await pilot.pause()
+            assert inp.scrollbar_size_vertical == 0  # 不绘制
+            assert inp.max_scroll_y > 0  # 但滚动功能不受影响
+
+    _run(_run_case())
+
+
+def test_input_grows_with_lines_and_caps(monkeypatch):
+    """输入框随内容行数向上长高，封顶 max-height 后不再变高。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 32)) as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            await pilot.pause()
+            baseline = inp.region.height
+
+            inp.text = "一行"
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == baseline  # 单行：保持原高度（min-height）
+
+            inp.text = "\n".join(f"行{i}" for i in range(6))
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height > baseline  # 多行：变高
+
+            inp.text = "\n".join(f"行{i}" for i in range(13))
+            await pilot.pause()
+            await pilot.pause()
+            capped = inp.region.height
+            assert capped == 13  # 到 max-height
+
+            inp.text = "\n".join(f"行{i}" for i in range(20))
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == capped  # 封顶后不再变高
+
+            inp.text = ""
+            await pilot.pause()
+            await pilot.pause()
+            assert inp.region.height == baseline  # 清空回落
+
+    _run(_run_case())
+
+
+def test_command_menu_anchors_above_input_at_any_height(monkeypatch):
+    """输入框长高后命令菜单仍贴住输入区顶部（锚点随实时几何重算）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        from smithcode import commands
+
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 32)) as pilot:
+            inp = app.query_one(ChatInput)
+            menu = app.query_one(CommandMenu)
+            wrap = app.query_one("#input-wrap")
+            inp.focus()
+            await pilot.pause()
+
+            for rows, running in ((1, False), (5, False), (10, False), (5, True)):
+                inp.text = "\n" * (rows - 1)
+                app.query_one("#running").display = running
+                await pilot.pause()
+                menu.show_candidates(commands.complete_commands(""))
+                await pilot.pause()
+                app.anchor_command_menu()
+                await pilot.pause()
+                assert menu.region.bottom == wrap.region.y  # 贴住输入区顶部
+
+    _run(_run_case())
+
+
+def test_input_keeps_bottom_padding_when_multiline(monkeypatch):
+    """换行后底部留白不消失：输入框上下 padding 各占 1 行，不靠 min-height 撑。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 34)) as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            await pilot.pause()
+
+            for rows in (1, 2, 3, 5):
+                inp.text = "\n".join(f"L{i}" for i in range(rows))
+                await pilot.pause()
+                await pilot.pause()
+                # 内容区高度 == 文本行数，说明多出的行是 padding 而非空内容行
+                assert inp.content_size.height == rows
+                # 盒高 = 内容 + 上下 padding(各 1)
+                assert inp.region.height == rows + 2
+
+    _run(_run_case())
+
+
+def test_shift_enter_inserts_newline_and_enter_sends(monkeypatch):
+    """Shift+Enter 插入换行不发送，Enter 发送且多行内容完整送达。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            inp.focus()
+            inp.insert("第一行")
+            await pilot.press("shift+enter")
+            await pilot.pause()
+            inp.insert("第二行")
+            await pilot.pause()
+            assert inp.text == "第一行\n第二行"  # 换行已插入、未发送
+            assert app._busy is False
+
+            await pilot.press("enter")
+            for _ in range(200):
+                if not app._busy:
+                    break
+                await pilot.pause(0.02)
+            await pilot.pause()
+            assert inp.text == ""  # 已发送并清空
+            text = _chat_text(app)
+            assert "第一行" in text and "第二行" in text  # 两行都进了对话区
+
+    _run(_run_case())
+
+
+def test_input_placeholder_hints_newline_keys(monkeypatch):
+    """空输入时占位提示给出换行键（含不支持 kitty 协议终端的 Ctrl+J 兜底）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            inp = app.query_one(ChatInput)
+            assert "Shift+Enter" in inp.placeholder
+            assert "Ctrl+J" in inp.placeholder  # 终端不支持时的可靠替代
+            inp.focus()
+            inp.insert("x")
+            await pilot.pause()
+            assert inp.text == "x"  # placeholder 只是提示，不干扰输入
 
     _run(_run_case())

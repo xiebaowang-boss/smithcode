@@ -424,6 +424,44 @@ def load_allow_private_urls() -> bool:
     return False
 
 
+# websearch 的检索后端：auto 按内置顺序逐个尝试（Brave → Bing → DuckDuckGo），
+# 命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如无代理时 Brave
+# 不可达、有代理时 Bing 会返回无关结果），故开放配置而不写死。
+SEARCH_BACKENDS = ("auto", "brave", "bing", "ddg")
+DEFAULT_SEARCH_BACKEND = "auto"
+
+
+def load_search_backend() -> str:
+    """websearch 使用哪个检索后端。
+
+    优先级：SMITHCODE_SEARCH_BACKEND > config.toml 的 [search].backend > 默认 auto。
+    可选 auto / brave / bing / ddg；空串视为"没配"，非法值打印警告并降级为 auto。
+    """
+    env = os.getenv("SMITHCODE_SEARCH_BACKEND", "").strip().lower()
+    if env:
+        if env in SEARCH_BACKENDS:
+            return env
+        print(
+            f"[警告] SMITHCODE_SEARCH_BACKEND 的值 {env!r} 无效"
+            f"（可选 {'/'.join(SEARCH_BACKENDS)}），已用默认值 {DEFAULT_SEARCH_BACKEND}"
+        )
+        return DEFAULT_SEARCH_BACKEND
+    data = _read_config_file().get("search") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [search] 段不是表，已忽略")
+        return DEFAULT_SEARCH_BACKEND
+    value = data.get("backend")
+    if value is None:
+        return DEFAULT_SEARCH_BACKEND
+    if isinstance(value, str) and value.strip().lower() in SEARCH_BACKENDS:
+        return value.strip().lower()
+    print(
+        f"[警告] config.toml 的 [search].backend = {value!r} 无效"
+        f"（可选 {'/'.join(SEARCH_BACKENDS)}），已用默认值 {DEFAULT_SEARCH_BACKEND}"
+    )
+    return DEFAULT_SEARCH_BACKEND
+
+
 # ---------- 技能（Skills） ----------
 
 SKILLS_PROJECT_MODES = ("ask", "on", "off")

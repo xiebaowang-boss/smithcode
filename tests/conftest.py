@@ -29,12 +29,13 @@ def _isolate_terminal_title(monkeypatch):
 
 # ---------- 本地假 HTTP 代理（网络工具的环境代理回归用例） ----------
 
-_PROXY_GET_BODY = "<html><body><p>来自代理 {path}</p></body></html>"
-_PROXY_POST_BODY = (
-    "<html><body>"
-    '<a rel="nofollow" class="result__a" href="https://proxy.example.org/r">代理结果</a>'
-    '<a class="result__snippet" href="https://proxy.example.org/r">代理摘要</a>'
-    "</body></html>"
+_PROXY_PAGE_BODY = "<html><body><p>来自代理 {path}</p></body></html>"
+# 检索用例把后端端点指到 .../search，据此回一份 Brave 结构的结果页
+_PROXY_SEARCH_BODY = (
+    '<html><body><div data-type="web"><a href="https://proxy.example.org/r">'
+    '<div class="title search-snippet-title">代理结果</div></a>'
+    '<div class="content line-clamp-dynamic">代理摘要</div>'
+    "</div></body></html>"
 )
 
 
@@ -42,9 +43,10 @@ _PROXY_POST_BODY = (
 def fake_http_proxy():
     """本地假 HTTP 代理：证明工具真的走了环境代理，且不依赖外网。
 
-    GET 回 `来自代理 <绝对 URL>`，POST 回一份 DDG 结果页；`.requests` 记录每个
-    被转发的请求（方法 / 绝对 URI / 表单体 / UA）。目标域名请用 `.invalid`
-    保留域——不走代理就必然 DNS 失败，所以用例通过即等价于"代理生效"。
+    按路径分流：含 `search` 的回一份 Brave 结构的结果页（websearch），其余回
+    `来自代理 <绝对 URL>`（webfetch）；`.requests` 记录每个被转发的请求
+    （方法 / 绝对 URI / 表单体 / UA）。目标域名请用 `.invalid` 保留域——不走
+    代理就必然 DNS 失败，所以用例通过即等价于"代理生效"。
     """
     requests: list[dict] = []
 
@@ -60,7 +62,7 @@ def fake_http_proxy():
                 "body": payload.decode("utf-8", "replace"),
                 "user_agent": self.headers.get("User-Agent", ""),
             })
-            template = _PROXY_POST_BODY if self.command == "POST" else _PROXY_GET_BODY
+            template = _PROXY_SEARCH_BODY if "search" in self.path else _PROXY_PAGE_BODY
             body = template.format(path=self.path).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
