@@ -216,12 +216,12 @@ class ChatView(VerticalScroll):
     def _user(self, text: str) -> None:
         """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
 
-        提交自己的消息视为回到最新位置：无条件滚到底（不受锚定约束）。"""
+        提交自己的消息视为回到最新位置：无条件滚到底并恢复锚定（不受翻历史约束）。"""
         self._finalize_context()
         block = Static(Text(text), classes="chat-item user-msg")
         block.can_focus = False
         self.mount(block)
-        self.scroll_end(animate=False)
+        self.anchor()
 
     def _assistant(self, text: str) -> None:
         """静态整段正文（历史回放）：复用流式按块渲染，一次定型。"""
@@ -271,14 +271,18 @@ class ChatView(VerticalScroll):
     def _tool_detail(self, tool_id, detail: str) -> None:
         widget = self._tool_widgets.get(tool_id) if tool_id is not None else None
         if widget is not None:
+            at_bottom = self._at_bottom()
             widget.set_detail(detail)
+            self._follow(at_bottom)
 
     def _tool_finish(self, item: ToolResult) -> None:
         widget = (self._tool_widgets.pop(item.tool_id, None)
                   if item.tool_id is not None else None)
         if widget is not None:
+            at_bottom = self._at_bottom()
             widget.set_result(item.result, expanded=item.expand, is_error=item.is_error)
             self.mark_tool_done(item.tool_id)
+            self._follow(at_bottom)
         else:  # 无配对（理论上不发生）：退化为独立块，不丢结果
             self.add_widget(ToolCall(
                 "[Tool]", item.result, expanded=item.expand,
@@ -450,9 +454,18 @@ class ChatView(VerticalScroll):
         return self.scroll_offset.y >= self.max_scroll_y - 1
 
     def _follow(self, at_bottom: bool) -> None:
-        """底部锚定跟随：用户贴底时才滚到底；翻看历史时保持位置不打断。"""
+        """底部锚定跟随：用户贴底时才贴底；翻看历史时保持位置不打断。
+
+        走 Textual 原生锚定（`anchor()`）而不是 `scroll_end()`：`scroll_end` 一次性
+        算出目标行号，只能在"发出那一刻"的 virtual_size 上取 max_scroll_y——流式
+        正文按帧节流（MessageBody 每 16ms 至多重排一次，节流掉的 chunk 不触发布局）、
+        输入区高度变化（运行动画 / 命令菜单 / 输入框增高会让聊天区变矮）都会让这个
+        目标值过期，落点差 1 行以上就再也追不回来（此后每次贴底判断都为假）。
+        锚定则把贴底交给合成器：**每次布局**都按真实内容高度重算贴底位置，节流与
+        容器高度变化都会自动纠正；用户滚动时 Textual 自动解除锚定（scroll_to 默认
+        release_anchor），滚回底部再重新锚定。"""
         if at_bottom:
-            self.scroll_end(animate=False)
+            self.anchor()
 
 
 # ---------- 运行中动画 ----------

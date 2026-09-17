@@ -3213,3 +3213,121 @@ def test_input_placeholder_hints_newline_keys(monkeypatch):
             assert inp.text == "x"  # placeholder 只是提示，不干扰输入
 
     _run(_run_case())
+
+
+# ---------- 对话区滚动跟随（底部锚定） ----------
+
+
+def _fill_chat(app, lines: int = 40) -> None:
+    """把对话区填到超出视口，供滚动跟随用例使用。"""
+    for i in range(lines):
+        app.ui_notice(f"填充行 {i}")
+
+
+def test_chat_follows_content_growth_when_at_bottom(monkeypatch):
+    """贴底时任何内容增长都保持贴底：普通块 / 流式正文（含节流窗口内的 chunk）/
+    工具结果展开 / 变更预览展开 / 聊天区变矮（输入框增高）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(80, 20)) as pilot:
+            chat = app.query_one(ChatView)
+            _fill_chat(app)
+            await pilot.pause()
+            assert chat._at_bottom()
+
+            app.ui_notice("普通通知")
+            await pilot.pause()
+            assert chat._at_bottom()
+
+            # 两个 chunk 落在同一节流窗口（MessageBody 每帧至多重排一次）：
+            # 第二次追加不触发布局，贴底必须由布局期锚定兜住
+            app.ui_stream("content", "第一段正文。\n\n")
+            app.ui_stream("content", "第二段正文，再多写一些内容让它长高。\n\n")
+            await pilot.pause()
+            assert chat._at_bottom()
+
+            # 非上下文工具（独立块）：结果展开让 body 由隐藏转可见
+            app.ui_tool_start(1, "write b.py", "block", "write_file")
+            await pilot.pause()
+            app.ui_tool_result(1, "\n".join(f"结果行 {i}" for i in range(12)), True, False)
+            await pilot.pause()
+            assert chat._at_bottom()
+
+            # pending 期收到变更预览：diff 就地展开
+            app.ui_tool_preview(
+                1, "--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-旧\n"
+                   + "\n".join(f"+新增行 {i}" for i in range(10))
+            )
+            await pilot.pause()
+            assert chat._at_bottom()
+
+            # 聊天区变矮：输入框增高会让容器高度变化，贴底位置必须重算
+            app.query_one(ChatInput).text = "\n".join(f"第 {i} 行" for i in range(5))
+            await pilot.pause()
+            assert chat._at_bottom()
+            app.ui_notice("容器变矮后的新内容")
+            await pilot.pause()
+            assert chat._at_bottom()
+
+    _run(_run_case())
+
+
+def test_chat_keeps_position_while_reading_history(monkeypatch):
+    """翻历史（离底）时新内容不移动视口；滚回底部后恢复跟随。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(80, 20)) as pilot:
+            chat = app.query_one(ChatView)
+            _fill_chat(app)
+            await pilot.pause()
+
+            for _ in range(4):  # 逐格上滚（每格一帧，同真实滚轮）
+                chat.scroll_up(animate=False)
+                await pilot.pause()
+            assert not chat._at_bottom()
+            parked = chat.scroll_offset.y
+
+            app.ui_notice("上滚期间的新内容")
+            app.ui_stream("content", "上滚期间的流式正文，写长一点。\n\n")
+            await pilot.pause()
+            assert chat.scroll_offset.y == parked  # 视口不动
+
+            for _ in range(20):  # 滚回底部
+                chat.scroll_down(animate=False)
+                await pilot.pause()
+            assert chat._at_bottom()
+            app.ui_notice("回底后的新内容")
+            await pilot.pause()
+            assert chat._at_bottom()  # 跟随恢复
+
+    _run(_run_case())
+
+
+def test_user_message_returns_to_bottom_while_reading_history(monkeypatch):
+    """翻历史时提交自己的消息：无条件回到最新位置并恢复跟随。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(80, 20)) as pilot:
+            chat = app.query_one(ChatView)
+            _fill_chat(app)
+            await pilot.pause()
+
+            for _ in range(4):
+                chat.scroll_up(animate=False)
+                await pilot.pause()
+            assert not chat._at_bottom()
+
+            app.query_one(ChatView).add_user("翻历史时的新提问")
+            await pilot.pause()
+            assert chat._at_bottom()
+            app.ui_notice("提问后的新内容")
+            await pilot.pause()
+            assert chat._at_bottom()  # 已重新锚定
+
+    _run(_run_case())
