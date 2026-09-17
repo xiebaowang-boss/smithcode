@@ -172,7 +172,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
-**busy 守卫**（对齐 opencode）：任务运行中 `/new` 被 TUI 拦截，只提示「请等待完成或先按 Esc 中断」而不执行——后台线程仍在写消息历史，中途重置会撕裂进行中的轮次。命令执行时机被约束到 agent 空闲时，从机制上消灭竞态；REPL 为同步运行，命令天然只在空闲时执行，无需守卫。同一守卫覆盖会改动 MCP 配置的操作（`/mcp add|remove|enable|disable|reconnect`）。
+**busy 守卫**（对齐 opencode）：任务运行中 `/new` 被 TUI 拦截，只提示「请等待完成或先按 Esc 中断」而不执行——后台线程仍在写消息历史，中途重置会撕裂进行中的轮次。命令执行时机被约束到 agent 空闲时，从机制上消灭竞态；REPL 为同步运行，命令天然只在空闲时执行，无需守卫。同一守卫覆盖会改动 MCP 配置的操作（`/mcp add|remove|enable|disable|reconnect`）与技能名直达（`/技能名`）：技能加载在分发期就登记进集合、正文要等宿主投递（busy 时被跳过），运行中放行会留下「已加载但正文没进对话」的坏状态。
 
 ## MCP（Model Context Protocol）
 

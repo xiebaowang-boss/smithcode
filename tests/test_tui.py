@@ -1275,7 +1275,6 @@ def test_tui_dynamic_skill_command_injects_payload_and_echoes_task(monkeypatch, 
 
                 chat = _chat_text(app)
                 assert "/proj 帮我处理报告" in chat  # 完整输入原文回显
-                assert "已加载技能 proj" in chat  # 一行加载提示
                 assert "以下为技能" not in chat  # 载荷不铺满聊天区
                 assert started == ["帮我处理报告"]
                 injected = [
@@ -1327,8 +1326,54 @@ def test_tui_skill_picker_dispatches_by_skill_name(monkeypatch, tmp_path):
                 await pilot.press("enter")  # 选中唯一技能 → 按 /proj 分发
                 await pilot.pause()
 
-                assert "已加载技能 proj" in _chat_text(app)
+                assert "/proj" in _chat_text(app)  # 命令回显，无额外回执
                 assert started and "以下为技能「proj」的完整指令" in started[0]
+
+        _run(_run_case())
+    finally:
+        skills.clear()
+
+
+def test_tui_skill_load_blocked_while_busy(monkeypatch, tmp_path):
+    """运行中不加载技能：加载在分发期登记集合、正文要等宿主投递，放行会留下坏状态。"""
+    no_prompting(monkeypatch)
+    from smithcode import skills
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (home / "config.toml").write_text('[skills]\nproject = "on"\n', encoding="utf-8")
+    skill_dir = workspace / ".agents" / "skills" / "proj"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: 测试技能\n---\n正文\n", encoding="utf-8"
+    )
+    skills.clear()
+    try:
+        skills.refresh()
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            started: list = []
+            app.start_task = lambda text: started.append(text)  # 捕获宿主动作，不起真实线程
+            async with app.run_test() as pilot:
+                app._busy = True  # 模拟后台任务运行中
+                app.handle_command("/proj")
+                await pilot.pause()
+
+                assert "任务运行中" in _chat_text(app)
+                assert started == []
+                assert skills.active_names() == []  # 关键：未被登记为已加载
+
+                app._busy = False
+                app.handle_command("/proj")
+                await pilot.pause()
+
+                assert started and "以下为技能「proj」的完整指令" in started[0]
+                assert skills.active_names() == ["proj"]
 
         _run(_run_case())
     finally:
@@ -2841,8 +2886,17 @@ def test_context_tools_grouped_with_counts(monkeypatch):
             groups = app.query(ContextGroup)
             assert len(groups) == 1
             assert groups.first().styles.margin.top == 1  # 与上方内容留出间隔
+            # 整组结算：全部出结果但还没封口（还可能有新的同组工具加入），
+            # 头行保持「探索中」，不闪变成「已探索」
+            header = str(groups.first().query_one(".group-header").content)
+            assert "探索中" in header
+            # 非上下文工具到来 → 封口，已收齐 → 「已探索」
+            _start_tools(app, [(5, "command ls", "run_command")])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 1  # 命令不新建组
             header = str(groups.first().query_one(".group-header").content)
             assert "已探索" in header
+            assert "探索中" not in header
             assert "2 次读取" in header  # read_file + list_dir
             assert "2 次搜索" in header  # grep + glob
             assert "列目录" not in header
@@ -2852,7 +2906,10 @@ def test_context_tools_grouped_with_counts(monkeypatch):
 
 
 def test_context_group_pending_then_done_wording(monkeypatch):
-    """「已探索」汇总行两态文案：进行中「探索中」，全部出结果后「已探索」。"""
+    """「已探索」汇总行两态文案：整组结算——封口且全部出结果后才「已探索」。
+
+    未封口前即使全部出结果仍保持「探索中」（还可能有新的同组工具加入，
+    中间空档不闪变）；非上下文工具到来封口后，已收齐才切「已探索」。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -2870,6 +2927,13 @@ def test_context_group_pending_then_done_wording(monkeypatch):
             for tool_id in (1, 2):
                 app.ui_tool_result(tool_id, "结果", False, False)
             await pilot.pause()
+            # 全部出结果、但还没封口：仍是「探索中」，不闪变成「已探索」
+            gap_header = str(group.query_one(".group-header").content)
+            assert "探索中" in gap_header
+            assert group._spin_timer is not None  # 转轮继续转
+            # 非上下文工具到来 → 封口，已收齐 → 「已探索」
+            _start_tools(app, [(3, "command ls", "run_command")])
+            await pilot.pause()
             done_header = str(group.query_one(".group-header").content)
             assert "已探索" in done_header
             assert "探索中" not in done_header
@@ -2877,13 +2941,38 @@ def test_context_group_pending_then_done_wording(monkeypatch):
     _run(_run_case())
 
 
-def test_context_group_keeps_exploring_until_children_finish(monkeypatch):
-    """封口不等于跑完：混批里非上下文工具把组封口后，仍在跑的子工具仍显示「探索中」。
+def test_context_group_gap_between_tools_stays_exploring(monkeypatch):
+    """同组工具的时间空档不闪变：第一个收工、第二个还没开始时仍「探索中」。"""
+    no_prompting(monkeypatch)
 
-    回归：此前封口会把文案无条件切成「已探索」（并停掉转轮），而 read/grep 与
-    命令混批很常见，导致「探索中」几乎永远看不到；现在状态只看组内是否还有
-    没出结果的子工具。
-    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            _start_tools(app, [(1, "read a.py", "read_file")])
+            await pilot.pause()
+            group = app.query_one(ContextGroup)
+            app.ui_tool_result(1, "结果", False, False)
+            await pilot.pause()
+            # 单个工具收工、组还没封口：保持「探索中」
+            assert "探索中" in str(group.query_one(".group-header").content)
+            assert group._spin_timer is not None
+            # 后续同组工具加入同一组（不另起）
+            _start_tools(app, [(2, "grep foo", "grep")])
+            await pilot.pause()
+            assert len(app.query(ContextGroup)) == 1
+            assert "探索中" in str(group.query_one(".group-header").content)
+            app.ui_tool_result(2, "结果", False, False)
+            _start_tools(app, [(3, "command ls", "run_command")])  # 封口
+            await pilot.pause()
+            assert "已探索" in str(group.query_one(".group-header").content)
+            assert group._spin_timer is None
+
+    _run(_run_case())
+
+
+def test_context_group_keeps_exploring_until_children_finish(monkeypatch):
+    """封口 + 收齐才算完：混批里非上下文工具封口后，仍在跑的子工具仍「探索中」，
+    收齐后才切「已探索」（整组结算）。"""
     no_prompting(monkeypatch)
 
     async def _run_case():

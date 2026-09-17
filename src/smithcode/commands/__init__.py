@@ -59,6 +59,24 @@ def dispatch(agent, text: str, interactive: bool = True) -> CommandResult:
         return CommandResult(text=f"[命令出错] {type(e).__name__}: {e}", style="red")
 
 
+def is_skill_command(text: str) -> bool:
+    """`/技能名 …` 是否为技能直达（非注册命令、技能已装载且存在）。
+
+    与 `_dispatch_skill` 同一套判定，供宿主在不分发的前提下预判——TUI 的 busy
+    守卫据此拦下运行中的技能加载：加载在分发期就登记集合、正文却要等宿主投递，
+    运行中放行会留下「已加载但正文没进对话」的坏状态。
+    """
+    tokens = text.strip().split()
+    if not tokens or not tokens[0].startswith("/"):
+        return False
+    name = tokens[0][1:]
+    if not name or base.get_command(name) is not None:
+        return False
+    from .. import skills as registry  # 延迟导入：本包 skills 是命令模块，避免重名
+
+    return registry.is_loaded() and registry.get(name) is not None
+
+
 def _dispatch_skill(name: str, args: list):
     """未知命令兜底：命中技能名则按技能名加载（`/技能名 [任务]`），否则返回 None。
 

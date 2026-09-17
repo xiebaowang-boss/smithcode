@@ -372,8 +372,10 @@ class ChatView(VerticalScroll):
     def _finalize_context(self) -> None:
         """封口当前「已探索」组（幂等）；后续上下文工具将另起一组。
 
-        封口只决定分组边界：组内仍在跑的子工具继续显示「探索中」+ 转轮，
-        直到各自出结果为止（状态完全由未完成的子工具决定）。"""
+        封口是整组结算的前置条件：组内单个工具先收工时头行保持「探索中」，
+        直到封口（不会再有新工具加入）并且全部子工具出结果，才切「已探索」。"""
+        if self._context_group is not None:
+            self._context_group.finalize()
         self._context_group = None
 
     def drain_context_groups(self) -> None:
@@ -864,9 +866,10 @@ class ContextGroup(Vertical):
     `▸ ⚙ 已探索 · …`；逐条明细是隐藏的子 ToolCall，展开可见。分组边界由
     ChatView 控制（遇到非上下文工具、正文/思考流、回合结束时封口）。
 
-    状态只看「组内还有没有没出结果的子工具」：封口只决定分组边界，不代表
-    跑完——因此混批（如 read + 命令）里封口后仍在跑的那次读取，头行依旧是
-    「探索中」，直到它出结果；轮次结束由 ChatView 兜底收尾（drain_pending）。
+    状态按整组结算：组创建起即「探索中」，直到封口（不会再有新的上下文
+    工具加入本组）**并且**组内子工具全部出结果，才切为「已探索」。因此
+    组内单个工具先收工时头行保持「探索中」（中间空档不闪变）；轮次结束
+    由 ChatView 兜底收尾（drain_pending）。
     """
 
     can_focus = True
@@ -881,6 +884,7 @@ class ContextGroup(Vertical):
         self._expanded = False
         self._items: list[tuple[str, ToolCall]] = []  # (工具名, 子控件)
         self._pending: set[int] = set()  # 未出结果的 tool_id
+        self._finalized = False  # 封口后不再有新工具加入本组（整组结算的前置条件）
         # 不能叫 _pending_children：那是 Textual Widget 的内部属性（compose 前注册
         # 子节点的缓冲），同名会串台——子控件被排到标题之前，且 on_mount 时已被
         # _compose 清空，永远补挂不进 .group-body（明细常驻可见、折叠失效）
@@ -915,21 +919,30 @@ class ContextGroup(Vertical):
         self._refresh_header()
 
     def mark_done(self, tool_id: int) -> None:
-        """某个子工具出结果：更新计数与进行中状态。"""
+        """某个子工具出结果：更新计数与进行中状态（整组结算：未封口前保持「探索中」）。"""
         self._pending.discard(tool_id)
         self._sync_spinner()
         self._refresh_header()
 
-    def drain_pending(self) -> None:
-        """轮次结束兜底：清掉没等到结果的子工具，避免转轮一直转。
-
-        正常路径上每个已上屏的工具都会收到结果（含被拒 / 中断的占位结果），
-        这里是保险——轮次已经结束，残留的进行中标记不可能还在跑。
-        """
-        if self._pending:
-            self._pending.clear()
+    def finalize(self) -> None:
+        """封口：不会再有新工具加入本组；已收齐时切为「已探索」。"""
+        if not self._finalized:
+            self._finalized = True
             self._sync_spinner()
             self._refresh_header()
+
+    def drain_pending(self) -> None:
+        """轮次结束兜底：封口并清掉没等到结果的子工具，避免转轮一直转。
+
+        正常路径上每个已上屏的工具都会收到结果（含被拒 / 中断的占位结果），
+        这里是保险——轮次已经结束，残留的进行中标记不可能还在跑，也不会
+        再有新工具加入本组。
+        """
+        self._finalized = True
+        if self._pending:
+            self._pending.clear()
+        self._sync_spinner()
+        self._refresh_header()
 
     def _counts(self) -> dict:
         counts = {"read": 0, "search": 0}
@@ -942,14 +955,15 @@ class ContextGroup(Vertical):
     def _header_text(self) -> str:
         arrow = "▾" if self._expanded else "▸"
         summary = context_summary(self._counts())
-        # 只要还有子工具在跑就是「探索中」（封口不等于跑完）：本地工具毫秒级结束、
-        # 混批时非上下文工具又会立刻封口，一旦按 _finalized 判定，这个状态几乎看不到
-        if self._pending:
+        # 整组结算：组创建起即「探索中」，封口（不会再有新工具加入）并且
+        # 全部子工具都出结果后才切「已探索」——单个工具先收工、后续同组
+        # 工具还没开始时，中间空档不闪变成「已探索」
+        if not self._finalized or self._pending:
             return f"{arrow} {self.SPINNER[self._spin_frame]} ⚙ 探索中 · {summary}"
         return f"{arrow} ⚙ 已探索 · {summary}"
 
     def _sync_spinner(self) -> None:
-        running = bool(self._pending)
+        running = not self._finalized or bool(self._pending)
         if running and self._spin_timer is None and self._header is not None:
             self._spin_timer = self.set_interval(0.1, self._spin)
         elif not running and self._spin_timer is not None:

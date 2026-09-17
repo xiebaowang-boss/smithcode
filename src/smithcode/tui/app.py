@@ -971,6 +971,8 @@ class SmithTUI(App):
 
         对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
         中途重置 / 切换 / 压缩 / 改 MCP 配置会撕裂进行中的轮次，先行拦截。
+        技能名直达同样拦截：加载在分发期就登记进集合，正文要等宿主投递
+        （busy 时被跳过），放行会留下「已加载但正文没进对话」的坏状态。
         """
         tokens = text.strip().split()
         mutating_session = bool(tokens) and tokens[0].lower() in ("/new", "/sessions", "/compact")
@@ -978,9 +980,12 @@ class SmithTUI(App):
             bool(tokens) and tokens[0].lower() == "/mcp" and len(tokens) > 1
             and tokens[1].lower() in ("add", "remove", "enable", "disable", "reconnect", "auth")
         )
-        if self._busy and (mutating_session or mutating_mcp):
+        if self._busy and (
+            mutating_session or mutating_mcp or commands.is_skill_command(text)
+        ):
             self.ui_notice(
-                "（任务运行中，不能切换会话、压缩上下文或修改 MCP 配置；请等待完成或先按 Esc 中断）",
+                "（任务运行中，不能切换会话、压缩上下文、加载技能或修改 MCP 配置；"
+                "请等待完成或先按 Esc 中断）",
                 "warning",
             )
             return None
