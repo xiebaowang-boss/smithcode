@@ -10,7 +10,8 @@
 - **分类**：`retryable()` / `classify()` 判定一个异常是否值得重试、属于哪类；
 - **预算与退避**：`RetryPolicy.should_retry()` / `delay()`；
 - **状态**：`RetryState` 是"正在重试"的进行态（含恢复时刻），UI 据此画倒计时；
-- **执行**：`RetryRunner.run()` 跑完整个重试过程，并在每次退避前上报状态。
+- **执行**：`stream_with_retry()` 按策略跑完整个流式重试过程（生成器版），
+  并在每次退避前上报状态。调用点只传"单次尝试"生成器与上报回调。
 
 禁止在调用点内联 `time.sleep` / 重试计数 / 提示文案——文案统一由
 `RetryState` 生成，TUI 与终端共用同一份，避免两处漂移。
@@ -250,58 +251,64 @@ class RetryState:
                 f"{self.wait:.0f}s 后重试（{self.attempt}/{self.total}）")
 
 
-class RetryRunner:
-    """按策略执行 `attempt()`，并在每次退避前上报重试状态。
+def build_retry_state(policy: RetryPolicy, attempt_no: int, exc: BaseException,
+                      rng: Callable[[], float] = random.random) -> RetryState:
+    """构造第 attempt_no 次失败（1 起）后的重试状态（文案在 `RetryState` 里）。"""
+    delay = policy.delay(attempt_no, exc, rng)
+    return RetryState(
+        attempt=attempt_no + 1,
+        total=policy.max_attempts,
+        reason=classify(exc),
+        wait=delay,
+        next_at=_time.monotonic() + delay,
+    )
+
+
+def stream_with_retry(attempt, policy: RetryPolicy | None = None, *,
+                      on_retry: Callable[[RetryState], None] | None = None,
+                      on_settled: Callable[[], None] | None = None,
+                      waiting: Callable[[RetryState], None] | None = None,
+                      rng: Callable[[], float] = random.random):
+    """按策略执行流式 `attempt()` 生成器，并在每次退避前上报重试状态。
 
     `attempt()` 每次调用都是一次**完整请求**（不是"续写半截"）：上游三家
     （opencode / Codex / Claude Code）都是整请求重发，重复的正文由上层按
-    各自的模型处理，客户端不掺和。
+    各自的模型处理，这里不掺和——每次尝试产出的 `content` / `reasoning`
+    事件都实时透出（重试会把上一次的正文再写一遍，上游同款行为），
+    `message` / `usage` 只透出最后一次**成功**尝试的（失败尝试的不污染会话）。
 
-    适用对象是**返回终值**的调用（如 `Agent._complete` 的摘要 / 标题补全）。
-    流式消费不能走这里——生成器无法把控制权交给外层循环，`llm.client.chat_stream`
-    自己持有循环，逐步调用 `RetryPolicy` 与 `wait()`，两者共用同一套策略与文案。
+    取消（`KeyboardInterrupt` / `SystemExit` / 已取消令牌）不重试、直接透传。
 
     - `on_retry(state)`：退避前回调，用于上报状态。
     - `on_settled()`：过程结束（成功或彻底失败）后回调一次。
-    - `wait(state)`：退避方式，默认 `wait()`（可被取消打断）。
+    - `waiting(state)`：退避方式，默认 `wait()`（可被取消打断）。
     """
-
-    def __init__(self, policy: RetryPolicy | None = None) -> None:
-        self.policy = policy or RetryPolicy()
-
-    def run(self, attempt: Callable[[], object], *,
-            on_retry: Callable[[RetryState], None] | None = None,
-            on_settled: Callable[[], None] | None = None,
-            waiting: Callable[[RetryState], None] | None = None,
-            rng: Callable[[], float] = random.random) -> object:
-        sleeper = waiting or wait
-        try:
-            for attempt_no in range(1, self.policy.max_attempts + 1):
-                try:
-                    return attempt()
-                except BaseException as e:  # 交策略判定是否值得重试
-                    if not self.policy.should_retry(e, attempt_no):
-                        raise
-                    state = self._state(attempt_no, e, rng)
-                    if on_retry is not None:
-                        on_retry(state)
-                    sleeper(state)
-            raise AssertionError("重试循环不应走到这里")  # pragma: no cover
-        finally:
-            if on_settled is not None:
-                on_settled()
-
-    def _state(self, attempt_no: int, exc: BaseException,
-               rng: Callable[[], float]) -> RetryState:
-        """构造第 attempt_no 次失败后的重试状态（文案在 `RetryState` 里）。"""
-        delay = self.policy.delay(attempt_no, exc, rng)
-        return RetryState(
-            attempt=attempt_no + 1,
-            total=self.policy.max_attempts,
-            reason=classify(exc),
-            wait=delay,
-            next_at=_time.monotonic() + delay,
-        )
+    policy = policy or RetryPolicy()
+    sleeper = waiting or wait
+    try:
+        for attempt_no in range(1, policy.max_attempts + 1):
+            events: list = []
+            try:
+                for kind, payload in attempt():
+                    if kind in ("content", "reasoning"):
+                        yield kind, payload
+                    else:
+                        events.append((kind, payload))
+                yield from events
+                return
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:  # 交策略判定是否值得重试
+                if not policy.should_retry(e, attempt_no):
+                    raise
+                state = build_retry_state(policy, attempt_no, e, rng)
+                if on_retry is not None:
+                    on_retry(state)
+                sleeper(state)
+        raise AssertionError("重试循环不应走到这里")  # pragma: no cover
+    finally:
+        if on_settled is not None:
+            on_settled()
 
 
 def wait(state: RetryState) -> None:

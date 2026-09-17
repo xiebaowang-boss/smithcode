@@ -62,6 +62,12 @@ WORKSPACE_ROOT = os.getcwd()
 def set_workspace(path):
     global WORKSPACE_ROOT
     WORKSPACE_ROOT = str(Path(path).resolve())
+    try:
+        from .llm.prompts import clear_git_repo_cache
+    except ImportError:  # 极早期的导入阶段 prompts 尚未就绪，下次调用时自然生效
+        pass
+    else:
+        clear_git_repo_cache()
 
 
 # ---------- 文件读取 ----------

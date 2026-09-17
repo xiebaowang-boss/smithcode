@@ -1,4 +1,4 @@
-"""LLM 客户端测试：`GET /models` 拉取的容错与去重；流中断线自动重试。"""
+"""LLM 客户端测试：`GET /models` 拉取的容错、去重与翻页；流中断线自动重试。"""
 
 from types import SimpleNamespace
 
@@ -11,22 +11,31 @@ from smithcode.llm import LLMClient
 DROP = "peer closed connection without sending complete message body (incomplete chunked read)"
 
 
-class _FakeModels:
-    def __init__(self, items=None, error=None):
-        self._items = items or []
-        self._error = error
+def _fake_client_factory(models=None, error=None):
+    """构造 OpenAI SDK 替身的工厂：只实现 models.list，供 from_config 注入。"""
 
-    def list(self):
-        if self._error:
-            raise self._error
-        return self._items
+    class _FakeModels:
+        def __init__(self):
+            self._items = models or []
+            self._error = error
+
+        def list(self):
+            if self._error:
+                raise self._error
+            return self._items
+
+    def factory(**kwargs):
+        return SimpleNamespace(models=_FakeModels())
+
+    return factory
 
 
 def _client(items=None, error=None):
-    # 跳过 __init__：不校验 key、不建真实连接，只替换 client.models
-    client = object.__new__(LLMClient)
-    client.client = SimpleNamespace(models=_FakeModels(items, error))
-    return client
+    # 显式构造：不校验 key、不建真实连接，只替换 models.list
+    return LLMClient(
+        api_key="test", base_url=None, timeout=1.0, default_model="m",
+        client_factory=_fake_client_factory(items, error),
+    )
 
 
 def test_list_models_returns_unique_ids():
@@ -69,9 +78,11 @@ class _FakeView:
 
 
 def _streaming_client(stream_once):
-    """绕过 __init__ 的流式客户端：只替换 _stream_once，固定请求头为空。"""
-    llm = object.__new__(LLMClient)
-    llm._custom_headers = {}
+    """显式构造的流式客户端：只替换 _stream_once，请求头为空。"""
+    llm = LLMClient(
+        api_key="test", base_url=None, timeout=1.0, default_model="m",
+        client_factory=lambda **kwargs: SimpleNamespace(),
+    )
     llm._stream_once = stream_once
     return llm
 
@@ -92,7 +103,7 @@ def test_chat_stream_retries_incomplete_stream(monkeypatch):
             yield ("reasoning", "先想一半…")
             raise httpx2.RemoteProtocolError(DROP)  # 已输出的思考不阻断重试
         yield ("content", "答案")
-        yield ("message", {"role": "assistant", "content": "答案"})
+        yield ("message", {"role": "assistant", "content": ""})
 
     view = _FakeView()
     _patch_retry(monkeypatch, view)
@@ -125,8 +136,7 @@ def test_chat_stream_retries_after_content(monkeypatch):
             yield ("content", "半句总结：改了 ")
             raise httpx2.ReadTimeout("The read operation timed out")
         yield ("content", "半句总结：改了 commands/base.py，Enter 已屏蔽。")
-        yield ("message", {"role": "assistant",
-                           "content": "半句总结：改了 commands/base.py，Enter 已屏蔽。"})
+        yield ("message", {"role": "assistant", "content": ""})
 
     view = _FakeView()
     _patch_retry(monkeypatch, view, retries=3)
@@ -138,10 +148,9 @@ def test_chat_stream_retries_after_content(monkeypatch):
     assert len(calls) == 2  # 关键在于：正文已上屏仍然重试了
     contents = [payload for kind, payload in events if kind == "content"]
     assert contents == ["半句总结：改了 ", "半句总结：改了 commands/base.py，Enter 已屏蔽。"]
-    # message / usage 只放行最后一次尝试的，失败的尝试不会污染会话
+    # message 只交付 tool_calls 与归属（content 刻意留空），失败尝试的不污染会话
     messages = [payload for kind, payload in events if kind == "message"]
-    assert messages == [{"role": "assistant",
-                         "content": "半句总结：改了 commands/base.py，Enter 已屏蔽。"}]
+    assert messages == [{"role": "assistant", "content": ""}]
     assert view.retries[0].reason == "读取超时"
 
 
@@ -195,7 +204,7 @@ def test_chat_stream_does_not_retry_non_transient(monkeypatch):
 def test_chat_stream_retry_finished_on_success_without_retry(monkeypatch):
     """一次成功也要发 retry_finished：消费方据此清除可能残留的重试态。"""
     def fake_stream(kwargs):
-        yield ("message", {"role": "assistant", "content": "好"})
+        yield ("message", {"role": "assistant", "content": ""})
 
     view = _FakeView()
     _patch_retry(monkeypatch, view)
@@ -207,3 +216,46 @@ def test_chat_stream_retry_finished_on_success_without_retry(monkeypatch):
     assert [kind for kind, _ in events] == ["message"]
     assert view.retries == []
     assert view.finished == 1
+
+
+def test_list_models_follows_next_page():
+    """多页模型列表按 has_next_page/get_next_page 翻页，去重后返回。"""
+    first = [SimpleNamespace(id="a"), SimpleNamespace(id="b")]
+    second = [SimpleNamespace(id="b"), SimpleNamespace(id="c")]
+
+    class _Page(list):
+        def __init__(self, items, nxt=None):
+            super().__init__(items)
+            self._next = nxt
+
+        def has_next_page(self):
+            return self._next is not None
+
+        def get_next_page(self):
+            return self._next
+
+    llm = LLMClient(
+        api_key="test", base_url=None, timeout=1.0, default_model="m",
+        client_factory=lambda **kwargs: SimpleNamespace(
+            models=SimpleNamespace(list=lambda: _Page(first, _Page(second)))),
+    )
+    assert llm.list_models() == ["a", "b", "c"]
+
+
+def test_list_models_page_failure_keeps_received():
+    """翻页失败不丢已收到的部分：用第一页结果返回。"""
+    first = [SimpleNamespace(id="a")]
+
+    class _BrokenPage(list):
+        def has_next_page(self):
+            return True
+
+        def get_next_page(self):
+            raise RuntimeError("翻页失败")
+
+    llm = LLMClient(
+        api_key="test", base_url=None, timeout=1.0, default_model="m",
+        client_factory=lambda **kwargs: SimpleNamespace(
+            models=SimpleNamespace(list=lambda: _BrokenPage(first))),
+    )
+    assert llm.list_models() == ["a"]

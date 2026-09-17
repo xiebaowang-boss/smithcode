@@ -121,8 +121,8 @@ class Renderer:
     def retry_finished(self, owner: object | None = None) -> None:
         """重试过程结束（成功或彻底失败）：宿主清除对应的重试态。默认忽略。
 
-        与 `retry_started` 必然成对且 owner 相同（`RetryRunner` / `chat_stream`
-        在 finally 里发），消费方不需要计数器兜底。
+        与 `retry_started` 必然成对且 owner 相同（`stream_with_retry` /
+        `chat_stream` 在 finally 里发），消费方不需要计数器兜底。
         """
 
     def turn_started(self) -> None:

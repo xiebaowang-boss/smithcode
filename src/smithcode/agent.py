@@ -20,7 +20,7 @@ from .context import (
     truncate_output,
     validate_summary,
 )
-from .llm import LLMClient
+from .llm import LLMClient as _RealLLMClient
 from .llm.models import (
     CachedModelSource,
     ConfiguredModelSource,
@@ -157,6 +157,24 @@ class _StatePart(NamedTuple):
     snapshot: Callable[[], object]
     restore: Callable[[object], None]
     reset: Callable[[], None]
+
+
+# 模块级 `LLMClient` 名字是测试替换点：monkeypatch 改写它时 `_default_llm`
+# 同步换成假 LLM。真实现另存 `_RealLLMClient`，供类型注解与文档引用。
+LLMClient = _RealLLMClient
+
+
+def _default_llm():
+    """按当前模块的 `LLMClient` 构造默认客户端（`from_config` 优先）。
+
+    经模块属性查找而非闭包直引：测试用 monkeypatch 替换
+    `smithcode.agent.LLMClient` 时，这里的构造同步换成假 LLM。
+    """
+    cls = globals()["LLMClient"]
+    factory = getattr(cls, "from_config", None)
+    if callable(factory):
+        return factory()
+    return cls()
 
 
 def _diff_preview(name: str, args: dict) -> str:
@@ -315,7 +333,7 @@ class Agent:
         """
         if reset_globals:
             reset_read_tracking()  # 新会话开始，「已读文件」记录从零开始
-        self.llm = llm or LLMClient()
+        self.llm = llm if llm is not None else _default_llm()
         self.session = session or Session()
         self.permission = permission or Permission()
         self.context = ContextMeter()  # 上下文快照计量：真实锚点 + 临近阈值提醒
@@ -338,11 +356,12 @@ class Agent:
         elif self._persist:
             self.session.bind_store(self._new_store(oneshot=oneshot))
         # 候选模型目录：命令层只读 `agent.models.list()`，不关心来源与装载时机
+        # （假 LLM 没有 list_models 时 Remote 恒返回 None，目录退化为"当前模型兜底"）
         cache = ModelCache()
         self.models = models or ModelCatalog(
             configured=ConfiguredModelSource(),
             cached=CachedModelSource(cache),
-            remote=RemoteModelSource(self.llm, cache),
+            remote=RemoteModelSource(getattr(self.llm, "list_models", None), cache),
             current_model=lambda: config.MODEL,
         )
 
@@ -910,8 +929,9 @@ class Agent:
         part）：llm 层每次尝试的正文都实时上屏，这里把它们按到达顺序拼进同一条
         消息——重试成功后，历史里是「第一次中断的那段 + 重试补完的那段」，与
         用户屏幕上看到的内容逐一对应，不会出现"屏幕上有、历史里没有"。
-        内容一律以累积的 `parts` 为准重建，不用 llm 层最后那条 message 的正文，
-        避免两条链路对"正文是什么"出现两套说法。
+        内容一律以累积的 `parts` 为准重建：llm 层最后那条 message 只交付
+        tool_calls 与归属，不再携带正文——"正文是什么"只有 `parts` 一个来源，
+        两条链路不会再出现两套说法（message.content 为空是刻意的，不是缺数据）。
 
         任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼成部分
         assistant 消息返回并标记 interrupted——残缺的工具调用不回传（无法解析），

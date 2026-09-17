@@ -13,11 +13,12 @@ from smithcode import config
 from smithcode.cancel import CancellationToken, activate_token
 from smithcode.llm.retry import (
     RetryPolicy,
-    RetryRunner,
     RetryState,
+    build_retry_state,
     classify,
     describe,
     retryable,
+    stream_with_retry,
     wait,
 )
 
@@ -147,41 +148,77 @@ def test_state_summary_reads_like_a_sentence():
 
 # ---------- 执行器与等待 ----------
 
-def test_runner_retries_then_succeeds():
+def test_stream_retries_then_succeeds():
+    """流式执行器：失败尝试的增量照常透出，终值事件只认最后一次成功尝试。"""
     calls = []
     states = []
 
     def attempt():
         calls.append(1)
         if len(calls) < 3:
+            yield ("content", f"第{len(calls)}次半截")
+            yield ("message", {"role": "assistant", "content": "坏的终值"})
             raise httpx2.ReadTimeout("x")
-        return "ok"
+        yield ("content", "最终正文")
+        yield ("message", {"role": "assistant", "content": ""})
+        yield ("usage", {"prompt_tokens": 1})
 
-    result = RetryRunner(RetryPolicy(max_attempts=5)).run(
-        attempt, on_retry=states.append, waiting=lambda s: None,
-    )
+    events = list(stream_with_retry(
+        attempt, RetryPolicy(max_attempts=5),
+        on_retry=states.append, waiting=lambda s: None,
+    ))
 
-    assert result == "ok"
     assert len(calls) == 3
     assert [s.attempt for s in states] == [2, 3]
+    kinds = [kind for kind, _ in events]
+    assert kinds.count("content") == 3  # 两次半截 + 一次最终，都实时透出
+    messages = [payload for kind, payload in events if kind == "message"]
+    assert messages == [{"role": "assistant", "content": ""}]  # 失败尝试的终值不污染
+    assert [payload for kind, payload in events if kind == "usage"] == [
+        {"prompt_tokens": 1}]
 
 
-def test_runner_settles_on_both_paths():
+def test_stream_settles_on_both_paths():
     settled = []
 
     def fail():
+        yield from ()
         raise ValueError("不可重试")
 
     with pytest.raises(ValueError):
-        RetryRunner(RetryPolicy()).run(fail, on_settled=lambda: settled.append("err"),
-                                       waiting=lambda s: None)
+        list(stream_with_retry(fail, RetryPolicy(),
+                               on_settled=lambda: settled.append("err"),
+                               waiting=lambda s: None))
     assert settled == ["err"]
 
     settled.clear()
-    assert RetryRunner(RetryPolicy()).run(lambda: "ok",
-                                         on_settled=lambda: settled.append("ok"),
-                                         waiting=lambda s: None) == "ok"
+    assert list(stream_with_retry(lambda: iter([("content", "好")]), RetryPolicy(),
+                                  on_settled=lambda: settled.append("ok"),
+                                  waiting=lambda s: None)) == [("content", "好")]
     assert settled == ["ok"]
+
+
+def test_stream_does_not_retry_system_exit():
+    """系统退出透传：不重试、不上报、不等待。"""
+    states = []
+
+    def attempt():
+        yield from ()
+        raise SystemExit(1)
+
+    with pytest.raises(SystemExit):
+        list(stream_with_retry(attempt, RetryPolicy(max_attempts=3),
+                               on_retry=states.append, waiting=lambda s: None))
+    assert states == []
+
+
+def test_build_retry_state_matches_runner_semantics():
+    """状态构造与旧 Runner 一致：attempt 为下一次序号，total 为预算。"""
+    state = build_retry_state(RetryPolicy(max_attempts=5), 2,
+                              httpx2.ReadTimeout("x"), rng=lambda: 0.0)
+    assert (state.attempt, state.total) == (3, 5)
+    assert state.reason == "读取超时"
+    assert state.wait == 4.0
 
 
 def test_wait_returns_immediately_when_cancelled():

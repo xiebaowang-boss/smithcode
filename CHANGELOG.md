@@ -4,6 +4,10 @@
 
 ## [未发布]
 
+### 重构
+
+- **LLM 交互子系统重构（功能不变）**：`llm/` 内职责重新切分，调用链去全局化。① 新增 `llm/request.py`（`ChatRequest` 值对象 + 纯函数 `build_kwargs`，请求组装可脱离网络单测）；② 新增 `llm/stream.py`（`parse_stream` 纯解析：content/reasoning 透出、tool_calls 按 index 累积、usage 取最新有效值——解析失败的包不再覆盖已收到的有效值）；③ `LLMClient` 改构造器注入 + `from_config()` 工厂（读全局 config 只发生在工厂里，`Agent` 经 `_default_llm()` 按模块属性构造，测试替身替换不受影响）；④ 重试执行收敛为 `stream_with_retry()` 生成器（删除生产零调用的 `RetryRunner`，`except BaseException` 改为 `Exception` + 系统退出透传）；⑤ 取消订阅泄漏修复（`CancellationToken.unsubscribe`，流关闭后摘除 `stream.close`，订阅窗口期复查令牌补关流）；⑥ `RemoteModelSource` 改吃 `list_models` 可调用（无该能力的 LLM 恒返回 None，目录退化为当前模型兜底）；⑦ 正文真相单一来源（`message` 只交付 tool_calls 与归属、`content` 留空，Agent 侧 `parts` 累积为唯一正文）；⑧ 漏洞修补（`reasoning_effort` 400 降级与 `stream_options` 同构、`_mentions` 状态码先行、`list_models` 按 `has_next_page/get_next_page` 翻页、`_is_git_repo` 按工作区缓存）。测试同步迁移（删 `object.__new__` hack，新增 `test_llm_stream.py` / `test_llm_request.py`）。
+
 ### 修复
 
 - **每轮回复都被误报「输出中断」（`AttributeError: 'TerminalTitlePresenter' object has no attribute 'on_retry_finished'`）**：新增的重试进度事件经 `Relay` 广播时用 `getattr(presenter, event)` 无条件取回调，而 `TerminalTitlePresenter` 只实现标题相关回调——取不到就抛 `AttributeError`，该异常被 Agent 的流异常处理捕获，于是**每一轮**都被判成 `stream_error`，把 UI 故障描述成网络中断（排查方向直接跑偏）。修法三层：① `Relay._notify` 改为「订阅者没实现该回调即视为不关心」（基类事件是可订阅总线，新增事件不得打断既有订阅者）；② Agent 侧把渲染后端异常单独成型为 `RendererError`，不再落进 `StreamInterrupted` 的收尾/重试语义——UI 坏了既不重试也不报「输出中断」，宿主如实报出后端异常，失败点一眼可见；③ 回归测试：假呈现器只实现标题回调时广播重试事件不得抛异常、渲染后端抛错必须冒泡为 `RendererError` 而非 `stream_error`。
@@ -28,6 +32,7 @@
 
 ### 变更
 
+- **启动 Logo 换用小一号字形**：TUI 欢迎横幅的 `SMITH` 大字由 6 行 42 列的块状字改为 4 行 36 列的 figlet「small」斜线字形（`welcome.LOGO` / `LOGO_WIDTH` 同步收紧），窄终端降级为单行紧凑版的判定阈值随之下移（`LOGO_WIDTH + 12`），启动屏更省竖向空间。REPL 与窄终端的紧凑版不受影响。
 - **`/skills` 改为只读展示面板（Enter 不再确认加载）**：此前 `/skills` 无参弹出技能选择框、Enter 选中即按技能名直达加载并开跑，现改为只读展示——面板内 Enter（含数字键）不确认，仅 ↑↓ 查看、Esc 关闭，加载技能请用 `/<技能名> [任务]` 直达。实现：`CommandSelect` 新增 `readonly` 标记，`SelectionPanel` 透传该标记（确认短路、底部提示改为「↑↓ 查看 · esc 关闭」），其他命令的选择意图不受影响。已补回归测试（只读下面板不关闭、不分发，Esc 关闭后直达仍可加载）。
 - **TUI 运行中拦截技能加载（busy 守卫扩展）**：任务运行中输入 `/技能名` 同样被拦截（与 `/new` / `/compact` / MCP 改配置同一守卫），提示等待完成或按 Esc 中断——技能加载在命令分发期就登记进集合、正文要等宿主投递（busy 时投递被跳过），运行中放行会留下「已加载但正文没进对话」的坏状态。判定逻辑收敛为 `commands.is_skill_command()`（与兜底分发同一套：非注册命令 + 技能已装载且存在），供宿主在不分发的前提下预判。已补回归测试（运行中拦截且不登记集合，空闲后可正常加载）。
 - **技能正文改为注入对话（对齐 Agent Skills 渐进披露：系统提示词只留目录）**：此前 `use_skill` / `/skill` 只把技能名记进加载集合，正文由 `skills.render_section()` → `Session.sync_system()` 写进 `messages[0]` 的「已激活技能」段——每次加载都改写系统提示词，破坏服务商的提示前缀缓存（改动点之后的历史全部重新 prefill）。现按 Agent Skills 标准把第 2 层载荷放进对话内容：模型触发时 `use_skill` 的**工具结果**就是载荷（前言 + `<skill>` 包装 + 资源清单 + 正文，role=`tool` 进历史），用户触发时同一载荷作为一条 user 消息进历史；系统提示词只剩「可用技能」目录（name + description），加载技能不再改动 `messages[0]`，会话内前缀缓存全程稳定。命令层新增 `CommandResult.inject_history`（宿主在 `start_task` 之前写入，运行中整体跳过，不留孤儿消息），TUI / REPL 分别接入；历史回放对载荷消息折叠为一行「已加载技能 X」，不整段铺开。**行为变化**：`/技能名`（不带任务）由静默加载改为**注入后立即开跑一回**（对齐 Claude Code 的 `/<技能名>`），`/skills` 选择框选中亦然；首次加载不留回执（界面上只有命令回显与随后的模型回应），仅**重复加载**时给一行提示——它是幂等语义的唯一出口，否则第二次加载看起来和第一次一模一样。长度护栏：载荷超 `[limits].max_tool_output` 时保留头部、省略尾部并附 `read_file` 指引（技能根目录在只读白名单内，可随时重读）。**压缩语义随之调整**——正文在对话历史里会被摘要掉，`Agent.compact()` 压缩后调用 `skills.prune_active()` 剔除正文已不在上下文中的技能（按载荷是否完整出现判定，从严：宁可多提示一次重载），并注入一行提示告知模型需要时重新 `use_skill` 加载；剔除结果立即写入 `t=state` 投影，恢复会话时集合与转录保持一致。

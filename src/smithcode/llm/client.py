@@ -1,7 +1,6 @@
 """LLM 客户端封装：OpenAI 兼容接口，统一走流式，重试策略见 `llm/retry.py`。"""
 from __future__ import annotations
 
-import time
 from contextlib import closing
 
 from openai import BadRequestError, OpenAI
@@ -10,19 +9,52 @@ from .. import config, renderer
 from ..cancel import current_token
 from ..utils.proxy import normalize_proxy_env
 from . import retry as retry_mod
-from .retry import RetryPolicy, RetryState, classify
+from .request import ChatRequest, build_kwargs
+from .retry import RetryPolicy
+from .stream import parse_stream, usage_to_dict
+
+# OpenAI SDK 的分页约定：`SyncPage.has_next_page/get_next_page`；旧版本或
+# 兼容网关可能直接返回 list，`getattr` 为空即视为单页，退化为现状行为。
+_MAX_MODEL_PAGES = 10
 
 
 class LLMClient:
-    def __init__(self):
+    """OpenAI 兼容客户端：显式构造参数 + `from_config()` 工厂。
+
+    读全局 `config` 只发生在 `from_config()` 里：`TIMEOUT` / `URL` / 请求头
+    在构造时固化（改完需重建 client），`MODEL` 仍每次请求现读（`/model`
+    秒切）——分裂语义见 `from_config` 说明。
+    """
+
+    def __init__(self, *, api_key: str | None = None, base_url: str | None = None,
+                 timeout: float = 120.0, default_model: str,
+                 reasoning_effort: str | None = None,
+                 custom_headers: dict | None = None,
+                 session_id: str | None = None, client_factory=OpenAI):
+        self.client = client_factory(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+        )
+        self.default_model = default_model
+        self.reasoning_effort = reasoning_effort
+        self._custom_headers = dict(custom_headers or {})
+        self._session_id = session_id
+
+    @classmethod
+    def from_config(cls, client_factory=OpenAI) -> LLMClient:
+        """从全局配置组装客户端：凭证缺失时给出人话指引，别让 SDK 抛裸异常。"""
         config.ensure_api_key()  # 凭证缺失时给出人话指引，别让 OpenAI SDK 抛裸异常
         normalize_proxy_env()  # 库被直接使用时（无 CLI 入口）同样兜底一次
-        self.client = OpenAI(
+        return cls(
             api_key=config.KEY,
             base_url=config.URL,
             timeout=config.LLM_TIMEOUT,
+            default_model=config.MODEL,
+            reasoning_effort=config.REASONING_EFFORT,
+            custom_headers=config.load_provider_headers(),
+            client_factory=client_factory,
         )
-        self._custom_headers = config.load_provider_headers()
 
     def _resolved_headers(self) -> dict:
         """把配置的自定义请求头解析为实际值：{$session} 占位符替换为当前会话 id。
@@ -31,8 +63,9 @@ class LLMClient:
         """
         if not self._custom_headers:
             return {}
+        session_id = self._session_id or config.SESSION_ID
         return {
-            name: value.replace("{$session}", config.SESSION_ID)
+            name: value.replace("{$session}", session_id)
             for name, value in self._custom_headers.items()
         }
 
@@ -47,10 +80,19 @@ class LLMClient:
         except Exception:  # noqa: BLE001
             return None
         names = []
-        for item in page:
-            name = getattr(item, "id", None)
-            if isinstance(name, str) and name and name not in names:
-                names.append(name)
+        seen = 0
+        while page is not None and seen < _MAX_MODEL_PAGES:
+            seen += 1
+            for item in page:
+                name = getattr(item, "id", None)
+                if isinstance(name, str) and name and name not in names:
+                    names.append(name)
+            nxt = getattr(page, "get_next_page", None)
+            has_nxt = getattr(page, "has_next_page", None)
+            try:
+                page = nxt() if callable(nxt) and callable(has_nxt) and has_nxt() else None
+            except Exception:  # noqa: BLE001 翻页失败就用已收到的部分
+                break
         return names or None
 
     def chat_stream(self, messages, tools=None, model: str | None = None,
@@ -58,7 +100,8 @@ class LLMClient:
         """发起流式对话请求，逐段 yield 模型输出。
 
         model 非空时覆盖当前会话模型（会话标题等后台小请求用），默认
-        使用 `config.MODEL`。policy 非空时覆盖重试策略（默认按 `config.MAX_RETRIES`）。
+        使用构造时的 `default_model`（`from_config` 即 `config.MODEL`）。
+        policy 非空时覆盖重试策略（默认按 `config.MAX_RETRIES`）。
 
         yield 的元素为 (kind, payload)：
           ("reasoning", 文本)  — 模型思考内容（如有），仅供展示
@@ -75,147 +118,113 @@ class LLMClient:
         任务被取消时（取消令牌已触发）流在下一块数据到达前截停并关闭
         HTTP 连接，不再产出 message/usage，由 agent 侧拼装部分消息。
         """
-        kwargs = {
-            "model": model or config.MODEL,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if config.REASONING_EFFORT:
-            kwargs["reasoning_effort"] = config.REASONING_EFFORT
-        if tools:
-            kwargs["tools"] = [
-                {"type": "function", "function": schema} for schema in tools
-            ]
-        headers = self._resolved_headers()
-        if headers:
-            kwargs["extra_headers"] = headers  # 自定义请求头，_open_stream 重连时随 kwargs 沿用
+        req = ChatRequest(
+            messages=messages,
+            tools=tools,
+            model=model,
+            reasoning_effort=self.reasoning_effort,
+            extra_headers=self._resolved_headers(),
+        )
+        kwargs = build_kwargs(req, default_model=self.default_model)
 
         view = renderer.current()
         owner = self  # 重试态的归属者：前台任务与后台标题各自清理，互不误清
         policy = policy or RetryPolicy(max_attempts=config.MAX_RETRIES + 1)
-        tail: dict = {}  # 最后一次尝试的 message / usage（循环正常结束才有效）
 
-        try:
-            for attempt_no in range(1, policy.max_attempts + 1):
-                try:
-                    # 增量边收边放：每次尝试都实时上屏（重试会把上一次的正文
-                    # 再写一遍——上游同款行为，重复部分由 Agent 的消息模型处理）
-                    for kind, payload in self._stream_once(kwargs):
-                        if kind in ("content", "reasoning"):
-                            yield kind, payload
-                        else:
-                            tail[kind] = payload  # 只认最后一次成功尝试的 message/usage
-                    break
-                except BaseException as e:  # 交策略判定是否值得重试
-                    if not policy.should_retry(e, attempt_no):
-                        raise
-                    delay = policy.delay(attempt_no, e)
-                    state = RetryState(
-                        attempt=attempt_no + 1,
-                        total=policy.max_attempts,
-                        reason=classify(e),
-                        wait=delay,
-                        next_at=time.monotonic() + delay,
-                    )
-                    view.retry_started(state, owner)
-                    retry_mod.wait(state)  # 退避期间可被 Esc 打断
-        finally:
+        def attempt():
+            yield from self._stream_once(kwargs)
+
+        def on_retry(state) -> None:
+            view.retry_started(state, owner)
+
+        def on_settled() -> None:
             view.retry_finished(owner)  # 成功或放弃都清掉重试态
-        if "message" in tail:
-            yield "message", tail["message"]
-        if "usage" in tail:
-            yield "usage", tail["usage"]
+
+        yield from retry_mod.stream_with_retry(
+            attempt, policy, on_retry=on_retry, on_settled=on_settled,
+        )
 
     def _stream_once(self, kwargs):
-        """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息与用量。
+        """消费一次流式响应：取消接线 + 解析委托给 `parse_stream`。
 
         取消即时生效：打开流后把 `stream.close` 登记为令牌监听——取消线程
         直接关流，即使正阻塞在等待下一块数据（模型静默期 / 网络慢）也会
         立即解除阻塞（读抛错或迭代结束），不必等下一块到达。关流引发的
         读错误按取消处理（吞掉），非取消的真实异常照常上抛；任务被中断时
         不产出 message/usage，由 agent 侧拼装部分消息。
+
+        监听在流关闭后摘除——不摘除则每轮残留一个已关闭流的回调，长任务
+        越积越多。`subscribe` 之后复查一次令牌：`_open_stream` 与订阅之间
+        的窗口里触发的取消同样立即关流，不必等下一块数据。
         """
-        content_parts = []
-        calls = {}  # 工具调用 index -> 累积中的 {"id", "name", "arguments"}
-        latest_usage = None  # 有的服务商每个 chunk 都带 usage，始终记住最新一份
         token = current_token()
         if token is not None and token.cancelled:
             return  # 已取消：连新请求都不发起（避免中断后仍白跑一次调用）
 
+        tail: list = []  # message / usage 只认完整跑完的尝试：取消后由 agent 侧拼装部分消息
         with closing(self._open_stream(kwargs)) as stream:
+            close = stream.close
             if token is not None:
-                token.subscribe(stream.close)  # 取消线程直接关流，解除阻塞中的读
+                token.subscribe(close)  # 取消线程直接关流，解除阻塞中的读
+                if token.cancelled:
+                    close()  # 订阅窗口期内已取消：不等下一块，直接关
             try:
-                for chunk in stream:
-                    if token is not None and token.cancelled:
-                        return
-                    if getattr(chunk, "usage", None) is not None:
-                        latest_usage = _usage_to_dict(chunk.usage)
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-
-                    reasoning = getattr(delta, "reasoning_content", None)
-                    if reasoning:
-                        yield ("reasoning", reasoning)
-                    if delta.content:
-                        content_parts.append(delta.content)
-                        yield ("content", delta.content)
-
-                    for tc in delta.tool_calls or []:
-                        idx = tc.index if tc.index is not None else 0
-                        slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                        if tc.id:
-                            slot["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            slot["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            slot["arguments"] += tc.function.arguments
+                for kind, payload in parse_stream(_iter_cancellable(stream, token)):
+                    if kind in ("content", "reasoning"):
+                        yield kind, payload
+                    else:
+                        tail.append((kind, payload))
             except Exception:
                 if token is not None and token.cancelled:
                     return  # 关流引发的读错误：本质是取消，非真实异常
                 raise
+            finally:
+                if token is not None:
+                    token.unsubscribe(close)
 
         if token is not None and token.cancelled:
             return  # 流恰好结束但已被取消：不产出 message/usage
-
-        msg = {"role": "assistant", "content": "".join(content_parts)}
-        if calls:
-            msg["tool_calls"] = [
-                {
-                    "id": slot["id"],
-                    "type": "function",
-                    "function": {
-                        "name": slot["name"],
-                        "arguments": slot["arguments"],
-                    },
-                }
-                for _, slot in sorted(calls.items())
-            ]
-        yield ("message", msg)
-        if latest_usage is not None:
-            yield ("usage", latest_usage)
+        yield from tail
 
     def _open_stream(self, kwargs):
-        """发起流式请求；个别兼容服务不认识 stream_options 时自动降级重连。
+        """发起流式请求；个别兼容服务不认识 `stream_options` / `reasoning_effort` 时降级重连。
 
-        降级后只是拿不到用量，对话本身不受影响。
+        降级后只是拿不到用量（或不用思考强度），对话本身不受影响。
+        `pop` 就地修改 kwargs——重试复用同一份 kwargs，降级对后续尝试同样生效。
         """
         try:
             return self.client.chat.completions.create(**kwargs)
         except BadRequestError as e:
-            if "stream_options" in kwargs and "stream_options" in str(e):
+            if _mentions(e, "stream_options") and "stream_options" in kwargs:
                 kwargs.pop("stream_options")
+                return self.client.chat.completions.create(**kwargs)
+            if _mentions(e, "reasoning_effort") and "reasoning_effort" in kwargs:
+                kwargs.pop("reasoning_effort")
                 return self.client.chat.completions.create(**kwargs)
             raise
 
 
+def _iter_cancellable(stream, token):
+    """逐块让出 chunk，每块之前查取消令牌：取消后不再产出 message/usage。"""
+    for chunk in stream:
+        if token is not None and token.cancelled:
+            return
+        yield chunk
+
+
+def _mentions(exc: BaseException, param: str) -> bool:
+    """400 错误是否在抱怨某个请求参数：状态码先行，错误文本子串匹配兜底。"""
+    status = getattr(exc, "status_code", None)
+    if status is not None and status != 400:
+        return False
+    text = str(exc)
+    body = getattr(exc, "body", None) or ""
+    return param.lower() in f"{text} {body}".lower()
+
+
 def _usage_to_dict(usage):
-    """把 SDK 的 usage 对象展平为普通 dict；结构异常时返回 None，绝不影响对话流。"""
-    try:
-        if isinstance(usage, dict):
-            return dict(usage)
-        return usage.model_dump()
-    except Exception:  # noqa: BLE001
-        return None
+    """旧入口保留：已搬至 `llm.stream.usage_to_dict`，此处 re-export。"""
+    return usage_to_dict(usage)
+
+
+__all__ = ["ChatRequest", "LLMClient", "build_kwargs"]

@@ -82,18 +82,22 @@ class CachedModelSource(ModelSource):
 
 
 class RemoteModelSource(ModelSource):
-    """远端来源：OpenAI 兼容 `GET /models`；成功后回写缓存，失败返回 None。"""
+    """远端来源：OpenAI 兼容 `GET /models`；成功后回写缓存，失败返回 None。
 
-    def __init__(self, client, cache: ModelCache):
-        self._client = client
+    `list_models` 为空（测试替身等无该能力的 LLM）时恒返回 None——目录退化为
+    "当前模型兜底"，不影响对话。
+    """
+
+    def __init__(self, list_models: Callable[[], list[str] | None] | None,
+                 cache: ModelCache):
+        self._list_models = list_models
         self._cache = cache
 
     def load(self) -> list[str] | None:
-        list_models = getattr(self._client, "list_models", None)
-        if list_models is None:
+        if not callable(self._list_models):
             return None
         try:
-            models = list_models()
+            models = self._list_models()
         except Exception:  # noqa: BLE001 网络/接口异常一律视为无数据
             return None
         if not models:

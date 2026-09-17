@@ -54,6 +54,13 @@ class CancellationToken:
         """登记取消通知回调（如 UI 显示「正在停止…」）。"""
         self._listeners.append(callback)
 
+    def unsubscribe(self, callback) -> None:
+        """摘除已登记的回调（如流关闭后不再需要关流通知）；找不到时静默。"""
+        try:
+            self._listeners.remove(callback)
+        except ValueError:
+            pass
+
 
 # 当前轮次的活跃令牌：agent.run() 激活，llm 流层 / 工具调度层按需读取
 _current: ContextVar = ContextVar("smithcode_cancel_token", default=None)

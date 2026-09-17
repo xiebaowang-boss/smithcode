@@ -15,15 +15,27 @@
 import platform
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from .. import config
 
 
+@lru_cache(maxsize=1)
+def _is_git_repo_cached(workspace: str) -> bool:
+    """`_is_git_repo` 的缓存内核：按工作区路径缓存，`set_workspace` 后需清缓存。"""
+    p = Path(workspace).resolve()
+    return any((d / ".git").exists() for d in (p, *p.parents))
+
+
 def _is_git_repo() -> bool:
     """工作区或其任一父目录存在 .git（`.git` 文件也算，兼容 git worktree）。"""
-    p = Path(config.WORKSPACE_ROOT).resolve()
-    return any((d / ".git").exists() for d in (p, *p.parents))
+    return _is_git_repo_cached(config.WORKSPACE_ROOT)
+
+
+def clear_git_repo_cache() -> None:
+    """工作区切换后清掉 git 探测缓存（见 `config.set_workspace`）。"""
+    _is_git_repo_cached.cache_clear()
 
 
 def _env_info() -> str:

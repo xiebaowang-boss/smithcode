@@ -1,6 +1,7 @@
 """Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
 
 import json
+from types import SimpleNamespace
 
 import httpx2
 import pytest
@@ -856,11 +857,10 @@ def test_retry_accumulates_both_attempts_in_one_message(monkeypatch):
             yield ("content", "已修改完成，")
             raise httpx2.ReadTimeout("The read operation timed out")
         yield ("content", "总结如下：改了 commands/base.py。")
-        yield ("message", {"role": "assistant",
-                           "content": "总结如下：改了 commands/base.py。"})
+        yield ("message", {"role": "assistant", "content": ""})
 
-    client = object.__new__(LLMClient)  # 绕过 __init__：不校验 key、不建连接
-    client._custom_headers = {}
+    client = LLMClient(api_key="test", base_url=None, timeout=1.0, default_model="m",
+                       client_factory=lambda **kwargs: SimpleNamespace())
     client._stream_once = stream_once
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: client)
     monkeypatch.setattr("smithcode.llm.retry.wait", lambda state: None)  # 不真等退避
