@@ -36,6 +36,7 @@ from .. import (
     title,
     welcome,
 )
+from ..agent import format_stream_interrupted
 from ..mcp.errors import McpConfigError
 from ..mcp.wizard import McpWizard, apply_plan
 from . import clipboard
@@ -344,6 +345,7 @@ class SmithTUI(App):
         self.agent = agent
         self._busy = False
         self._turn_start: float | None = None
+        self._turn_reason = ""  # 本轮 stream_error 的失败原因（页脚带出，便于排障）
         # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
         # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
         self._select_stack: list = []
@@ -884,6 +886,7 @@ class SmithTUI(App):
 
     def _run_task(self, text: str) -> None:
         status = "ok"
+        result = None
         try:
             result = self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
             status = result.status
@@ -893,6 +896,7 @@ class SmithTUI(App):
             )
             status = "error"
         finally:
+            self._turn_reason = getattr(result, "reason", "") if result is not None else ""
             self._busy = False
             self.post_message(UiAction("focus_input"))
             self.post_message(UiAction("status"))
@@ -982,6 +986,8 @@ class SmithTUI(App):
         elapsed = time.monotonic() - self._turn_start
         self._turn_start = None
         suffix = {"interrupted": "已停止", "stream_error": "输出中断"}.get(status)
+        if status == "stream_error":
+            suffix += format_stream_interrupted(self._turn_reason)  # 带上失败原因
         found = self.query(ChatView)
         if found:
             # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）

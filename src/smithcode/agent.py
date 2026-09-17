@@ -28,6 +28,7 @@ from .llm.models import (
     ModelCatalog,
     RemoteModelSource,
 )
+from .llm.retry import describe as describe_error
 from .mcp import McpService
 from .permission import Permission
 from .plan import has_active, render_current, summary
@@ -79,8 +80,31 @@ SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
 INTERRUPTED_NOTE = "\n⏹ 已中断"
 # 响应流断开（读完超时 / 对端掐断连接）：控制台收尾提示。部分正文已上屏并入库，
 # 提示用户这是残缺输出、可直接追问让模型接着写。TUI 对应页脚的「· 输出中断」。
+# 末尾接 `format_stream_interrupted(reason)` 的失败原因——只报「输出中断」而不报
+# 为什么断，用户与排查者都无从下手（是读超时？限流？对端掐断？）。
 STREAM_INTERRUPTED_NOTE = "\n⏹ 输出中断（内容不完整，可继续追问让模型接着写）"
 INTERRUPTED_RESULT = "（未执行：用户中断了任务）"
+
+# 读超时的排障提示：这个模型/网关在长思考时可能长时间不吐数据，
+# `[limits].llm_timeout` 是**空闲超时**（静默超过它就断），不是总时长上限。
+TIMEOUT_HINT = (
+    "模型长时间未输出数据触发了空闲超时（[limits].llm_timeout，当前 {timeout:.0f}s）。"
+    "推理型模型的首字延迟可能很长，可调大该值后重试"
+)
+
+
+def format_stream_interrupted(reason: str | None) -> str:
+    """流中断的失败原因后缀：TUI 页脚与控制台提示共用同一份文案。
+
+    reason 由 `llm.retry.describe` 产出（`分类: 原始信息`）；缺失时退回空串，
+    保证调用方不用分支。
+    """
+    if not reason:
+        return ""
+    detail = f"（{reason}）"
+    if reason.startswith(("读取超时", "连接超时")):
+        return detail + " " + TIMEOUT_HINT.format(timeout=config.LLM_TIMEOUT)
+    return detail
 # 中断回写上下文：任务被手动中止时，作为一条 user 消息追加进会话历史
 # （不触发任何新请求），下一轮用户提问时模型即可看到上轮是被主动叫停的、
 # 任务未完成，避免把部分输出当成完整结果。
@@ -95,6 +119,15 @@ STREAM_INTERRUPTED_CONTEXT = (
     "（上一条回复在生成过程中因网络错误中断，内容不完整；"
     "以上是已经写出的部分。请基于它继续完成任务，不要从头重做。）"
 )
+
+
+def stream_interrupted_context(reason: str | None) -> str:
+    """流中断回写上下文，带上具体失败原因（下一轮模型能知道断在哪类故障上）。"""
+    if not reason:
+        return STREAM_INTERRUPTED_CONTEXT
+    return STREAM_INTERRUPTED_CONTEXT.replace(
+        "因网络错误中断", f"因 {reason} 中断", 1
+    )
 # 迭代上限收尾提示词：`[limits].max_iterations` > 0 且用尽时，系统不再暴露工具，
 # 把它作为一条 user 消息注入并强制模型用纯文本总结收尾（对齐 opencode 的
 # max-steps「最后一轮只回文本」行为）。总结是本次任务的最后一条可见回复。
@@ -573,8 +606,9 @@ class Agent:
             result = self._run_loop(token)
             status = result.status
         except StreamInterrupted as e:
-            self._note_stream_interrupted(e.partial)
-            result = RunResult("stream_error", e.partial)
+            reason = describe_error(e.original)  # 分类: 原始信息（诊断用）
+            self._note_stream_interrupted(e.partial, reason)
+            result = RunResult("stream_error", e.partial, reason=reason)
             status = result.status
         finally:
             self._token = None
@@ -761,16 +795,17 @@ class Agent:
         self.compact()
         return self._chat(use_tools=use_tools)
 
-    def _note_stream_interrupted(self, partial: str) -> None:
+    def _note_stream_interrupted(self, partial: str, reason: str | None = None) -> None:
         """把「流中断」事件写进会话历史：已上屏的部分正文 + 一行中断说明。
 
         部分正文按 assistant 消息落库（与屏幕上看到的一致）；正文为空（首块之前
         就断了）则只写说明，不留空 assistant 消息。说明是 user 消息、不触发新请求，
-        下一轮模型据此续写而非重做。
+        下一轮模型据此续写而非重做；reason（`分类: 原始信息`）一并写入，让下一轮
+        模型知道断在哪类故障上。
         """
         if partial.strip():
             self.session.messages.append({"role": "assistant", "content": partial})
-        self.session.add("user", STREAM_INTERRUPTED_CONTEXT)
+        self.session.add("user", stream_interrupted_context(reason))
 
     def _compact_if_needed(self) -> None:
         """每轮调用前的预检：估算越过阈值（预算 × COMPACT_TRIGGER）就先压缩。"""

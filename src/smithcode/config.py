@@ -236,7 +236,7 @@ CONTEXT_TOKEN_BUDGET = _resolve_number("context", "budget", 65536)
 COMPACT_TRIGGER = _resolve_number("context", "compact_trigger", 0.8)  # 占预算的比例
 COMPACT_KEEP_TOKENS = _resolve_number("context", "compact_keep_tokens", 15000)  # 压缩时尾部原样保留的 token 数
 MAX_RETRIES = _resolve_number("limits", "max_retries", 3)  # LLM 瞬时错误（限流/断网/5xx）自动重试次数
-LLM_TIMEOUT = _resolve_number("limits", "llm_timeout", 120)  # 单次 LLM 请求超时（秒）
+LLM_TIMEOUT = _resolve_number("limits", "llm_timeout", 120)  # LLM 空闲超时（秒）：静默超过它就断开，不是整个请求的总时长上限
 
 # /goal 持久目标的默认回合预算：正整数表示目标存续期间最多自动推进的回合数，
 # 用尽后系统注入收尾提示词并停止（/goal budget N 可改当前目标）。默认 -1 表示

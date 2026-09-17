@@ -746,9 +746,8 @@ def test_stream_timeout_keeps_partial_in_history(monkeypatch):
     """重试用尽：状态为 stream_error，已上屏的部分正文必须写进会话历史。
 
     否则下一轮模型看不到自己说过什么，会从头重做、再复述一遍（原始故障现象）。
+    中断说明还要带上失败原因——只报「中断」不报为什么断，用户无从排障。
     """
-    from smithcode.agent import STREAM_INTERRUPTED_CONTEXT
-
     monkeypatch.setattr("smithcode.agent.LLMClient", MidStreamTimeoutLLM)
     agent = Agent(session=Session())
 
@@ -756,9 +755,12 @@ def test_stream_timeout_keeps_partial_in_history(monkeypatch):
 
     assert result.status == "stream_error"
     assert result.text == "已修改完成，总结如下："
+    assert result.reason.startswith("读取超时")  # TUI 页脚 / 控制台据此展示原因
     contents = [m.get("content") for m in agent.session.messages]
     assert "已修改完成，总结如下：" in contents  # partial 落库
-    assert contents[-1] == STREAM_INTERRUPTED_CONTEXT  # 末尾补中断说明
+    note = contents[-1]
+    assert "读取超时" in note  # 原因写进下一轮可见的中断说明
+    assert "请基于它继续完成任务，不要从头重做。" in note  # 续写引导仍在
     assert [m["role"] for m in agent.session.messages][-2:] == ["assistant", "user"]
 
 
@@ -875,3 +877,25 @@ def test_retry_accumulates_both_attempts_in_one_message(monkeypatch):
     assistant = [m for m in agent.session.messages if m["role"] == "assistant"]
     assert len(assistant) == 1  # 一条消息，不是两条
     assert assistant[0]["content"] == "已修改完成，总结如下：改了 commands/base.py。"
+
+
+def test_format_stream_interrupted_carries_reason_and_timeout_hint(monkeypatch):
+    """「输出中断」必须带出失败原因；读超时额外给出可操作提示。
+
+    只报「输出中断」而不报为什么断，用户与排查者都无从下手——这正是原始
+    故障里最难定位的一点。
+    """
+    from smithcode.agent import format_stream_interrupted
+
+    monkeypatch.setattr(config, "LLM_TIMEOUT", 120)
+    timeout_text = format_stream_interrupted("读取超时: The read operation timed out")
+    assert "读取超时" in timeout_text
+    assert "read operation timed out" in timeout_text
+    assert "llm_timeout" in timeout_text and "120" in timeout_text  # 可操作提示
+
+    other = format_stream_interrupted("请求过于频繁: 429")
+    assert "请求过于频繁" in other
+    assert "llm_timeout" not in other  # 非超时不给超时提示
+
+    assert format_stream_interrupted("") == ""
+    assert format_stream_interrupted(None) == ""

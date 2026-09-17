@@ -4,7 +4,12 @@ import threading
 from pathlib import Path
 
 from . import __version__, commands, config, renderer, sessions, title
-from .agent import INTERRUPTED_NOTE, STREAM_INTERRUPTED_NOTE, Agent
+from .agent import (
+    INTERRUPTED_NOTE,
+    STREAM_INTERRUPTED_NOTE,
+    Agent,
+    format_stream_interrupted,
+)
 from .session import Session
 from .utils.proxy import normalize_proxy_env
 from .utils.terminal import (
@@ -80,7 +85,7 @@ def _run_agent_task(agent: Agent, text: str) -> None:
     if result.status == "interrupted":
         print(INTERRUPTED_NOTE)
     elif result.status == "stream_error":
-        print(STREAM_INTERRUPTED_NOTE)
+        print(STREAM_INTERRUPTED_NOTE + format_stream_interrupted(result.reason))
 
 
 def _run_compact_task(agent: Agent) -> None:
@@ -210,7 +215,7 @@ def run_once(agent: Agent, task: str):
     if result.status == "interrupted":
         print(INTERRUPTED_NOTE)
     elif result.status == "stream_error":
-        print(STREAM_INTERRUPTED_NOTE)
+        print(STREAM_INTERRUPTED_NOTE + format_stream_interrupted(result.reason))
 
 
 def _cleanup_old_sessions() -> None:

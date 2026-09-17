@@ -3823,3 +3823,21 @@ def test_retry_end_from_other_owner_keeps_state(monkeypatch):
             assert "正在重试" in str(running.render())
 
     _run(_run_case())
+
+
+def test_stream_error_footer_carries_reason(monkeypatch):
+    """页脚「输出中断」要带上失败原因（只报中断不报原因无法排障）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app._turn_start = time.monotonic() - 3
+            app._turn_reason = "读取超时: The read operation timed out"
+            app.ui_turn_end("stream_error")
+            await pilot.pause()
+            text = _chat_text(app)
+            assert "输出中断" in text
+            assert "读取超时" in text
+
+    _run(_run_case())
