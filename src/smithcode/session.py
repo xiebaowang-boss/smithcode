@@ -164,9 +164,9 @@ class Session:
             self._store.append_title(text, source)
 
     def save(self) -> Path:
-        """手动保存：有转录时 flush 并返回转录路径；无持久化时回退旧的全量导出。"""
+        """手动保存：有转录时 fsync 落盘并返回转录路径；无持久化时回退旧的全量导出。"""
         if self._store is not None:
-            self._store.flush()
+            self._store.sync()  # 手动保存要的是「真的在磁盘上」，不只是交给内核
             return self._store.path
         sessions_dir = Path(config.WORKSPACE_ROOT) / "sessions"
         sessions_dir.mkdir(exist_ok=True)

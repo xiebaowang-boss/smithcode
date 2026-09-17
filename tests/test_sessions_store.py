@@ -140,6 +140,58 @@ def test_import_legacy_json_rejects_invalid(_isolated):
         import_json(bad)
 
 
+def test_model_record_dedupes_and_last_wins(_isolated):
+    """t=model 回答「谁生成的」：同值不重复写、变化才追加，加载取最后一条。"""
+    store = SessionStore.create(model="m1")
+    store.append_message({"role": "user", "content": "第一轮"})
+    store.append_model("m1", "high")
+    store.append_model("m1", "high")  # 未变化：不写
+    store.append_model("m2", "low")  # /model 切换：追加
+    store.close()
+
+    lines = [json.loads(line) for line in store.path.read_text(encoding="utf-8").splitlines()]
+    written = [(r["model"], r["effort"]) for r in lines if r["t"] == "model"]
+    assert written == [("m1", "high"), ("m2", "low")]
+
+    loaded = load(summary_from_path(store.path))
+    assert (loaded.model, loaded.effort) == ("m2", "low")  # 最后一条生效
+
+
+def test_model_falls_back_to_meta_for_legacy_transcript(_isolated):
+    """旧转录没有 t=model：回退 meta 的创建时模型，而不是留空。"""
+    legacy = SessionStore.create(model="old-model")
+    legacy.append_message({"role": "user", "content": "旧会话"})
+    legacy.close()
+    loaded = load(summary_from_path(legacy.path))
+    assert loaded.model == "old-model"
+
+    # 列举同样取最后一条 model 记录（长会话里标题/模型记录都靠尾窗读取）
+    fresh = SessionStore.create(model="m1")
+    fresh.append_message({"role": "user", "content": "新会话"})
+    fresh.append_model("m2", "low")
+    fresh.close()
+    assert summary_from_path(fresh.path).model == "m2"
+
+
+def test_sync_fsyncs_only_with_a_live_handle(_isolated, monkeypatch):
+    """sync 是 fsync 屏障：没有句柄（未物化 / 已 close）时是纯无操作。"""
+    calls = []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd))
+
+    store = SessionStore.create()
+    store.sync()
+    assert calls == []
+    assert not store.path.exists()  # 不因 sync 建出空转录
+
+    store.append_message({"role": "user", "content": "你好"})
+    store.sync()
+    assert len(calls) == 1
+
+    store.close()
+    store.sync()
+    assert len(calls) == 1  # close 之后不再触碰已释放的句柄
+
+
 def test_write_failure_disables_store(_isolated, monkeypatch, capsys):
     from smithcode.sessions import store as store_mod
 

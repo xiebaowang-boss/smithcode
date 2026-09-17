@@ -13,6 +13,16 @@ def test_record_roundtrip_via_line():
     assert parsed["m"]["content"] == "你好"
 
 
+def test_model_record_roundtrip():
+    """t=model 记录每轮实际使用的模型与思考强度（供恢复与审计）。"""
+    record = format.model_record("deepseek-chat", "high")
+    parsed = format.parse_line(format.dump_record(record))
+    assert parsed["v"] == format.FORMAT_VERSION
+    assert parsed["t"] == "model"
+    assert parsed["model"] == "deepseek-chat"
+    assert parsed["effort"] == "high"
+
+
 def test_parse_line_rejects_invalid_shapes():
     assert format.parse_line("") is None
     assert format.parse_line("不是 JSON") is None
@@ -50,6 +60,23 @@ def test_repair_appends_placeholder_for_tail_dangling():
     assert messages[-1]["content"] == format.CRASH_PLACEHOLDER
     # 修复后历史合法：再修一次无改动（幂等）
     assert format.repair_dangling_tool_calls(messages) == ("none", [])
+
+
+def test_repair_placeholder_declares_unknown_outcome():
+    """占位结果不得断言工具「未执行」：崩溃只证明结果没落盘，副作用可能已生效。
+
+    占位内容是模型可见的，直接决定它会不会盲目重试写操作，因此这里断言的是
+    语义而非措辞细节：必须承认结果未知，并给出可操作的核实建议。
+    """
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+    ]
+    status, appended = format.repair_dangling_tool_calls(messages)
+    assert status == "appended"
+    content = appended[0]["content"]
+    assert "未知" in content
+    assert "未执行" not in content
+    assert "核实" in content
 
 
 def test_repair_truncates_mid_history_dangling():

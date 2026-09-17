@@ -49,6 +49,7 @@ class _StubAgent:
             title=summary.title,
             repair="none",
             bad_lines=0,
+            model="",
         )
 
     def rename_session(self, title):
@@ -120,6 +121,23 @@ def test_sessions_by_prefix_switches():
     agent, outcome = _run(f"/sessions {store.id[:8]}")
     assert agent.resumed == [store.id]
     assert outcome.refresh_status is True
+
+
+def test_sessions_switch_reports_recorded_model(monkeypatch):
+    """转录里的模型与当前不同：切换提示点出，且不悄悄改全局模型。"""
+    store = _store_with()
+    monkeypatch.setattr(config, "MODEL", "current-model")
+
+    class _ModelStub(_StubAgent):
+        def resume(self, summary):
+            report = super().resume(summary)
+            report.model = "other-model"
+            return report
+
+    _, outcome = _run(f"/sessions {store.id[:8]}", agent=_ModelStub())
+    assert "other-model" in outcome.text
+    assert "current-model" in outcome.text
+    assert config.MODEL == "current-model"
 
 
 def test_sessions_ambiguous_prefix_reports():

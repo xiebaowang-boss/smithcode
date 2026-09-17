@@ -38,6 +38,7 @@ def test_parser_session_flags():
 class _FakeAgent:
     def __init__(self):
         self.resumed = None
+        self.report_model = ""  # 转录里最后使用的模型（测试按需改写）
 
     def resume(self, summary):
         from smithcode.agent import ResumeReport
@@ -50,6 +51,7 @@ class _FakeAgent:
             message_count=3,
             repair="none",
             bad_lines=0,
+            model=self.report_model,
         )
 
 
@@ -73,6 +75,22 @@ def test_resume_session_uses_latest(capsys):
     _resume_session(agent, True, "")
     assert agent.resumed is not None and agent.resumed.id == store.id
     assert "已恢复" in capsys.readouterr().out
+
+
+def test_resume_session_reports_recorded_model(capsys, monkeypatch):
+    """转录里的模型与当前不同：恢复提示点出，方便用户决定是否 /model 切回。"""
+    store = SessionStore.create()
+    store.append_message({"role": "user", "content": "hi"})
+    store.close()
+
+    monkeypatch.setattr(config, "MODEL", "current-model")
+    agent = _FakeAgent()
+    agent.report_model = "other-model"
+    _resume_session(agent, True, "")
+    out = capsys.readouterr().out
+    assert "other-model" in out
+    assert "current-model" in out
+    assert config.MODEL == "current-model"  # 恢复不悄悄改全局模型
 
 
 def test_resume_session_missing_notice(capsys):

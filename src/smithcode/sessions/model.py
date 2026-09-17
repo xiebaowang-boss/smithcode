@@ -42,6 +42,8 @@ class LoadedSession:
     title: str = ""
     title_source: str = ""
     compact_count: int = 0
+    model: str = ""  # 最后一条 model 记录（无记录时回退 meta 的创建时模型）
+    effort: str = ""
     bad_lines: int = 0
     repair: str = "none"  # none / appended / truncated（崩溃修复结果）
     repaired: list = field(default_factory=list)  # appended 时补的占位消息
@@ -53,10 +55,6 @@ class LoadedSession:
     @property
     def cwd(self) -> str:
         return str(self.meta.get("cwd") or "")
-
-    @property
-    def model(self) -> str:
-        return str(self.meta.get("model") or "")
 
     @property
     def oneshot(self) -> bool:

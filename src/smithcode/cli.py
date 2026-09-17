@@ -263,11 +263,17 @@ def _resume_session(agent: Agent, last: bool, target: str) -> None:
     if report.title:
         note += f"：{report.title}"
     if report.repair == "appended":
-        note += "；已修复中断留下的未完成工具调用"
+        note += "；已修复中断留下的未完成工具调用（结果未知，已提示模型先核实）"
     elif report.repair == "truncated":
         note += "；检测到历史损坏，已截断修复"
     if report.bad_lines:
         note += f"；跳过 {report.bad_lines} 行损坏记录"
+    if report.model and report.model != config.MODEL:
+        # 转录用 t=model 记录每轮实际使用的模型；恢复了会话但不悄悄改全局模型
+        note += (
+            f"；该会话上次使用模型 {report.model}"
+            f"（当前 {config.MODEL}，如需沿用请 /model {report.model}）"
+        )
     print(note)
 
 

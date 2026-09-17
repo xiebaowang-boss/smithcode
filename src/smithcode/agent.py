@@ -149,6 +149,7 @@ class ResumeReport:
     message_count: int
     repair: str  # none / appended / truncated
     bad_lines: int
+    model: str = ""  # 该会话最后使用的模型（转录里的 model 记录，回退创建时模型）
 
 
 class _StatePart(NamedTuple):
@@ -499,6 +500,7 @@ class Agent:
             message_count=len(loaded.messages),
             repair=loaded.repair,
             bad_lines=loaded.bad_lines,
+            model=loaded.model,
         )
 
     @staticmethod
@@ -669,6 +671,7 @@ class Agent:
             reset_token()
             view.turn_finished(status)
         self._persist_turn()  # 状态投影缓存落盘（无变化不写）
+        self._checkpoint()  # 每轮结束的 fsync 屏障：本轮消息与状态挺过断电
         if result.status == "ok":
             self._maybe_generate_title()  # 本轮结束后自动标题（后台，失败下轮补试）
         if result.status == "interrupted":
@@ -778,6 +781,7 @@ class Agent:
                 name = tc.get("function", {}).get("name", "")
                 if name and name not in tools_used:
                     tools_used.append(name)
+            self._checkpoint()  # 副作用屏障：本批 tool_calls 先落盘，工具才会真正执行
             stopped = self._execute_batch(msg["tool_calls"])
             if stopped == "denied":
                 return RunResult(
@@ -795,9 +799,25 @@ class Agent:
         """登记一次模型调用：会话用量 + 真实 token 锚点 + 转录用量 + 消息入库。"""
         self.session.usage.add(usage)
         self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
-        if usage and self.session.store is not None:
-            self.session.store.append_usage(usage)
+        store = self.session.store
+        if store is not None:
+            # 记「谁生成的」：用本轮 pin 住的快照，而不是可能已被 /model 改掉的全局值
+            turn = self._turn or TurnConfig.capture(self._model)
+            store.append_model(turn.model, turn.effort)
+            if usage:
+                store.append_usage(usage)
         self.session.messages.append(msg)
+
+    def _checkpoint(self) -> None:
+        """崩溃持久化屏障：把已追加的记录 fsync 到磁盘（无持久化时无操作）。
+
+        只在语义点调用——工具可能产生外部副作用之前，以及本轮结束之后。两次
+        检查点之间的普通追加只 `flush()`（进程内可见即可），fsync 的成本留给
+        "错了就没法挽回"的时刻。失败仍按既有策略降级为纯内存会话（fail-open）。
+        """
+        store = self.session.store
+        if store is not None:
+            store.sync()
 
     def _wrap_up(self, tools_used: list) -> RunResult:
         """到达迭代上限后的收尾轮：不再暴露工具，要求模型用纯文本总结。

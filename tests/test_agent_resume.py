@@ -10,6 +10,7 @@ from smithcode import config, goal, instructions, plan, skills
 from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.sessions import SessionStore, list_sessions, load, summary_from_path
+from smithcode.tools import FUNCTIONS
 from smithcode.tools import files as files_mod
 
 
@@ -79,6 +80,75 @@ def test_run_persists_and_resume_roundtrip(monkeypatch):
     reloaded = load(summary_from_path(store.path))
     assert reloaded.messages[-1]["content"] == "最终回复"
     assert any(m.get("content") == "继续" for m in reloaded.messages)
+
+
+class _ToolThenAnswerLLM:
+    """第一轮请求一个工具调用，第二轮给最终回复。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None, model=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield ("message", {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": {"name": "checkpoint_probe", "arguments": "{}"},
+                }],
+            })
+        else:
+            yield ("message", {"role": "assistant", "content": "完成"})
+
+
+def test_fsync_checkpoints_bracket_tool_execution(monkeypatch):
+    """fsync 只在两个语义点发生：工具执行前（副作用屏障）与每轮结束。
+
+    普通的逐条追加只 flush：fsync 的成本留给「错了就没法挽回」的时刻。
+    """
+    events = []
+
+    def probe():
+        events.append("tool")
+        return "ok"
+
+    monkeypatch.setitem(FUNCTIONS, "checkpoint_probe", probe)
+    monkeypatch.setattr(os, "fsync", lambda fd: events.append("fsync"))
+    monkeypatch.setattr("smithcode.agent.LLMClient", _ToolThenAnswerLLM)
+    agent = Agent(session=Session(), persist=True)
+    # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+
+    agent.run("跑个工具")
+
+    assert "tool" in events, "工具应当被执行"
+    assert events[: events.index("tool")] == ["fsync"], "工具执行前必须先 fsync"
+    assert events[-1] == "fsync", "每轮结束还要再 fsync 一次"
+    assert events.count("fsync") >= 2
+
+
+def test_run_records_model_and_resume_reports_it(monkeypatch):
+    """每轮把实际模型写进 t=model；恢复把「上次使用模型」交回宿主且不改全局模型。"""
+    monkeypatch.setattr(config, "MODEL", "model-a")
+    agent = _make_agent(monkeypatch)
+    agent.run("你好")
+    monkeypatch.setattr(config, "MODEL", "model-b")  # 中途 /model 切换
+    agent.run("再问")
+    store = agent.session.store
+    store.close()
+
+    records = [
+        json.loads(line) for line in store.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [r["model"] for r in records if r["t"] == "model"] == ["model-a", "model-b"]
+
+    resumed = _make_agent(monkeypatch)
+    report = resumed.resume(store.id)
+    assert report.model == "model-b"  # 上次使用的模型交回宿主
+    assert config.MODEL == "model-b"  # 恢复不悄悄改全局模型
 
 
 def test_resume_repairs_dangling_tool_calls_and_persists(monkeypatch):

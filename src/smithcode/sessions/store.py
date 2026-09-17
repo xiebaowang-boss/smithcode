@@ -2,11 +2,14 @@
 
 写路径（`SessionStore`）：懒物化（首条非 system 消息才建文件）、每条记录
 一次 `write` + `flush`、任何 `OSError` 降级为禁用持久化（绝不阻断 Agent）。
+`sync()` 是持久化屏障（flush + fsync），只在语义点调用：工具执行前与每轮结束
+——单条 `flush` 只把数据交给内核页缓存，扛不住断电。
 读路径（模块函数）：列举只读文件头/尾，加载单遍流式并做崩溃修复。
 """
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -47,6 +50,7 @@ class SessionStore:
         self._disabled = False
         self._reported = False
         self._materialized = False
+        self._last_model: tuple[str, str] | None = None  # 已写入的 (模型, 强度)：去重
 
     # ---------- 构造 ----------
 
@@ -103,6 +107,18 @@ class SessionStore:
         if isinstance(usage, dict) and usage:
             self._append(format.usage_record(usage))
 
+    def append_model(self, model: str, effort: str = "") -> None:
+        """记录本次调用实际使用的模型 / 思考强度（与上一条相同则不写）。
+
+        首次调用必写一条（`_last_model` 为空），此后仅在变化时追加——`meta`
+        只记创建时的模型，`/model` 中途切换后需要靠这条记录回答「谁生成的」。
+        """
+        key = (str(model or ""), str(effort or ""))
+        if not key[0] or key == self._last_model:
+            return
+        self._last_model = key
+        self._append(format.model_record(*key))
+
     def _append(self, record: dict) -> None:
         if self._disabled:
             return
@@ -144,6 +160,32 @@ class SessionStore:
             else:
                 return
         self._report(error)
+
+    def sync(self) -> None:
+        """持久化屏障：flush + `os.fsync`，确保已追加记录挺过断电 / 内核崩溃。
+
+        与 `flush()` 的区别只在落盘层级：`flush()` 把数据交给内核页缓存（进程被
+        kill 通常能保住），`fsync()` 才真正写进设备。成本是每次一次系统调用，
+        所以只在语义点调用（工具执行前 / 每轮结束），不追求每条记录都 fsync。
+        写失败仍按既有策略降级为纯内存会话（fail-open）。
+        """
+        if self._disabled:
+            return
+        error = None
+        with self._lock:
+            fh = self._fh
+            if fh is None:
+                return
+            try:
+                fh.flush()
+                os.fsync(fh.fileno())
+            except ValueError:
+                return  # 句柄已被 close() 关闭（并发竞争），不是写失败，不降级
+            except OSError as exc:
+                self._disabled = True
+                error = exc
+        if error is not None:
+            self._report(error)
 
     def close(self) -> None:
         with self._lock:
@@ -314,12 +356,14 @@ def sweep(cleanup_days) -> int:
 # ---------- 内部 ----------
 
 def _assemble(path: Path, records: list, bad_lines: int = 0) -> LoadedSession:
-    """把记录流装配为加载结果：compact 重置投影，最后一条 state/title 生效。"""
+    """把记录流装配为加载结果：compact 重置投影，最后一条 state/title/model 生效。"""
     meta = {}
     messages: list = []
     state = None
     title = ""
     title_source = ""
+    model = ""
+    effort = ""
     compact_count = 0
     for record in records:
         kind = record.get("t")
@@ -341,12 +385,21 @@ def _assemble(path: Path, records: list, bad_lines: int = 0) -> LoadedSession:
         elif kind == format.T_TITLE:
             title = str(record.get("title") or "")
             title_source = str(record.get("source") or "")
+        elif kind == format.T_MODEL:
+            # 只采纳带模型的记录：残缺记录退回上一条，而不是清空已还原的值
+            candidate = str(record.get("model") or "")
+            if candidate:
+                model, effort = candidate, str(record.get("effort") or "")
     if not meta:
         meta = _synthesize_meta(path)
+    if not model:  # 旧转录（或首次调用尚未登记）回退 meta 的创建时模型
+        model = str(meta.get("model") or "")
+        effort = effort or str(meta.get("effort") or "")
     repair, repaired = format.repair_dangling_tool_calls(messages)
     return LoadedSession(
         path=path, meta=meta, messages=messages, state=state,
         title=title, title_source=title_source, compact_count=compact_count,
+        model=model, effort=effort,
         bad_lines=bad_lines, repair=repair, repaired=repaired,
     )
 
@@ -382,10 +435,11 @@ def _read_summary(path: Path) -> SessionSummary | None:
         if meta and first_prompt:
             break
 
-    title, title_source = _last_title(_parse_chunk(tail or head))
+    title, title_source, model = _last_tail_facts(_parse_chunk(tail or head))
     if not title and size > len(head) + len(tail):
         # 标题可能被长会话推到文件深处：回退全文扫描（仅此一种情况读全文）
-        title, title_source = _last_title(_iter_records(path))
+        title, title_source, scanned_model = _last_tail_facts(_iter_records(path))
+        model = model or scanned_model
     if not meta and not first_prompt and not title:
         return None
     return SessionSummary(
@@ -394,7 +448,8 @@ def _read_summary(path: Path) -> SessionSummary | None:
         cwd=str(meta.get("cwd") or ""),
         created=float(meta.get("created") or stat.st_mtime),
         updated=stat.st_mtime,
-        model=str(meta.get("model") or ""),
+        # 首轮 prompt 与标题来自头尾窗口；模型取最后一条 model 记录（回退创建时模型）
+        model=model or str(meta.get("model") or ""),
         title=title,
         title_source=title_source,
         first_prompt=first_prompt,
@@ -440,13 +495,17 @@ def _iter_records(path: Path):
                 yield record
 
 
-def _last_title(records) -> tuple[str, str]:
-    title, source = "", ""
+def _last_tail_facts(records) -> tuple[str, str, str]:
+    """一段记录里最后生效的 (标题, 标题来源, 模型)：列举只读头尾窗口时用。"""
+    title, source, model = "", "", ""
     for record in records:
-        if record.get("t") == format.T_TITLE:
+        kind = record.get("t")
+        if kind == format.T_TITLE:
             title = str(record.get("title") or "")
             source = str(record.get("source") or "")
-    return title, source
+        elif kind == format.T_MODEL:
+            model = str(record.get("model") or "") or model
+    return title, source, model
 
 
 def _text_of(content) -> str:

@@ -7,6 +7,7 @@
 - `compact` 压缩检查点：从本行起活动上下文 = summary + tail（自包含）
 - `state`   会话级投影缓存（goal / plan / skills），取最后一条
 - `title`   标题记录（source=user/auto），取最后一条
+- `model`   生效模型 / 思考强度（与上一条不同时才追加，取最后一条）
 - `branch`  分支血缘（fork 时写入新文件）
 - `usage`   单次调用的 token 用量（列表/统计用，不参与上下文装配）
 """
@@ -23,14 +24,21 @@ T_MSG = "msg"
 T_COMPACT = "compact"
 T_STATE = "state"
 T_TITLE = "title"
+T_MODEL = "model"
 T_BRANCH = "branch"
 T_USAGE = "usage"
 
 TITLE_SOURCE_USER = "user"
 TITLE_SOURCE_AUTO = "auto"
 
-# 崩溃恢复时补的占位工具结果（悬空 tool_calls 会让服务商拒绝下一次请求）
-CRASH_PLACEHOLDER = "（未执行：上次会话中断）"
+# 崩溃恢复时补的占位工具结果（悬空 tool_calls 会让服务商拒绝下一次请求）。
+# 措辞必须承认「结果未知」，不能断言「未执行」：崩溃点只能证明结果没落盘，
+# 工具可能早已执行并产生了副作用；断言未执行会诱使模型直接重试写操作。
+CRASH_PLACEHOLDER = (
+    "（上次会话中断，此工具调用的执行结果未知：它可能已经执行并产生了副作用。"
+    "只读或幂等操作可以直接重试；写文件、运行命令等可能改动外部状态的操作，"
+    "请先核实当前状态（重新读取文件、检查命令输出等）再决定，必要时询问用户。）"
+)
 
 # 标题长度上限的兜底（config [sessions].title_max_chars 可配）
 DEFAULT_TITLE_CHARS = 60
@@ -83,6 +91,21 @@ def title_record(title: str, source: str = TITLE_SOURCE_USER) -> dict:
         "t": T_TITLE,
         "title": str(title),
         "source": str(source),
+        "ts": time.time(),
+    }
+
+
+def model_record(model: str, effort: str = "") -> dict:
+    """生效模型记录（与上一条不同时才写，取最后一条）。
+
+    `meta` 只记创建会话时的模型，`/model` 中途切换后转录无法回答「这条消息是
+    谁生成的」；本记录补上这个事实，恢复时据此还原上一轮的模型与思考强度。
+    """
+    return {
+        "v": FORMAT_VERSION,
+        "t": T_MODEL,
+        "model": str(model),
+        "effort": str(effort),
         "ts": time.time(),
     }
 
@@ -142,8 +165,9 @@ def repair_dangling_tool_calls(messages: list) -> tuple[str, list]:
 
     - `none`      ：历史合法，无改动；
     - `appended`  ：悬空在尾部（崩溃点，assistant 已落盘、结果未落盘），
-                    按 tool_calls 顺序补占位结果——调用方应把追加的消息
-                    持久化，避免下次恢复被误判为中段损坏；
+                    按 tool_calls 顺序补占位结果（内容为 `CRASH_PLACEHOLDER`，
+                    声明「结果未知」并给出核实建议，不断言工具未执行）——
+                    调用方应把追加的消息持久化，避免下次恢复被误判为中段损坏；
     - `truncated` ：悬空出现在历史中段（手改/截断等异常），从最早的悬空
                     assistant 消息起截断尾部，保证「每个 tool_call_id 恰有
                     一条结果」的不变量。
