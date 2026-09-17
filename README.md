@@ -311,5 +311,3 @@ ruff check src tests      # 代码检查
 ## 文档
 
 - [架构说明](docs/architecture.md)：模块划分、Agent 循环、安全边界设计、如何新增一个工具
-- [发布文档](docs/release.md)：版本号规则、发布流程（SOP）、GitHub Release 约定与各版本发布说明
-- [更新日志](CHANGELOG.md)

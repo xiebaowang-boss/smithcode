@@ -4,7 +4,7 @@
 > 后续调整：装载时机改为会话边界一次（启动 / `/new` / 恢复），会话中途不重载
 > 以保护提示前缀缓存（对齐 Codex「每会话装载一次」）；项目级探测扩展为
 > git 根到工作区的目录链（对齐 Codex / opencode 的向上发现）。§1–§5 中
-> 「每轮 mtime 检测」「仅工作区级」的描述已不适用，以代码与 CHANGELOG 为准。
+> 「每轮 mtime 检测」「仅工作区级」的描述已不适用，以代码与 git 历史为准。
 > 目标：会话启动时自动读取用户级与项目级 `AGENTS.md`，注入
 > `messages[0]` 系统提示词；优先级明确、提示缓存稳定、安全边界不被文本覆盖。
 > 术语与既有设计一致，实现细节以 [architecture.md](architecture.md) 为准。
@@ -260,7 +260,7 @@ ruff check src tests
 1. **config**：`InstructionsConfig` + loader + `test_config_file.py` 用例。
 2. **instructions.py**：扫描 / 指纹 / 预算渲染 + `test_instructions.py` 全量用例。
 3. **注入接线**：`prompts.py` 签名、`session.py`、`agent.start()` + `test_session.py`。
-4. **回归与文档**：`pytest` 全量 + `ruff`；更新 `CHANGELOG.md` `[未发布]`、`docs/architecture.md`
+4. **回归与文档**：`pytest` 全量 + `ruff`；更新 `docs/architecture.md`
    模块表与安全小节、`AGENTS.md` 模块速查表、`README.md` 功能特性。
 5. （可选）P2 命令 / `/init`。
 
