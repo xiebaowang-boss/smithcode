@@ -279,7 +279,7 @@ def test_model_switches_with_arg(monkeypatch):
     monkeypatch.setattr(config, "MODEL", "old-model")
     _, outcome = _run("/model new-model")
     assert config.MODEL == "new-model"
-    assert "已切换模型" in outcome.text
+    assert outcome.text is None  # 静默切换：反馈由底栏状态刷新承担
     assert outcome.refresh_status
     assert outcome.select is None
 

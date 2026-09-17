@@ -42,6 +42,7 @@
 - **技能重复加载改为分通道语义（用户侧静默开跑）**：重复加载仍不重复注入正文（幂等），但模型通道与用户通道分开处理——模型 `use_skill` 重复调用时工具结果回一句已加载提示（指明完整指令在本轮之前的对话历史里、给出载荷识别特征，历史找不到时用 `read_file` 按绝对路径重读），模型照着去历史里找正文；用户 `/技能名 [任务]` 重复调用时**不再向用户打印**已加载提示，一律静默开跑：注入一句历史回找引导（`render.recall_notice`，非载荷、不占上下文）让模型先定位此前的载荷再执行，有任务时引导先进历史、任务随后发起，无任务时引导本身即本轮 user 消息。`activate(by="user")` 重复时回内部哨兵供命令层判定，提示语统一由渲染层产出。
 - **检索与读取性能优化（glob / grep / read_file）**：`glob` 改 `os.scandir` 递归（入口处剪掉 `SKIP_DIRS` 整棵子树、有序遍历、命中上限早停，排序只对截断后的命中集 `stat`），不再 `Path.glob("**")` 全量展开 + 全量 `stat` 排序；`grep` 的 `files_with_matches` 首命中即停（不建全文件匹配表）、二进制先读 8KB 预检再决定是否解码、无匹配全扫加扫描预算熔断（5000 文件 / 50MB，超限停并提示收窄）；`read_file` 分页走流式 `_read_slice`（内存只保留窗口）、超 2MB 默认拒绝整读，大文件 diff 预览限 2 万字符，`edit_file` 多匹配行号报错只找前 5 处早停。已补回归测试。
 - **工具文件名与工具名对齐（改名，无行为变化）**：`tools/search.py`（装 `glob` + `grep` 两个工具）拆为 `tools/glob.py` + `tools/grep.py`，共享基座抽入 `tools/_shared_local.py`（下划线前缀=非工具、不注册：SKIP_DIRS、沙箱根判定、有序遍历、行截断）；`tools/web.py`（装 `webfetch`）改名 `tools/webfetch.py`，与 `websearch.py` 并列——文件名即工具名。测试同步拆分/改名（`test_tools_glob.py` / `test_tools_grep.py` / `test_tools_webfetch.py`），`docs/architecture.md` 模块表同步更新。
+- **`/model` 切换改为静默（对齐 `/effort`）**：`/model <名称>` 不再向对话框打印「已切换模型」绿色提示行，反馈由底栏「模型」刷新承担；标题失败计数重置逻辑不变。
 
 ## [0.9.1] - 2026-09-17
 

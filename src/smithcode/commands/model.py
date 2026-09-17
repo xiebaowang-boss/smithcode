@@ -19,7 +19,8 @@ def _model(ctx):
         reset = getattr(ctx.agent, "reset_title_attempts", None)
         if callable(reset):
             reset()
-        return CommandResult(text=f"已切换模型: {name}", style="green", refresh_status=True)
+        # 静默切换：反馈由底栏「模型」刷新承担，不再打印提示行（对齐 /effort）
+        return CommandResult(refresh_status=True)
 
     choices = [
         CommandChoice(label=name, value=name, current=(name == config.MODEL))

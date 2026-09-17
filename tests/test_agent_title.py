@@ -159,7 +159,7 @@ def test_model_switch_resets_title_attempts(monkeypatch):
     agent._title_attempts = TITLE_MAX_ATTEMPTS
     agent._title_cooldown = 2
     outcome = commands.dispatch(agent, "/model other-model")
-    assert "已切换模型" in outcome.text
+    assert outcome.text is None  # 静默切换：反馈由底栏状态刷新承担
     assert agent._title_attempts == 0
     assert agent._title_cooldown == 0
 
