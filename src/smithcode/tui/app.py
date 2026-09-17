@@ -978,6 +978,9 @@ class SmithTUI(App):
     def ui_turn_end(self, status: str = "ok") -> None:
         """轮次结束：在会话末尾追加 opencode 式元数据页脚「▣ 模型 · 思考强度 · 用时」。
 
+        模型与思考强度读本轮 pin 住的快照（实际发出的值）：轮内切配置不影响
+        本轮，页脚不再误报切换后的值；快照缺失（假 LLM 路径）回退全局配置。
+
         中断收尾（status == "interrupted"）时在页脚行尾补「· 已停止」，替代此前
         对话区单独一行的中断提示；响应流断开（status == "stream_error"）补
         「· 输出中断」——正文是残缺的，页脚要能一眼看出来。"""
@@ -988,13 +991,17 @@ class SmithTUI(App):
         suffix = {"interrupted": "已停止", "stream_error": "输出中断"}.get(status)
         if status == "stream_error":
             suffix += format_stream_interrupted(self._turn_reason)  # 带上失败原因
+        turn = self.agent.last_turn
+        model = turn.model if turn is not None else config.MODEL
+        effort = turn.effort if turn is not None else (
+            config.REASONING_EFFORT or config.DEFAULT_EFFORT)
         found = self.query(ChatView)
         if found:
             # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）
             found.first().drain_context_groups()
             found.first().apply(Footer(
-                config.MODEL,
-                config.REASONING_EFFORT or config.DEFAULT_EFFORT,
+                model,
+                effort,
                 format_duration(elapsed),
                 suffix,
             ))

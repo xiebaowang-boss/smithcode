@@ -22,9 +22,14 @@ class LLMClient:
     """OpenAI 兼容客户端：显式构造参数 + `from_config()` 工厂。
 
     读全局 `config` 只发生在 `from_config()` 里：`TIMEOUT` / `URL` / 请求头
-    在构造时固化（改完需重建 client），`MODEL` 仍每次请求现读（`/model`
-    秒切）——分裂语义见 `from_config` 说明。
+    在构造时固化（改完需重建 client）。`default_model` / `reasoning_effort`
+    只是回退值——Agent 每轮 pin 一份 `TurnConfig` 经 `model` / `effort` 参数
+    透传进来，轮级优先，构造值只在轮外调用（如后台标题）时生效。
     """
+
+    # Agent 探测点：支持轮级参数（model / effort）透传的客户端置 True。
+    # 测试替身（签名只有 messages/tools）保持 False，Agent 走旧 kwargs 组装。
+    accepts_turn_params = True
 
     def __init__(self, *, api_key: str | None = None, base_url: str | None = None,
                  timeout: float = 120.0, default_model: str,
@@ -96,12 +101,13 @@ class LLMClient:
         return names or None
 
     def chat_stream(self, messages, tools=None, model: str | None = None,
-                    policy: RetryPolicy | None = None):
+                    effort: str | None = None, policy: RetryPolicy | None = None):
         """发起流式对话请求，逐段 yield 模型输出。
 
-        model 非空时覆盖当前会话模型（会话标题等后台小请求用），默认
-        使用构造时的 `default_model`（`from_config` 即 `config.MODEL`）。
-        policy 非空时覆盖重试策略（默认按 `config.MAX_RETRIES`）。
+        model / effort 非空时覆盖构造值（Agent 每轮 pin 的 `TurnConfig` 经此
+        透传，轮级优先）；为空时回退构造值（`from_config` 即 `config` 快照）。
+        会话标题等后台小请求用 model 单独覆盖。policy 非空时覆盖重试策略
+        （默认按 `config.MAX_RETRIES`）。
 
         yield 的元素为 (kind, payload)：
           ("reasoning", 文本)  — 模型思考内容（如有），仅供展示
@@ -122,7 +128,7 @@ class LLMClient:
             messages=messages,
             tools=tools,
             model=model,
-            reasoning_effort=self.reasoning_effort,
+            reasoning_effort=effort or self.reasoning_effort,
             extra_headers=self._resolved_headers(),
         )
         kwargs = build_kwargs(req, default_model=self.default_model)

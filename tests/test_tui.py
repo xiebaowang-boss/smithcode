@@ -15,6 +15,7 @@ import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
 from smithcode.llm import RetryState
+from smithcode.llm.request import TurnConfig
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
@@ -1692,6 +1693,29 @@ def test_turn_footer_shows_stopped_on_interrupt(monkeypatch):
             footer = str(app.query_one("#chat").children[-1].content)
             assert footer.startswith("▣")
             assert footer.endswith(" · 已停止")
+
+    _run(_run_case())
+
+
+def test_turn_footer_reads_pinned_snapshot(monkeypatch):
+    """页脚读轮级快照而非全局配置：轮内切换后显示实际发出的值。"""
+    no_prompting(monkeypatch)
+    monkeypatch.setattr(config, "MODEL", "m-switched")
+    monkeypatch.setattr(config, "REASONING_EFFORT", "max")
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        # run() 已结束但快照保留：页脚读到的是 pin 住的值，不是切后的全局值
+        agent._turn = TurnConfig(model="m-pinned", effort="low")
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            app._turn_start = time.monotonic()
+            app.ui_turn_end("ok")
+            await pilot.pause()
+            footer = str(app.query_one("#chat").children[-1].content)
+            assert "m-pinned" in footer
+            assert "low" in footer
+            assert "m-switched" not in footer
 
     _run(_run_case())
 

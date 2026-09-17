@@ -22,7 +22,7 @@ from .models import (
     RemoteModelSource,
 )
 from .prompts import build_system_prompt
-from .request import ChatRequest, build_kwargs
+from .request import ChatRequest, TurnConfig, build_kwargs
 from .retry import RetryPolicy, RetryState, build_retry_state, stream_with_retry
 from .stream import parse_stream, usage_to_dict
 from .usage import UsageAccumulator, UsageTracker, format_call
@@ -39,6 +39,7 @@ __all__ = [
     "RemoteModelSource",
     "RetryPolicy",
     "RetryState",
+    "TurnConfig",
     "UsageAccumulator",
     "UsageTracker",
     "build_kwargs",

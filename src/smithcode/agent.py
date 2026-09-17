@@ -28,6 +28,7 @@ from .llm.models import (
     ModelCatalog,
     RemoteModelSource,
 )
+from .llm.request import TurnConfig
 from .llm.retry import describe as describe_error
 from .mcp import McpService
 from .permission import Permission
@@ -341,6 +342,7 @@ class Agent:
         self.mcp = mcp if mcp is not None else McpService()
         self._token: CancellationToken | None = None  # 当前轮次的取消令牌（run 期间非空）
         self._model = model  # 非空时覆盖 config.MODEL
+        self._turn: TurnConfig | None = None  # 本轮请求快照：run() 开头 pin，轮内冻结
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
         self.max_iterations = (
             config.MAX_ITERATIONS if max_iterations is None else int(max_iterations)
@@ -364,6 +366,26 @@ class Agent:
             remote=RemoteModelSource(getattr(self.llm, "list_models", None), cache),
             current_model=lambda: config.MODEL,
         )
+
+    @property
+    def last_turn(self) -> TurnConfig | None:
+        """本轮（最近一轮）请求快照：页脚据此展示实际发出的模型与思考强度。
+
+        `run_with_goal` 连跑多轮时每轮覆盖，读到的是最后一轮的。轮外调用
+        （如后台标题）不经过 `run()`，此时为上一轮的值或 None（回退 config）。
+        """
+        return self._turn
+
+    def _turn_kwargs(self) -> dict:
+        """本轮请求参数：真客户端透传 pin 住的 model/effort，替身走旧逻辑。
+
+        30 多个 FakeLLM 的签名只有 `(messages, tools)`，无条件传参会全炸——
+        只有置了 `accepts_turn_params` 的真客户端才透传。
+        """
+        if getattr(self.llm, "accepts_turn_params", False):
+            turn = self._turn or TurnConfig.capture(self._model)
+            return {"model": turn.model, "effort": turn.effort}
+        return {"model": self._model} if self._model else {}
 
     def _new_store(self, oneshot: bool = False):
         """新建一个会话转录（轮换 id，文件懒物化）。"""
@@ -621,9 +643,13 @@ class Agent:
         上屏，这里把它与中断说明一并写进历史（`_note_stream_interrupted`），
         返回 `stream_error` 状态并保留部分正文作为 `text`——宿主据此提示"输出
         中断"，下一轮模型也能接着写，而不是从头重做。
+        本轮请求快照（模型与思考强度）在入口 pin 住：`run()` 内所有 `_chat` /
+        `_complete` 都用它，轮内切配置不影响本轮，下一轮自动用新的；页脚据此
+        展示实际发出的值。`finally` 里不清——页脚在返回后才读，下一轮开头覆盖。
         """
         self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
         self.session.add("user", user_input)
+        self._turn = TurnConfig.capture(self._model)
         token = CancellationToken()
         self._token = token
         reset_token = activate_token(token)
@@ -908,9 +934,19 @@ class Agent:
         return "cancelled" if token.cancelled else "empty"
 
     def _complete(self, request: list[dict], model: str | None = None) -> str:
-        """一次不带工具的补全，收集完整文本（摘要 / 标题生成专用）。"""
+        """一次不带工具的补全，收集完整文本（摘要 / 标题生成专用）。
+
+        显式 `model`（标题专用模型）优先；否则用本轮 pin 住的快照，保证轮内
+        压缩摘要与主循环用同一份；轮外调用（`_turn` 为空）回退旧逻辑。
+        """
         parts = []
-        kwargs = {"model": model} if model else {}
+        if model:
+            kwargs = {"model": model}
+        elif getattr(self.llm, "accepts_turn_params", False):
+            turn = self._turn or TurnConfig.capture(self._model)
+            kwargs = {"model": turn.model, "effort": turn.effort}
+        else:
+            kwargs = {"model": self._model} if self._model else {}
         for kind, payload in self.llm.chat_stream(request, tools=None, **kwargs):
             if kind == "content":
                 parts.append(payload)
@@ -948,7 +984,7 @@ class Agent:
         parts: list[str] = []
         r = renderer.current()
         schemas = visible_schemas() if use_tools else None
-        kwargs = {"model": self._model} if self._model else {}
+        kwargs = self._turn_kwargs()
 
         def emit(kind: str, payload) -> None:
             """把增量交给渲染后端；后端自身的异常不得伪装成流中断。

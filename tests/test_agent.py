@@ -58,6 +58,69 @@ def test_run_records_messages(monkeypatch):
     assert roles == ["system", "user", "assistant"]
 
 
+def test_run_pins_turn_snapshot(monkeypatch):
+    """run() 入口 pin 住模型与思考强度：页脚据此展示实际发出的值。"""
+    monkeypatch.setattr(config, "MODEL", "m-turn")
+    monkeypatch.setattr(config, "REASONING_EFFORT", "low")
+    agent = _make_agent(monkeypatch)
+    agent.run("打个招呼")
+    assert agent.last_turn is not None
+    assert (agent.last_turn.model, agent.last_turn.effort) == ("m-turn", "low")
+
+
+def test_turn_snapshot_frozen_within_run(monkeypatch):
+    """轮内切配置不影响本轮：第二轮 iteration 仍用入口 pin 住的值。
+
+    真客户端（accepts_turn_params）路径：`_chat` 收到的 model/effort 全程不变。
+    """
+    from types import SimpleNamespace
+
+    from smithcode.llm.client import LLMClient
+
+    seen = []
+
+    def stream_once(kwargs):
+        seen.append((kwargs["model"], kwargs.get("reasoning_effort")))
+        if len(seen) == 1:
+            # 首轮 iteration 内切配置：模拟用户中途 /model + /effort
+            config.MODEL = "m-changed"
+            config.REASONING_EFFORT = "max"
+            yield ("message", {"role": "assistant", "content": "",
+                               "tool_calls": [_fake_tool_call()]})
+        else:
+            yield ("message", {"role": "assistant", "content": "完成"})
+
+    monkeypatch.setattr(config, "MODEL", "m-pinned")
+    monkeypatch.setattr(config, "REASONING_EFFORT", "low")
+    client = LLMClient(api_key="test", base_url=None, timeout=1.0, default_model="m-x",
+                       client_factory=lambda **kwargs: SimpleNamespace())
+    client._stream_once = stream_once
+    monkeypatch.setattr("smithcode.agent.LLMClient", lambda: client)
+    monkeypatch.setattr("smithcode.llm.retry.wait", lambda state: None)
+
+    try:
+        agent = Agent(session=Session())
+        agent.run("多轮任务")
+    finally:
+        monkeypatch.setattr(config, "MODEL", "m-pinned")
+        monkeypatch.setattr(config, "REASONING_EFFORT", "low")
+
+    assert [m for m, _ in seen] == ["m-pinned"] * len(seen)
+    assert [e for _, e in seen] == ["low"] * len(seen)
+    assert agent.last_turn.model == "m-pinned"  # 页脚读到的也是 pin 住的值
+
+
+def test_next_run_repins_snapshot(monkeypatch):
+    """下一轮重新 pin：上一轮的值不污染，中断轮也不留旧值。"""
+    monkeypatch.setattr(config, "MODEL", "m-one")
+    agent = _make_agent(monkeypatch)
+    agent.run("第一轮")
+    assert agent.last_turn.model == "m-one"
+    monkeypatch.setattr(config, "MODEL", "m-two")
+    agent.run("第二轮")
+    assert agent.last_turn.model == "m-two"
+
+
 def test_agent_loop_caps_and_wraps_up(monkeypatch):
     class ToolCallLoopLLM(FakeLLM):
         """持续请求工具；收尾轮（tools=None）返回纯文本总结。"""

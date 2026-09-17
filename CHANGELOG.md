@@ -7,6 +7,7 @@
 ### 重构
 
 - **LLM 交互子系统重构（功能不变）**：`llm/` 内职责重新切分，调用链去全局化。① 新增 `llm/request.py`（`ChatRequest` 值对象 + 纯函数 `build_kwargs`，请求组装可脱离网络单测）；② 新增 `llm/stream.py`（`parse_stream` 纯解析：content/reasoning 透出、tool_calls 按 index 累积、usage 取最新有效值——解析失败的包不再覆盖已收到的有效值）；③ `LLMClient` 改构造器注入 + `from_config()` 工厂（读全局 config 只发生在工厂里，`Agent` 经 `_default_llm()` 按模块属性构造，测试替身替换不受影响）；④ 重试执行收敛为 `stream_with_retry()` 生成器（删除生产零调用的 `RetryRunner`，`except BaseException` 改为 `Exception` + 系统退出透传）；⑤ 取消订阅泄漏修复（`CancellationToken.unsubscribe`，流关闭后摘除 `stream.close`，订阅窗口期复查令牌补关流）；⑥ `RemoteModelSource` 改吃 `list_models` 可调用（无该能力的 LLM 恒返回 None，目录退化为当前模型兜底）；⑦ 正文真相单一来源（`message` 只交付 tool_calls 与归属、`content` 留空，Agent 侧 `parts` 累积为唯一正文）；⑧ 漏洞修补（`reasoning_effort` 400 降级与 `stream_options` 同构、`_mentions` 状态码先行、`list_models` 按 `has_next_page/get_next_page` 翻页、`_is_git_repo` 按工作区缓存）。测试同步迁移（删 `object.__new__` hack，新增 `test_llm_stream.py` / `test_llm_request.py`）。
+- **轮级请求快照 `TurnConfig` + 页脚换数据源**：`run()` 入口 pin 住模型与思考强度，本轮内所有 `_chat` / `_complete`（含压缩摘要）都用它——轮内 `/model`、`/effort` 切换不影响本轮，下一轮自动用新的；TUI 轮次页脚读快照展示实际发出的值（缺失时回退全局配置），不再误报切换后的值。`chat_stream` 新增 `effort` 透传参数（与 `model` 对齐），测试替身经 `accepts_turn_params` 探测走旧逻辑、零改动兼容。
 
 ### 修复
 

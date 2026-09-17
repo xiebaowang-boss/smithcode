@@ -259,3 +259,46 @@ def test_list_models_page_failure_keeps_received():
             models=SimpleNamespace(list=lambda: _BrokenPage(first))),
     )
     assert llm.list_models() == ["a"]
+
+
+def _recording_client(seen: list):
+    """记录每次尝试实际发出的 model / reasoning_effort 的真客户端。"""
+    llm = LLMClient(
+        api_key="test", base_url=None, timeout=1.0, default_model="m-default",
+        reasoning_effort="high",
+        client_factory=lambda **kwargs: SimpleNamespace(),
+    )
+
+    class _Stream:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            pass
+
+    def fake_open(kwargs):
+        seen.append((kwargs["model"], kwargs.get("reasoning_effort")))
+        return _Stream()
+
+    llm._open_stream = fake_open
+    return llm
+
+
+def test_chat_stream_effort_param_overrides_constructed(monkeypatch):
+    """effort 参数覆盖构造值：Agent 的轮级快照经此透传。"""
+    seen = []
+    llm = _recording_client(seen)
+    view = _FakeView()
+    _patch_retry(monkeypatch, view)
+    list(llm.chat_stream([{"role": "user", "content": "hi"}], effort="low"))
+    assert seen == [("m-default", "low")]  # model 回退构造值，effort 用透传值
+
+
+def test_chat_stream_effort_falls_back_to_constructed(monkeypatch):
+    """effort 为空回退构造值：轮外调用（如后台标题）行为不变。"""
+    seen = []
+    llm = _recording_client(seen)
+    view = _FakeView()
+    _patch_retry(monkeypatch, view)
+    list(llm.chat_stream([{"role": "user", "content": "hi"}], model="m-req"))
+    assert seen == [("m-req", "high")]
