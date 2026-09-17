@@ -899,3 +899,35 @@ def test_format_stream_interrupted_carries_reason_and_timeout_hint(monkeypatch):
 
     assert format_stream_interrupted("") == ""
     assert format_stream_interrupted(None) == ""
+
+
+def test_renderer_failure_is_not_reported_as_stream_error(monkeypatch):
+    """渲染后端抛异常时不得被当成「输出中断」（UI 故障 vs 网络故障必须区分）。
+
+    回归用户实际遇到的现象：`Relay` 广播未知事件给标题呈现器时抛
+    `AttributeError`，被流异常处理捕获后每一轮都报 stream_error，把 UI 故障
+    描述成网络中断、排查方向直接跑偏。
+    """
+    from smithcode.agent import RendererError
+
+    class OkStreamLLM:
+        def chat_stream(self, messages, tools=None):
+            yield ("content", "你好！")
+            yield ("message", {"role": "assistant", "content": "你好！"})
+
+    class BrokenRenderer(_RecordingView):
+        def stream(self, kind, chunk):
+            raise AttributeError("'TerminalTitlePresenter' object has no attribute 'x'")
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", OkStreamLLM)
+    broken = BrokenRenderer()
+    monkeypatch.setattr("smithcode.renderer.current", lambda: broken)
+    agent = Agent(session=Session())
+
+    with pytest.raises(RendererError) as err:
+        agent.run("hello")
+
+    assert "渲染后端异常" in str(err.value)
+    assert "AttributeError" in str(err.value)
+    roles = [m["role"] for m in agent.session.messages]
+    assert roles == ["system", "user"]  # 没有 partial 入库、没有中断说明

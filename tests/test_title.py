@@ -10,6 +10,7 @@ import pytest
 import smithcode.renderer as renderer_module
 from smithcode import title
 from smithcode.agent import Agent
+from smithcode.llm import RetryState
 from smithcode.renderer import Renderer
 from smithcode.session import Session
 
@@ -45,6 +46,9 @@ class FakeRenderer(Renderer):
 
     def turn_waiting_finished(self) -> None:
         self.calls.append(("waiting_finished",))
+
+    def warn(self, text: str) -> None:
+        self.calls.append(("warn", text))
 
     def info(self, text: str, scope=None) -> None:
         self.calls.append(("info", text))
@@ -533,3 +537,30 @@ def test_agent_rename_pushes_title_to_terminal(monkeypatch):
     agent = Agent(session=Session(), persist=False)
     assert agent.rename_session("数据库迁移") is True
     assert sink.writes[-1] == "\x1b]0;Smith · 数据库迁移\x07"
+
+
+def test_relay_tolerates_presenter_without_new_event_callbacks():
+    """订阅者没有某个事件的回调时不能抛异常——新增事件不得打断任务。
+
+    回归：`Relay.retry_finished` 广播 `on_retry_finished`，而
+    `TerminalTitlePresenter` 只实现标题相关回调，`getattr(...)` 直接抛
+    `AttributeError`；该异常被 Agent 的流异常处理捕获后，每一轮都被误判成
+    `stream_error`（用户侧：每次回复结尾都显示「输出中断」）。
+    """
+    sink = Recorder()
+    p = _make_presenter(sink)
+    p.enable()
+    inner = FakeRenderer()
+    relay = title.Relay(inner, p)
+    presenter_api = {name for name in dir(p) if name.startswith("on_")}
+    assert "on_retry_started" not in presenter_api  # 前提：标题呈现器不关心重试
+    assert "on_retry_finished" not in presenter_api
+
+    state = RetryState(attempt=2, total=3, reason="读取超时", wait=2.0, next_at=0.0)
+    relay.retry_started(state, "owner")  # 不得抛 AttributeError
+    relay.retry_finished("owner")
+    relay.info("继续")
+
+    kinds = [call[0] for call in inner.calls]
+    assert "warn" in kinds  # retry_started 照常透传（基类默认降级为一行 warn）
+    assert inner.calls[-1] == ("info", "继续")  # 后续事件不受影响

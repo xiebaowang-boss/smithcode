@@ -292,6 +292,15 @@ class StreamInterrupted(Exception):
         self.partial = partial
 
 
+class RendererError(Exception):
+    """渲染后端自身的异常（UI 故障），与"模型响应流中断"是两回事。
+
+    单独成型是为了不落进 `StreamInterrupted` 的收尾语义：渲染层坏了既不该重试、
+    也不该报成「输出中断」（那会把排查方向引到网络上）。宿主照常按未处理异常
+    展示，失败点一眼可见。
+    """
+
+
 class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None,
                  store=None, persist: bool = False, oneshot: bool = False,
@@ -920,6 +929,22 @@ class Agent:
         r = renderer.current()
         schemas = visible_schemas() if use_tools else None
         kwargs = {"model": self._model} if self._model else {}
+
+        def emit(kind: str, payload) -> None:
+            """把增量交给渲染后端；后端自身的异常不得伪装成流中断。
+
+            渲染层的 bug（如事件总线对未知回调抛 `AttributeError`）此前会被下面
+            的流异常处理捕获，于是每一轮都报"输出中断"——把 UI 故障描述成网络故障，
+            排查方向直接跑偏。这里换成一个不参与流重试语义的独立异常：宿主如实
+            报出渲染后端异常，不再误标成网络中断。
+            """
+            try:
+                r.stream(kind, payload)
+            except Exception as e:  # 渲染后端故障：不重试，只如实上报
+                raise RendererError(
+                    f"渲染后端异常: {type(e).__name__}: {e}"
+                ) from e
+
         try:
             for kind, payload in self.llm.chat_stream(
                 self.session.messages, tools=schemas, **kwargs
@@ -931,9 +956,9 @@ class Agent:
                 else:
                     if kind == "content":
                         parts.append(payload)
-                    r.stream(kind, payload)
-        except StreamInterrupted:
-            raise
+                    emit(kind, payload)
+        except (StreamInterrupted, RendererError):
+            raise  # 流中断已成型；渲染后端故障不参与流重试/收尾语义
         except Exception as e:
             token = current_token()
             if token is not None and token.cancelled:

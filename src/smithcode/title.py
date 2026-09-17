@@ -353,9 +353,18 @@ class Relay(Renderer):
     # ----- 标题相关事件（拦截后转发） -----
 
     def _notify(self, event: str, *args) -> None:
-        """把事件喂给标题订阅者；纯总线模式（无订阅者）下静默跳过。"""
-        if self._presenter is not None:
-            getattr(self._presenter, event)(*args)
+        """把事件喂给标题订阅者；纯总线模式（无订阅者）下静默跳过。
+
+        订阅者只需实现自己关心的事件回调：基类事件是前端可订阅的总线，新增事件
+        不能让既有订阅者（如只关心标题的 `TerminalTitlePresenter`）直接抛
+        `AttributeError`——那会被 Agent 的流异常处理误判成"流中断"。没有对应
+        回调即视为不关心。
+        """
+        if self._presenter is None:
+            return
+        handler = getattr(self._presenter, event, None)
+        if handler is not None:
+            handler(*args)
 
     def title_changed(self, title: str) -> None:
         self._notify("on_title_changed", title)
