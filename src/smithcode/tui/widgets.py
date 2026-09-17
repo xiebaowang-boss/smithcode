@@ -172,6 +172,7 @@ class ChatView(VerticalScroll):
         self._context_groups: dict[int, ContextGroup] = {}  # 未出结果的上下文工具 → 所属组
         self._tool_widgets: dict[int, ToolCall] = {}  # tool_id → pending 中的工具行
         self._thinking_block: ThinkingBlock | None = None  # 进行中的思考块
+        self._stick = True  # 贴底跟随意图：内容增长时保持贴底（用户滚动离开即关闭）
 
     # ----- 唯一打印入口 -----
 
@@ -216,12 +217,13 @@ class ChatView(VerticalScroll):
     def _user(self, text: str) -> None:
         """用户消息（opencode 式）：面板底色 + 左侧角色色竖线，无前缀。
 
-        提交自己的消息视为回到最新位置：无条件滚到底并恢复锚定（不受翻历史约束）。"""
+        提交自己的消息视为回到最新位置：无条件恢复贴底跟随（不受翻历史约束），
+        实际落位由布局期的贴底赋值完成（见 `_size_updated`）。"""
         self._finalize_context()
         block = Static(Text(text), classes="chat-item user-msg")
         block.can_focus = False
         self.mount(block)
-        self.anchor()
+        self._stick = True
 
     def _assistant(self, text: str) -> None:
         """静态整段正文（历史回放）：复用流式按块渲染，一次定型。"""
@@ -271,18 +273,14 @@ class ChatView(VerticalScroll):
     def _tool_detail(self, tool_id, detail: str) -> None:
         widget = self._tool_widgets.get(tool_id) if tool_id is not None else None
         if widget is not None:
-            at_bottom = self._at_bottom()
             widget.set_detail(detail)
-            self._follow(at_bottom)
 
     def _tool_finish(self, item: ToolResult) -> None:
         widget = (self._tool_widgets.pop(item.tool_id, None)
                   if item.tool_id is not None else None)
         if widget is not None:
-            at_bottom = self._at_bottom()
             widget.set_result(item.result, expanded=item.expand, is_error=item.is_error)
             self.mark_tool_done(item.tool_id)
-            self._follow(at_bottom)
         else:  # 无配对（理论上不发生）：退化为独立块，不丢结果
             self.add_widget(ToolCall(
                 "[Tool]", item.result, expanded=item.expand,
@@ -326,16 +324,13 @@ class ChatView(VerticalScroll):
     def add_widget(self, widget) -> None:
         """挂载任意消息组件（如可折叠的工具调用块）。"""
         self._finalize_context()
-        at_bottom = self._at_bottom()
         self.mount(widget)
-        self._follow(at_bottom)
 
     def place_tool(self, tool_id: int, name: str, widget) -> None:
         """放置一个工具控件：上下文类工具归入当前「已探索」组，其余独立成块。
 
         组只吸收**连续**的上下文工具——遇到非上下文工具、正文/思考流、回合
         结束时封口（_finalize_context）；封口后新的上下文工具另起一组。"""
-        at_bottom = self._at_bottom()
         if context_category(name) is None:
             self._finalize_context()
             self.mount(widget)
@@ -345,7 +340,6 @@ class ChatView(VerticalScroll):
                 self.mount(self._context_group)
             self._context_group.add_tool(tool_id, name, widget)
             self._context_groups[tool_id] = self._context_group
-        self._follow(at_bottom)
 
     def mark_tool_done(self, tool_id: int) -> None:
         """上下文工具出结果：更新所属组的计数与进行中状态。"""
@@ -361,7 +355,9 @@ class ChatView(VerticalScroll):
     def reset(self) -> None:
         """清空对话区与全部瞬时渲染状态（会话重置 / 回放前调用）。
 
-        工具块映射、思考块引用随聊天区一并清理，否则会滞留已卸载 widget 的引用。"""
+        工具块映射、思考块引用随聊天区一并清理，否则会滞留已卸载 widget 的引用。
+        贴底意图一并复位为跟随：清空后内容为空，跟随即"内容从顶部开始"，
+        且旧意图可能停在"已翻走"上（滚动被夹回同值时不触发 watch_scroll_y）。"""
         self._finalize_context()
         self._context_groups.clear()
         self._tool_widgets.clear()
@@ -370,6 +366,7 @@ class ChatView(VerticalScroll):
         self._text = None
         self._block = None
         self._body = None
+        self._stick = True
         self.remove_children()
 
     def _finalize_context(self) -> None:
@@ -408,15 +405,11 @@ class ChatView(VerticalScroll):
             self.end_stream()
             self.begin_stream(kind)
         if kind == "content":
-            at_bottom = self._at_bottom()
             if self._body is not None:
                 self._body.append(chunk)
-            self._follow(at_bottom)
             return
-        at_bottom = self._at_bottom()
         self._text.append(chunk, style="grey50")
         self._block.update(self._text)
-        self._follow(at_bottom)
 
     def end_stream(self) -> None:
         """流结束：尾部块最后一次定型，与中途渲染视觉连续（不再有"文本突然
@@ -440,49 +433,46 @@ class ChatView(VerticalScroll):
         return block
 
     def _mount_block(self, block) -> None:
-        """挂载一个顶层消息组件（统一的锚定跟随与分组封口）。"""
+        """挂载一个顶层消息组件（统一的分组封口；贴底跟随由布局期负责）。"""
         self._finalize_context()
-        at_bottom = self._at_bottom()
         self.mount(block)
-        self._follow(at_bottom)
 
     # ----- 底部锚定跟随 -----
 
     def _at_bottom(self) -> bool:
-        """当前是否贴在底部（留 1 行容差）。必须在挂载/更新内容**之前**取值——
-        新内容一进来 virtual_size 就涨，贴底判断会被误判成"用户已翻走"。"""
+        """当前是否贴在底部（留 1 行容差）。"""
         return self.scroll_offset.y >= self.max_scroll_y - 1
 
-    def _follow(self, at_bottom: bool) -> None:
-        """底部锚定跟随：用户贴底时才贴底；翻看历史时保持位置不打断。
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        """滚动位置一变就重判跟随意图。
 
-        走 Textual 原生锚定（`anchor()`）而不是 `scroll_end()`：`scroll_end` 一次性
-        算出目标行号，只能在"发出那一刻"的 virtual_size 上取 max_scroll_y——流式
-        正文按帧节流（MessageBody 每 16ms 至多重排一次，节流掉的 chunk 不触发布局）、
-        输入区高度变化（运行动画 / 命令菜单 / 输入框增高会让聊天区变矮）都会让这个
-        目标值过期，落点差 1 行以上就再也追不回来（此后每次贴底判断都为假）。
-        锚定则把贴底交给合成器：**每次布局**都按真实内容高度重算贴底位置，节流与
-        容器高度变化都会自动纠正；用户滚动时 Textual 自动解除锚定（scroll_to 默认
-        release_anchor），滚回底部再重新锚定。
-
-        内容还不足一屏时**不锚定**：锚定的贴底位置按 `内容底 - 容器高` 算，不足
-        一屏时为负，而合成器用 `set_reactive` 写入（文档明示绕过校验器与 watcher），
-        负偏移会把整块内容推到视口下方——启动时的欢迎 Logo 因此跑到对话区底部。
-        复位放在 `_size_updated`（尺寸变化后判定，见该方法的注释）。"""
-        if at_bottom:
-            self.anchor()
+        用户翻历史、滚回底部、自动贴底、尺寸变化后的夹取都经过这里，跟随意图
+        因此始终跟着真实滚动位置走——不必在各内容增长点各自判断（那里拿到的
+        `max_scroll_y` 常是增长前的旧值，容易漏判）。"""
+        super().watch_scroll_y(old_value, new_value)
+        self._stick = self._at_bottom()
 
     def _size_updated(self, size, virtual_size, container_size, layout: bool = True) -> bool:
-        """尺寸变化后复位锚定：内容不足一屏时必须解除锚定，否则合成器会把负的
-        "贴底位置"写进 scroll_y（见 `_follow`）。
+        """布局结束后按真实内容高度贴底（跟随滚动）。
 
-        本方法在合成器排版**之后**被调用，故同一次排版里被写坏的偏移已由
-        `super()` 内的 `_scroll_update` 夹回合法区间（内容不足一屏时贴底即顶部），
-        这里只需切断后续排版的再次写入；`_refresh_scroll` 带来的 reflow 会按
-        修正后的偏移重排。内容长过一屏后由下一次 `_follow` 重新锚定。"""
+        这里**不用** Textual 自带的 `anchor()`：它算的贴底位置是"内容底 - 容器高"，
+        内容不足一屏时为负，而合成器用 `set_reactive` 写入（文档明示绕过校验器与
+        watcher）——负偏移会把整块内容推到视口下方（欢迎 Logo 跑到底部、内容短时
+        整屏上移）。改为自己在排版后赋值：走 `scroll_y` 的校验器，天然夹在
+        `[0, max_scroll_y]`，不足一屏时就是 0（贴底即顶部）。
+
+        触发条件是**任何尺寸变化**：内容增长（含被 MessageBody 节流推迟到后续布局
+        的流式正文）、聊天区高度变化（输入框 / 运行动画 / 命令菜单）都会走到这里。
+        本方法在合成器排版之后被调用，赋值经 watch_scroll_y 的 `_refresh_scroll`
+        触发 reflow，按修正后的偏移重排，故不会出现"画一帧旧位置"。
+
+        `scroll_target_y` 必须一起同步：滚轮 / 翻页走的是**相对**滚动
+        （`y = scroll_target_y ± 1`），只改 scroll_y 会让下一次滚轮从旧位置起跳
+        （贴底后一按上滚直接跳到顶部）——Textual 的锚定同样同步这两个值。"""
         changed = super()._size_updated(size, virtual_size, container_size, layout)
-        if changed and self.is_anchored and self.max_scroll_y <= 0:
-            self.anchor(False)
+        if changed and self._stick:
+            self.scroll_target_y = self.max_scroll_y
+            self.scroll_y = self.max_scroll_y
         return changed
 
 

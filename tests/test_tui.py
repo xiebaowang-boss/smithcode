@@ -3215,13 +3215,58 @@ def test_input_placeholder_hints_newline_keys(monkeypatch):
     _run(_run_case())
 
 
-# ---------- 对话区滚动跟随（底部锚定） ----------
+# ---------- 对话区滚动跟随（贴底意图 + 布局期贴底） ----------
 
 
 def _fill_chat(app, lines: int = 40) -> None:
     """把对话区填到超出视口，供滚动跟随用例使用。"""
     for i in range(lines):
         app.ui_notice(f"填充行 {i}")
+
+
+def _bottom_reached(chat) -> bool:
+    """贴底判定：滚动位置到顶，且**排版结果**同步（末块底边贴在内容区底边）。
+
+    只断言 scroll_y 会漏掉"偏移改了但画面按旧位置重排"的情况。"""
+    return (
+        chat.scroll_y == chat.max_scroll_y
+        and chat.max_scroll_y > 0
+        and abs(chat.children[-1].region.bottom - chat.content_region.bottom) <= 1
+    )
+
+
+def test_chat_never_scrolls_above_top_during_first_turn(monkeypatch):
+    """第一轮（用户消息 + 流式正文）全程不得出现负偏移。
+
+    回归：曾用 Textual 原生锚定（`anchor()`）实现贴底，而锚定的贴底位置按
+    「内容底 - 容器高」算、内容不足一屏时为负，又经不校验的 set_reactive 写入，
+    于是第一轮一有输出整块内容就被推到视口下方（欢迎 Logo 落到底部再向上滚）。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(100, 30)) as pilot:
+            chat = app.query_one(ChatView)
+            await pilot.pause()
+            assert chat.scroll_y == 0
+
+            app.ui_notice("你：看看这个问题")
+            await pilot.pause()
+            assert chat.scroll_y == 0  # 不足一屏：内容从顶部排，不产生负偏移
+            assert chat.query(".welcome").first().region.y == chat.content_region.y
+
+            for i in range(10):
+                app.ui_stream("content", f"第 {i} 段回答正文，写一些内容。\n\n")
+                await pilot.pause()
+                assert chat.scroll_y >= 0  # 全程不得为负
+                if chat.max_scroll_y > 0:  # 长过一屏后必须贴底
+                    assert _bottom_reached(chat)
+
+            app.ui_stream_done()
+            await pilot.pause()
+            assert _bottom_reached(chat)
+
+    _run(_run_case())
 
 
 def test_chat_follows_content_growth_when_at_bottom(monkeypatch):
@@ -3235,25 +3280,25 @@ def test_chat_follows_content_growth_when_at_bottom(monkeypatch):
             chat = app.query_one(ChatView)
             _fill_chat(app)
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
             app.ui_notice("普通通知")
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
             # 两个 chunk 落在同一节流窗口（MessageBody 每帧至多重排一次）：
-            # 第二次追加不触发布局，贴底必须由布局期锚定兜住
+            # 第二次追加不触发布局，贴底必须由布局期重算兜住
             app.ui_stream("content", "第一段正文。\n\n")
             app.ui_stream("content", "第二段正文，再多写一些内容让它长高。\n\n")
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
             # 非上下文工具（独立块）：结果展开让 body 由隐藏转可见
             app.ui_tool_start(1, "write b.py", "block", "write_file")
             await pilot.pause()
             app.ui_tool_result(1, "\n".join(f"结果行 {i}" for i in range(12)), True, False)
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
             # pending 期收到变更预览：diff 就地展开
             app.ui_tool_preview(
@@ -3261,23 +3306,22 @@ def test_chat_follows_content_growth_when_at_bottom(monkeypatch):
                    + "\n".join(f"+新增行 {i}" for i in range(10))
             )
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
             # 聊天区变矮：输入框增高会让容器高度变化，贴底位置必须重算
             app.query_one(ChatInput).text = "\n".join(f"第 {i} 行" for i in range(5))
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
             app.ui_notice("容器变矮后的新内容")
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
 
     _run(_run_case())
 
 
 def test_welcome_stays_at_top_when_content_shorter_than_view(monkeypatch):
-    """内容不足一屏时不锚定：Textual 的锚定贴底按「内容底 - 容器高」算，为负时
-    （合成器经不校验的 set_reactive 写入）会把整块内容推到视口下方——启动欢迎
-    Logo 因此跑到对话区底部。清屏（/new）缩回一屏内同样要复位。"""
+    """内容不足一屏时贴底即顶部（不得出现负偏移把内容推到底部），清屏（/new）
+    缩回一屏内同样要复位。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -3285,27 +3329,24 @@ def test_welcome_stays_at_top_when_content_shorter_than_view(monkeypatch):
         async with app.run_test(size=(100, 30)) as pilot:
             chat = app.query_one(ChatView)
             await pilot.pause()
-            welcome = chat.query(".welcome").first()
             assert chat.scroll_y == 0
-            assert welcome.region.y == chat.content_region.y  # Logo 贴内容区顶部
-            assert not chat.is_anchored  # 不足一屏：不锚定
+            assert chat.query(".welcome").first().region.y == chat.content_region.y
 
             _fill_chat(app)
             await pilot.pause()
-            assert chat.is_anchored  # 满一屏后正常锚定
+            assert _bottom_reached(chat)
 
             chat.reset()
             app._show_welcome()  # /new 路径：清屏 + 重挂欢迎横幅
             await pilot.pause()
             assert chat.scroll_y == 0
             assert chat.query(".welcome").first().region.y == chat.content_region.y
-            assert not chat.is_anchored
 
     _run(_run_case())
 
 
 def test_chat_follows_stream_starting_from_short_content(monkeypatch):
-    """对话区还没满一屏时流式输出：跨过一屏那一刻必须自动恢复贴底跟随。"""
+    """对话区还没满一屏时流式输出：跨过一屏那一刻必须自动接上贴底跟随。"""
     no_prompting(monkeypatch)
 
     async def _run_case():
@@ -3321,8 +3362,7 @@ def test_chat_follows_stream_starting_from_short_content(monkeypatch):
                 app.ui_stream("content", f"第 {i} 段补充（同帧第二块）。\n\n")
                 await pilot.pause()
             assert chat.max_scroll_y > 0  # 已长过一屏
-            assert chat._at_bottom()
-            assert chat.is_anchored  # 跟随已恢复
+            assert _bottom_reached(chat)
 
     _run(_run_case())
 
@@ -3355,7 +3395,7 @@ def test_chat_keeps_position_while_reading_history(monkeypatch):
             assert chat._at_bottom()
             app.ui_notice("回底后的新内容")
             await pilot.pause()
-            assert chat._at_bottom()  # 跟随恢复
+            assert _bottom_reached(chat)  # 跟随恢复
 
     _run(_run_case())
 
@@ -3376,11 +3416,11 @@ def test_user_message_returns_to_bottom_while_reading_history(monkeypatch):
                 await pilot.pause()
             assert not chat._at_bottom()
 
-            app.query_one(ChatView).add_user("翻历史时的新提问")
+            chat.add_user("翻历史时的新提问")
             await pilot.pause()
-            assert chat._at_bottom()
+            assert _bottom_reached(chat)
             app.ui_notice("提问后的新内容")
             await pilot.pause()
-            assert chat._at_bottom()  # 已重新锚定
+            assert _bottom_reached(chat)  # 跟随保持
 
     _run(_run_case())
