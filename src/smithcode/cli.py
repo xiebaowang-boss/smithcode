@@ -140,6 +140,9 @@ def repl(agent: Agent):
             if outcome.wizard is not None:
                 _run_wizard(agent, outcome.wizard)
             if outcome.start_task is not None:
+                # 技能载荷等注入必须在 run() 之前落库（run 内部先 sync_system 再写用户消息）
+                for role, content in outcome.inject_history:
+                    agent.session.add(role, content)
                 # /goal 设定/恢复后立即开跑，走与普通任务相同的后台线程 + 取消通道
                 task = threading.Thread(
                     target=_run_agent_task, args=(agent, outcome.start_task), daemon=True
@@ -170,7 +173,10 @@ def _print_select(select):
     for index, choice in enumerate(select.items, 1):
         mark = "（当前）" if choice.current else ""
         print(f"  {index}. {choice.label}{mark}")
-    print(f"非交互模式无法弹出选择器，请用 /{select.command} <候选值> 指定。")
+    if select.command:
+        print(f"非交互模式无法弹出选择器，请用 /{select.command} <候选值> 指定。")
+    else:
+        print("非交互模式无法弹出选择器，请直接输入 /<候选值>（技能名即命令）。")
 
 
 def _run_wizard(agent, wizard) -> None:

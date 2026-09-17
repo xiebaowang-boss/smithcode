@@ -62,7 +62,7 @@ def test_sync_schema_sets_enum_and_unhides(isolated):
     assert schema["parameters"]["properties"]["name"]["enum"] == ["proj"]
 
 
-def test_use_skill_activates_and_injects_body(isolated):
+def test_use_skill_returns_body_as_result(isolated):
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
@@ -70,9 +70,11 @@ def test_use_skill_activates_and_injects_body(isolated):
 
     text = FUNCTIONS["use_skill"](name="proj")
 
-    assert "已激活" in text
+    assert "以下为技能「proj」的完整指令" in text
+    assert "正文" in text
+    assert 'location="' in text
     assert skills.active_names() == ["proj"]
-    assert "已激活技能" in skills.render_section()
+    assert "## 已激活技能" not in skills.render_section()  # 正文不进系统提示词
 
 
 def test_use_skill_unknown_name_returns_error(isolated):
@@ -84,3 +86,34 @@ def test_use_skill_unknown_name_returns_error(isolated):
 
     assert text.startswith("错误:")
     assert "proj" in text
+
+
+def test_use_skill_repeat_call_does_not_duplicate_body(isolated):
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+
+    first = FUNCTIONS["use_skill"](name="proj")
+    second = FUNCTIONS["use_skill"](name="proj")
+
+    assert "正文" in first
+    assert "正文" not in second
+    assert "无需重复" in second
+
+
+def test_use_skill_truncates_oversized_payload(isolated, monkeypatch):
+    """载荷超上限时截断并给出读取指引（技能文件仍可用 read_file 取回）。"""
+    workspace, _ = isolated
+    directory = workspace / ".agents" / "skills" / "big"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: big\ndescription: d\n---\n" + "长" * 3000, encoding="utf-8"
+    )
+    monkeypatch.setattr(config, "MAX_TOOL_OUTPUT", 500)
+    skills.refresh()
+
+    text = FUNCTIONS["use_skill"](name="big")
+
+    assert len(text) <= 500
+    assert "已截断" in text
+    assert "read_file" in text

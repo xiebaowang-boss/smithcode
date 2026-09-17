@@ -36,7 +36,7 @@ def dispatch(agent, text: str, interactive: bool = True) -> CommandResult:
 
     REPL / TUI 共用这一个入口：未知命令、参数误用、命令内异常都收敛为
     友好的中文提示（异常不得拖垮 REPL / TUI 主循环）。注册命令未命中时
-    兜底查技能名（`/技能名 [任务]` 直达，等价 /skill）。
+    兜底查技能名（`/技能名 [任务]` 直达，技能名即命令）。
     """
     parts = text[1:].split()
     name = parts[0] if parts else ""
@@ -60,21 +60,16 @@ def dispatch(agent, text: str, interactive: bool = True) -> CommandResult:
 
 
 def _dispatch_skill(name: str, args: list):
-    """未知命令兜底：命中技能名则手动激活（同 /skill），否则返回 None。
+    """未知命令兜底：命中技能名则按技能名加载（`/技能名 [任务]`），否则返回 None。
 
-    注册命令始终优先（同名技能只能走 /skill <名称>）；技能未装载时不触发
-    磁盘扫描，直接按未知命令处理。
+    注册命令始终优先（与内置命令重名的技能不进命令面，只能由模型用 use_skill
+    加载）；技能未装载时不触发磁盘扫描，直接按未知命令处理。
     """
     from .. import skills as registry  # 延迟导入：本包 skills 是命令模块，避免重名
+    from .skills import load_skill
 
     if not name or not registry.is_loaded():
         return None
     if registry.get(name) is None:
         return None
-    message = registry.activate(name, by="user")
-    if message.startswith("错误:"):
-        return CommandResult(text=message, style="red")
-    task = " ".join(args).strip()
-    if task:
-        return CommandResult(start_task=task, echo_input=True)
-    return CommandResult()
+    return load_skill(name, " ".join(args).strip())

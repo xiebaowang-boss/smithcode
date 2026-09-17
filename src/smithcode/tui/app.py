@@ -32,6 +32,7 @@ from .. import (
     permission,
     plan,
     renderer,
+    skills,
     title,
     welcome,
 )
@@ -407,8 +408,9 @@ class SmithTUI(App):
     def _replay_history(self) -> None:
         """恢复会话后回放历史：user / assistant 文本走既有渲染路径静态上屏。
 
-        工具调用与结果不逐条回放（历史长且没有 pending 状态语义），也不追加
-        任何恢复提示；用 batch_update 一次性绘制，避免逐条 append 闪屏。
+        工具调用与结果不逐条回放（历史长且没有 pending 状态语义），技能载荷消息
+        （技能正文）折叠为一行提示，避免整段正文铺满聊天区；用 batch_update 一次性
+        绘制，避免逐条 append 闪屏。
         """
         messages = getattr(self.agent.session, "messages", None) or []
         chat = self.query_one(ChatView)
@@ -417,7 +419,11 @@ class SmithTUI(App):
                 role = message.get("role")
                 text = _message_text(message.get("content"))
                 if role == "user" and text:
-                    chat.apply(User(text))
+                    skill_name = skills.render.payload_skill_name(text)
+                    if skill_name:
+                        chat.apply(Notice(f"已加载技能 {skill_name}"))
+                    else:
+                        chat.apply(User(text))
                 elif role == "assistant" and text.strip():
                     chat.apply(Assistant(text))
 
@@ -655,7 +661,8 @@ class SmithTUI(App):
         if value is None:
             self._select_back()
             return
-        command = f"/{select.command} {value}"
+        # command 留空 = value 本身即命令名（技能名直达，见 commands/skills.py）
+        command = f"/{select.command} {value}" if select.command else f"/{value}"
         outcome = self._dispatch_command(command)
         if outcome is None:  # busy 守卫拦截：清栈，面板已关
             self._select_stack.clear()
@@ -1015,16 +1022,21 @@ class SmithTUI(App):
             self.query_one(Sidebar).update_plan("", has_active=False)
         if outcome.refresh_status:
             self.ui_status()
+        if outcome.inject_history and not self._busy:
+            # 技能载荷等注入：必须在 run() 之前落库；busy 时与 start_task 一起跳过，
+            # 不留没有任务的孤儿消息
+            for role, content in outcome.inject_history:
+                self.agent.session.add(role, content)
         if outcome.start_task is not None:
             # /goal 设定/恢复后立即开跑；任务运行中则只提示——正在跑的续跑循环
             # 会在当前轮结束后读到新目标状态并自动接续
             if self._busy:
-                if outcome.echo_input:  # 技能手动激活：不排队，提示用户等待/中断
+                if outcome.echo_input:  # 技能手动加载：不排队，提示用户等待/中断
                     self.ui_notice("（上一条任务还在运行，请等待完成或先按 Esc 中断）", "warning")
                 else:
                     self.ui_notice("（目标已记录，当前任务结束后自动接续）", "info")
             else:
-                if outcome.echo_input:  # 技能手动激活带任务：用户输入原文整体回显
+                if outcome.echo_input:  # 技能手动加载带任务：用户输入原文整体回显
                     self._chat().apply(User(text))
                 self.start_task(outcome.start_task)
         if outcome.start_compact:

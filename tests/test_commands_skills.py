@@ -1,4 +1,4 @@
-"""技能斜杠命令测试：/skills 列表与刷新、/skill 选择器与加载、动态 /技能名 直达。"""
+"""技能斜杠命令测试：/skills 列表/选择框/刷新、技能名直达（/技能名）。"""
 
 import pytest
 
@@ -49,7 +49,8 @@ def _run(text):
 
 def test_commands_registered():
     names = {cmd.name for cmd in commands.all_commands()}
-    assert {"skills", "skill"} <= names
+    assert "skills" in names
+    assert "skill" not in names  # 技能名即命令，不再有 /skill 汇总入口
 
 
 def test_skills_lists_discovered(isolated):
@@ -75,7 +76,7 @@ def test_skills_without_args_returns_picker(isolated):
     _, outcome = _run("/skills")
 
     assert outcome.select is not None
-    assert outcome.select.command == "skill"
+    assert outcome.select.command == ""  # 空 = 选中后按 /<技能名> 重新分发
     assert [c.value for c in outcome.select.items] == ["proj"]
 
 
@@ -91,9 +92,9 @@ def test_skills_rejects_unknown_arg(isolated):
     assert "用法" in outcome.text
 
 
-# ---------- /skill：无参选择器 ----------
+# ---------- /skills：选择器内容 ----------
 
-def test_skill_without_args_returns_picker(isolated):
+def test_picker_lists_manually_loadable_skills(isolated):
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj", description="项目技能")
     _write_skill(
@@ -103,78 +104,63 @@ def test_skill_without_args_returns_picker(isolated):
     )
     _write_skill(workspace / ".agents" / "skills", "hidden-x")
 
-    _, outcome = _run("/skill")
+    _, outcome = _run("/skills")
 
     assert outcome.select is not None
-    assert outcome.select.command == "skill"
     values = [c.value for c in outcome.select.items]
     assert values == ["manual", "proj"]  # 被禁用的 hidden-x 不进选择列表
     assert all(c.current is False for c in outcome.select.items)
 
 
-def test_skill_picker_marks_active(isolated):
+def test_picker_marks_active(isolated):
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
     skills.activate("proj")
 
-    _, outcome = _run("/skill")
+    _, outcome = _run("/skills")
 
     assert [c.value for c in outcome.select.items if c.current] == ["proj"]
     assert "已激活" in outcome.select.items[0].label
 
 
-def test_skill_without_args_and_no_skills_returns_empty_picker(isolated):
-    _, outcome = _run("/skill")
+def test_picker_empty_without_skills(isolated):
+    _, outcome = _run("/skills")
 
     assert outcome.select is not None
     assert outcome.select.items == []  # 无技能时也是选择框，不打印提示文字
 
 
-# ---------- /skill：带参加载 ----------
-
-def test_skill_unknown_name_is_error(isolated):
-    _, outcome = _run("/skill ghost")
-    assert outcome.style == "red"
-    assert outcome.text.startswith("错误:")
-
-
-def test_skill_activates(isolated):
+def test_picker_excludes_names_colliding_with_commands(isolated):
+    """与内置命令重名的技能不进选择框：分发时内置命令优先，选中只会执行内置命令。"""
     workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "help", description="冒充 help")
     _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
 
-    _, outcome = _run("/skill proj")
+    _, outcome = _run("/skills")
 
-    assert outcome.text is None  # 静默激活，不打印"已加载技能"提示
-    assert outcome.start_task is None
-    assert skills.active_names() == ["proj"]
-
-
-def test_skill_with_task_starts_task(isolated):
-    workspace, _ = isolated
-    _write_skill(workspace / ".agents" / "skills", "proj")
-
-    _, outcome = _run("/skill proj 帮我处理报告")
-
-    assert outcome.start_task == "帮我处理报告"
-    assert outcome.echo_input is True  # 宿主把用户输入原文整体回显
-    assert outcome.text is None
+    assert [c.value for c in outcome.select.items] == ["proj"]
 
 
-# ---------- 动态 /技能名 直达 ----------
+# ---------- 技能名直达（/技能名） ----------
 
-def test_dynamic_skill_command_activates(isolated):
+def test_dynamic_skill_command_loads_and_runs(isolated):
+    """首次加载且无任务：载荷本身就是本轮 user 消息（加载后立即开跑一回）。"""
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
 
     _, outcome = _run("/proj")
 
-    assert outcome.text is None  # 静默激活
+    assert outcome.text == "已加载技能 proj"
+    assert outcome.inject_history == []
+    assert "以下为技能「proj」的完整指令" in outcome.start_task
+    assert outcome.echo_input is True
     assert skills.active_names() == ["proj"]
 
 
-def test_dynamic_skill_command_with_task_starts_task(isolated):
+def test_dynamic_skill_command_with_task_injects_then_starts_task(isolated):
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
@@ -182,8 +168,37 @@ def test_dynamic_skill_command_with_task_starts_task(isolated):
     _, outcome = _run("/proj 处理报告")
 
     assert outcome.start_task == "处理报告"
-    assert outcome.echo_input is True
+    assert outcome.echo_input is True  # 宿主把用户输入原文整体回显
+    assert outcome.text == "已加载技能 proj"
+    assert [role for role, _ in outcome.inject_history] == ["user"]
+    assert "以下为技能「proj」的完整指令" in outcome.inject_history[0][1]
     assert skills.active_names() == ["proj"]
+
+
+def test_dynamic_skill_command_already_loaded_does_not_inject_again(isolated):
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+    _run("/proj 第一次")
+
+    _, outcome = _run("/proj 第二次")
+
+    assert outcome.inject_history == []  # 幂等：不重复占上下文
+    assert outcome.start_task == "第二次"
+    assert "已加载" in outcome.text
+
+
+def test_dynamic_skill_command_already_loaded_without_task_only_notifies(isolated):
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+    _run("/proj")
+
+    _, outcome = _run("/proj")
+
+    assert outcome.start_task is None  # 不重复开跑
+    assert outcome.style == "yellow"
+    assert "无需重复" in outcome.text
 
 
 def test_registered_command_wins_over_skill(isolated):

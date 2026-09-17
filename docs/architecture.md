@@ -124,7 +124,9 @@ skills.refresh() ──► frontmatter 宽容解析 ──► 优先级去重（
 Session.sync_system() ──► messages[0]「可用技能」目录（name + 描述，字符预算降级）
    │
    ▼
-模型 ──► use_skill(name) ──► 激活集合 ──► 下一轮 messages[0]「已激活技能」正文 + 资源清单
+模型 ──► use_skill(name) ──► 工具结果 = 第 2 层载荷（正文 + 资源清单，role=tool 进历史）
+   │
+   └──► 用户 /<技能名> [任务] ──► 同一载荷作为 user 消息进历史（无任务即开跑一回）
    │
    ▼
 第 3 层：引用文件用 read_file（技能目录只读免确认），脚本用 run_command（照常权限）
@@ -132,10 +134,10 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 - **扫描与优先级**：项目级只扫 `<工作区>/.agents/skills/`，用户级只扫 `~/.smithcode/skills/`，外加 `[skills].paths`；同名"先命中者生效"（附加 > 项目 > 用户），被遮蔽/跳过者进 `/skills` 诊断；单根限深度 4、2000 目录。
 - **信任门控**：项目级技能随仓库分发、可能不可信，默认 `[skills].project="ask"` 交互确认（`[a]` 落盘 `~/.smithcode/skills_trust.json`、`[y]` 仅本会话、`[n]` 跳过）；非交互模式 fail-closed 跳过。
-- **披露与激活**：目录段与已激活正文都注入 `messages[0]`（同 goal 段机制，压缩天然保留、普通回合逐字节稳定）；`use_skill` 工具（`serial`、enum 约束技能名、默认 `allow`）只标记激活，正文由下一轮 `sync_system()` 注入；无可用技能时工具与目录一起隐藏。
-- **用户侧**：`/skills` 无参数直接弹出技能选择框（TUI 选择弹窗，选中即加载），`/skills list` 查看来源分组/状态/诊断、`/skills refresh` 重扫磁盘（新装技能无需重启）；`/skill <名称> [任务]` 直接加载（激活成功保持静默、不打印提示），带任务时用户输入原文（含技能指令）整体回显为消息后开跑；技能名并入 `/` 输入补全（功能命令在前、技能按名称在后，同名技能不重复），`/技能名 [任务]` 直达与 `/skill` 等价；`disable-model-invocation: true` 的技能只允许手动加载。
+- **披露与加载**：目录段注入 `messages[0]`（同 goal 段机制，普通回合逐字节稳定）；加载技能只把第 2 层载荷（前言 + `<skill>` 包装 + 资源清单 + 正文）投进对话——模型侧 `use_skill`（`serial`、enum 约束技能名、默认 `allow`）直接把它作为工具结果返回，用户侧由命令注入为 user 消息。**正文不进系统提示词**：加载不改变 `messages[0]`，提示前缀缓存全程稳定；重复加载只回一句提示（幂等，不重复占上下文）；无可用技能时工具与目录一起隐藏。载荷超 `[limits].max_tool_output` 时截断并附 `read_file` 指引。
+- **用户侧**：`/skills` 无参数直接弹出技能选择框（选中即按技能名直达加载并开跑），`/skills list` 查看来源分组/状态/诊断、`/skills refresh` 重扫磁盘（新装技能无需重启）；技能名即命令：`/技能名 [任务]` 由 commands.dispatch 的兜底分发加载——载荷经 `CommandResult.inject_history` 作为一条 user 消息注入历史，带任务时随后再发起任务消息（用户输入原文整体回显），无任务时载荷本身就是本轮 user 消息（加载后立即开跑一回）；技能名同时并入 `/` 输入补全（功能命令在前、技能按名称在后），与内置命令重名的技能不进命令面（内置命令优先，只能由模型用 `use_skill` 加载）；`disable-model-invocation: true` 的技能只允许手动加载。
 - **安全边界**：技能根目录登记为**只读白名单**（`config.read_roots()`），读引用文件免越界确认、不弹权限框；写操作只认授权目录（`_resolve(write=True)`）；frontmatter 的 `allowed-tools` 不产生任何授权效果。
-- **会话与压缩**：`/new` 时 `skills.reset()` 清空激活集合（发现结果保留）；正文在 `messages[0]` 所以压缩不丢；`/context` 的 system 桶如实计量技能成本。
+- **会话与压缩**：`/new` 时 `skills.reset()` 清空加载集合（发现结果保留）；正文在对话历史里，压缩会把中段摘要掉——`Agent.compact()` 随后调 `skills.prune_active()` 剔除正文已不在上下文中的技能（按载荷是否完整出现判定，从严）并注入一行提示（需要时重新 `use_skill`），剔除结果立即写入 `t=state` 投影；`/context` 的桶计量如实反映技能成本。
 
 ## 项目指令（AGENTS.md）
 
@@ -158,7 +160,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 - `reset_read_tracking()`：清空工具侧「已读文件」记录（新会话中未读过的文件重新受 write/edit 前置校验约束）
 - `plan.reset()`：清空步骤清单
 - `goal.reset()`：清空持久目标（`/new` 即 `/clear` 语义，目标不跨会话保留）
-- `skills.reset()`：清空技能激活集合（技能目录与项目信任决定保留，省一次磁盘扫描）
+- `skills.reset()`：清空技能加载集合（技能目录与项目信任决定保留，省一次磁盘扫描）
 
 ### 会话持久化与恢复
 
@@ -225,7 +227,7 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
 | `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer`）与全局实例（`current()` / `set_renderer()`）：Agent 全部终端交互经此收口；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`） |
 | `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |
-| `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级激活集合、`render.py` 目录段与已激活段渲染（字符预算降级）；`/new` 时重置激活集合 |
+| `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级加载集合与载荷投递（含压缩后裁剪）、`render.py` 目录段与载荷渲染（字符预算降级）；`/new` 时重置加载集合 |
 | `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
@@ -242,7 +244,7 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `tools/ask.py` | ask_user 任务中途向用户提问（复数入参：一个面板一次问 1-N 个问题，可手动切题） |
 | `tools/todo.py` | todo_write / todo_read 任务拆分与分步骤执行的状态机与只读快照 |
 | `tools/goal.py` | goal_update / goal_read 持久目标的状态声明与权威快照（complete 证据核验、blocked 阻碍门槛），默认放行 |
-| `tools/skills.py` | use_skill 技能激活工具 + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
+| `tools/skills.py` | use_skill 技能加载工具（正文作为本次调用的结果返回） + `sync_schema()`（按技能集合同步 enum 与可见性，零技能时隐藏） |
 | `mcp/` | MCP 子系统：`config.py` 双作用域配置（env / headers 内联表、条目 `enabled` / `oauth`）、`secrets.py` 引用展开/凭据库/Redactor、`auth.py` OAuth token 持久化与浏览器回调、`runtime.py` 共享 asyncio loop 线程、`connection.py` 基于官方 SDK 的同步门面、`factory.py` 按传输构造连接、`catalog.py` 命名与结果映射、`service.py` 连接生命周期与动态注册、`wizard.py` + `templates.py` 添加向导（TUI/REPL 共用纯状态机）；`commands/mcp.py` 提供 `/mcp` 命令 |
 | `tui/` | Textual 全屏聊天界面（仅交互终端加载）：`app.py` 组装层（`SmithTUI` 布局接线 + 集中 CSS）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据，`ChatView.apply` 是唯一打印入口）、`widgets.py` 自包含控件（消息区/折叠块/侧边栏/命令菜单/输入框 + `UiAction` 消息）、`bridge.py` 线程桥（`TuiRenderer`，worker 线程经 `post_message` 投递 UI 事件）、`panels.py` 弹窗面板（权限/提问/通用选择/MCP 向导）、`render.py` 纯函数工具（markdown 渲染、git 分支、token 缩写） |
 

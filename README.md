@@ -43,7 +43,7 @@
 | `ask_user` | 任务中途向你提问（一次可提 1-4 个，带候选项） |
 | `todo_write` / `todo_read` | 维护 / 读取任务步骤清单 |
 | `goal_update` / `goal_read` | 更新 / 读取持久目标状态 |
-| `use_skill` | 加载某个技能的完整指令 |
+| `use_skill` | 加载某个技能的完整指令（正文作为该次调用的结果返回） |
 
 多个工具调用**流式调度**：边预检边执行，可并行的只读 / 网络调用进线程池并发跑，有跨调用状态的工具（shell、写文件、交互确认）在主线程串行执行并作为顺序屏障，结果按提交顺序回传。
 
@@ -56,10 +56,10 @@
 
 兼容 agentskills.io 开放格式：技能是含 `SKILL.md`（YAML frontmatter 的 `name` + `description`，正文写指令，可附 `scripts/`、`references/` 资源）的目录。
 
-- **渐进式披露**：启动只把技能名与描述装进系统提示词（约 100 token/技能），命中任务后由模型调用 `use_skill` 按需加载完整指令
+- **渐进式披露**：启动只把技能名与描述装进系统提示词（约 100 token/技能），命中任务后由模型调用 `use_skill` 按需加载完整指令（正文随该次调用的结果进对话，不改动系统提示词）
 - **发现位置**：项目 `.agents/skills/`、用户 `~/.smithcode/skills/`，以及 `[skills].paths` 追加的目录
 - **信任门控**：项目级技能来自可能不可信的仓库，默认首次发现时确认（可「始终信任」落盘）
-- **用户操作**：`/skills` 弹选择框（选中即加载）、`/skills list` 查看来源与诊断、`/skills refresh` 重扫磁盘；`/skill <名称> [任务]` 或 `/技能名 [任务]` 直达
+- **用户操作**：`/skills` 弹选择框（选中即加载并开跑）、`/skills list` 查看来源与诊断、`/skills refresh` 重扫磁盘；技能名即命令，`/技能名 [任务]` 直达加载并开跑
 
 ### 项目约定（AGENTS.md）
 
@@ -180,9 +180,8 @@ python -m smithcode              # 等价的另一种启动方式
 | `/model [名称]` | 切换模型（无参弹候选列表） |
 | `/effort [档位]` | 调整思考强度（none / minimal / low / medium / high / xhigh / max） |
 | `/goal <目标> \| pause \| resume \| clear \| budget <N>` | 设定 / 管理持久目标；无参查看状态 |
-| `/skills [list\|refresh]` | 无参弹技能选择框（选中即加载）、`list` 查看列表与诊断、`refresh` 重扫磁盘 |
-| `/skill [名称] [任务]` | 加载技能；带任务时加载后立即开跑 |
-| `/技能名 [任务]` | 技能名直达（等价 `/skill`） |
+| `/skills [list\|refresh]` | 无参弹技能选择框（选中即加载并开跑）、`list` 查看列表与诊断、`refresh` 重扫磁盘 |
+| `/技能名 [任务]` | 技能名即命令：加载技能并开跑，带任务时按任务执行，不带任务时模型先回应 |
 | `/exit` | 退出程序 |
 
 ### 命令行参数
@@ -260,7 +259,7 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[limits] max_tool_concurrency` | 5 | 一轮内可并行工具的最大并发数 |
 | `[sessions] enabled` | true | 会话自动保存总开关 |
 | `[sessions] cleanup_days` | 30 | 转录保留天数；0 = 不自动清理 |
-| `[sessions] persist_state` | true | 是否随会话持久化 goal / plan / 技能激活集 |
+| `[sessions] persist_state` | true | 是否随会话持久化 goal / plan / 技能加载集 |
 | `[sessions] list_limit` | 20 | `/sessions` 默认展示条数 |
 | `[sessions] auto_title` | true | 首轮结束后自动生成会话标题 |
 | `[sessions] title_model` | 空 | 标题专用模型（空 = 当前模型，建议配廉价快模型） |

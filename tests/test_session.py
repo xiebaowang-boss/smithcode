@@ -55,8 +55,8 @@ def test_sync_system_refreshes_goal_section():
     assert "## 当前持久目标" not in session.messages[0]["content"]
 
 
-def test_sync_system_includes_skills_section(tmp_path, monkeypatch):
-    """技能装载后目录进系统提示词；激活/重置后已激活正文随之增删。"""
+def test_sync_system_includes_skills_catalog_only(tmp_path, monkeypatch):
+    """技能装载后只有目录进系统提示词；加载正文不改动 messages[0]（前缀缓存稳定）。"""
     from smithcode import skills
 
     workspace = tmp_path / "ws"
@@ -77,17 +77,18 @@ def test_sync_system_includes_skills_section(tmp_path, monkeypatch):
         skills.refresh()
         session = Session()
         session.sync_system()
-        assert "## 可用技能" in session.messages[0]["content"]
-        assert "正文标记" not in session.messages[0]["content"]
+        catalog = session.messages[0]["content"]
+        assert "## 可用技能" in catalog
+        assert "正文标记" not in catalog
 
-        skills.activate("proj")
+        payload = skills.activate("proj")
+        assert "正文标记" in payload  # 正文作为载荷返回，由调用方投递进对话
         session.sync_system()
-        assert "正文标记" in session.messages[0]["content"]
+        assert session.messages[0]["content"] == catalog
 
         skills.reset()
         session.sync_system()
-        assert "正文标记" not in session.messages[0]["content"]
-        assert "## 可用技能" in session.messages[0]["content"]
+        assert session.messages[0]["content"] == catalog
     finally:
         skills.clear()
 

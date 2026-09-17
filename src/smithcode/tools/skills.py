@@ -1,6 +1,8 @@
-"""use_skill 工具：把技能的完整指令注入系统提示词的「已激活技能」段。
+"""use_skill 工具：把技能的完整指令作为本次调用的结果返回。
 
-技能只提供文本指令与资源清单；技能目录中的脚本执行仍走 run_command
+正文由 skills.activate() 渲染并登记进会话级加载集合（含长度护栏），随后作为
+role="tool" 的消息进入会话历史——系统提示词只保留「可用技能」目录，不随加载
+变化。技能只提供文本指令与资源清单；技能目录中的脚本执行仍走 run_command
 正常权限确认，不做任何捷径（frontmatter 的 allowed-tools 也不参与授权）。
 """
 from __future__ import annotations
@@ -29,8 +31,8 @@ def sync_schema() -> None:
         "describe": lambda args: f"skill {args.get('name', '?')}",
         "serial": True,
         "description": "加载某个技能的完整指令。当任务与系统提示词「可用技能」中某个技能的"
-        "描述相符时，先调用本工具加载其完整指令，再按指令执行；name 必须是可用技能名之一。"
-        "已激活的技能无需重复加载。",
+        "描述相符时，先调用本工具加载其完整指令（正文会作为本次调用的结果返回），再按"
+        "指令执行；name 必须是可用技能名之一。已加载的技能无需重复调用。",
         "parameters": {
             "type": "object",
             "properties": {

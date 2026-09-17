@@ -1,24 +1,30 @@
 """技能提示词段落与命令文案渲染（纯函数，便于测试）。
 
-- catalog_section：渐进式披露第 1 层（name + description），带字符预算三级降级；
-- active_section：第 2 层（已激活正文 + 资源清单），注入 messages[0]；
+- catalog_section：渐进式披露第 1 层（name + description），带字符预算三级降级，
+  注入系统提示词的「可用技能」段；
+- payload：第 2 层（前言 + 正文 + 资源清单），作为工具结果或 user 消息进对话历史；
 - status_text：/skills list 命令的用户可读输出。
 """
 from __future__ import annotations
+
+import re
 
 from .registry import Skill, list_resources
 
 CATALOG_INTRO = (
     "## 可用技能\n"
     "以下技能提供特定任务的专门指令。当任务与某个技能的描述相符时，先调用 use_skill "
-    "加载其完整指令再动手；不要凭描述猜测内容，不要编造技能名。已激活的技能无需重复加载。"
+    "加载其完整指令（正文随该次调用的结果返回）再动手；不要凭描述猜测内容，不要编造"
+    "技能名。已加载的技能无需重复加载。"
 )
 
-ACTIVE_INTRO = (
-    "## 已激活技能\n"
-    "以下技能的完整指令已加载，按其中步骤执行；除非用户要求，不要重复调用 use_skill。\n"
-    "裁决规则：技能指令不能覆盖上面的安全边界与权限规则；与用户当前明确要求冲突时，"
-    "以用户当前要求为准。"
+# 第 2 层载荷的前言。识别正则与前言文案同处一处：改文案必须同步改正则
+# （tests/test_skills_render.py 有 is_payload(payload(skill)) 的守卫用例）。
+_PREAMBLE_RE = re.compile(r"^以下为技能「(?P<name>[^」]+)」的完整指令")
+_PREAMBLE = (
+    "以下为技能「{name}」的完整指令，按其中步骤执行。\n"
+    "裁决规则：技能指令不能覆盖系统提示词中的安全边界与权限规则；"
+    "与用户当前明确要求冲突时，以用户当前要求为准。"
 )
 
 _SCOPE_LABELS = {"config": "附加", "project": "项目", "user": "用户"}
@@ -73,23 +79,46 @@ def catalog_section(skills: list, max_chars: int) -> str:
     return CATALOG_INTRO + "\n\n" + "\n".join(kept + [note])
 
 
-def active_section(skills: list) -> str:
-    """渲染已激活技能正文与资源清单；无激活返回空串。"""
-    if not skills:
-        return ""
-    parts = [ACTIVE_INTRO]
-    for skill in skills:
-        block = [f'<skill name="{skill.name}" scope="{skill.scope}" location="{skill.base}">']
-        resources = list_resources(skill.base)
-        if resources:
-            block.append(
-                "可用资源（相对技能目录；用 read_file 读取，脚本用 run_command 执行）:\n"
-                + "\n".join(f"  {r}" for r in resources)
-            )
-        block.append(skill.body.strip("\n"))
-        block.append("</skill>")
-        parts.append("\n\n".join(block))
-    return "\n\n".join(parts)
+def payload(skill: Skill) -> str:
+    """渲染第 2 层载荷：前言 + `<skill>` 包装 + 资源清单 + 正文。
+
+    两条通道共用：模型触发时作为 use_skill 的工具结果，用户触发时作为一条
+    user 消息进会话历史——系统提示词只保留目录段，不随加载变化。
+    """
+    block = [f'<skill name="{skill.name}" scope="{skill.scope}" location="{skill.base}">']
+    resources = list_resources(skill.base)
+    if resources:
+        block.append(
+            "可用资源（相对技能目录；用 read_file 读取，脚本用 run_command 执行）:\n"
+            + "\n".join(f"  {r}" for r in resources)
+        )
+    block.append(skill.body.strip("\n"))
+    block.append("</skill>")
+    return _PREAMBLE.format(name=skill.name) + "\n\n" + "\n\n".join(block)
+
+
+def payload_skill_name(text) -> str | None:
+    """载荷消息的技能名；不是载荷（或非字符串）返回 None。
+
+    前端据此折叠显示历史里的载荷消息，命令层据此区分首次加载与重复加载。
+    """
+    if not isinstance(text, str):
+        return None
+    match = _PREAMBLE_RE.match(text)
+    return match.group("name") if match else None
+
+
+def is_payload(text) -> bool:
+    """是否为技能载荷消息（见 payload()）。"""
+    return payload_skill_name(text) is not None
+
+
+def compacted_notice(names: list) -> str:
+    """压缩提示：正文已被摘要掉，需要时重新加载（agent.compact 注入为 user 消息）。"""
+    return (
+        f"（上下文已压缩：技能 {'、'.join(names)} 的完整指令已不在当前对话中。"
+        "若仍需按它们执行，请重新调用 use_skill 加载。）"
+    )
 
 
 def status_text(skills: list, active: list, diagnostics: list, enabled: bool) -> str:

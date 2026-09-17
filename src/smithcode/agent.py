@@ -734,6 +734,12 @@ class Agent:
             assembled[1], assembled[2:], before=before,
             after=total_tokens(assembled),
         )
+        dropped = skills.prune_active(self.session.messages)
+        if dropped:
+            # 技能正文在被压缩的中段里：剔除加载集合并显式告知模型，
+            # 避免它以为手上还有一份看不见的指令（需要时重新 use_skill 加载）
+            self.session.add("user", skills.render.compacted_notice(dropped))
+            self._persist_turn()  # 剔除结果立即落进 t=state，恢复时不与转录打架
         self.context.compact_count += 1
         renderer.current().info(
             f"[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens"

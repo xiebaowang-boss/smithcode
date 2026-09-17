@@ -214,6 +214,52 @@ def test_run_compacts_when_over_threshold(monkeypatch, capsys):
     assert "已压缩" in capsys.readouterr().out
 
 
+def test_compact_prunes_skills_lost_from_context(monkeypatch, capsys, tmp_path):
+    """技能正文随中段被摘要掉：从加载集合剔除，并注入一行提示告知可重新加载。"""
+    from smithcode import skills
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (home / "config.toml").write_text('[skills]\nproject = "on"\n', encoding="utf-8")
+    directory = workspace / ".agents" / "skills" / "proj"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: d\n---\n技能正文标记\n", encoding="utf-8"
+    )
+
+    skills.clear()
+    try:
+        skills.refresh()
+        payload = skills.activate("proj")
+
+        monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 500)
+        monkeypatch.setattr(config, "COMPACT_KEEP_TOKENS", 150)
+        monkeypatch.setattr("smithcode.agent.LLMClient", CompactAwareLLM)
+        session = Session()
+        # 中段：技能载荷（用户侧加载注入的那条 user 消息）→ 会被摘要回收
+        session.messages = (
+            [{"role": "system", "content": "SYS"},
+             {"role": "user", "content": payload},
+             {"role": "assistant", "content": "收到"}]
+            + _turn("上次任务", 4000)
+        )
+        agent = Agent(session=session)
+
+        assert agent.compact() is True
+
+        assert skills.active_names() == []  # 正文已不在上下文：剔除
+        notice = agent.session.messages[-1]
+        assert notice["role"] == "user"
+        assert "技能 proj" in notice["content"]
+        assert "use_skill" in notice["content"]
+    finally:
+        skills.clear()
+
+
 def test_compact_aborts_silently_when_cancelled(monkeypatch, capsys):
     """任务已中断时不再发起摘要请求，静默放弃压缩（不打印失败噪音）。"""
     from smithcode.cancel import CancellationToken, activate_token

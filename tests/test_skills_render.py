@@ -1,4 +1,4 @@
-"""技能渲染测试：目录段预算降级、已激活段与 /skills 文案（纯函数）。"""
+"""技能渲染测试：目录段预算降级、第 2 层载荷与 /skills 文案（纯函数）。"""
 
 from pathlib import Path
 
@@ -25,7 +25,6 @@ def _skill(name, description="描述", scope="project", model_invocable=True,
 
 def test_catalog_empty_returns_empty_string():
     assert render.catalog_section([], 8000) == ""
-    assert render.active_section([]) == ""
 
 
 def test_catalog_contains_name_scope_and_description():
@@ -58,20 +57,41 @@ def test_catalog_omits_overflow_with_note():
     assert len(text) <= 150
 
 
-def test_active_section_wraps_body_and_lists_resources(tmp_path):
+def test_payload_wraps_body_and_lists_resources(tmp_path):
     base = tmp_path / "skill-a"
     (base / "scripts").mkdir(parents=True)
     (base / "scripts" / "run.py").write_text("print(1)", encoding="utf-8")
     (base / "SKILL.md").write_text("---\nname: a\ndescription: d\n---\nbody", encoding="utf-8")
 
-    text = render.active_section([_skill("a", base=base)])
+    text = render.payload(_skill("a", base=base))
 
-    assert '## 已激活技能' in text
+    assert "以下为技能「a」的完整指令" in text
+    assert "不能覆盖系统提示词中的安全边界" in text
     assert '<skill name="a" scope="project" location="' in text
     assert "scripts/run.py" in text
     assert "SKILL.md" not in text
     assert "正文内容" in text
     assert text.rstrip().endswith("</skill>")
+
+
+def test_payload_detection_helpers(tmp_path):
+    base = tmp_path / "skill-a"
+    base.mkdir()
+    (base / "SKILL.md").write_text("---\nname: a\ndescription: d\n---\nbody", encoding="utf-8")
+    text = render.payload(_skill("a", base=base))
+
+    assert render.is_payload(text) is True
+    assert render.payload_skill_name(text) == "a"
+    assert render.is_payload("普通用户消息") is False
+    assert render.is_payload(None) is False
+    assert render.payload_skill_name(None) is None
+
+
+def test_compacted_notice_names_dropped_skills():
+    text = render.compacted_notice(["a", "b"])
+
+    assert "技能 a、b" in text
+    assert "use_skill" in text
 
 
 def test_status_text_disabled_feature():

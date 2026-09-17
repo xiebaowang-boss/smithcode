@@ -35,15 +35,16 @@ class CommandSelect:
     """命令要求宿主弹出的选择意图：选中后按 `/<command> <value>` 重新分发。
 
     command 是被调用的命令名（如 "model"），宿主不关心选项语义，只负责
-    展示并回填参数——命令处理器保持同步、纯函数。
+    展示并回填参数——命令处理器保持同步、纯函数。command 留空时按 `/<value>`
+    分发：value 本身就是命令名（技能名直达，见 commands/skills.py）。
 
     size 是弹窗宽度档位（small / medium / large / xlarge），由调用方按内容
     长度声明；缺省 medium，宿主不测量内容、只按档位取宽度。
     """
 
     title: str
-    command: str
     items: list  # CommandChoice 列表
+    command: str = ""
     size: str = "medium"
 
 
@@ -73,6 +74,9 @@ class CommandResult:
     select: CommandSelect | None = None  # 非空时宿主弹出选择器
     start_task: str | None = None  # 非空时宿主立即以此文本发起一次任务（如 /goal 开跑）
     echo_input: bool = False      # 与 start_task 搭配：宿主先把用户输入原文回显为消息
+    inject_history: list = field(default_factory=list)
+    # 注入会话历史的消息 [(role, content), ...]，宿主在 start_task 之前逐条写入；
+    # 与 start_task 同为「运行中则整体跳过」语义（避免产生没有任务的孤儿消息）
     start_compact: bool = False   # True 时宿主在后台执行一次压缩（如 /compact）
     wizard: CommandWizard | None = None  # 非空时宿主启动向导（如 /mcp add）
 
@@ -146,8 +150,8 @@ def complete_commands(prefix: str) -> list:
     """按前缀过滤命令与技能，供输入补全菜单用（REPL 与 TUI 共用同一份数据）。
 
     prefix 为 "/" 后已敲出的字符（可为空串 = 全部命令）；别名不进菜单。
-    排序：功能命令按名称在前，技能条目按名称在后；同名技能不重复出现
-    （仍可用 /skill 加载）；技能未装载时不并入（补全路径不做磁盘扫描/信任确认）。
+    排序：功能命令按名称在前，技能条目按名称在后；与内置命令重名的技能不并入
+    （分发时内置命令优先）；技能未装载时不并入（补全路径不做磁盘扫描/信任确认）。
     """
     registered = [cmd for cmd in all_commands() if cmd.name.startswith(prefix)]
     taken = {cmd.name for cmd in registered}
@@ -179,7 +183,7 @@ def _skill_commands(prefix: str, taken: set) -> list:
 
 # /help 尾部的输入操作提示（REPL 与 TUI 通用）
 HELP_FOOTER = (
-    "技能: /skills 打开选择框，/<技能名> [任务] 直达，/skill <名称> [任务] 直接加载。\n"
+    "技能: /skills 打开选择框（选中即加载并开跑），/<技能名> [任务] 直达。\n"
     "输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"
 )
 

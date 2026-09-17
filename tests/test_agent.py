@@ -649,8 +649,8 @@ def test_session_reusable_after_interrupt(monkeypatch):
     assert result.text == "最终回复"
 
 
-def test_run_with_skill_injects_catalog_and_active_body(monkeypatch, tmp_path):
-    """端到端：目录进首轮系统提示词；use_skill 激活后，下一轮请求携带技能正文。"""
+def test_run_with_skill_returns_body_in_tool_result(monkeypatch, tmp_path):
+    """端到端：目录进首轮系统提示词；use_skill 的正文作为工具结果进历史。"""
     from smithcode import skills
 
     workspace = tmp_path / "ws"
@@ -697,10 +697,12 @@ def test_run_with_skill_injects_catalog_and_active_body(monkeypatch, tmp_path):
         result = agent.run("用技能处理")
 
         assert result.status == "ok"
-        assert "## 可用技能" in agent.llm.requests[0][0]["content"]
+        first_prompt = agent.llm.requests[0][0]["content"]
+        assert "## 可用技能" in first_prompt
         assert any(s["name"] == "use_skill" for s in agent.llm.tools[0])
         second_prompt = agent.llm.requests[1][0]["content"]
-        assert "## 已激活技能" in second_prompt
-        assert "BODY-MARKER" in second_prompt
+        assert second_prompt == first_prompt  # 加载技能不改动系统提示词
+        tool_results = [m for m in agent.llm.requests[1] if m.get("role") == "tool"]
+        assert tool_results and "BODY-MARKER" in tool_results[-1]["content"]
     finally:
         skills.clear()

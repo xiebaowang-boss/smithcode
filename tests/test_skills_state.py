@@ -50,7 +50,8 @@ def test_render_section_before_load_is_empty(isolated):
     assert skills.render_section() == ""
 
 
-def test_render_section_contains_catalog_and_active_body(isolated):
+def test_render_section_is_catalog_only_and_stable_across_loads(isolated):
+    """加载技能不改动系统提示词：正文作为载荷返回，提示前缀缓存全程稳定。"""
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
@@ -58,14 +59,12 @@ def test_render_section_contains_catalog_and_active_body(isolated):
     catalog = skills.render_section()
     assert "## 可用技能" in catalog
     assert "proj" in catalog
-    assert "唯一正文标记" not in catalog  # 第 2 层未激活前不出现
+    assert "唯一正文标记" not in catalog  # 目录段只有第 1 层信息
 
-    text = skills.activate("proj")
-    assert "已激活" in text
-    section = skills.render_section()
-    assert "## 已激活技能" in section
-    assert "唯一正文标记" in section
-    assert "<skill name=" in section
+    payload = skills.activate("proj")
+    assert "唯一正文标记" in payload  # 第 2 层载荷由调用方投递进对话
+    assert "<skill name=" in payload
+    assert skills.render_section() == catalog
 
 
 def test_activate_unknown_lists_available(isolated):
@@ -85,7 +84,7 @@ def test_activate_is_idempotent(isolated):
     skills.refresh()
 
     skills.activate("proj")
-    assert "已激活" in skills.activate("proj")
+    assert "已加载" in skills.activate("proj")
     assert skills.activate("proj").count("无需重复") == 1
     assert skills.active_names() == ["proj"]
 
@@ -113,7 +112,7 @@ def test_manual_only_skill_rejects_model_and_allows_user(isolated):
 
     assert skills.model_skills() == []
     assert skills.activate("manual").startswith("错误:")
-    assert "已加载技能 manual" in skills.activate("manual", by="user")
+    assert "以下为技能「manual」的完整指令" in skills.activate("manual", by="user")
 
 
 def test_disabled_skill_cannot_activate(isolated):
@@ -154,3 +153,40 @@ def test_status_text_lists_sources_and_states(isolated):
     assert "技能（2 个）" in text
     assert "项目" in text and "用户" in text
     assert "[已激活]" in text
+
+
+def test_prune_active_drops_skills_missing_from_context(isolated):
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+    skills.activate("proj")
+
+    dropped = skills.prune_active([{"role": "user", "content": "无关内容"}])
+
+    assert dropped == ["proj"]
+    assert skills.active_names() == []
+
+
+def test_prune_active_keeps_payload_still_in_context(isolated):
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+    payload = skills.activate("proj")
+
+    dropped = skills.prune_active([{"role": "tool", "content": payload}])
+
+    assert dropped == []
+    assert skills.active_names() == ["proj"]
+
+
+def test_prune_active_treats_truncated_payload_as_dropped(isolated):
+    """尾部压缩会把超长 tool 消息头尾截断：截断即视为指令已不完整。"""
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+    payload = skills.activate("proj")
+
+    truncated = payload[:200] + "…（已省略中间部分）"
+    dropped = skills.prune_active([{"role": "tool", "content": truncated}])
+
+    assert dropped == ["proj"]

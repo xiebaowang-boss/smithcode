@@ -153,8 +153,8 @@ def build_system_prompt(
 
     动态段由 session.sync_system() 传入（instructions.render_section() /
     skills.render_section() / goal.render_section()），顺序即优先级阶梯：
-    base → 项目约定 → 技能 → 目标（越具体/越使命性越靠后）。各段只在自身
-    内容变化时变化，普通回合保持逐字节稳定。
+    base → 项目约定 → 技能目录 → 目标（越具体/越使命性越靠后）。技能正文不在这
+    里（它随加载进对话历史），各段只在自身内容变化时变化，普通回合保持逐字节稳定。
     """
     sections = "\n\n".join(_SECTIONS)
     prompt = f"""{_HEAD.rstrip()}

@@ -66,7 +66,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
 | `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）与 Relay 在 ask 类方法上报的等待态，合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；装配入口两个：终端宿主 `attach()`（总线 + 接管标题）、GUI 前端 `bus()`（纯总线，不碰终端标题）（设计见 `docs/architecture.md` 的「终端窗口标题」节） |
 | `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
-| `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级激活集合、目录/已激活段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
+| `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级加载集合与载荷投递（模型走工具结果、用户走 user 消息，正文不进系统提示词；压缩后裁剪 + 提示）、目录段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
 | `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程、`shell_policy.py` Shell 命令静态分析（只读判定 `is_safe_command` + 前缀推导 `command_key` / `derive_prefix`，命令规范表 `COMMANDS`），`__init__.py` 汇总公共 API |
 | `config.py` | 配置中心，优先级：内置默认 < `config.toml` < 环境变量 < CLI 参数 |

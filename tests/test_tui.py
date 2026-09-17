@@ -985,6 +985,40 @@ def test_tui_replays_restored_history(monkeypatch):
     _run(_run_case())
 
 
+def test_tui_replays_skill_payload_as_single_line(monkeypatch, tmp_path):
+    """恢复会话回放历史时，技能载荷折叠为一行提示，不整段铺开。"""
+    no_prompting(monkeypatch)
+    from smithcode.skills import render
+    from smithcode.skills.registry import Skill
+
+    base = tmp_path / "proj"
+    base.mkdir()
+    (base / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: d\n---\n载荷正文标记\n", encoding="utf-8"
+    )
+    skill = Skill(
+        name="proj", description="d", location=base / "SKILL.md", base=base,
+        root=base.parent, scope="project", body="载荷正文标记",
+    )
+    payload = render.payload(skill)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.messages = [
+            {"role": "user", "content": payload},
+            {"role": "assistant", "content": "已按技能处理"},
+        ]
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            text = _chat_text(app)
+            assert "已加载技能 proj" in text
+            assert "载荷正文标记" not in text  # 正文不铺满聊天区
+            assert "已按技能处理" in text
+
+    _run(_run_case())
+
+
 # ---------- 侧边栏会话标题 ----------
 
 def test_tui_sidebar_shows_session_title(monkeypatch):
@@ -1210,8 +1244,8 @@ def test_tui_goal_command_starts_task(monkeypatch):
     _run(_run_case())
 
 
-def test_tui_skill_command_echoes_task_silently(monkeypatch, tmp_path):
-    """技能手动激活保持静默；带任务时任务原文回显为用户消息后开跑。"""
+def test_tui_dynamic_skill_command_injects_payload_and_echoes_task(monkeypatch, tmp_path):
+    """技能名直达：载荷注入会话历史并提示一行；带任务时输入原文回显后开跑。"""
     no_prompting(monkeypatch)
     from smithcode import skills
 
@@ -1236,14 +1270,65 @@ def test_tui_skill_command_echoes_task_silently(monkeypatch, tmp_path):
             started: list = []
             app.start_task = lambda text: started.append(text)  # 捕获宿主动作，不起真实线程
             async with app.run_test() as pilot:
-                app.handle_command("/skill proj 帮我处理报告")
+                app.handle_command("/proj 帮我处理报告")
                 await pilot.pause()
 
                 chat = _chat_text(app)
-                assert "/skill proj 帮我处理报告" in chat  # 完整输入原文回显（含技能指令）
-                assert "已加载技能" not in chat  # 激活不打印提示
+                assert "/proj 帮我处理报告" in chat  # 完整输入原文回显
+                assert "已加载技能 proj" in chat  # 一行加载提示
+                assert "以下为技能" not in chat  # 载荷不铺满聊天区
                 assert started == ["帮我处理报告"]
+                injected = [
+                    m["content"]
+                    for m in app.agent.session.messages
+                    if m.get("role") == "user"
+                ]
+                assert any("以下为技能「proj」的完整指令" in c for c in injected)
                 assert skills.active_names() == ["proj"]
+
+        _run(_run_case())
+    finally:
+        skills.clear()
+
+
+def test_tui_skill_picker_dispatches_by_skill_name(monkeypatch, tmp_path):
+    """选择框选中技能后按 /<技能名> 重新分发（command 留空 = value 即命令）。"""
+    no_prompting(monkeypatch)
+    from smithcode import skills
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    (home / "config.toml").write_text('[skills]\nproject = "on"\n', encoding="utf-8")
+    skill_dir = workspace / ".agents" / "skills" / "proj"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: proj\ndescription: 测试技能\n---\n正文\n", encoding="utf-8"
+    )
+    skills.clear()
+    try:
+        skills.refresh()
+
+        async def _run_case():
+            app = SmithTUI(_make_agent(monkeypatch))
+            started: list = []
+            app.start_task = lambda text: started.append(text)
+            async with app.run_test() as pilot:
+                inp = app.query_one(ChatInput)
+                inp.focus()
+                inp.insert("/skills")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, SelectionScreen)
+                await pilot.press("enter")  # 选中唯一技能 → 按 /proj 分发
+                await pilot.pause()
+
+                assert "已加载技能 proj" in _chat_text(app)
+                assert started and "以下为技能「proj」的完整指令" in started[0]
 
         _run(_run_case())
     finally:

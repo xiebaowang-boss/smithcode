@@ -1,10 +1,11 @@
-"""技能斜杠命令：/skills 选择/查看/刷新、/skill 选择/加载。
+"""技能斜杠命令：`/skills` 选择/查看/刷新（技能名本身即命令，见下）。
 
-`/skills` 无参数直接弹出技能选择框（TUI SelectionPanel，选中自动加载）；
+`/skills` 无参数直接弹出技能选择框（TUI SelectionPanel，选中即加载并开跑）；
 `/skills list` 输出文本列表与扫描诊断，`/skills refresh` 重扫磁盘。
-`/skill <名称> [任务]` 直接加载或加载后立即开跑（脚本/非交互场景）。
-技能名还会作为动态条目并入 `/` 输入补全（commands/base.complete_commands），
-`/技能名 [任务]` 直达与 /skill 等价（见 commands.dispatch 的技能兜底）。
+技能名作为动态命令直达：`/技能名 [任务]` 由 commands.dispatch 的兜底分发进来，
+载荷作为一条 user 消息进会话历史（无任务时它本身就是本轮 user 消息，加载后
+立即开跑一回），带任务时随后再发起任务；技能名同时并入 `/` 输入补全。与内置
+命令重名的技能不进命令面（分发时内置命令优先），只能由模型用 use_skill 加载。
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from .base import (
     CommandChoice,
     CommandResult,
     CommandSelect,
+    get_command,
     register,
 )
 
@@ -39,36 +41,43 @@ def cmd_skills(ctx) -> CommandResult:
     return CommandResult(text="用法: /skills [list|refresh]", style="yellow")
 
 
-@register(
-    "skill",
-    "加载指定技能（无参数弹出选择框）",
-    usage="/skill [名称] [任务]",
-    accepts_args=True,
-)
-def cmd_skill(ctx) -> CommandResult:
-    if not ctx.args:
-        return _skill_picker()
-    name = ctx.args[0]
-    message = skills.activate(name, by="user")
-    if message.startswith("错误:"):
-        return CommandResult(text=message, style="red")
-    # 激活成功保持静默（不打印"已加载技能"提示）；带任务时由宿主把用户输入
-    # 原文（含技能指令）回显为消息，聊天区看到的与用户实际输入一致
-    task = " ".join(ctx.args[1:]).strip()
-    if task:
-        return CommandResult(start_task=task, echo_input=True)
-    return CommandResult()
+def load_skill(name: str, task: str) -> CommandResult:
+    """加载技能并决定载荷的投递方式（`/技能名 [任务]` 直达的实现）。
+
+    首次加载：载荷作为一条 user 消息注入会话历史；有任务时随后再发起任务消息，
+    无任务时载荷本身就是本轮 user 消息（即加载后立即开跑一回）。已加载：不重复
+    注入（幂等），有任务直接开跑，无任务只提示。
+
+    载荷只进 `inject_history` / `start_task`，由宿主在会话就绪时写入——命令层
+    不直接碰 session（运行中整体跳过，不留孤儿消息）。
+    """
+    text = skills.activate(name, by="user")
+    if text.startswith("错误:"):
+        return CommandResult(text=text, style="red")
+    if skills.render.is_payload(text):  # 首次加载：正文进对话历史
+        notice = f"已加载技能 {name}"
+        if task:
+            return CommandResult(
+                text=notice, style="green",
+                inject_history=[("user", text)], start_task=task, echo_input=True,
+            )
+        return CommandResult(text=notice, style="green", start_task=text, echo_input=True)
+    if task:  # 已加载：不重复注入
+        return CommandResult(text=text, start_task=task, echo_input=True)
+    return CommandResult(text=text, style="yellow")
 
 
 def _skill_picker() -> CommandResult:
-    """技能选择意图：列出全部可用技能（含仅手动加载的），选中后重分发 /skill <名称>。
+    """技能选择意图：列出可手动加载的技能，选中后按技能名直达（`/<技能名>`）。
 
-    没有可用技能时同样返回空选择框（不打印创建路径等提示文字）。
+    command 留空 = 宿主按 `/<value>` 重新分发（技能名即命令）。与内置命令重名的
+    技能不进列表——分发时内置命令优先，选中只会执行内置命令；没有可用技能时
+    同样返回空选择框（不打印创建路径等提示文字）。
     """
     active = set(skills.active_names())
     items = []
     for skill in skills.all_skills():
-        if skill.disabled:
+        if skill.disabled or get_command(skill.name) is not None:
             continue
         tags = []
         if skill.name in active:
@@ -84,4 +93,4 @@ def _skill_picker() -> CommandResult:
                 current=skill.name in active,
             )
         )
-    return CommandResult(select=CommandSelect(title="选择技能", command="skill", items=items))
+    return CommandResult(select=CommandSelect(title="选择技能", items=items))
