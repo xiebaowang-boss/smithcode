@@ -98,7 +98,8 @@ def test_use_skill_repeat_call_does_not_duplicate_body(isolated):
 
     assert "正文" in first
     assert "正文" not in second
-    assert "无需重复" in second
+    assert "已加载" in second
+    assert "对话历史" in second
 
 
 def test_use_skill_truncates_oversized_payload(isolated, monkeypatch):

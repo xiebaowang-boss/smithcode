@@ -44,9 +44,14 @@ def cmd_skills(ctx) -> CommandResult:
 def load_skill(name: str, task: str) -> CommandResult:
     """加载技能并决定载荷的投递方式（`/技能名 [任务]` 直达的实现）。
 
-    首次加载：载荷作为一条 user 消息注入会话历史；有任务时随后再发起任务消息，
-    无任务时载荷本身就是本轮 user 消息（即加载后立即开跑一回）。已加载：不重复
-    注入（幂等），有任务直接开跑，无任务只提示。
+    首次加载**保持静默**：界面上的命令回显与随后的模型回应已说明发生了什么，
+    再加一行回执只是噪音。载荷作为一条 user 消息注入会话历史，有任务时随后再
+    发起任务消息，无任务时载荷本身就是本轮 user 消息（即加载后立即开跑一回）。
+
+    重复加载同样**静默开跑、不向用户打印**：不重复注入正文（幂等），改为注入
+    一句历史回找引导（`render.recall_notice`，`is_payload` 为假、不占上下文），
+    让模型先在历史中找到此前的完整载荷、再按其中步骤执行；有任务时引导先进
+    历史、任务文本随后发起，无任务时引导本身就是本轮 user 消息。
 
     载荷只进 `inject_history` / `start_task`，由宿主在会话就绪时写入——命令层
     不直接碰 session（运行中整体跳过，不留孤儿消息）。
@@ -55,16 +60,19 @@ def load_skill(name: str, task: str) -> CommandResult:
     if text.startswith("错误:"):
         return CommandResult(text=text, style="red")
     if skills.render.is_payload(text):  # 首次加载：正文进对话历史
-        notice = f"已加载技能 {name}"
         if task:
             return CommandResult(
-                text=notice, style="green",
                 inject_history=[("user", text)], start_task=task, echo_input=True,
             )
-        return CommandResult(text=notice, style="green", start_task=text, echo_input=True)
-    if task:  # 已加载：不重复注入
-        return CommandResult(text=text, start_task=task, echo_input=True)
-    return CommandResult(text=text, style="yellow")
+        return CommandResult(start_task=text, echo_input=True)
+    # 重复加载：activate 回 `__already_loaded__:<name>` 哨兵（非载荷）；静默开跑
+    skill = skills.get(name)
+    notice = skills.render.recall_notice(skill) if skill is not None else text
+    if task:
+        return CommandResult(
+            inject_history=[("user", notice)], start_task=task, echo_input=True,
+        )
+    return CommandResult(start_task=notice, echo_input=True)
 
 
 def _skill_picker() -> CommandResult:

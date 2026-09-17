@@ -83,9 +83,26 @@ def test_activate_is_idempotent(isolated):
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
 
-    skills.activate("proj")
-    assert "已加载" in skills.activate("proj")
-    assert skills.activate("proj").count("无需重复") == 1
+    first = skills.activate("proj")
+    assert "唯一正文标记" in first
+    second = skills.activate("proj")
+    # 模型通道重复：回已加载提示 + 历史回找指引，不重复注入正文
+    assert "唯一正文标记" not in second
+    assert "已加载" in second
+    assert "对话历史" in second
+    assert "read_file" in second
+    assert skills.active_names() == ["proj"]
+
+
+def test_activate_repeat_by_user_returns_sentinel(isolated):
+    """用户通道重复：回哨兵供命令层判定，提示语由 render.recall_notice 渲染。"""
+    workspace, _ = isolated
+    _write_skill(workspace / ".agents" / "skills", "proj")
+    skills.refresh()
+
+    skills.activate("proj", by="user")
+
+    assert skills.activate("proj", by="user") == "__already_loaded__:proj"
     assert skills.active_names() == ["proj"]
 
 

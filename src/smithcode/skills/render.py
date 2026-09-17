@@ -121,6 +121,25 @@ def compacted_notice(names: list) -> str:
     )
 
 
+def recall_notice(skill) -> str:
+    """人工重复加载的回找引导：注入历史供模型定位此前的载荷。
+
+    不是载荷（`is_payload` 为假，不重复占上下文），而是一句轻量指引：
+    完整指令在本轮之前的对话历史里（前言 + `<skill>` 包装的载荷消息），
+    让模型先在历史中找到它并按其中步骤执行本轮任务；历史中找不到时
+    （如压缩后被摘要）用 read_file 按绝对路径重读 SKILL.md。
+    由命令层经 `inject_history` / `start_task` 投递，不向用户打印。
+    """
+    return (
+        f"（技能「{skill.name}」已在本会话加载：完整指令见本轮之前的对话历史"
+        f"（以“以下为技能「{skill.name}」的完整指令”开头、"
+        f"<skill name=\"{skill.name}\">包装的载荷消息），"
+        f"请先在历史中找到它并按其中步骤执行；若本次还附带了新任务则优先"
+        f"执行新任务；若历史中找不到完整载荷，用 read_file 读取 {skill.location}"
+        f"后再执行（技能目录 {skill.base} 只读可直接读，引用资源相对技能目录）。）"
+    )
+
+
 def status_text(skills: list, active: list, diagnostics: list, enabled: bool) -> str:
     """/skills list 输出：按来源分组列出技能、状态与诊断。"""
     if not enabled:

@@ -122,8 +122,10 @@ def activate(name: str, by: str = "model") -> str:
 
     载荷由调用方投递：`use_skill` 作为工具结果返回，技能名命令（`/技能名`）作为
     一条 user 消息注入会话历史——系统提示词只保留「可用技能」目录，不随加载
-    变化，所以提示前缀缓存在会话内全程稳定。重复加载返回一句提示（正文已在
-    对话中，不重复注入）；失败返回 `错误: ...`。
+    变化，所以提示前缀缓存在会话内全程稳定。重复加载不重复注入正文（幂等）：
+    模型通道（`use_skill` 工具结果）回一句已加载提示，模型照着去历史里找正文；
+    用户通道（技能名命令）的重复语义由命令层决定（静默开跑 + 历史回找引导，
+    不向用户打印）；失败返回 `错误: ...`。
     """
     ensure()
     skill = _index.get(name)
@@ -135,9 +137,14 @@ def activate(name: str, by: str = "model") -> str:
     if not skill.model_invocable and by == "model":
         return f"错误: 技能 {name} 仅允许用户手动加载（输入 /{name} 加载）"
     if name in _active:
+        if by == "user":
+            # 命令层专用：调用方据 `is_payload` 为假判定重复；正recall_notice文见 render.recall_notice。
+            return f"__already_loaded__:{name}"
         return (
-            f"技能 {name} 已加载，完整指令已在本会话中，无需重复加载"
-            f"（技能目录: {skill.base}；需要重读时用 read_file 读取技能文件）。"
+            f"技能 {name} 已加载，完整指令已在本会话的对话历史中（本次调用之前"
+            f"返回的载荷消息，以“以下为技能「{name}」的完整指令”开头）。"
+            f"请先在历史中找到它并按其中步骤执行；历史中找不到完整载荷时，"
+            f"用 read_file 读取 {skill.location}（技能目录: {skill.base}）。"
         )
     _active.append(name)
     return _fit_payload(render.payload(skill), skill)

@@ -153,7 +153,7 @@ def test_dynamic_skill_command_loads_and_runs(isolated):
 
     _, outcome = _run("/proj")
 
-    assert outcome.text == "已加载技能 proj"
+    assert outcome.text is None  # 首次加载静默，不打印回执
     assert outcome.inject_history == []
     assert "以下为技能「proj」的完整指令" in outcome.start_task
     assert outcome.echo_input is True
@@ -169,13 +169,14 @@ def test_dynamic_skill_command_with_task_injects_then_starts_task(isolated):
 
     assert outcome.start_task == "处理报告"
     assert outcome.echo_input is True  # 宿主把用户输入原文整体回显
-    assert outcome.text == "已加载技能 proj"
+    assert outcome.text is None  # 首次加载静默
     assert [role for role, _ in outcome.inject_history] == ["user"]
     assert "以下为技能「proj」的完整指令" in outcome.inject_history[0][1]
     assert skills.active_names() == ["proj"]
 
 
 def test_dynamic_skill_command_already_loaded_does_not_inject_again(isolated):
+    """已加载 + 带任务：静默开跑，回找引导先进历史、任务随后发起。"""
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
@@ -183,12 +184,18 @@ def test_dynamic_skill_command_already_loaded_does_not_inject_again(isolated):
 
     _, outcome = _run("/proj 第二次")
 
-    assert outcome.inject_history == []  # 幂等：不重复占上下文
+    assert outcome.text is None  # 不向用户打印已加载提示
+    assert outcome.echo_input is True
     assert outcome.start_task == "第二次"
-    assert "已加载" in outcome.text
+    assert [role for role, _ in outcome.inject_history] == ["user"]
+    notice = outcome.inject_history[0][1]
+    assert "已在本会话加载" in notice
+    assert "proj" in notice
+    assert skills.render.is_payload(notice) is False  # 引导语不是载荷，不占上下文
 
 
-def test_dynamic_skill_command_already_loaded_without_task_only_notifies(isolated):
+def test_dynamic_skill_command_already_loaded_without_task_still_runs(isolated):
+    """已加载 + 无任务：引导语本身即本轮 user 消息，静默开跑一回。"""
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
     skills.refresh()
@@ -196,9 +203,12 @@ def test_dynamic_skill_command_already_loaded_without_task_only_notifies(isolate
 
     _, outcome = _run("/proj")
 
-    assert outcome.start_task is None  # 不重复开跑
-    assert outcome.style == "yellow"
-    assert "无需重复" in outcome.text
+    assert outcome.text is None
+    assert outcome.echo_input is True
+    assert outcome.inject_history == []
+    assert "已在本会话加载" in outcome.start_task
+    assert "proj" in outcome.start_task
+    assert skills.render.is_payload(outcome.start_task) is False
 
 
 def test_registered_command_wins_over_skill(isolated):

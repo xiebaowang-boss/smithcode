@@ -94,6 +94,20 @@ def test_compacted_notice_names_dropped_skills():
     assert "use_skill" in text
 
 
+def test_recall_notice_points_to_history_payload():
+    """回找引导：指向历史载荷的识别特征，给出 read_file 兜底，不是载荷本身。"""
+    skill = _skill("a")
+
+    text = render.recall_notice(skill)
+
+    assert "已在本会话加载" in text
+    assert "以下为技能「a」的完整指令" in text
+    assert '<skill name="a">' in text
+    assert "read_file" in text
+    assert str(skill.location) in text
+    assert render.is_payload(text) is False
+
+
 def test_status_text_disabled_feature():
     assert "[skills].enabled" in render.status_text([], [], [], enabled=False)
 
