@@ -860,6 +860,38 @@ class SmithTUI(App):
             self.post_message(UiAction("running_off"))
             self.post_message(UiAction("turn_end", status))
 
+    def start_compact(self) -> None:
+        """手动 /compact：后台线程压缩，主线程只负责即时反馈，避免 UI 卡住。
+
+        压缩要发摘要请求（数秒到数十秒），同步跑会冻结界面；这里复用任务的
+        忙守卫与运行动画：立即提示「正在压缩」，完成后由后台线程投递结果。
+        """
+        if self._busy:
+            self.ui_notice("（上一条任务还在运行，请等待完成或先按 Esc 中断）", "warning")
+            return
+        self._busy = True
+        self.ui_notice(commands.COMPACT_RUNNING, "info")
+        running = self.query_one("#running", RunningIndicator)
+        running.display = True
+        running.start()
+        self._sync_command_menu_anchor(running=True)
+        threading.Thread(target=self._run_compact, daemon=True).start()
+
+    def _run_compact(self) -> None:
+        """后台线程执行一次手动压缩，结果经 UiAction 回主线程渲染。"""
+        try:
+            status = self.agent.compact_manual()
+        except Exception as e:  # noqa: BLE001
+            self.post_message(UiAction("notice", f"压缩失败：{type(e).__name__}: {e}", "error"))
+        else:
+            text, style = commands.compact_report(status)
+            self.post_message(UiAction("notice", text, level_from_style(style)))
+        finally:
+            self._busy = False
+            self.post_message(UiAction("focus_input"))
+            self.post_message(UiAction("status"))
+            self.post_message(UiAction("running_off"))
+
     def ui_running_off(self) -> None:
         # 应用退出时组件可能已卸载，消息晚到会导致 NoMatches——查不到就忽略
         found = self.query("#running")
@@ -931,16 +963,17 @@ class SmithTUI(App):
         """busy 守卫 + commands.dispatch；被拦截时提示并返回 None。
 
         对齐 opencode 的 busy 拒绝：任务运行中后台线程还在写消息历史，
-        中途重置 / 切换 / 改 MCP 配置会撕裂进行中的轮次，先行拦截。
+        中途重置 / 切换 / 压缩 / 改 MCP 配置会撕裂进行中的轮次，先行拦截。
         """
         tokens = text.strip().split()
+        mutating_session = bool(tokens) and tokens[0].lower() in ("/new", "/sessions", "/compact")
         mutating_mcp = (
             bool(tokens) and tokens[0].lower() == "/mcp" and len(tokens) > 1
             and tokens[1].lower() in ("add", "remove", "enable", "disable", "reconnect", "auth")
         )
-        if self._busy and (tokens and tokens[0].lower() in ("/new", "/sessions") or mutating_mcp):
+        if self._busy and (mutating_session or mutating_mcp):
             self.ui_notice(
-                "（任务运行中，不能切换会话或修改 MCP 配置；请等待完成或先按 Esc 中断）",
+                "（任务运行中，不能切换会话、压缩上下文或修改 MCP 配置；请等待完成或先按 Esc 中断）",
                 "warning",
             )
             return None
@@ -994,6 +1027,8 @@ class SmithTUI(App):
                 if outcome.echo_input:  # 技能手动激活带任务：用户输入原文整体回显
                     self._chat().apply(User(text))
                 self.start_task(outcome.start_task)
+        if outcome.start_compact:
+            self.start_compact()  # 压缩在后台线程执行，界面保持可响应
 
     def reset_chat(self) -> None:
         """开新会话：清空聊天区并重新渲染欢迎横幅，屏幕回归会话起点。

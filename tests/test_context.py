@@ -280,6 +280,55 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
     assert "上下文溢出" in capsys.readouterr().out
 
 
+# ---------- 手动压缩（/compact 的宿主入口） ----------
+
+def _compactable_agent(monkeypatch):
+    """可压历史：system + 一轮旧历史（待压）+ 一轮近期（尾部保留）。"""
+    agent = _over_threshold_agent(monkeypatch)
+    agent.session.messages = agent.session.messages + _turn("最近一轮", 50)
+    return agent
+
+
+def test_compact_manual_compacts_and_reports_ok(monkeypatch):
+    """compact_manual 自建令牌执行压缩，成功后返回 ok。"""
+    agent = _compactable_agent(monkeypatch)
+
+    assert agent.compact_manual() == "ok"
+    assert agent.context.compact_count == 1
+    assert agent._token is None  # 令牌已复位，不残留到下一次任务
+
+
+def test_compact_manual_reports_empty_when_nothing_to_compact(monkeypatch):
+    """历史太短（无中段可压）时返回 empty，不改动消息。"""
+    monkeypatch.setattr("smithcode.agent.LLMClient", CompactAwareLLM)
+    session = Session()
+    session.messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "你好"},
+    ]
+    agent = Agent(session=session)
+
+    assert agent.compact_manual() == "empty"
+    assert len(agent.session.messages) == 2
+
+
+def test_compact_manual_reports_cancelled_when_interrupted(monkeypatch):
+    """压缩途中按 Esc 触发 interrupt()：令牌截停摘要重试，返回 cancelled。"""
+    agent = _compactable_agent(monkeypatch)
+    calls: list = []
+
+    def on_complete(request):
+        calls.append(1)
+        agent.interrupt()  # 模拟摘要请求期间用户中断
+        return ""
+
+    monkeypatch.setattr(agent, "_complete", on_complete)
+
+    assert agent.compact_manual() == "cancelled"
+    assert calls == [1]  # 第二次重试前查令牌，不再发请求
+    assert agent.context.compact_count == 0
+
+
 # ---------- 与 Agent 循环的接线 ----------
 
 def test_agent_run_records_anchor(monkeypatch):

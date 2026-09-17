@@ -33,7 +33,6 @@ class _StubAgent:
 
     def __init__(self):
         self.saved_path = "/tmp/session.json"
-        self.compact_result = True
         self.reset_called = False
         self.session = SimpleNamespace(
             reset=self._reset,
@@ -50,9 +49,6 @@ class _StubAgent:
 
     def new_session(self):
         self.reset_called = True
-
-    def compact(self):
-        return self.compact_result
 
 
 def _run(text, **kwargs):
@@ -230,14 +226,18 @@ def test_save_reports_path():
     assert "会话已保存" in outcome.text
 
 
-def test_compact_success_and_failure():
+def test_compact_returns_host_intent():
+    """/compact 只声明意图（由宿主后台执行），不在命令层同步发起请求。"""
     _, outcome = _run("/compact")
-    assert "已压缩" in outcome.text and outcome.refresh_status
+    assert outcome.start_compact is True
+    assert outcome.text is None  # 进度与结果文案由宿主按运行状态给出
 
-    agent2 = _StubAgent()
-    agent2.compact_result = False
-    outcome2 = commands.dispatch(agent2, "/compact")
-    assert "没有可压缩的上下文" in outcome2.text
+
+def test_compact_report_maps_status():
+    assert commands.compact_report("ok") == ("上下文压缩完成。", "green")
+    assert "已取消" in commands.compact_report("cancelled")[0]
+    assert "没有可压缩的上下文" in commands.compact_report("empty")[0]
+    assert "正在压缩" in commands.COMPACT_RUNNING
 
 
 def test_usage_and_context_are_blocks_with_status_refresh():

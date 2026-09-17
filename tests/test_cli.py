@@ -205,6 +205,33 @@ def test_wait_for_task_second_interrupt_exits(capsys):
     assert "再见" in out
 
 
+# ---------- REPL 手动压缩：后台线程完成后打印结果 ----------
+
+def test_run_compact_task_prints_result(capsys):
+    """/compact 的后台线程：完成后打印统一的结果文案。"""
+    from smithcode.cli import _run_compact_task
+
+    class FakeAgent:
+        def compact_manual(self):
+            return "ok"
+
+    _run_compact_task(FakeAgent())
+    assert "上下文压缩完成" in capsys.readouterr().out
+
+
+def test_run_compact_task_reports_error(capsys):
+    """压缩抛异常时打印中文错误，不拖垮 REPL 主循环。"""
+    from smithcode.cli import _run_compact_task
+
+    class FakeAgent:
+        def compact_manual(self):
+            raise RuntimeError("接口超时")
+
+    _run_compact_task(FakeAgent())
+    out = capsys.readouterr().out
+    assert "压缩失败" in out and "RuntimeError" in out
+
+
 # ---------- 控制序列直写真实终端（窗口标题用） ----------
 
 def test_write_terminal_control_prefers_real_stdout(monkeypatch):

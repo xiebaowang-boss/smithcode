@@ -911,6 +911,59 @@ def test_tui_resume_blocked_while_busy(monkeypatch):
     _run(_run_case())
 
 
+def test_tui_compact_runs_in_background_with_feedback(monkeypatch):
+    """/compact 不阻塞 UI：立即提示「正在压缩」，完成后回主线程提示「压缩完成」。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        app = SmithTUI(agent)
+        started, release = threading.Event(), threading.Event()
+
+        def fake_compact_manual():
+            started.set()
+            release.wait(2)  # 卡住后台线程，模拟耗时的摘要请求
+            return "ok"
+
+        monkeypatch.setattr(agent, "compact_manual", fake_compact_manual)
+        async with app.run_test() as pilot:
+            app.handle_command("/compact")
+            await pilot.pause()
+
+            assert started.wait(1)  # 命令已交给后台线程执行
+            assert "正在压缩上下文" in _chat_text(app)  # 发送后立即有反馈
+            assert "上下文压缩完成" not in _chat_text(app)
+            assert app._busy is True
+            assert app.query_one("#running").display is True
+
+            release.set()
+            for _ in range(200):  # 等后台线程收尾并经 UiAction 回主线程
+                if not app._busy:
+                    break
+                await pilot.pause(0.02)
+            assert "上下文压缩完成" in _chat_text(app)
+            assert app._busy is False
+            assert app.query_one("#running").display is False
+
+    _run(_run_case())
+
+
+def test_tui_compact_blocked_while_busy(monkeypatch):
+    """任务运行中 /compact 被忙守卫拦截：后台线程正写历史，压缩会撕裂轮次。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            app._busy = True
+            app.handle_command("/compact")
+            await pilot.pause()
+            assert "任务运行中" in _chat_text(app)
+            assert "正在压缩上下文" not in _chat_text(app)
+
+    _run(_run_case())
+
+
 def test_tui_replays_restored_history(monkeypatch):
     """启动时若会话已有历史（-c/--resume 恢复），TUI 回放 user/assistant 文本。"""
     no_prompting(monkeypatch)

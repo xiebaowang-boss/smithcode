@@ -171,10 +171,19 @@ def _save(ctx):
 
 @register("compact", "手动压缩上下文")
 def _compact(ctx):
-    if ctx.agent.compact():
-        return CommandResult(text="已压缩上下文。", style="green", refresh_status=True)
-    return CommandResult(
-        text="没有可压缩的上下文（历史太短或摘要未生成）。",
-        style="yellow",
-        refresh_status=True,
-    )
+    # 压缩要发多次摘要请求，同步执行会阻塞宿主主循环（TUI 直接卡死）：
+    # 命令层只声明意图，由宿主在后台线程执行并反馈进度与结果。
+    return CommandResult(start_compact=True)
+
+
+# 手动压缩的宿主文案：开始提示与结果映射集中在此，REPL / TUI 共用同一份措辞
+COMPACT_RUNNING = "正在压缩上下文…"
+
+
+def compact_report(status: str) -> tuple[str, str]:
+    """把 Agent.compact_manual() 的状态映射为宿主文案 (文本, 命令层 style)。"""
+    if status == "ok":
+        return "上下文压缩完成。", "green"
+    if status == "cancelled":
+        return "已取消压缩。", "yellow"
+    return "没有可压缩的上下文（历史太短或摘要未生成）。", "yellow"

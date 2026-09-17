@@ -740,6 +740,27 @@ class Agent:
         )
         return True
 
+    def compact_manual(self) -> str:
+        """手动 /compact 的宿主入口：在独立轮次令牌下压缩，返回结果状态。
+
+        与 `compact()` 的差别只在取消语义：自动压缩跑在任务轮次里，令牌由
+        `run()` 提供；手动压缩没有轮次，这里自建令牌并挂到 `_token` 上，
+        使 Esc / Ctrl+C 能经 `interrupt()` 关流截停摘要请求（否则压缩一旦
+        开始就只能等它跑完）。返回 "ok"（已压缩）/ "cancelled"（被中断）/
+        "empty"（无中段可压或摘要两次不合格）。
+        """
+        token = CancellationToken()
+        self._token = token
+        reset_token = activate_token(token)
+        try:
+            changed = self.compact()
+        finally:
+            self._token = None
+            reset_token()
+        if changed:
+            return "ok"
+        return "cancelled" if token.cancelled else "empty"
+
     def _complete(self, request: list[dict], model: str | None = None) -> str:
         """一次不带工具的补全，收集完整文本（摘要 / 标题生成专用）。"""
         parts = []

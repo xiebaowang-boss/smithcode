@@ -28,6 +28,7 @@ from .base import (  # noqa: F401
     get_command,
     help_text,
 )
+from .session import COMPACT_RUNNING, compact_report  # noqa: F401  宿主共用的压缩文案
 
 
 def dispatch(agent, text: str, interactive: bool = True) -> CommandResult:

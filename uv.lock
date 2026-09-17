@@ -1114,7 +1114,7 @@ wheels = [
 
 [[package]]
 name = "smithcode"
-version = "0.9.0"
+version = "0.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx2", extra = ["socks"] },

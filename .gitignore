@@ -39,3 +39,10 @@ Thumbs.db
 
 # CommandCode 工具数据
 .commandcode/
+
+# Qoder Collab 工具运行时产物
+.qoder-collab-runtime/
+
+# Looptroop 工具数据与工作区（db.sqlite*、worktrees/）及其工单运行时
+.looptroop/
+.ticket/

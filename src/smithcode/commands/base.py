@@ -73,6 +73,7 @@ class CommandResult:
     select: CommandSelect | None = None  # 非空时宿主弹出选择器
     start_task: str | None = None  # 非空时宿主立即以此文本发起一次任务（如 /goal 开跑）
     echo_input: bool = False      # 与 start_task 搭配：宿主先把用户输入原文回显为消息
+    start_compact: bool = False   # True 时宿主在后台执行一次压缩（如 /compact）
     wizard: CommandWizard | None = None  # 非空时宿主启动向导（如 /mcp add）
 
 

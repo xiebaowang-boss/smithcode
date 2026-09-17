@@ -81,6 +81,16 @@ def _run_agent_task(agent: Agent, text: str) -> None:
         print(INTERRUPTED_NOTE)
 
 
+def _run_compact_task(agent: Agent) -> None:
+    """后台线程执行手动压缩：完成后打印结果（主线程留作 Ctrl+C 取消通道）。"""
+    try:
+        status = agent.compact_manual()
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[错误] 压缩失败: {type(e).__name__}: {e}")
+        return
+    print(commands.compact_report(status)[0])
+
+
 def _wait_for_task(agent: Agent, task: threading.Thread) -> None:
     """等待后台任务结束，主线程专职做取消通道。
 
@@ -133,6 +143,15 @@ def repl(agent: Agent):
                 # /goal 设定/恢复后立即开跑，走与普通任务相同的后台线程 + 取消通道
                 task = threading.Thread(
                     target=_run_agent_task, args=(agent, outcome.start_task), daemon=True
+                )
+                task.start()
+                _wait_for_task(agent, task)
+            if outcome.start_compact:
+                # 压缩要发摘要请求，放后台线程并先给出「正在压缩」反馈，
+                # 主线程继续做 Ctrl+C 取消通道（同普通任务的等待方式）
+                print(commands.COMPACT_RUNNING)
+                task = threading.Thread(
+                    target=_run_compact_task, args=(agent,), daemon=True
                 )
                 task.start()
                 _wait_for_task(agent, task)
