@@ -3274,6 +3274,59 @@ def test_chat_follows_content_growth_when_at_bottom(monkeypatch):
     _run(_run_case())
 
 
+def test_welcome_stays_at_top_when_content_shorter_than_view(monkeypatch):
+    """内容不足一屏时不锚定：Textual 的锚定贴底按「内容底 - 容器高」算，为负时
+    （合成器经不校验的 set_reactive 写入）会把整块内容推到视口下方——启动欢迎
+    Logo 因此跑到对话区底部。清屏（/new）缩回一屏内同样要复位。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(100, 30)) as pilot:
+            chat = app.query_one(ChatView)
+            await pilot.pause()
+            welcome = chat.query(".welcome").first()
+            assert chat.scroll_y == 0
+            assert welcome.region.y == chat.content_region.y  # Logo 贴内容区顶部
+            assert not chat.is_anchored  # 不足一屏：不锚定
+
+            _fill_chat(app)
+            await pilot.pause()
+            assert chat.is_anchored  # 满一屏后正常锚定
+
+            chat.reset()
+            app._show_welcome()  # /new 路径：清屏 + 重挂欢迎横幅
+            await pilot.pause()
+            assert chat.scroll_y == 0
+            assert chat.query(".welcome").first().region.y == chat.content_region.y
+            assert not chat.is_anchored
+
+    _run(_run_case())
+
+
+def test_chat_follows_stream_starting_from_short_content(monkeypatch):
+    """对话区还没满一屏时流式输出：跨过一屏那一刻必须自动恢复贴底跟随。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(100, 30)) as pilot:
+            chat = app.query_one(ChatView)
+            chat.reset()
+            await pilot.pause()
+            assert chat.max_scroll_y == 0  # 空对话区：无从滚动
+            for i in range(12):
+                # 每轮两个 chunk 落在同一节流窗口，逼近"不足一屏 → 超过一屏"的边界
+                app.ui_stream("content", f"第 {i} 段正文，继续写一些内容。\n\n")
+                app.ui_stream("content", f"第 {i} 段补充（同帧第二块）。\n\n")
+                await pilot.pause()
+            assert chat.max_scroll_y > 0  # 已长过一屏
+            assert chat._at_bottom()
+            assert chat.is_anchored  # 跟随已恢复
+
+    _run(_run_case())
+
+
 def test_chat_keeps_position_while_reading_history(monkeypatch):
     """翻历史（离底）时新内容不移动视口；滚回底部后恢复跟随。"""
     no_prompting(monkeypatch)

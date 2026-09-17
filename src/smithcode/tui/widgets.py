@@ -463,9 +463,27 @@ class ChatView(VerticalScroll):
         目标值过期，落点差 1 行以上就再也追不回来（此后每次贴底判断都为假）。
         锚定则把贴底交给合成器：**每次布局**都按真实内容高度重算贴底位置，节流与
         容器高度变化都会自动纠正；用户滚动时 Textual 自动解除锚定（scroll_to 默认
-        release_anchor），滚回底部再重新锚定。"""
+        release_anchor），滚回底部再重新锚定。
+
+        内容还不足一屏时**不锚定**：锚定的贴底位置按 `内容底 - 容器高` 算，不足
+        一屏时为负，而合成器用 `set_reactive` 写入（文档明示绕过校验器与 watcher），
+        负偏移会把整块内容推到视口下方——启动时的欢迎 Logo 因此跑到对话区底部。
+        复位放在 `_size_updated`（尺寸变化后判定，见该方法的注释）。"""
         if at_bottom:
             self.anchor()
+
+    def _size_updated(self, size, virtual_size, container_size, layout: bool = True) -> bool:
+        """尺寸变化后复位锚定：内容不足一屏时必须解除锚定，否则合成器会把负的
+        "贴底位置"写进 scroll_y（见 `_follow`）。
+
+        本方法在合成器排版**之后**被调用，故同一次排版里被写坏的偏移已由
+        `super()` 内的 `_scroll_update` 夹回合法区间（内容不足一屏时贴底即顶部），
+        这里只需切断后续排版的再次写入；`_refresh_scroll` 带来的 reflow 会按
+        修正后的偏移重排。内容长过一屏后由下一次 `_follow` 重新锚定。"""
+        changed = super()._size_updated(size, virtual_size, container_size, layout)
+        if changed and self.is_anchored and self.max_scroll_y <= 0:
+            self.anchor(False)
+        return changed
 
 
 # ---------- 运行中动画 ----------
