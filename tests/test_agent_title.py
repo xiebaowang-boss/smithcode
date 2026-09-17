@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from smithcode import config, renderer
-from smithcode.agent import TITLE_MAX_ATTEMPTS, Agent
+from smithcode.agent import TITLE_MAX_ATTEMPTS, TITLE_RETRY_ROUNDS, Agent
 from smithcode.session import Session
 
 
@@ -96,7 +96,7 @@ def test_failed_title_is_retried_next_turn(agent, monkeypatch, capsys):
 
 
 def test_title_stops_after_max_attempts(agent, monkeypatch, capsys):
-    """到顶后不再发起，并提示改用 /rename。"""
+    """到顶后进入冷却（静默），不再发起，并提示改用 /rename。"""
     calls = _patch_complete(agent, monkeypatch, [RuntimeError("boom")])
     for _ in range(TITLE_MAX_ATTEMPTS + 2):
         _attempt(agent)
@@ -105,6 +105,63 @@ def test_title_stops_after_max_attempts(agent, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "将在下一轮结束后重试" in out
     assert "已停止重试" in out and "/rename" in out
+
+
+def test_title_cooldown_reprobes_after_rounds(agent, monkeypatch):
+    """到顶后不是永久沉默：冷却 TITLE_RETRY_ROUNDS 轮后自动再探。"""
+    calls = _patch_complete(agent, monkeypatch, [RuntimeError("boom")])
+    for _ in range(TITLE_MAX_ATTEMPTS):
+        _attempt(agent)
+    assert len(calls) == TITLE_MAX_ATTEMPTS
+    # 冷却期内：静默、不发起（归零发生在第 TITLE_RETRY_ROUNDS 次调用内，
+    # 只归零不发起；再下一次调用才再探）
+    for _ in range(TITLE_RETRY_ROUNDS):
+        _attempt(agent)
+    assert len(calls) == TITLE_MAX_ATTEMPTS
+    # 冷却结束的下一轮：计数已归零，再探
+    _attempt(agent)
+    assert len(calls) == TITLE_MAX_ATTEMPTS + 1
+    assert agent._title_cooldown == 0
+
+
+def test_title_cooldown_success_stops_retry(agent, monkeypatch):
+    """冷却后重探成功：标题落定，不再发起。"""
+    calls = _patch_complete(
+        agent, monkeypatch,
+        [RuntimeError("boom")] * TITLE_MAX_ATTEMPTS + ['{"title": "冷却后成功"}'],
+    )
+    for _ in range(TITLE_MAX_ATTEMPTS + TITLE_RETRY_ROUNDS + 1):
+        _attempt(agent)
+    assert agent.session.title == "冷却后成功"
+    before = len(calls)
+    _attempt(agent)
+    assert len(calls) == before  # 已有标题：不再发起
+
+
+def test_reset_title_attempts_unblocks_exhausted(agent, monkeypatch):
+    """reset_title_attempts（/model 切换调用）：耗尽后立即归零可再试。"""
+    calls = _patch_complete(agent, monkeypatch, [RuntimeError("boom")])
+    for _ in range(TITLE_MAX_ATTEMPTS):
+        _attempt(agent)
+    assert len(calls) == TITLE_MAX_ATTEMPTS
+    agent.reset_title_attempts()
+    assert agent._title_attempts == 0
+    assert agent._title_cooldown == 0
+    _attempt(agent)
+    assert len(calls) == TITLE_MAX_ATTEMPTS + 1
+
+
+def test_model_switch_resets_title_attempts(monkeypatch):
+    """回归：/model 切换模型后，耗尽的标题计数归零（换模型多半已消除失败原因）。"""
+    from smithcode import commands
+
+    agent = Agent(session=Session(), persist=False)
+    agent._title_attempts = TITLE_MAX_ATTEMPTS
+    agent._title_cooldown = 2
+    outcome = commands.dispatch(agent, "/model other-model")
+    assert "已切换模型" in outcome.text
+    assert agent._title_attempts == 0
+    assert agent._title_cooldown == 0
 
 
 def test_user_title_never_attempted(agent, monkeypatch):

@@ -1042,6 +1042,7 @@ class Sidebar(Vertical):
         self._goal = Static("", classes="goal-body")
         self._plan = Static("（暂无任务计划）", classes="plan-body")
         self._title = Static("", classes="sidebar-title")
+        self._last_title = ""  # 标题去重：同内容跳过 update，免整栏重排闪动
 
     def compose(self):
         # 会话标题置顶（/rename 或后台自动生成；无内容/新会话时整段隐藏）
@@ -1102,9 +1103,17 @@ class Sidebar(Vertical):
         section.display = True
 
     def update_title(self, title: Text) -> None:
-        """更新侧边栏顶部的会话标题；空内容整段隐藏。"""
+        """更新侧边栏顶部的会话标题；空内容整段隐藏。
+
+        同内容跳过 `update`：`Static.update` 恒触发重排，Shift+Tab 整栏刷新时
+        会让标题闪一下；内容没变就不碰控件。
+        """
+        text = str(title)
+        if text == self._last_title:
+            return
+        self._last_title = text
         self._title.update(title)
-        self._title.display = bool(str(title))
+        self._title.display = bool(text)
 
 
 # ---------- 输入区 ----------

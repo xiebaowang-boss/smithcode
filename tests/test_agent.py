@@ -1,7 +1,8 @@
-﻿"""Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
+"""Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
 
 import json
 
+import httpx2
 import pytest
 
 from smithcode import config
@@ -338,6 +339,20 @@ def _run_call(agent: Agent, call: dict) -> str:
     """跑单个工具调用并返回其结果文本（批量路径的单调用用法，结果在最后一条 tool 消息）。"""
     agent._execute_batch([call])
     return agent.session.messages[-1]["content"]
+
+
+def test_tool_summary_flattened_to_single_line(monkeypatch, capsys):
+    """摘要必须先压成单行再截断：run_command 的 describe 会拼进命令原文，
+    多行命令（heredoc 等）的换行会把终端里的工具行撑成多行。"""
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
+    agent = Agent(session=Session())
+    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: False)
+
+    command = "python - <<'PY'\nprint('hi')\nPY"
+    _run_call(agent, _fake_tool_call("run_command", json.dumps({"command": command})))
+
+    rows = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("⚙ ")]
+    assert rows == ["⚙ command python - <<'PY' print('hi') PY"]
 
 
 def test_execute_outside_path_denied(monkeypatch, tmp_path):
@@ -706,3 +721,96 @@ def test_run_with_skill_returns_body_in_tool_result(monkeypatch, tmp_path):
         assert tool_results and "BODY-MARKER" in tool_results[-1]["content"]
     finally:
         skills.clear()
+
+
+# ---------- 响应流中途断开：部分正文入库 + 不重做 ----------
+
+class MidStreamTimeoutLLM:
+    """先正常吐一段正文，再抛读完超时（真实链路的模型静默超时）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None):
+        self.calls += 1
+        yield ("content", "已修改完成，")
+        yield ("content", "总结如下：")
+        raise httpx2.ReadTimeout("The read operation timed out")
+
+
+def test_stream_timeout_keeps_partial_in_history(monkeypatch):
+    """流中断：状态为 stream_error，已上屏的部分正文必须写进会话历史。
+
+    否则下一轮模型看不到自己说过什么，会从头重做、再复述一遍（原始故障现象）。
+    """
+    from smithcode.agent import STREAM_INTERRUPTED_CONTEXT
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", MidStreamTimeoutLLM)
+    agent = Agent(session=Session())
+
+    result = agent.run("改一下")
+
+    assert result.status == "stream_error"
+    assert result.text == "已修改完成，总结如下："
+    contents = [m.get("content") for m in agent.session.messages]
+    assert "已修改完成，总结如下：" in contents  # partial 落库
+    assert contents[-1] == STREAM_INTERRUPTED_CONTEXT  # 末尾补中断说明
+    assert [m["role"] for m in agent.session.messages][-2:] == ["assistant", "user"]
+
+
+def test_stream_timeout_before_content_leaves_no_empty_assistant(monkeypatch):
+    """首块之前就断开：不留空 assistant 消息，只补一行中断说明。"""
+    class FailFirstTokenLLM:
+        def chat_stream(self, messages, tools=None):
+            raise httpx2.ReadTimeout("The read operation timed out")
+            yield  # pragma: no cover 生成器语义需要
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", FailFirstTokenLLM)
+    agent = Agent(session=Session())
+
+    result = agent.run("改一下")
+
+    assert result.status == "stream_error"
+    assert result.text == ""
+    roles = [m["role"] for m in agent.session.messages]
+    assert "assistant" not in roles  # 没有空 assistant 消息
+    assert roles == ["system", "user", "user"]
+
+
+def test_stream_timeout_does_not_record_partial_twice(monkeypatch):
+    """上下文溢出恢复后才断开：partial 只入库一次（恢复层与 run 层不重复记账）。"""
+    class OverflowThenTimeoutLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_stream(self, messages, tools=None):
+            if messages[0].get("content", "").startswith("你是上下文压缩器"):
+                yield ("message", {"role": "assistant", "content": "## 目标\n压缩旧历史\n## 下一步\n继续"})
+                return
+            self.calls += 1
+            if self.calls == 1:
+                # 措辞要能被 is_context_overflow 认出，才走恢复路径
+                raise RuntimeError("This model's maximum context length is 4096 tokens")
+            yield ("content", "部分总结")
+            raise httpx2.ReadTimeout("The read operation timed out")
+
+    monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 5000)  # 不触发预检，纯溢出恢复
+    monkeypatch.setattr(config, "COMPACT_KEEP_TOKENS", 150)
+    monkeypatch.setattr("smithcode.agent.LLMClient", OverflowThenTimeoutLLM)
+    session = Session()
+    # 造出可压缩的中段，让恢复路径真的压缩一次再重试
+    session.messages = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "旧任务"},
+        {"role": "assistant", "content": "旧回复" * 200},
+        {"role": "user", "content": "再问一次"},
+        {"role": "assistant", "content": "再答一次" * 200},
+    ]
+    agent = Agent(session=session)
+
+    result = agent.run("改一下")
+
+    assert result.status == "stream_error"
+    assert result.text == "部分总结"
+    contents = [m.get("content") for m in agent.session.messages]
+    assert contents.count("部分总结") == 1  # 只落一次

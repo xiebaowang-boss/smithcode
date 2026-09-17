@@ -1,4 +1,4 @@
-"""技能斜杠命令测试：/skills 列表/选择框/刷新、技能名直达（/技能名）。"""
+"""技能斜杠命令测试：/skills 列表/展示面板/刷新、技能名直达（/技能名）。"""
 
 import pytest
 
@@ -69,14 +69,14 @@ def test_skills_empty_hint(isolated):
     assert "尚未发现技能" in outcome.text
 
 
-def test_skills_without_args_returns_picker(isolated):
+def test_skills_without_args_returns_readonly_panel(isolated):
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "proj")
 
     _, outcome = _run("/skills")
 
     assert outcome.select is not None
-    assert outcome.select.command == ""  # 空 = 选中后按 /<技能名> 重新分发
+    assert outcome.select.readonly is True  # 只读展示：Enter 不确认加载
     assert [c.value for c in outcome.select.items] == ["proj"]
 
 
@@ -92,7 +92,7 @@ def test_skills_rejects_unknown_arg(isolated):
     assert "用法" in outcome.text
 
 
-# ---------- /skills：选择器内容 ----------
+# ---------- /skills：展示面板内容 ----------
 
 def test_picker_lists_manually_loadable_skills(isolated):
     workspace, _ = isolated
@@ -128,11 +128,11 @@ def test_picker_empty_without_skills(isolated):
     _, outcome = _run("/skills")
 
     assert outcome.select is not None
-    assert outcome.select.items == []  # 无技能时也是选择框，不打印提示文字
+    assert outcome.select.items == []  # 无技能时也是展示面板，不打印提示文字
 
 
 def test_picker_excludes_names_colliding_with_commands(isolated):
-    """与内置命令重名的技能不进选择框：分发时内置命令优先，选中只会执行内置命令。"""
+    """与内置命令重名的技能不进展示面板（内置命令优先）。"""
     workspace, _ = isolated
     _write_skill(workspace / ".agents" / "skills", "help", description="冒充 help")
     _write_skill(workspace / ".agents" / "skills", "proj")

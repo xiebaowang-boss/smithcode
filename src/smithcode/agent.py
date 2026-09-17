@@ -52,8 +52,14 @@ MAX_SUMMARY_LEN = 80
 MAX_PREVIEW_LINES = 40
 
 # 自动标题的最大尝试次数：单次失败（网络抖动、瞬时错误重试耗尽、模型输出不可用）
-# 不永久放弃——下一轮任务正常结束后补试，到顶后提示用户手动 /rename。
+# 不永久放弃——下一轮任务正常结束后补试；到顶后进入冷却（TITLE_RETRY_ROUNDS
+# 轮内静默），冷却一过自动再探一次，期间 /model 切换模型或 /rename 改名都会
+# 立即重置计数——换模型往往意味着标题失败的原因已消除，不应继续沉默。
 TITLE_MAX_ATTEMPTS = 3
+
+# 到顶后的冷却轮数：冷却期内 _maybe_generate_title 直接返回（静默、不提示，
+# 到顶时已提示过一次 /rename）；冷却一过自动再探，避免"3 次用完就永久沉默"。
+TITLE_RETRY_ROUNDS = 5
 
 # 结果详情默认展开的工具：写/编辑类的 diff 是本次改动的关键信息（apply_patch
 # 与 edit_file 同族），ask_user 的结果就是用户回答（页面主体）；都直接可见、可收起。
@@ -71,6 +77,9 @@ SKIPPED_RESULT = "（未执行：权限请求被拒绝，任务已中止）"
 # TUI 不再经 renderer 打印此提示，改由宿主机按 RunResult.status 渲染到
 # 运行动画行（正在停止）/ 轮次页脚（已停止）。
 INTERRUPTED_NOTE = "\n⏹ 已中断"
+# 响应流断开（读完超时 / 对端掐断连接）：控制台收尾提示。部分正文已上屏并入库，
+# 提示用户这是残缺输出、可直接追问让模型接着写。TUI 对应页脚的「· 输出中断」。
+STREAM_INTERRUPTED_NOTE = "\n⏹ 输出中断（内容不完整，可继续追问让模型接着写）"
 INTERRUPTED_RESULT = "（未执行：用户中断了任务）"
 # 中断回写上下文：任务被手动中止时，作为一条 user 消息追加进会话历史
 # （不触发任何新请求），下一轮用户提问时模型即可看到上轮是被主动叫停的、
@@ -78,6 +87,13 @@ INTERRUPTED_RESULT = "（未执行：用户中断了任务）"
 INTERRUPTED_CONTEXT = (
     "（用户手动中断了上一个任务，任务未完成。此前部分输出可能不完整，"
     "未执行的工具已标记为「未执行：用户中断了任务」。请以用户的最新输入为准。）"
+)
+# 流中断回写上下文：模型响应流中途断开（读完超时 / 对端掐断连接）时，已上屏的
+# 部分正文仍会写进会话历史，随后追加这条 user 消息（不触发新请求）——下一轮模型
+# 即可看到上一轮说到哪、是为什么断的，从而续写而不是从头重做一遍。
+STREAM_INTERRUPTED_CONTEXT = (
+    "（上一条回复在生成过程中因网络错误中断，内容不完整；"
+    "以上是已经写出的部分。请基于它继续完成任务，不要从头重做。）"
 )
 # 迭代上限收尾提示词：`[limits].max_iterations` > 0 且用尽时，系统不再暴露工具，
 # 把它作为一条 user 消息注入并强制模型用纯文本总结收尾（对齐 opencode 的
@@ -229,6 +245,20 @@ class _BatchScheduler:
         return self._token is not None and self._token.cancelled
 
 
+class StreamInterrupted(Exception):
+    """模型响应流中途断开（读完超时 / 对端掐断连接）。
+
+    `partial` 是流里已经收到的正文（可能为空字符串，即首块之前就断了）。
+    已上屏的部分同时会被写进会话历史，保证「用户看到的」与「历史里的」一致；
+    异常照常上抛，由 `run()` 转成 `stream_error` 状态交宿主渲染。
+    """
+
+    def __init__(self, original: BaseException, partial: str) -> None:
+        super().__init__(f"{type(original).__name__}: {original}")
+        self.original = original
+        self.partial = partial
+
+
 class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None,
                  store=None, persist: bool = False, oneshot: bool = False,
@@ -260,6 +290,7 @@ class Agent:
         self._persist = bool(persist) and self.sessions_config.enabled
         self._last_state = None  # 最近一次写盘的 state 快照（去重）
         self._title_attempts = 0  # 自动标题已尝试次数（有限次补试，见 _maybe_generate_title）
+        self._title_cooldown = 0  # 到顶后的冷却轮数（见 TITLE_RETRY_ROUNDS）
         if store is not None:
             self.session.bind_store(store)
         elif self._persist:
@@ -318,6 +349,7 @@ class Agent:
             part.reset()
         self._last_state = None
         self._title_attempts = 0
+        self._title_cooldown = 0
         instructions.refresh()  # 会话边界：重新装载项目约定（中途修改在此生效）
         if self._persist:
             self.session.bind_store(self._new_store())
@@ -372,6 +404,7 @@ class Agent:
                     part.restore(loaded.state[part.name])
         self._last_state = None
         self._title_attempts = 0
+        self._title_cooldown = 0
         instructions.refresh()  # 会话边界：恢复即按磁盘最新内容重建项目约定段
         self.session.sync_system()  # system 段按当前提示词立即重建
         renderer.current().title_changed(self.session.title)  # 标题随恢复的会话同步
@@ -433,11 +466,18 @@ class Agent:
         每次任务正常结束调用一次；标题请求本身失败（网络抖动、瞬时错误重试
         耗尽、模型输出不可用）时保留计数，下一轮结束再试，最多
         `TITLE_MAX_ATTEMPTS` 次——原来的"只试一次"会让一次抖动永久丢掉标题。
+        到顶后不永久沉默：进入 `TITLE_RETRY_ROUNDS` 轮冷却，冷却一过自动再探
+        （计数归零重来，期间只提示一次）；`reset_title_attempts`（/model 切换
+        模型）同样重置计数——换模型往往意味着失败原因已消除。
         已生成标题或用户自行命名后不再发起（`should_generate` 判空）。
         """
         if self.session.store is None or not self.sessions_config.auto_title:
             return
         if self._title_attempts >= TITLE_MAX_ATTEMPTS:
+            self._title_cooldown += 1
+            if self._title_cooldown >= TITLE_RETRY_ROUNDS:
+                self._title_attempts = 0  # 冷却结束：再给一轮机会
+                self._title_cooldown = 0
             return
         if not sessions.should_generate(self.session.title, self.session.title_source):
             return
@@ -449,6 +489,15 @@ class Agent:
             target=self._title_worker, args=(request, model, self._title_attempts),
             name="smithcode-title", daemon=True,
         ).start()
+
+    def reset_title_attempts(self) -> None:
+        """重置自动标题计数与冷却（如 /model 切换模型后调用）。
+
+        标题失败常与当前模型相关（小模型不按 JSON 输出、4xx 拒标题请求）；
+        换模型后沿用旧的耗尽计数不合理——直接归零，让下一轮正常结束即再试。
+        """
+        self._title_attempts = 0
+        self._title_cooldown = 0
 
     def _title_worker(self, request, model, attempt: int = 1) -> None:
         """后台生成标题；失败只提示不抛，绝不影响主流程。"""
@@ -473,7 +522,8 @@ class Agent:
         if attempt < TITLE_MAX_ATTEMPTS:
             hint = f"将在下一轮结束后重试（{attempt}/{TITLE_MAX_ATTEMPTS}）"
         else:
-            hint = f"已停止重试（{TITLE_MAX_ATTEMPTS} 次均失败），可用 /rename 手动命名"
+            hint = (f"已停止重试（{TITLE_MAX_ATTEMPTS} 次均失败），可用 /rename 手动命名；"
+                    f"{TITLE_RETRY_ROUNDS} 轮后会自动再试一次，切换模型会立即重试")
         renderer.current().warn(f"[标题] 自动命名失败：{reason}；{hint}")
 
     def rename_session(self, title: str) -> bool:
@@ -501,11 +551,15 @@ class Agent:
             self._token.cancel()
 
     def run(self, user_input: str) -> RunResult:
-        """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限）。
+        """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限 / 流中断）。
 
         每次调用激活一个取消令牌并经 ContextVar 沿调用链传播（llm 流层、
         工具调度层按需读取）；结束后复位，保证下一次任务不受残留取消状态
         影响。
+        响应流中途断开（`StreamInterrupted`）不向上抛异常：部分正文已经实时
+        上屏，这里把它与中断说明一并写进历史（`_note_stream_interrupted`），
+        返回 `stream_error` 状态并保留部分正文作为 `text`——宿主据此提示"输出
+        中断"，下一轮模型也能接着写，而不是从头重做。
         """
         self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
         self.session.add("user", user_input)
@@ -517,6 +571,10 @@ class Agent:
         view.turn_started()
         try:
             result = self._run_loop(token)
+            status = result.status
+        except StreamInterrupted as e:
+            self._note_stream_interrupted(e.partial)
+            result = RunResult("stream_error", e.partial)
             status = result.status
         finally:
             self._token = None
@@ -681,19 +739,38 @@ class Agent:
     def _chat_with_recovery(self, use_tools: bool = True) -> tuple[dict, dict | None, bool]:
         """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
 
-        仅当错误文本命中溢出特征才走这条路，其他异常原样上抛。恢复后的
-        调用再溢出就直接抛给 REPL——每步只重试一次，不反复烧钱。
+        仅当错误文本命中溢出特征才走这条路，其他异常原样上抛；每步只重试
+        一次，不反复烧钱。流中途断开（`StreamInterrupted`）不重试——正文已
+        经实时上屏，重放只会重复打印；但已收到的部分要写进会话历史后继续
+        上抛，保证「界面上看到的」与「历史里的」一致，否则下一轮模型看不见
+        自己的输出，会从头重做一遍。首块之前就断开（部分正文为空）时历史
+        没有任何残缺内容，纯溢出重试照常进行。
         `use_tools=False` 用于迭代上限的收尾轮（强制纯文本，不暴露工具）。
         返回 (消息, 用量, 是否被中断)。
         """
         try:
             return self._chat(use_tools=use_tools)
+        except StreamInterrupted as e:
+            if e.partial.strip() or not is_context_overflow(e.original):
+                raise
+            # 首块之前就断且是上下文溢出：历史里没有残留正文，按溢出恢复重试
         except Exception as e:
             if not is_context_overflow(e):
                 raise
         renderer.current().info("[context] 上下文溢出，压缩后重试…")
         self.compact()
         return self._chat(use_tools=use_tools)
+
+    def _note_stream_interrupted(self, partial: str) -> None:
+        """把「流中断」事件写进会话历史：已上屏的部分正文 + 一行中断说明。
+
+        部分正文按 assistant 消息落库（与屏幕上看到的一致）；正文为空（首块之前
+        就断了）则只写说明，不留空 assistant 消息。说明是 user 消息、不触发新请求，
+        下一轮模型据此续写而非重做。
+        """
+        if partial.strip():
+            self.session.messages.append({"role": "assistant", "content": partial})
+        self.session.add("user", STREAM_INTERRUPTED_CONTEXT)
 
     def _compact_if_needed(self) -> None:
         """每轮调用前的预检：估算越过阈值（预算 × COMPACT_TRIGGER）就先压缩。"""
@@ -787,6 +864,10 @@ class Agent:
         任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼
         成部分 assistant 消息返回并标记 interrupted——残缺的工具调用不
         回传（无法解析），完整正文得以保留。
+        流中途异常（读完超时 / 对端掐断连接）时正文已经实时上屏，故异常也
+        要携带已收到的部分上抛（`StreamInterrupted`），由恢复层写进会话历史；
+        `r.stream_done()` 放 finally——否则 TUI 的正文块永不收口，下一轮的
+        增量会直接追加进上一轮那个还没闭合的块里（两轮内容黏成一团）。
         思考内容（reasoning_content，仅部分模型返回）以灰色实时展示，
         但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
         """
@@ -796,18 +877,27 @@ class Agent:
         r = renderer.current()
         schemas = visible_schemas() if use_tools else None
         kwargs = {"model": self._model} if self._model else {}
-        for kind, payload in self.llm.chat_stream(
-            self.session.messages, tools=schemas, **kwargs
-        ):
-            if kind == "message":
-                msg = payload
-            elif kind == "usage":
-                usage = payload
-            else:
-                if kind == "content":
-                    parts.append(payload)
-                r.stream(kind, payload)
-        r.stream_done()
+        try:
+            for kind, payload in self.llm.chat_stream(
+                self.session.messages, tools=schemas, **kwargs
+            ):
+                if kind == "message":
+                    msg = payload
+                elif kind == "usage":
+                    usage = payload
+                else:
+                    if kind == "content":
+                        parts.append(payload)
+                    r.stream(kind, payload)
+        except StreamInterrupted:
+            raise
+        except Exception as e:
+            token = current_token()
+            if token is not None and token.cancelled:
+                raise  # 取消引发的读错误：不是流故障，按取消语义上抛
+            raise StreamInterrupted(e, "".join(parts)) from e
+        finally:
+            r.stream_done()  # 幂等；异常路径也必须收口，否则下一轮流会黏进本块
         token = current_token()
         if token is not None and token.cancelled and not msg:
             msg = {"role": "assistant", "content": "".join(parts)}
@@ -846,7 +936,10 @@ class Agent:
             tool_id = renderer.current().tool_call(f"[Tool] {name}({args_json[:80]})", name=name)
             return _ToolPlan(tc, name, tool_id, lambda: text), False
 
-        line = self._describe(name, args)
+        # 摘要必须是单行：自定义 describe 会把命令原文等参数直接拼进来，多行命令
+        # （heredoc 等）的换行会在终端撑成多行。压平放在截断之前，保证 80 字符
+        # 上限全部花在可见内容上。
+        line = " ".join(self._describe(name, args).split())
         display = DISPLAY.get(name, "inline")
         # 既有计划的更新不上屏工具行：todo_write 每完成一步就更新一次，若每次都
         # 生成工具块会往对话区反复打印进度；更新只静默刷新侧边栏，新建清单才展示

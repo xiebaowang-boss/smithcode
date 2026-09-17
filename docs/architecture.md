@@ -46,11 +46,11 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 2. **LLM 流截停**：`llm.py` 打开流后把 `stream.close` 登记为令牌监听——取消线程**直接关流**，即使正阻塞在等下一块数据（模型静默期 / 网络慢）也立即解除；流消费每块数据前再查一次令牌。取消后不再产出 message/usage，关流引发的读错误按取消吞掉；已收到的正文由 Agent 拼成**部分消息**保留入库（残缺的工具调用不回传）。打开流之前也先查令牌——中断后**不再发起任何新请求**（含压缩摘要、溢出恢复重试）。
 3. **工具批截停**：`_BatchScheduler` 在**每个待预检项**与每个串行屏障前查令牌——预检阶段（含权限确认）中断时剩余确认框不再弹出、当前项即使刚答 y/n 也不执行、已预检未执行的（缓冲区波次）同样跳过（中断 = 不再发起任何新工作，且优先于拒绝语义）；未执行的计划与剩余 `tool_calls` 补占位结果（与权限被拒共用同一会话修复路径，`tool_call_id` 永不悬空），**非 shell** 的正在执行工具让其自然跑完（线程不可强杀）并照常收集结果。
 4. **运行中命令强杀**：正在执行的 shell 命令是例外——`run_command`（serial，跑在 run 线程）经 `process.py` 执行命令，`process.run` 自读当前线程令牌并在轮询中判定取消，触发即**终止整个进程树**（Windows `taskkill /F /T`、POSIX 先 SIGTERM 宽限后 SIGKILL），无需等命令自然结束或撞超时；超时路径共用同一终止逻辑。并行 worker 读不到令牌时安全降级为不响应取消。
-5. **收尾**：`run()` 返回结构化 `RunResult`（`ok / interrupted / denied / max_iterations`，`partial` 标记流中截停），令牌在 finally 中复位，下一任务不受残留状态影响；会话历史始终合法，可直接继续追问。中断时 `run()` 还会把事件作为一条 user 注释（`INTERRUPTED_CONTEXT`：任务未完成、部分输出可能不完整）追加进会话历史——**不触发任何新请求**，只是让模型在下一轮提问时知道上一轮是被主动叫停的，避免把部分输出当成完整结果。
+5. **收尾**：`run()` 返回结构化 `RunResult`（`ok / interrupted / denied / max_iterations / stream_error`，`partial` 标记流中截停），令牌在 finally 中复位，下一任务不受残留状态影响；会话历史始终合法，可直接继续追问。中断时 `run()` 还会把事件作为一条 user 注释（`INTERRUPTED_CONTEXT`：任务未完成、部分输出可能不完整）追加进会话历史——**不触发任何新请求**，只是让模型在下一轮提问时知道上一轮是被主动叫停的，避免把部分输出当成完整结果。响应流**非取消**地断在正文中间（读完超时 `ReadTimeout` / 对端掐断连接 `RemoteProtocolError`）走另一条收尾路径：`_chat()` 的 `try/finally` 保证 `r.stream_done()` 一定执行（TUI 的正文块必须收口，否则下一轮的增量会被追加进上一轮那个还没闭合的块），流中异常包成 `StreamInterrupted(original, partial)` 上抛；`run()` 捕获后把已上屏的部分正文按 assistant 消息入库并追加 `STREAM_INTERRUPTED_CONTEXT`，返回 `stream_error`（`text` 为部分正文）——屏幕上看到的与历史里的一致，下一轮模型接着写而不是从头重做。
 
 模型输出以流式方式逐字显示；思考内容（如 DeepSeek-R1 类模型的 `reasoning_content`）以暗色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
 
-工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止（附带展示 write/edit 的变更预览 diff），`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。TUI 侧另有一层纯展示的**上下文汇总**（对齐 opencode 的「已探索」）：连续的读取 / 搜索工具（`read_file` / `list_dir` 计入读取，`glob` / `grep` 计入搜索）汇总成一个可折叠块（头行按类别计数，展开看逐条明细），遇到非上下文工具、助手正文/思考流或回合结束时封口；分组不改变 `ConsoleRenderer` 行为与回传模型的内容。
+工具调用在执行前打印一行短摘要（`read src/agent.py`、`command git push`，由各工具注册的 `describe` 生成；生成后先压平空白再截断，多行命令（heredoc 等）的换行不会把工具行撑成多行，TUI 里超列宽的摘要按宽度省略而非折行），粒度由 `~/.smithcode/config.toml` 的 `tool_display` 控制：`summary`（默认）到此为止（附带展示 write/edit 的变更预览 diff），`detail` 再以 `[Result]` 追加结果内容（前 500 字符）。展示粒度只影响终端，回传给模型的内容始终是截断后的完整结果；失败信息（`错误: ...`、用户拒绝）无论粒度都原样展示。TUI 侧另有一层纯展示的**上下文汇总**（对齐 opencode 的「已探索」）：连续的读取 / 搜索工具（`read_file` / `list_dir` 计入读取，`glob` / `grep` 计入搜索）汇总成一个可折叠块（头行按类别计数，展开看逐条明细），遇到非上下文工具、助手正文/思考流或回合结束时封口；分组不改变 `ConsoleRenderer` 行为与回传模型的内容。
 
 ### 对话区消息模型（TUI）
 
@@ -135,7 +135,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 - **扫描与优先级**：项目级只扫 `<工作区>/.agents/skills/`，用户级只扫 `~/.smithcode/skills/`，外加 `[skills].paths`；同名"先命中者生效"（附加 > 项目 > 用户），被遮蔽/跳过者进 `/skills` 诊断；单根限深度 4、2000 目录。
 - **信任门控**：项目级技能随仓库分发、可能不可信，默认 `[skills].project="ask"` 交互确认（`[a]` 落盘 `~/.smithcode/skills_trust.json`、`[y]` 仅本会话、`[n]` 跳过）；非交互模式 fail-closed 跳过。
 - **披露与加载**：目录段注入 `messages[0]`（同 goal 段机制，普通回合逐字节稳定）；加载技能只把第 2 层载荷（前言 + `<skill>` 包装 + 资源清单 + 正文）投进对话——模型侧 `use_skill`（`serial`、enum 约束技能名、默认 `allow`）直接把它作为工具结果返回，用户侧由命令注入为 user 消息。**正文不进系统提示词**：加载不改变 `messages[0]`，提示前缀缓存全程稳定；重复加载不重复注入正文（幂等）：模型侧 `use_skill` 重复调用回一句已加载提示（含历史回找指引 + `read_file` 兜底），用户侧 `/技能名 [任务]` 重复调用静默开跑（注入一句历史回找引导让模型定位此前的载荷，不向用户打印）；无可用技能时工具与目录一起隐藏。载荷超 `[limits].max_tool_output` 时截断并附 `read_file` 指引。
-- **用户侧**：`/skills` 无参数直接弹出技能选择框（选中即按技能名直达加载并开跑），`/skills list` 查看来源分组/状态/诊断、`/skills refresh` 重扫磁盘（新装技能无需重启）；技能名即命令：`/技能名 [任务]` 由 commands.dispatch 的兜底分发加载——载荷经 `CommandResult.inject_history` 作为一条 user 消息注入历史，带任务时随后再发起任务消息（用户输入原文整体回显），无任务时载荷本身就是本轮 user 消息（加载后立即开跑一回）；技能名同时并入 `/` 输入补全（功能命令在前、技能按名称在后），与内置命令重名的技能不进命令面（内置命令优先，只能由模型用 `use_skill` 加载）；`disable-model-invocation: true` 的技能只允许手动加载。
+- **用户侧**：`/skills` 无参数弹出技能展示面板（只读：Enter 不确认，仅 ↑↓ 查看、Esc 关闭；加载请用 `/<技能名> [任务]` 直达），`/skills list` 查看来源分组/状态/诊断、`/skills refresh` 重扫磁盘（新装技能无需重启）；技能名即命令：`/技能名 [任务]` 由 commands.dispatch 的兜底分发加载——载荷经 `CommandResult.inject_history` 作为一条 user 消息注入历史，带任务时随后再发起任务消息（用户输入原文整体回显），无任务时载荷本身就是本轮 user 消息（加载后立即开跑一回）；技能名同时并入 `/` 输入补全（功能命令在前、技能按名称在后），与内置命令重名的技能不进命令面（内置命令优先，只能由模型用 `use_skill` 加载）；`disable-model-invocation: true` 的技能只允许手动加载。
 - **安全边界**：技能根目录登记为**只读白名单**（`config.read_roots()`），读引用文件免越界确认、不弹权限框；写操作只认授权目录（`_resolve(write=True)`）；frontmatter 的 `allowed-tools` 不产生任何授权效果。
 - **会话与压缩**：`/new` 时 `skills.reset()` 清空加载集合（发现结果保留）；正文在对话历史里，压缩会把中段摘要掉——`Agent.compact()` 随后调 `skills.prune_active()` 剔除正文已不在上下文中的技能（按载荷是否完整出现判定，从严）并注入一行提示（需要时重新 `use_skill`），剔除结果立即写入 `t=state` 投影；`/context` 的桶计量如实反映技能成本。
 
@@ -168,7 +168,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径；旧 `.json` 可导入），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
 
-恢复时：system 段按最新提示词重建（不入转录）；`compact` 检查点重置模型可见投影（旧消息保留供导出/审计）；尾部悬空 `tool_calls` 补「未执行：上次会话中断」占位（崩溃修复，中段损坏则截断）；goal/plan/技能激活集从 `t=state` 投影缓存恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在每轮正常结束后由后台模型自动生成（`[sessions].title_model`，用户标题优先），单次请求失败不永久放弃——下一轮结束后补试，上限 `TITLE_MAX_ATTEMPTS`（3）次，失败经 renderer 提示并说明是否还会补试，到顶后提示 `/rename` 手动命名；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏）。完整设计见本文件「会话持久化与恢复」节。
+恢复时：system 段按最新提示词重建（不入转录）；`compact` 检查点重置模型可见投影（旧消息保留供导出/审计）；尾部悬空 `tool_calls` 补「未执行：上次会话中断」占位（崩溃修复，中段损坏则截断）；goal/plan/技能激活集从 `t=state` 投影缓存恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在每轮正常结束后由后台模型自动生成（`[sessions].title_model`，用户标题优先），只取首个真实用户轮（中断回写 / 流中断回写 / 压缩提示 / 技能回找引导 / 迭代上限收尾五类记账消息跳过，不污染 payload、不错位轮次边界），单次请求失败不永久放弃——下一轮结束后补试，上限 `TITLE_MAX_ATTEMPTS`（3）次，失败经 renderer 提示并说明是否还会补试；到顶后进入 `TITLE_RETRY_ROUNDS`（5）轮冷却再自动探一次，`/model` 切换模型立即重置计数（到顶提示一并告知这两条出路，另提示 `/rename` 手动命名）；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏；同内容跳过重写，Shift+Tab 只刷底栏模式段、不碰标题）。完整设计见本文件「会话持久化与恢复」节。
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
@@ -234,8 +234,10 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
-| `tools/search.py` | 文件名与内容检索（glob / grep） |
-| `tools/web.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取，用真实浏览器 UA 降低被按机器人 403 的概率；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
+| `tools/_shared_local.py` | 本地检索共享基座（glob / grep 共用：SKIP_DIRS、沙箱根判定、有序遍历、行截断；下划线前缀=非工具，不注册） |
+| `tools/glob.py` | glob 文件名通配检索 |
+| `tools/grep.py` | grep 文件内容正则检索 |
+| `tools/webfetch.py` | webfetch 网页抓取转结构化文本（仅 http/https，支持批量并行）：HTTP 层走 `utils/http.py`（httpx2 + 环境代理），流式限流读取，用真实浏览器 UA 降低被按机器人 403 的概率；默认拒访内网 / 本机地址并按跳校验重定向（SSRF 防护） |
 | `tools/websearch.py` | websearch 网页检索（多后端：Tavily / Brave / Bing / DuckDuckGo，`[search].backend` 可切换；默认 auto 依次回退；默认放行）：与 webfetch 共用 `utils/http.py` 的客户端工厂；Tavily 走 JSON API（需 key），其余三个各一个 HTML 解析函数 |
 | `utils/http.py` | 网络工具的 HTTP 客户端工厂：统一代理语义（`normalize_proxy_env` 先归一化 `socks://`，`trust_env` 读 `ALL_PROXY`/`HTTP(S)_PROXY`，socks5 由 socksio 支持）+ 屏蔽 ALPN（历史遗留：DuckDuckGo 反爬按 TLS 指纹判定；Bing 不敏感）+ SSRF 地址判定（`is_public_address` / `private_target`，见「网络出网」节） |
 | `utils/htmltext.py` | HTML → 结构化 Markdown（标准库 `HTMLParser`）：保留标题 / 链接 / 代码块 / 列表 / 表格 / 引用，供 webfetch 输出可读正文 |

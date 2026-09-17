@@ -1,103 +1,21 @@
-"""检索工具：文件名通配匹配（glob）与内容正则搜索（grep）。
+"""grep 工具：在工作区文件内容中按正则表达式搜索（本地检索）。
 
-在真实代码库里靠 list_dir + read_file 盲目翻找效率极低，
-这两个工具是 Agent 定位代码的主要手段。
+与 glob 共用 _shared_local 基座（SKIP_DIRS、沙箱根判定、有序遍历、行截断）。
 """
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
+import stat
 from pathlib import Path
 
 from .. import config, textfile
+from . import _shared_local as ls
 from .base import register
 
-# 检索时跳过的目录：依赖、缓存、版本控制等对定位代码没有价值
-SKIP_DIRS = {
-    ".git", ".idea", ".vscode", ".pytest_cache", ".ruff_cache",
-    "__pycache__", "node_modules", ".venv", "venv", "dist", "build",
-    "sessions",
-}
-MAX_RESULTS = 100  # 单次最多返回的文件数 / 匹配行数
 MAX_FILE_SIZE = 1_000_000  # 超过 1MB 的文件跳过（多为构建产物或数据文件）
-MAX_LINE_LEN = 200  # 单行匹配内容展示的最大长度
-# 匹配内容一律按原文输出（不去缩进）：Agent 会直接复制到 edit_file 的 old_string，
-# 行首缩进一旦被吃掉，多行锚点就与文件内容对不上、必然报「old_string 未找到」。
 
 OUTPUT_MODES = ("content", "files_with_matches", "count")
-
-
-def _roots(path: str) -> tuple:
-    """解析搜索起始路径，返回 (命中的根, 起始路径)。越界直接拒绝。
-
-    相对路径锚定主工作区；结果落在任一读根（授权目录 + 技能目录只读白名单）
-    内即放行，展示路径相对该根。
-    """
-    base = (Path(config.WORKSPACE_ROOT) / path).resolve()
-    for root in config.read_roots():
-        if base.is_relative_to(root):
-            return root, base
-    raise PermissionError(f"路径越界: {path}")
-
-
-def _mtime(p: Path) -> float:
-    """取修改时间；stat 失败（坏链接等）按最旧处理。"""
-    try:
-        return p.stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _describe_glob(args: dict) -> str:
-    path = args.get("path")
-    suffix = "" if not path or path == "." else f" {path}"
-    return f"glob {args.get('pattern', '?')}{suffix}"
-
-
-@register(
-    {
-        "name": "glob",
-        "pattern_arg": "path",
-        "describe": _describe_glob,
-        "description": "按通配符模式搜索工作区内的文件，支持 ** 递归，"
-        "返回相对路径列表（按修改时间新→旧排序，最近改动的文件排前面）。"
-        "示例：**/*.py、docs/**/*.md",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string", "description": "通配符模式"},
-                "path": {
-                    "type": "string",
-                    "description": "搜索起始目录，默认工作区根",
-                },
-            },
-            "required": ["pattern"],
-        },
-    }
-)
-def glob(pattern: str, path: str = ".") -> str:
-    root, base = _roots(path)
-    try:
-        found = sorted(base.glob(pattern), key=_mtime, reverse=True)
-    except ValueError as e:
-        return f"错误: 无效的通配符模式 {pattern!r}: {e}"
-
-    out = []
-    for p in found:
-        rp = p.resolve()
-        if not rp.is_relative_to(root):
-            continue
-        rel = rp.relative_to(root)
-        if SKIP_DIRS & set(rel.parts):
-            continue
-        out.append(rel.as_posix() + ("/" if rp.is_dir() else ""))
-        if len(out) >= MAX_RESULTS:
-            break
-    if not out:
-        return "(无匹配文件)"
-    note = f"\n(已达 {MAX_RESULTS} 条上限，请收窄 pattern)" if len(out) >= MAX_RESULTS else ""
-    return "\n".join(out) + note
 
 
 def _describe_grep(args: dict) -> str:
@@ -122,12 +40,13 @@ def _describe_grep(args: dict) -> str:
         "name": "grep",
         "pattern_arg": "path",
         "describe": _describe_grep,
-        "description": "在工作区文件内容中按正则表达式搜索。"
+        "description": "在工作区文件内容中按正则表达式搜索（按单行匹配，不跨行）。"
         "默认返回「路径:行号: 内容」；output_mode=files_with_matches 只列包含匹配的文件，"
         "output_mode=count 返回「路径:匹配数」。ignore_case 忽略大小写，"
         "context=N 显示每个匹配的上下文 N 行。可用 include 按文件名过滤（如 *.py）。"
         "匹配内容按文件原文输出、保留行首缩进，去掉「路径:行号: 」前缀后可直接用作 "
-        "edit_file 的 old_string（多行锚点每行缩进都要照原样）。",
+        "edit_file 的 old_string（多行锚点每行缩进都要照原样）；超长行截断处有 … 标记，"
+        "不可逐字复制。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -163,59 +82,118 @@ def grep(pattern: str, path: str = ".", include: str | None = None,
          context: int | None = None) -> str:
     if output_mode not in OUTPUT_MODES:
         return f"错误: output_mode 只支持 {' / '.join(OUTPUT_MODES)}"
-    root, base = _roots(path)
+    if context is not None:
+        try:
+            width = int(context)
+        except (TypeError, ValueError):
+            return "错误: context 必须是非负整数"
+        if width < 0:
+            return "错误: context 必须是非负整数"
+    else:
+        width = 0
+    _, base = ls.roots(path)
     try:
         rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as e:
         return f"错误: 无效的正则表达式: {e}"
+    roots = config.read_roots()
 
-    candidates = iter([base]) if base.is_file() else _iter_files(base)
+    if base.is_file():
+        candidates: object = [base]
+    elif base.is_dir():
+        candidates = ls.walk_entries(base, yield_dirs=False)
+    else:
+        return "(无匹配)"
 
     matches = []
     truncated = False
-    for fpath in candidates:
+    scan_capped = False
+    scanned_files = 0
+    scanned_bytes = 0
+    for fpath in candidates:  # type: ignore[union-attr]
+        assert isinstance(fpath, Path)
         if include and not fnmatch.fnmatch(fpath.name, include):
             continue
+        # 沙箱：walk 产出的是 lexical 路径，符号链接必须 resolve 后重判——
+        # 工作区内的 link -> /etc/passwd 在此被拦下（此前缺这一步直接读出）。
         try:
-            if fpath.stat().st_size > MAX_FILE_SIZE:
-                continue
+            rp = fpath.resolve()
+        except OSError:
+            continue
+        root = ls.containing_root(rp, roots)
+        if root is None:
+            continue
+        rel_path = rp.relative_to(root)
+        if ls.SKIP_DIRS & set(rel_path.parts):
+            continue
+        try:
+            st = rp.stat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            continue  # 链接到目录的按目录处理，内容检索只读文件
+        if st.st_size > MAX_FILE_SIZE:
+            continue
+        scanned_files += 1
+        scanned_bytes += st.st_size
+        if scanned_files > ls.MAX_SCAN_FILES or scanned_bytes > ls.MAX_SCAN_BYTES:
+            scan_capped = True
+            truncated = True
+            break
+        try:
+            with open(rp, "rb") as head:
+                if b"\x00" in head.read(8192):
+                    continue  # 二进制预检：命中空字节直接跳过，省下整文件解码
+        except OSError:
+            continue
+        try:
             # errors="replace"：GBK 等非 UTF-8 文件也能搜到 ASCII 内容
-            text, _fmt = textfile.read(fpath, errors="replace")
+            text, _fmt = textfile.read(rp, errors="replace")
         except (OSError, textfile.TextFileError):
             continue
-        if "\x00" in text:  # 含空字节，视为二进制文件
+        if "\x00" in text:  # 8KB 之后才出现的空字节，解码后二次确认
             continue
-        rel = fpath.relative_to(root).as_posix()
+        rel = rel_path.as_posix()
+
+        if output_mode == "files_with_matches":
+            # 只需存在性：首个命中即停，不建全文件匹配表
+            if any(rx.search(line) for line in text.splitlines()):
+                matches.append(rel)
+                if len(matches) >= ls.MAX_RESULTS:
+                    truncated = True
+                    break
+            continue
+
         lines = text.splitlines()
         matched = [(i, line) for i, line in enumerate(lines) if rx.search(line)]
         if not matched:
             continue
 
-        if output_mode == "files_with_matches":
-            matches.append(rel)
-            if len(matches) >= MAX_RESULTS:
-                truncated = True
-                break
-        elif output_mode == "count":
+        if output_mode == "count":
             matches.append(f"{rel}:{len(matched)}")
-            if len(matches) >= MAX_RESULTS:
+            if len(matches) >= ls.MAX_RESULTS:
                 truncated = True
                 break
         else:
-            if context:
-                matches.extend(_render_context(rel, lines, matched, max(0, int(context))))
+            if width:
+                matches.extend(_render_context(rel, lines, matched, width))
             else:
-                matches.extend(f"{rel}:{i + 1}: {line[:MAX_LINE_LEN]}"
+                matches.extend(f"{rel}:{i + 1}: {ls.clip_line(line)}"
                                for i, line in matched)
-            if len(matches) >= MAX_RESULTS:
+            if len(matches) >= ls.MAX_RESULTS:
                 truncated = True
                 break
 
     if not matches:
         return "(无匹配)"
     if truncated:
-        matches = matches[:MAX_RESULTS]
-        matches.append(f"(已达 {MAX_RESULTS} 条上限，请收窄 pattern 或加 include)")
+        matches = matches[:ls.MAX_RESULTS]
+        if scan_capped:
+            matches.append(
+                f"(已扫描 {scanned_files} 个文件，达到扫描上限，请用 path 或 include 收窄范围)"
+            )
+        else:
+            matches.append(f"(已达 {ls.MAX_RESULTS} 条上限，请收窄 pattern 或加 include)")
     return "\n".join(matches)
 
 
@@ -240,15 +218,7 @@ def _render_context(rel: str, lines: list[str], matched: list, width: int) -> li
             out.append("--")
         for i in range(start, end):
             sep = ":" if i in matched_idx else "-"
-            out.append(f"{rel}{sep}{i + 1}{sep} {lines[i][:MAX_LINE_LEN]}")
-            if len(out) >= MAX_RESULTS:
+            out.append(f"{rel}{sep}{i + 1}{sep} {ls.clip_line(lines[i])}")
+            if len(out) >= ls.MAX_RESULTS:
                 return out
     return out
-
-
-def _iter_files(base: Path):
-    """遍历目录下的所有文件（修剪无关目录）。"""
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for name in filenames:
-            yield Path(dirpath) / name

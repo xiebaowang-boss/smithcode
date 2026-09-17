@@ -6,7 +6,7 @@ HTTP 层用 httpx2 的 MockTransport 打桩（替换工具的客户端工厂）�
 import httpx2
 import pytest
 
-from smithcode.tools import web
+from smithcode.tools import webfetch as web
 
 
 @pytest.fixture(autouse=True)

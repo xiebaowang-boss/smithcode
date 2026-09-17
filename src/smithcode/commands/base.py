@@ -40,12 +40,16 @@ class CommandSelect:
 
     size 是弹窗宽度档位（small / medium / large / xlarge），由调用方按内容
     长度声明；缺省 medium，宿主不测量内容、只按档位取宽度。
+
+    readonly 为 True 时仅展示：宿主禁用 Enter（含数字键快选）确认，
+    只留 ↑↓ 查看与 Esc 关闭（如 /skills 技能列表）。
     """
 
     title: str
     items: list  # CommandChoice 列表
     command: str = ""
     size: str = "medium"
+    readonly: bool = False
 
 
 @dataclass
@@ -183,7 +187,7 @@ def _skill_commands(prefix: str, taken: set) -> list:
 
 # /help 尾部的输入操作提示（REPL 与 TUI 通用）
 HELP_FOOTER = (
-    "技能: /skills 打开选择框（选中即加载并开跑），/<技能名> [任务] 直达。\n"
+    "技能: /skills 查看技能列表，/<技能名> [任务] 加载并开跑。\n"
     "输入: Enter 发送，Ctrl+Enter 换行；↑↓ 翻历史，Ctrl+W 删词。"
 )
 

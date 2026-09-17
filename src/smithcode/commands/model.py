@@ -14,6 +14,11 @@ def _model(ctx):
     if ctx.args:
         name = ctx.args[0]
         config.MODEL = name
+        # 标题失败常与当前模型相关（不按 JSON 输出、拒标题请求）：换模型后把
+        # 耗尽的计数归零，下一轮正常结束即再试，不再继续沉默
+        reset = getattr(ctx.agent, "reset_title_attempts", None)
+        if callable(reset):
+            reset()
         return CommandResult(text=f"已切换模型: {name}", style="green", refresh_status=True)
 
     choices = [

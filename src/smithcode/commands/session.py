@@ -115,7 +115,7 @@ def _new(ctx):
     "查看 / 切换历史会话",
     usage="/sessions [list [数量] | delete <id> | <id|序号>]",
     accepts_args=True,
-    immediate=True,  # 菜单里选中即弹选择框（与 /model /skills 一致）
+    immediate=True,  # 菜单里选中即弹选择框（与 /model 一致）
 )
 def _sessions(ctx):
     args = ctx.args

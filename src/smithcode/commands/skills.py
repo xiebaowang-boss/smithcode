@@ -1,6 +1,7 @@
-"""技能斜杠命令：`/skills` 选择/查看/刷新（技能名本身即命令，见下）。
+"""技能斜杠命令：`/skills` 展示/查看/刷新（技能名本身即命令，见下）。
 
-`/skills` 无参数直接弹出技能选择框（TUI SelectionPanel，选中即加载并开跑）；
+`/skills` 无参数弹出技能展示面板（TUI SelectionPanel，只读：Enter 不确认，
+仅 ↑↓ 查看、Esc 关闭；加载技能请用 `/<技能名> [任务]` 直达）；
 `/skills list` 输出文本列表与扫描诊断，`/skills refresh` 重扫磁盘。
 技能名作为动态命令直达：`/技能名 [任务]` 由 commands.dispatch 的兜底分发进来，
 载荷作为一条 user 消息进会话历史（无任务时它本身就是本轮 user 消息，加载后
@@ -22,7 +23,7 @@ from .base import (
 
 @register(
     "skills",
-    "打开技能选择框（list 文本列表 / refresh 重新扫描）",
+    "查看技能列表（list 文本列表 / refresh 重新扫描）",
     usage="/skills [list|refresh]",
     accepts_args=True,
     immediate=True,
@@ -76,11 +77,11 @@ def load_skill(name: str, task: str) -> CommandResult:
 
 
 def _skill_picker() -> CommandResult:
-    """技能选择意图：列出可手动加载的技能，选中后按技能名直达（`/<技能名>`）。
+    """技能展示意图：列出可手动加载的技能，仅展示、不确认加载。
 
-    command 留空 = 宿主按 `/<value>` 重新分发（技能名即命令）。与内置命令重名的
-    技能不进列表——分发时内置命令优先，选中只会执行内置命令；没有可用技能时
-    同样返回空选择框（不打印创建路径等提示文字）。
+    readonly 展示面板：Enter（含数字键）不确认，Esc 关闭；加载技能请用
+    `/<技能名> [任务]` 直达。与内置命令重名的技能不进列表（内置命令优先）；
+    没有可用技能时同样返回空展示面板（不打印创建路径等提示文字）。
     """
     active = set(skills.active_names())
     items = []
@@ -101,4 +102,4 @@ def _skill_picker() -> CommandResult:
                 current=skill.name in active,
             )
         )
-    return CommandResult(select=CommandSelect(title="选择技能", items=items))
+    return CommandResult(select=CommandSelect(title="技能列表", items=items, readonly=True))

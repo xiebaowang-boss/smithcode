@@ -6,11 +6,15 @@ import unicodedata
 from pathlib import Path
 
 from .. import config, textfile
+from ._shared_local import SKIP_DIRS
 from .base import register
-from .search import SKIP_DIRS
 
 MAX_READ_LINES = 2000  # read_file 单次最多返回的行数（可用 limit 调整）
 MAX_READ_LINE_LEN = 2000  # 单行展示的最大长度（超长行截断，避免撑爆上下文）
+MAX_READ_BYTES = 2_000_000  # 超过 2MB 默认拒绝整读，提示用 grep 定位 + offset/limit 分段读
+MAX_PREVIEW_CHARS = 20_000  # 权限确认 diff 预览的字符上限，超出截断（与 MAX_TOOL_OUTPUT 对齐）
+# 超长行截断标记：该行未展示全貌，不可逐字复制成 edit_file 的 old_string
+TRUNC_SUFFIX = "…"
 
 # 行号与正文之间的分隔符：用一个醒目的非空白字符，而不是两个空格——否则
 # 分隔符会被误当成正文的缩进，old_string 一复制就多出前导空格、必然匹配失败。
@@ -23,6 +27,28 @@ READ_FILES: set[str] = set()
 def reset_read_tracking() -> None:
     """清空会话级「已读文件」记录（新会话/新 Agent 开始时调用）。"""
     READ_FILES.clear()
+
+
+def _read_slice(p: Path, start: int, max_lines: int) -> tuple[list[str], int]:
+    """流式读窗口行与总行数：内存只保留窗口，不整载全文。
+
+    utf-8-sig 去 BOM、通用换行转 LF——与 textfile.read 的归一化结果一致，
+    模型看到的永远是 LF 内容。非法 UTF-8 转 TextFileError，由调用方报友好错误。
+    """
+    selected: list[str] = []
+    total = 0
+    end = start + max_lines - 1
+    try:
+        with open(p, "r", encoding="utf-8-sig", newline=None) as handle:
+            for raw in handle:
+                total += 1
+                if start <= total <= end:
+                    selected.append(raw.rstrip("\n"))
+    except UnicodeDecodeError as e:
+        raise textfile.TextFileError(f"文件不是有效的 UTF-8 文本: {e}") from e
+    except OSError as e:
+        raise textfile.TextFileError(f"读取失败: {e}") from e
+    return selected, total
 
 
 def _remember(path: Path) -> None:
@@ -51,8 +77,18 @@ def _is_binary(p: Path) -> bool:
         return False
 
 
+def _clip_line(line: str) -> str:
+    """超长行截断并打标记：静默截断会让 Agent 复制半行去 edit，必然「未找到」。"""
+    if len(line) <= MAX_READ_LINE_LEN:
+        return line
+    return line[:MAX_READ_LINE_LEN] + TRUNC_SUFFIX
+
+
 def _unified(old_text: str, new_text: str, path: str) -> str:
-    """两份文本的 unified diff（带 a/ b/ 前缀头，行尾不补换行符）。"""
+    """两份文本的 unified diff（带 a/ b/ 前缀头，行尾不补换行符）。
+
+    大文件预览限长：超 MAX_PREVIEW_CHARS 只保留头部，避免确认框撑爆上下文。
+    """
     diff = difflib.unified_diff(
         old_text.splitlines(),
         new_text.splitlines(),
@@ -60,12 +96,16 @@ def _unified(old_text: str, new_text: str, path: str) -> str:
         tofile=f"b/{path}",
         lineterm="",
     )
-    return "\n".join(diff)
+    result = "\n".join(diff)
+    if len(result) > MAX_PREVIEW_CHARS:
+        result = result[:MAX_PREVIEW_CHARS] + "\n…(预览过长，已截断)"
+    return result
 
 
 def _protected_path(p: Path) -> bool:
-    """预览不回显内容的保护路径：.env（密钥）与 .git 子树（config 里常含令牌）。"""
-    return p.name == ".env" or ".git" in p.parts
+    """预览不回显内容的保护路径：.env 系列（密钥）与 .git 子树（config 里常含令牌）。"""
+    name = p.name
+    return (name == ".env" or name.startswith(".env.")) or ".git" in p.parts
 
 
 def _existing_format(p: Path) -> textfile.FileFormat | None:
@@ -137,7 +177,9 @@ def _preview_edit(args: dict) -> str | None:
         "description": "读取工作区内一个文本文件，返回带行号的内容（形如「行号│代码」，"
         "`│` 是行号与正文的分隔符、不属于文件内容）。"
         "大文件用 offset/limit 分段读取；二进制文件会被拒绝。"
-        "行号与 `│` 前缀仅供定位，edit_file 的 old_string 不要把它复制进去。",
+        "行号与 `│` 前缀仅供定位，edit_file 的 old_string 不要把它复制进去。"
+        "超长行截断处有 … 标记，不可逐字复制；超过 2MB 的文件默认拒绝整读，"
+        "先用 grep 定位行号再分段读取。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -164,24 +206,33 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None) ->
     if _is_binary(p):
         return f"错误: {path} 是二进制文件，无法以文本读取"
     try:
-        text = textfile.read(p)[0]
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    start = max(1, int(offset) if offset else 1)
+    max_lines = max(1, int(limit) if limit else MAX_READ_LINES)
+    if size > MAX_READ_BYTES and not offset and not limit:
+        return (f"错误: {path} 约 {size // 1024}KB，过大无法整读；"
+                "先用 grep 定位行号，再用 offset/limit 分段读取")
+    try:
+        if offset or limit or size > MAX_READ_BYTES:
+            selected, total = _read_slice(p, start, max_lines)
+        else:
+            lines_full = textfile.read(p)[0].splitlines()
+            total = len(lines_full)
+            selected = lines_full[start - 1 : start - 1 + max_lines]
     except textfile.TextFileError as e:
         return f"错误: {e}"
     _remember(p)
 
-    lines = text.splitlines()
-    total = len(lines)
     if total == 0:
         return "(空文件)"
-    start = max(1, int(offset) if offset else 1)
-    max_lines = max(1, int(limit) if limit else MAX_READ_LINES)
-    selected = lines[start - 1 : start - 1 + max_lines]
     if not selected:
         return f"(第 {start} 行超出范围，文件共 {total} 行)"
 
     width = len(str(start + len(selected) - 1))
     out = [
-        f"{start + i:>{width}}{LINE_GUTTER}{line[:MAX_READ_LINE_LEN]}"
+        f"{start + i:>{width}}{LINE_GUTTER}{_clip_line(line)}"
         for i, line in enumerate(selected)
     ]
     result = "\n".join(out)
@@ -280,16 +331,17 @@ def edit_file(path: str, old_string: str, new_string: str,
     return f"已编辑 {p}" + (f"（替换 {count} 处）" if count > 1 else "")
 
 
-def _match_linenos(text: str, needle: str) -> list[int]:
-    """返回 needle 在 text 中各次出现的行号（从 1 开始）。"""
+def _match_linenos(text: str, needle: str, limit: int = 5) -> list[int]:
+    """返回 needle 前 limit 次出现的行号（从 1 开始）：报错展示只取前几处，早停。"""
     linenos = []
     idx = 0
-    while True:
+    while len(linenos) < limit:
         i = text.find(needle, idx)
         if i < 0:
             return linenos
         linenos.append(text.count("\n", 0, i) + 1)
-        idx = i + len(needle) or i + 1
+        idx = i + len(needle) if needle else i + 1
+    return linenos
 
 
 @register(
@@ -309,14 +361,24 @@ def _match_linenos(text: str, needle: str) -> list[int]:
 )
 def list_dir(path: str = ".") -> str:
     p = _resolve(path)
+    if not p.exists():
+        return f"错误: 路径不存在: {path}"
+    if p.is_file():
+        return f"错误: {path} 是文件，请用 read_file 读取"
+    try:
+        entries = sorted(p.iterdir(), key=lambda entry: entry.name.lower())
+    except OSError as e:
+        return f"错误: 无法列出目录 {path}: {e.strerror or e}"
     rows: list[tuple[bool, str, str, str]] = []  # (是否目录, 显示名, 大小, 修改时间)
-    for item in sorted(p.iterdir(), key=lambda entry: entry.name.lower()):
+    for item in entries:
         if item.name in SKIP_DIRS:
             continue
-        is_dir = item.is_dir()
+        # lstat 语义：符号链接目录按链接本身处理，不跟随到目标——
+        # 否则指向仓外的 dirlink 会泄漏目标的目录性 / 大小 / mtime。
+        is_dir = item.is_dir(follow_symlinks=False)
         size, mtime = "", ""
         try:
-            st = item.stat()
+            st = item.stat(follow_symlinks=False)
             mtime = _fmt_mtime(st.st_mtime)
             if not is_dir:
                 size = _fmt_size(st.st_size)

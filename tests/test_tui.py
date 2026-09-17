@@ -5,6 +5,7 @@ import threading
 import time
 from pathlib import Path
 
+import httpx2
 import pytest
 from rich.color import ColorTriplet
 from textual.geometry import Region
@@ -696,6 +697,21 @@ def test_tool_call_summary_markup_not_parsed(monkeypatch):
     _run(_run_case())
 
 
+def test_tool_call_header_single_row_when_overlong(monkeypatch):
+    """摘要超过可用列宽时按宽度省略，不折成第二行：工具行恒占一行。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            block = ToolCall("command " + "x" * 200)
+            app.query_one(ChatView).add_widget(block)
+            await pilot.pause()
+            assert block.query_one(".tool-header").size.height == 1
+
+    _run(_run_case())
+
+
 def test_question_panel_question_markup_not_parsed(monkeypatch):
     """回归：模型提问文本含 markup 样式时，提问面板标题原样展示不崩溃。"""
     no_prompting(monkeypatch)
@@ -1290,8 +1306,8 @@ def test_tui_dynamic_skill_command_injects_payload_and_echoes_task(monkeypatch, 
         skills.clear()
 
 
-def test_tui_skill_picker_dispatches_by_skill_name(monkeypatch, tmp_path):
-    """选择框选中技能后按 /<技能名> 重新分发（command 留空 = value 即命令）。"""
+def test_tui_skills_panel_is_readonly(monkeypatch, tmp_path):
+    """技能面板只读展示：Enter 不确认加载，仅 ↑↓ 查看、Esc 关闭。"""
     no_prompting(monkeypatch)
     from smithcode import skills
 
@@ -1323,10 +1339,21 @@ def test_tui_skill_picker_dispatches_by_skill_name(monkeypatch, tmp_path):
                 await pilot.press("enter")
                 await pilot.pause()
                 assert isinstance(app.screen, SelectionScreen)
-                await pilot.press("enter")  # 选中唯一技能 → 按 /proj 分发
+                panel = app.screen.query_one("SelectionPanel")
+                assert panel._readonly is True
+                await pilot.press("enter")  # 只读：Enter 不确认、不分发
                 await pilot.pause()
 
-                assert "/proj" in _chat_text(app)  # 命令回显，无额外回执
+                assert isinstance(app.screen, SelectionScreen)  # 面板仍在
+                assert started == []
+                assert "/proj" not in _chat_text(app)
+                await pilot.press("escape")  # Esc 关闭
+                await pilot.pause()
+                assert not isinstance(app.screen, SelectionScreen)
+
+                # 加载技能请用 /<技能名> 直达，仍可加载并开跑
+                app.handle_command("/proj")
+                await pilot.pause()
                 assert started and "以下为技能「proj」的完整指令" in started[0]
 
         _run(_run_case())
@@ -1408,6 +1435,60 @@ def test_tui_cycle_permission_mode(monkeypatch):
             app.action_cycle_permission_mode()
             await pilot.pause()
             assert app.agent.permission.mode == "smith"
+
+    _run(_run_case())
+
+
+def test_tui_cycle_permission_mode_does_not_touch_sidebar_title(monkeypatch):
+    """回归：Shift+Tab 只刷新底栏模式段，不碰侧边栏标题控件。
+
+    标题控件此前随全量 ui_status() 被无条件重写（Static.update 恒触发重排），
+    空闲时按一次整栏闪一下，看起来像标题"跟着变化"。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        agent = _make_agent(monkeypatch)
+        agent.session.set_title("重构会话管理")
+        app = SmithTUI(agent)
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            sidebar = app.query_one(Sidebar)
+            widget = sidebar.query_one(".sidebar-title")
+            before = str(widget.content)
+            sentinel = object()
+            widget.update = lambda content, **kw: setattr(widget, "_touched", True) or sentinel
+            widget._touched = False
+            app.action_cycle_permission_mode()
+            await pilot.pause()
+            assert app.agent.permission.mode == "accept_edits"
+            assert str(app.query_one("#composer-mode").content) == "Accept Edits"
+            assert getattr(widget, "_touched", False) is False  # 标题控件一次都没被碰
+            assert str(sidebar.query_one(".sidebar-title").content) == before
+
+    _run(_run_case())
+
+
+def test_tui_sidebar_title_update_dedupes_same_content(monkeypatch):
+    """同内容跳过 update：标题控件不再因无关刷新整栏重排闪动。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        from rich.text import Text
+
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.pause()
+            sidebar = app.query_one(Sidebar)
+            widget = sidebar.query_one(".sidebar-title")
+            calls = []
+            orig_update = widget.update
+            widget.update = lambda content, **kw: calls.append(str(content))
+            sidebar.update_title(Text("同标题", style="#7dcfff"))
+            sidebar.update_title(Text("同标题", style="#7dcfff"))
+            sidebar.update_title(Text("新标题", style="#7dcfff"))
+            assert len(calls) == 2  # 第二次同内容被跳过
+            widget.update = orig_update
 
     _run(_run_case())
 
@@ -3596,5 +3677,58 @@ def test_user_message_returns_to_bottom_while_reading_history(monkeypatch):
             app.ui_notice("提问后的新内容")
             await pilot.pause()
             assert _bottom_reached(chat)  # 跟随保持
+
+    _run(_run_case())
+
+
+# ---------- 流中断：正文块收口，下一轮不黏进上一轮 ----------
+
+class TimeoutLLM:
+    """先吐一段正文再断流：模拟读完超时（原始故障的触发条件）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield ("content", "已修改完成，")
+            raise httpx2.ReadTimeout("The read operation timed out")
+        yield ("content", "第二轮正文")
+
+
+def test_tui_stream_block_closed_after_timeout(monkeypatch):
+    """流中断后正文块必须收口：下一轮的增量另起新块，不能黏进上一轮那个块。
+
+    回归的是「ReadTimeout 打断 _chat 的 for 循环 → r.stream_done() 不执行 →
+    ChatView._kind 停在 content、_body 仍是旧块 → 第二轮正文追加进同一个块」
+    这条链（用户看到两轮内容叠在一起、错位渲染）。
+    """
+    no_prompting(monkeypatch)
+    agent = _make_agent(monkeypatch)
+    fake = TimeoutLLM()
+    agent.llm = fake  # 同一实例供两轮调用（第一轮断流，第二轮正常）
+
+    def _drive():
+        first = agent.run("第一轮")
+        second = agent.run("第二轮")
+        return first, second
+
+    async def _run_case():
+        app = SmithTUI(agent)
+        async with app.run_test() as pilot:
+            chat = app.query_one(ChatView)
+            first, second = await asyncio.to_thread(_drive)
+            await pilot.pause()
+
+            assert first.status == "stream_error"
+            assert second.status == "ok"
+            blocks = [
+                b.content.plain for b in chat.query(".assistant-stream")
+                if "已修改完成" in b.content.plain or "第二轮正文" in b.content.plain
+            ]
+            assert len(blocks) == 2, f"两轮内容应各占一块，实际 {blocks!r}"
+            assert "第二轮正文" not in blocks[0]
+            assert "已修改完成" not in blocks[1]
 
     _run(_run_case())

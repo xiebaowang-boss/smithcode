@@ -797,6 +797,9 @@ class SelectionScreen(ModalScreen):
 class SelectionPanel(Vertical):
     """数据驱动的通用选择面板：↑↓/j/k/数字键选择、Enter 确认、Esc 取消。
 
+    readonly 为 True 时仅展示：Enter（含数字键快选）不确认，只留 ↑↓ 查看
+    与 Esc 关闭（宿主按 CommandSelect.readonly 透传，如 /skills 技能列表）。
+
     只认识 SelectionItem，不认识具体业务；选中后经 on_done(value) 回调交回宿主
     （Esc 传 None）。主线程回调式，不阻塞事件循环——与 ask/权限面板的
     Event 阻塞协议区分开。
@@ -823,11 +826,12 @@ class SelectionPanel(Vertical):
     ]
 
     def __init__(self, title: str, items: list, on_done, size: str = DEFAULT_SIZE,
-                 initial: str | None = None, **kwargs):
+                 initial: str | None = None, readonly: bool = False, **kwargs):
         super().__init__(**kwargs)
         self._title = title
         self._items = list(items)
         self._on_done = on_done
+        self._readonly = readonly
         self.size_class = size if size in self.SIZES else self.DEFAULT_SIZE
         self.add_class(f"size-{self.size_class}")
         # 可选中的行（跳过间隔行）；初始光标：initial 指定值优先（如从下级
@@ -872,7 +876,8 @@ class SelectionPanel(Vertical):
             len(self._rows), self.row_spec, classes="selection-rows"
         )
         yield self._rows_view
-        yield Static("↑↓ 选择 · enter 确认 · esc 取消", classes="selection-hint", markup=False)
+        hint = "↑↓ 查看 · esc 关闭" if self._readonly else "↑↓ 选择 · enter 确认 · esc 取消"
+        yield Static(hint, classes="selection-hint", markup=False)
 
     def on_mount(self) -> None:
         self.focus()  # 不聚焦，按键会落进隐藏的输入框
@@ -966,6 +971,8 @@ class SelectionPanel(Vertical):
         self._refresh()          # 再置脏：两者在同一次刷新里产出，无中间态
 
     def action_confirm(self) -> None:
+        if self._readonly:  # 只读展示：Enter 不确认
+            return
         if not self._selectable:
             return
         item = self._items[self._selected]
@@ -977,7 +984,9 @@ class SelectionPanel(Vertical):
         self._finish(None)
 
     def on_key(self, event) -> None:
-        """数字键快选（1-9 直接确认，按可选项序号）；特殊键的 character 为 None。"""
+        """数字键快选（1-9 直接确认，按可选项序号）；特殊键的 character 为 None。
+
+        只读展示时数字键只移动光标、不确认。"""
         char = event.character or ""
         if not char.isdigit():
             return
@@ -987,6 +996,8 @@ class SelectionPanel(Vertical):
             event.prevent_default()
             self._selected = self._selectable[n - 1]
             self._refresh()
+            if self._readonly:
+                return
             self.action_confirm()
 
     def _finish(self, value: str | None) -> None:

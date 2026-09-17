@@ -29,7 +29,7 @@ from .. import config
 from ..utils.http import client as http_client
 from ..utils.http import read_limited
 from .base import register
-from .web import _USER_AGENT, MAX_FETCH_BYTES
+from .webfetch import _USER_AGENT, MAX_FETCH_BYTES
 
 SEARCH_TIMEOUT = 20  # 单次检索超时（秒）
 DEFAULT_RESULTS = 5  # 默认返回条数

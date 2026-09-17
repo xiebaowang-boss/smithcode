@@ -4,7 +4,7 @@ import re
 import pytest
 
 from smithcode import config
-from smithcode.tools import files, search
+from smithcode.tools import files, grep
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +60,7 @@ def test_write_creates_parent_dirs(workspace):
 def test_edit_file_accepts_multiline_anchor_copied_from_grep(workspace):
     """回归：grep 输出曾被 strip 掉行首缩进，照抄成多行 old_string 会匹配不上文件。"""
     files.write_file("a.py", "def m():\n    warn = log\n    error = log\n")
-    out = search.grep("warn = log|error = log", path="a.py")
+    out = grep.grep("warn = log|error = log", path="a.py")
     # 「路径:行号: 内容」去掉前缀后应逐字等于原文（含缩进）
     anchor = "\n".join(line.split(": ", 1)[1] for line in out.splitlines())
     assert anchor == "    warn = log\n    error = log"
@@ -319,6 +319,57 @@ def test_edit_file_non_utf8_returns_friendly_error(workspace):
     files.write_file("latin.py", "x = 1\n")  # 先记录为已读
     (workspace / "latin.py").write_bytes(b"# caf\xe9\nx = 1\n")  # 外部改成非 UTF-8
     assert "UTF-8" in files.edit_file("latin.py", "x = 1", "x = 2")
+
+
+# ---------- 安全与性能回归 ----------
+
+def test_read_file_long_line_marked_truncated(workspace):
+    """超长行截断必须打标记，否则 Agent 复制半行去 edit 必然「未找到」。"""
+    files.write_file("wide.txt", "z" * (files.MAX_READ_LINE_LEN + 50))
+    out = files.read_file("wide.txt")
+    assert out.endswith("…")
+    assert "z" * (files.MAX_READ_LINE_LEN + 50) not in out
+
+
+def test_read_file_huge_requires_paging(workspace, monkeypatch):
+    """超大文件默认拒绝整读，分段读可用（流式分页不整载全文）。"""
+    (workspace / "huge.txt").write_bytes(b"l\n" * 1000)
+    monkeypatch.setattr(files, "MAX_READ_BYTES", 100)
+    assert "分段读取" in files.read_file("huge.txt")
+    out = files.read_file("huge.txt", offset=3, limit=2)
+    assert "3│l" in out and "4│l" in out and "共 1000 行" in out
+
+
+def test_list_dir_missing_and_file_friendly_error(workspace):
+    files.write_file("n.txt", "x")
+    assert "不存在" in files.list_dir("nope")
+    assert "read_file" in files.list_dir("n.txt")
+
+
+def test_list_dir_symlink_dir_not_followed(workspace, tmp_path):
+    """指向仓外的目录软链按链接本身展示：不跟随，不泄漏目标的目录性。"""
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.mkdir(exist_ok=True)
+    try:
+        (workspace / "dirlink").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前平台不支持创建符号链接")
+    out = files.list_dir()
+    assert "dirlink" in out
+    assert "dirlink/" not in out  # 不带 / 后缀：按非目录展示
+
+
+def test_edit_file_many_matches_returns_message(workspace):
+    """≥5 处匹配不得崩 TypeError：返回中文多匹配报错。"""
+    files.write_file("m.txt", "x\n" * 10)
+    out = files.edit_file("m.txt", "x", "y")
+    assert "匹配了 10 处" in out
+
+
+def test_preview_write_env_variant_hidden(workspace):
+    """.env.local 等变体同样含密钥，不生成预览。"""
+    (workspace / ".env.local").write_text("SECRET=1\n", encoding="utf-8")
+    assert files._preview_write({"path": ".env.local", "content": "SECRET=2\n"}) is None
 
 
 # ---------- 技能目录只读白名单 ----------

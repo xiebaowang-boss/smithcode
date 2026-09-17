@@ -80,12 +80,14 @@ class RunResult:
 
     partial 表示截停于流中（部分正文已入库）；宿主层（REPL / TUI）按
     status 决定提示文案与渲染，agent 层不再产出面向用户的哨兵字符串。
+    `stream_error` 是响应流中途断开（读完超时 / 对端掐断连接）：部分正文
+    已入库，`text` 即那部分内容，宿主应提示"输出中断"而非当作正常结束。
     tools_used 为本次任务实际执行过的工具名（按调用顺序去重保序），供
     /goal 的续跑裁决使用：续跑轮没有任何工具调用视为空转、有推进动作
     则重置阻碍连击。
     """
 
-    status: str  # "ok" | "interrupted" | "denied" | "max_iterations"
+    status: str  # "ok" | "interrupted" | "denied" | "max_iterations" | "stream_error"
     text: str = ""
     partial: bool = False
     tools_used: tuple = ()

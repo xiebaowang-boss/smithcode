@@ -221,7 +221,12 @@ class SmithTUI(App):
         padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
     }
     ToolCall { height: auto; }
-    ToolCall .tool-header { color: #808080; }
+    /* 摘要超列宽时按宽度省略，不折成第二行——工具行恒占一行（Agent 侧已保证无换行） */
+    ToolCall .tool-header {
+        color: #808080;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
     ToolCall .tool-header.tool-error { color: #f7768e; }
     ToolCall .tool-body { color: #808080; margin-left: 2; }
     ToolCall .tool-body.tool-error { color: #f7768e; }
@@ -481,11 +486,16 @@ class SmithTUI(App):
             menu.show_candidates(commands.complete_commands(text[1:]))
 
     def action_cycle_permission_mode(self) -> None:
-        """Shift+Tab 循环权限模式并刷新底栏。权限/提问面板弹出期间不响应（瞬时态）。"""
+        """Shift+Tab 循环权限模式，只刷新底栏模式段。权限/提问面板弹出期间不响应（瞬时态）。
+
+        模式只展示在底栏 `#composer-mode`，此处不调全量 `ui_status()`——后者会
+        无条件重写侧边栏标题等控件（`Static.update` 恒触发重排），空闲时按一次
+        就让整栏闪一下，看起来像标题"跟着变化"。"""
         if self.query(PermissionPanel) or self.query(QuestionPanel):
             return
         self.agent.permission.cycle_mode()
-        self.ui_status()
+        mode, _, _ = self._composer_status()
+        self.query_one("#composer-mode").update(mode)
 
     def action_interrupt(self) -> None:
         """Esc：任务运行中请求中断；空闲且无弹层时清空输入框（Claude Code 式）。
@@ -623,6 +633,7 @@ class SmithTUI(App):
         选中值时逐级返回上一级（带锚点恢复光标），栈空（根级）则关闭。
         ModalScreen 的半透明背景让底层界面轻微变暗；选中后重新分发
         `/<command> <value>`，若结果仍是选择意图则继续下钻。
+        readonly 意图仅展示：面板禁用 Enter 确认，只留 ↑↓ 查看与 Esc 关闭。
         """
         self._select_stack.clear()
         self._present_select(select)
@@ -650,6 +661,7 @@ class SmithTUI(App):
             select.title, items, lambda value: self.screen.dismiss(value),
             size=select.size,  # 宽度档位由命令声明，宿主不测量内容
             initial=anchor,
+            readonly=select.readonly,  # 只读展示：禁用 Enter 确认
         )
         self.push_screen(
             SelectionScreen(panel),
@@ -943,11 +955,13 @@ class SmithTUI(App):
         """轮次结束：在会话末尾追加 opencode 式元数据页脚「▣ 模型 · 思考强度 · 用时」。
 
         中断收尾（status == "interrupted"）时在页脚行尾补「· 已停止」，替代此前
-        对话区单独一行的中断提示。"""
+        对话区单独一行的中断提示；响应流断开（status == "stream_error"）补
+        「· 输出中断」——正文是残缺的，页脚要能一眼看出来。"""
         if self._turn_start is None:
             return
         elapsed = time.monotonic() - self._turn_start
         self._turn_start = None
+        suffix = {"interrupted": "已停止", "stream_error": "输出中断"}.get(status)
         found = self.query(ChatView)
         if found:
             # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）
@@ -956,7 +970,7 @@ class SmithTUI(App):
                 config.MODEL,
                 config.REASONING_EFFORT or config.DEFAULT_EFFORT,
                 format_duration(elapsed),
-                "已停止" if status == "interrupted" else None,
+                suffix,
             ))
 
     def handle_command(self, text: str) -> None:

@@ -18,6 +18,26 @@ TITLE_PROMPT = (
 # 送入标题模型前每部分的截断长度（标题只需要开头信息）
 MAX_PART_CHARS = 800
 
+# 内部记账消息的前缀：它们占 user role，但不是用户的原话——中断回写
+# （agent.INTERRUPTED_CONTEXT）、流中断回写（agent.STREAM_INTERRUPTED_CONTEXT）、
+# 压缩提示（skills.render.compacted_notice）、技能回找引导
+# （skills.render.recall_notice）、迭代上限收尾（agent.MAX_ITERATIONS_WRAPUP）。
+# 标题 payload 必须跳过它们，否则中断残留会污染标题、把首轮和后面的轮次搅在一起。
+# 注意：文案与来源常量同处两地，改任一处必须同步另一处
+# （tests/test_sessions_title.py 有一致性守卫用例）。
+_INTERNAL_PREFIXES = (
+    "（用户手动中断了上一个任务",
+    "（上一条回复在生成过程中因网络错误中断",
+    "（上下文已压缩",
+    "（技能「",
+    "已达到本次任务的迭代上限",
+)
+
+
+def _is_internal_note(text: str) -> bool:
+    """是否为会话内部的记账消息（见 _INTERNAL_PREFIXES）。"""
+    return text.startswith(_INTERNAL_PREFIXES)
+
 
 def _text_of(content) -> str:
     if isinstance(content, str):
@@ -32,14 +52,23 @@ def _text_of(content) -> str:
 
 
 def build_title_request(messages, max_chars: int = 60) -> list:
-    """构造一次不带工具的标题补全请求：首轮 user + 助手正文截断。"""
+    """构造一次不带工具的标题补全请求：首轮 user + 助手正文截断。
+
+    只取首个「真实用户轮」：内部记账消息（中断回写 / 压缩提示 / 技能回找
+    引导 / 迭代上限收尾）占 user role 但不是用户原话，必须先跳过——否则
+    轮次边界就不是首轮的结束，而是记账消息的位置，标题会被中断残留污染、
+    或把第二轮及之后的内容也算进来。
+    """
     parts = []
     for message in messages:
         role = message.get("role")
         if role == "user":
             text = _text_of(message.get("content")).strip()
-            if text:
-                parts.append(f"用户: {text[:MAX_PART_CHARS]}")
+            if not text or _is_internal_note(text):
+                continue
+            if parts:
+                break  # 第二个真实用户轮：首轮到此结束
+            parts.append(f"用户: {text[:MAX_PART_CHARS]}")
         elif role == "assistant" and parts:
             text = _text_of(message.get("content")).strip()
             if text:
