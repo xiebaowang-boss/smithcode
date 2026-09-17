@@ -369,6 +369,16 @@ class Relay(Renderer):
         self._notify("on_turn_finished", status)
         self._inner.turn_finished(status)
 
+    def retry_started(self, state, owner: object | None = None) -> None:
+        """重试开始：纯透传给内层（终端标题不关心重试进度）与订阅者。"""
+        self._notify("on_retry_started", state, owner)
+        self._inner.retry_started(state, owner)
+
+    def retry_finished(self, owner: object | None = None) -> None:
+        """重试结束：纯透传（与 retry_started 成对、owner 相同）。"""
+        self._notify("on_retry_finished", owner)
+        self._inner.retry_finished(owner)
+
     # ----- 等待用户输入（总线：呈现器与内层后端都收） -----
 
     def turn_waiting_started(self) -> None:

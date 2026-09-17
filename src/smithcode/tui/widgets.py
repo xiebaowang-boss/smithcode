@@ -96,6 +96,11 @@ class MessageBody(Static):
         """最近一次渲染出的文本（只读；动态渲染块不适用 Static.content）。"""
         return self._rendered
 
+    @property
+    def raw(self) -> str:
+        """本块累积的 markdown 源文本（未渲染）。"""
+        return self._raw
+
     def append(self, chunk: str) -> None:
         """追加源文本（流式）；节流重排，密集 chunk 每帧最多重排一次。"""
         self._raw += chunk
@@ -427,6 +432,19 @@ class ChatView(VerticalScroll):
         self._block = None
         self._body = None
 
+    def mark_stream_interrupted(self, note: str = "（已中断，正在重试…）") -> None:
+        """标记"这一次尝试的正文到此为止"：定型当前块并在尾部追加灰色说明。
+
+        请求重试时调用——第一段尝试的正文已经上屏、无法撤回，与其让它和重试后
+        的完整正文长得一模一样的并排出现，不如明确标出它是残缺的。随后重试产出的
+        新正文会另起一块（`_kind` 已归零），历史里两段仍按顺序保留。
+        """
+        if self._kind != "content" or self._body is None:
+            return
+        if note not in self._body.raw:
+            self._body.append(f" {note}")
+        self.end_stream()
+
     def _mk(self, renderable, classes: str | None = None) -> Static:
         # 所有顶层消息统一带 chat-item：缩进 / 间距的唯一来源（见 app.py 的 CSS）
         block = Static(renderable, classes="chat-item" if not classes else f"chat-item {classes}")
@@ -496,6 +514,8 @@ class RunningIndicator(Static):
         self._frame = 0
         self._start: float | None = None
         self._stopping = False  # Esc 中断请求后置位：行尾追加「· 正在停止…」
+        self._retry = None  # 失败重试进行中的 RetryState（见 set_retry）
+        self._retry_owner = None  # 该重试态的归属者（前台任务 / 后台标题各自清理）
 
     def on_mount(self) -> None:
         self.set_interval(0.1, self._spin)
@@ -504,6 +524,7 @@ class RunningIndicator(Static):
         self._start = time.monotonic()
         self._frame = 0
         self._stopping = False
+        self._retry = None
         # 立即上屏初始文案并触发一次布局（默认重排）：组件初始无内容、width:auto
         # 下宽度为 0，而 _spin 的 layout=False 不再重排——若不在首次 start 定宽，
         # 第一次显示会因零宽整轮不可见（第二次起 display 翻转强制重排才恢复）
@@ -523,6 +544,31 @@ class RunningIndicator(Static):
         if self._start is not None:
             self.update(self._spin_text(time.monotonic() - self._start))
 
+    def set_retry(self, state, owner=None) -> None:
+        """进入重试态：行尾追加「· 正在重试 2/3 · 8s 后」（倒计时由转轮刷新）。
+
+        与 mark_stopping 同款处理：文案变宽需要一次 layout=True 的 update，
+        之后由 10Hz 的 `_spin` 带倒计时原地刷新。
+        owner 用于区分发起方：只有清自己那条时才撤下重试后缀，后台标题的
+        重试结束不会误清前台任务的进度显示。"""
+        self._retry = state
+        self._retry_owner = owner
+        if self._start is not None:
+            self.update(self._spin_text(time.monotonic() - self._start))
+
+    def clear_retry(self, owner=None) -> None:
+        """退出重试态（重试成功或放弃）：恢复普通 Working… 文案。
+
+        owner 与当前记录不符时忽略——另一个请求的重试可能正在进行。"""
+        if self._retry is None:
+            return
+        if owner is not None and self._retry_owner is not None and owner is not self._retry_owner:
+            return
+        self._retry = None
+        self._retry_owner = None
+        if self._start is not None:
+            self.update(self._spin_text(time.monotonic() - self._start))
+
     def _spin(self) -> None:
         if self._start is None:
             return  # 未运行：保持静止（display 已由调用方控制）
@@ -533,7 +579,11 @@ class RunningIndicator(Static):
         # 左对齐定宽（覆盖到 99h 的最大形态）：秒→分→秒 逐级变长不改变组件宽度，
         # 配合 layout=False 全程免布局重排（避免输入框竖线抖动）
         text = f"{self.FRAMES[self._frame]} Working… {format_duration(elapsed):<11}"
-        return text + " · 正在停止…" if self._stopping else text
+        if self._stopping:
+            return text + " · 正在停止…"
+        if self._retry is not None:
+            return text + " · " + self._retry.text()
+        return text
 
 
 def _tick_spinner(widget: Static, text: str, *, column: int = 0) -> None:

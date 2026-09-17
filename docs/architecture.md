@@ -46,7 +46,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 2. **LLM 流截停**：`llm.py` 打开流后把 `stream.close` 登记为令牌监听——取消线程**直接关流**，即使正阻塞在等下一块数据（模型静默期 / 网络慢）也立即解除；流消费每块数据前再查一次令牌。取消后不再产出 message/usage，关流引发的读错误按取消吞掉；已收到的正文由 Agent 拼成**部分消息**保留入库（残缺的工具调用不回传）。打开流之前也先查令牌——中断后**不再发起任何新请求**（含压缩摘要、溢出恢复重试）。
 3. **工具批截停**：`_BatchScheduler` 在**每个待预检项**与每个串行屏障前查令牌——预检阶段（含权限确认）中断时剩余确认框不再弹出、当前项即使刚答 y/n 也不执行、已预检未执行的（缓冲区波次）同样跳过（中断 = 不再发起任何新工作，且优先于拒绝语义）；未执行的计划与剩余 `tool_calls` 补占位结果（与权限被拒共用同一会话修复路径，`tool_call_id` 永不悬空），**非 shell** 的正在执行工具让其自然跑完（线程不可强杀）并照常收集结果。
 4. **运行中命令强杀**：正在执行的 shell 命令是例外——`run_command`（serial，跑在 run 线程）经 `process.py` 执行命令，`process.run` 自读当前线程令牌并在轮询中判定取消，触发即**终止整个进程树**（Windows `taskkill /F /T`、POSIX 先 SIGTERM 宽限后 SIGKILL），无需等命令自然结束或撞超时；超时路径共用同一终止逻辑。并行 worker 读不到令牌时安全降级为不响应取消。
-5. **收尾**：`run()` 返回结构化 `RunResult`（`ok / interrupted / denied / max_iterations / stream_error`，`partial` 标记流中截停），令牌在 finally 中复位，下一任务不受残留状态影响；会话历史始终合法，可直接继续追问。中断时 `run()` 还会把事件作为一条 user 注释（`INTERRUPTED_CONTEXT`：任务未完成、部分输出可能不完整）追加进会话历史——**不触发任何新请求**，只是让模型在下一轮提问时知道上一轮是被主动叫停的，避免把部分输出当成完整结果。响应流**非取消**地断在正文中间（读完超时 `ReadTimeout` / 对端掐断连接 `RemoteProtocolError`）走另一条收尾路径：`_chat()` 的 `try/finally` 保证 `r.stream_done()` 一定执行（TUI 的正文块必须收口，否则下一轮的增量会被追加进上一轮那个还没闭合的块），流中异常包成 `StreamInterrupted(original, partial)` 上抛；`run()` 捕获后把已上屏的部分正文按 assistant 消息入库并追加 `STREAM_INTERRUPTED_CONTEXT`，返回 `stream_error`（`text` 为部分正文）——屏幕上看到的与历史里的一致，下一轮模型接着写而不是从头重做。
+5. **收尾**：`run()` 返回结构化 `RunResult`（`ok / interrupted / denied / max_iterations / stream_error`，`partial` 标记流中截停），令牌在 finally 中复位，下一任务不受残留状态影响；会话历史始终合法，可直接继续追问。中断时 `run()` 还会把事件作为一条 user 注释（`INTERRUPTED_CONTEXT`：任务未完成、部分输出可能不完整）追加进会话历史——**不触发任何新请求**，只是让模型在下一轮提问时知道上一轮是被主动叫停的，避免把部分输出当成完整结果。响应流**非取消**地断在正文中间（读完超时 `ReadTimeout` / 对端掐断连接 `RemoteProtocolError`）先由客户端按 `llm/retry.py` 的策略重试整请求：正文已输出也照常重试，每次尝试的正文都实时上屏、并按到达顺序累积进同一条 assistant 消息（对齐 opencode 的 text part 累积），因此历史里既有中断的那段、也有补完的那段。重试预算用尽才走收尾路径：`_chat()` 的 `try/finally` 保证 `r.stream_done()` 一定执行（TUI 的正文块必须收口，否则下一轮的增量会被追加进上一轮那个还没闭合的块），流中异常包成 `StreamInterrupted(original, partial)` 上抛；`run()` 捕获后把已上屏的部分正文按 assistant 消息入库并追加 `STREAM_INTERRUPTED_CONTEXT`，返回 `stream_error`（`text` 为部分正文）——屏幕上看到的与历史里的一致，下一轮模型接着写而不是从头重做。
 
 模型输出以流式方式逐字显示；思考内容（如 DeepSeek-R1 类模型的 `reasoning_content`）以暗色实时展示，但不写入会话——多数 OpenAI 兼容服务不接受它被回传。
 
@@ -220,7 +220,7 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
 | `textfile.py` | 文本文件读写的唯一出口：换行风格（LF / CRLF / CR）与 UTF-8 BOM 的探测、LF 归一化与写回还原、`TextFileError` 友好错误。文件工具（read_file / write_file / edit_file / apply_patch / grep）全部经此读写，保证**编辑不改动文件既有的换行风格与 BOM**（见「安全边界」的换行保真条目） |
-| `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自动重试、自定义请求头注入、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
+| `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自定义请求头注入、`/models` 拉取）、`retry.py` 重试策略与状态机（分类 / 预算 / 退避 / 状态文案的唯一权威，见「请求保护与重试」）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根：消息历史（`MessageLog` 追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
 | `sessions/` | 会话持久化子系统：JSONL 转录（`paths` / `format` / `store`）、崩溃修复、项目级列表 / 查找 / 删除 / 导入 / 保留期清理、标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
@@ -285,7 +285,7 @@ webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
 - **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
 - **超时保护**：shell 命令默认 60 秒超时；超时或被中断时终止整个进程树（`process.py`）。
-- **请求保护**：LLM 请求默认 120 秒超时；限流、断网、服务端 5xx 以及流中途的传输层错误（对端掐断连接 `RemoteProtocolError`、读流超时等）按指数退避自动重试（默认 3 次），每次重试前把错误打印到终端；已输出正文的流不重试以免重复打印（思考内容仅展示、不入库，可安全重算）。
+- **请求保护与重试**：LLM 请求默认 120 秒超时。重试策略收敛在 `llm/retry.py`（分类 / 预算 / 退避 / 状态文案的唯一权威）：限流、断网、服务端 5xx 与流中途的传输层错误（对端掐断连接 `RemoteProtocolError`、读流超时等）按指数退避重试，2s 起步 ×2、25% 抖动、本地退避上限 30s，服务端 `Retry-After` 优先且只受宽上限（300s）约束——限流窗口常有 60s 量级，砍到 30s 提前重试只会再撞一次；默认 3 次（`[limits].max_retries`）。可重试判定顺序：取消 → 否；5xx → 是；已知永久错误（参数 / 鉴权 / 无权限 / 404）→ 否；已知传输层类型 → 是；最后按**错误文本**兜底（对齐 opencode 的 `RETRYABLE_MESSAGE_PATTERNS`：服务商把瞬时故障包成普通异常时只能看文案，且放在永久错误之后，4xx 响应体里含 `timeout` 不会被误判）。上下文溢出单独排除，由压缩恢复处理。**正文已输出过也照常重试**——整轮报废的代价大于重复显示，上游（opencode / Codex / Claude Code）同为整请求重发；重复的正文由 Agent 侧按「每次尝试的正文都记进同一条 assistant 消息」处理（对齐 opencode 的 text part 累积，见「Agentic Loop」第 5 步）。重试进行态（尝试序号 / 原因 / 恢复时刻）经 `Renderer.retry_started` 上报：TUI 显示在输入框上方的运行动画行（`Working… · 正在重试 2/3 · 8s 后`，倒计时由组件自刷），其他后端降级为一行提示；`retry_finished` 与之一一配对并带 owner，前台任务与后台标题的重试互不误清。退避等待可被取消打断（分段 sleep 查令牌），Esc 不必等满退避时长。
 - **输出截断**：单次工具返回超过 `MAX_TOOL_OUTPUT`（默认 2 万字符）时保留头尾、省略中间，防止超长输出撑爆上下文窗口。
 - **迭代上限**：默认不限（`[limits].max_iterations = -1`）——只要模型持续请求工具就继续，直到模型给出纯文本回复或用户中断。配置为正整数时封顶；达到上限不再硬中止，而是强制最后一轮纯文本总结收尾（见「Agentic Loop」第 6 步）。
 

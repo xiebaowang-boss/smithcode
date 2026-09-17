@@ -861,11 +861,19 @@ class Agent:
         `use_tools=False` 时不暴露任何工具（迭代上限收尾轮强制纯文本）。
         返回 (消息, 用量, 是否被中断)。用量由 llm 层从流中提取，服务商
         不提供时为 None。渲染交给 renderer（CLI 逐字打印 / TUI 进组件）。
-        任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼
-        成部分 assistant 消息返回并标记 interrupted——残缺的工具调用不
-        回传（无法解析），完整正文得以保留。
-        流中途异常（读完超时 / 对端掐断连接）时正文已经实时上屏，故异常也
-        要携带已收到的部分上抛（`StreamInterrupted`），由恢复层写进会话历史；
+
+        **正文按尝试累积**（对齐 opencode 在一条 assistant 消息里累积多个 text
+        part）：llm 层每次尝试的正文都实时上屏，这里把它们按到达顺序拼进同一条
+        消息——重试成功后，历史里是「第一次中断的那段 + 重试补完的那段」，与
+        用户屏幕上看到的内容逐一对应，不会出现"屏幕上有、历史里没有"。
+        内容一律以累积的 `parts` 为准重建，不用 llm 层最后那条 message 的正文，
+        避免两条链路对"正文是什么"出现两套说法。
+
+        任务被取消时流在下一块数据前截停（llm 层负责），已收到的正文拼成部分
+        assistant 消息返回并标记 interrupted——残缺的工具调用不回传（无法解析），
+        完整正文得以保留。
+        重试预算用尽（读完超时 / 对端掐断连接）时正文同样已实时上屏，故异常也
+        要携带已收到的部分上抛（`StreamInterrupted`），由恢复层写进会话历史。
         `r.stream_done()` 放 finally——否则 TUI 的正文块永不收口，下一轮的
         增量会直接追加进上一轮那个还没闭合的块里（两轮内容黏成一团）。
         思考内容（reasoning_content，仅部分模型返回）以灰色实时展示，
@@ -902,6 +910,8 @@ class Agent:
         if token is not None and token.cancelled and not msg:
             msg = {"role": "assistant", "content": "".join(parts)}
             return msg, usage, True
+        if msg and parts:
+            msg = {**msg, "content": "".join(parts)}  # 多尝试累积的正文以 parts 为准
         return msg, usage, False
 
     def _preflight_safe(self, tc: dict) -> tuple[_ToolPlan, bool]:

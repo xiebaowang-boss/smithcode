@@ -546,6 +546,26 @@ class SmithTUI(App):
         """后台自动标题生成完成（Renderer.title_changed）：刷新底栏标题。"""
         self.ui_status()
 
+    def ui_retry_start(self, state, owner=None) -> None:
+        """模型请求失败即将重试（Renderer.retry_started）：进度落在输入框上方那一行。
+
+        同时把已经上屏的这一段正文标记为「已中断」——重试会把完整正文重写一遍，
+        不标的话屏幕上会出现两段几乎相同的内容（上游同样会重放，但至少这里说清楚
+        哪段是残缺的）。组件已卸载（应用退出）时忽略。
+        """
+        found = self.query("#running")
+        if found:
+            found.first().set_retry(state, owner)
+        chat = self.query(ChatView)
+        if chat:
+            chat.first().mark_stream_interrupted()
+
+    def ui_retry_end(self, owner=None) -> None:
+        """重试过程结束（成功或放弃）：清掉运行动画行的重试后缀。"""
+        found = self.query("#running")
+        if found:
+            found.first().clear_retry(owner)
+
     def ui_block(self, text: str, style: str | None = None) -> None:
         """多行文本块；解析内嵌 ANSI 转义（如计划清单的颜色码），避免转义符作为
         字面字符进入渲染流（真实终端会打花整个界面）。"""

@@ -90,6 +90,18 @@ class TuiRenderer(renderer.Renderer):
         """会话标题变化（/rename 或后台自动标题）：通知主线程刷新底栏。"""
         self._post("title", title)
 
+    def retry_started(self, state, owner=None) -> None:
+        """模型请求失败即将重试：宿主在运行动画行显示「正在重试 N/M · Xs 后」。
+
+        不落对话区（对齐 opencode：重试进度属于状态行，不是对话内容）；已上屏的
+        那一段正文由宿主标记为中断，避免与重试后的正文看起来一模一样。
+        owner 随事件带上，宿主据此只清自己那条重试态（后台标题可能同时在重试）。"""
+        self._post("retry_start", state, owner)
+
+    def retry_finished(self, owner=None) -> None:
+        """重试过程结束（成功或放弃）：清除运行动画行的重试态。"""
+        self._post("retry_end", owner)
+
     def ask_form(self, questions: list[dict]) -> list[str]:
         """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
         result, evt = {}, threading.Event()

@@ -1,37 +1,16 @@
-"""LLM 客户端封装：OpenAI 兼容接口，统一走流式，自带瞬时错误重试。"""
+"""LLM 客户端封装：OpenAI 兼容接口，统一走流式，重试策略见 `llm/retry.py`。"""
 from __future__ import annotations
 
-import random
 import time
 from contextlib import closing
 
-import httpx2
-from openai import (
-    APIConnectionError,
-    APITimeoutError,
-    BadRequestError,
-    InternalServerError,
-    OpenAI,
-    RateLimitError,
-)
+from openai import BadRequestError, OpenAI
 
 from .. import config, renderer
 from ..cancel import current_token
 from ..utils.proxy import normalize_proxy_env
-
-# 限流 / 断网 / 超时 / 服务端 5xx 属于瞬时错误，重试有意义；
-# 4xx（鉴权失败、参数错误等）重试也不会成功，直接抛出。
-# 流中途的传输层错误（对端掐断连接、读流超时等）由 OpenAI SDK 原样透传
-# （不再包装成 APIConnectionError），需单独纳入重试。
-RETRYABLE_ERRORS = (
-    RateLimitError,
-    APIConnectionError,
-    APITimeoutError,
-    InternalServerError,
-    httpx2.RemoteProtocolError,  # 对端中途断连（incomplete chunked read 等）
-    httpx2.ReadError,  # 读取流时连接被重置
-    httpx2.ReadTimeout,  # 模型长时间静默超过 llm_timeout
-)
+from . import retry as retry_mod
+from .retry import RetryPolicy, RetryState, classify
 
 
 class LLMClient:
@@ -74,11 +53,12 @@ class LLMClient:
                 names.append(name)
         return names or None
 
-    def chat_stream(self, messages, tools=None, model: str | None = None):
+    def chat_stream(self, messages, tools=None, model: str | None = None,
+                    policy: RetryPolicy | None = None):
         """发起流式对话请求，逐段 yield 模型输出。
 
         model 非空时覆盖当前会话模型（会话标题等后台小请求用），默认
-        使用 `config.MODEL`。
+        使用 `config.MODEL`。policy 非空时覆盖重试策略（默认按 `config.MAX_RETRIES`）。
 
         yield 的元素为 (kind, payload)：
           ("reasoning", 文本)  — 模型思考内容（如有），仅供展示
@@ -86,9 +66,12 @@ class LLMClient:
           ("message", dict)    — 流结束时组装好的完整 assistant 消息
           ("usage", dict)      — 流中携带的 token 用量（服务商支持才发）
 
-        瞬时错误按指数退避自动重试，每次重试前把错误打印出来；失败前已
-        输出过正文则不重试，避免把已打印的正文重放一遍（思考内容只展示、
-        不写入会话，流中断后可安全重算；工具调用在流结束前也不落历史）。
+        瞬时错误按 `llm.retry` 的策略自动重试（次数、退避、可重试判定都在那里），
+        每次退避前上报 `retry_started` 供宿主显示进度。**正文已输出过也照常重试**：
+        重放会重复打印已上屏的正文，但整轮报废的代价更大——上游（opencode /
+        Codex / Claude Code）都是整请求重发，重复部分由上层按自己的消息模型
+        处理（Agent 会把每次尝试的正文都记进同一条 assistant 消息）。思考内容
+        只展示、不写入会话，流中断后可安全重算；工具调用在流结束前也不落历史。
         任务被取消时（取消令牌已触发）流在下一块数据到达前截停并关闭
         HTTP 连接，不再产出 message/usage，由 agent 侧拼装部分消息。
         """
@@ -108,23 +91,41 @@ class LLMClient:
         if headers:
             kwargs["extra_headers"] = headers  # 自定义请求头，_open_stream 重连时随 kwargs 沿用
 
-        for attempt in range(config.MAX_RETRIES + 1):
-            printed = False  # 已向终端输出正文：重试会重放，不再重试
-            try:
-                for event in self._stream_once(kwargs):
-                    if event[0] == "content":
-                        printed = True
-                    yield event
-                return
-            except RETRYABLE_ERRORS as e:
-                if attempt == config.MAX_RETRIES or printed:
-                    raise
-                wait = 2**attempt + random.random()
-                renderer.current().warn(
-                    f"[LLM] 请求失败（{type(e).__name__}: {e}），"
-                    f"{wait:.0f}s 后重试（{attempt + 1}/{config.MAX_RETRIES}）..."
-                )
-                time.sleep(wait)
+        view = renderer.current()
+        owner = self  # 重试态的归属者：前台任务与后台标题各自清理，互不误清
+        policy = policy or RetryPolicy(max_attempts=config.MAX_RETRIES + 1)
+        tail: dict = {}  # 最后一次尝试的 message / usage（循环正常结束才有效）
+
+        try:
+            for attempt_no in range(1, policy.max_attempts + 1):
+                try:
+                    # 增量边收边放：每次尝试都实时上屏（重试会把上一次的正文
+                    # 再写一遍——上游同款行为，重复部分由 Agent 的消息模型处理）
+                    for kind, payload in self._stream_once(kwargs):
+                        if kind in ("content", "reasoning"):
+                            yield kind, payload
+                        else:
+                            tail[kind] = payload  # 只认最后一次成功尝试的 message/usage
+                    break
+                except BaseException as e:  # 交策略判定是否值得重试
+                    if not policy.should_retry(e, attempt_no):
+                        raise
+                    delay = policy.delay(attempt_no, e)
+                    state = RetryState(
+                        attempt=attempt_no + 1,
+                        total=policy.max_attempts,
+                        reason=classify(e),
+                        wait=delay,
+                        next_at=time.monotonic() + delay,
+                    )
+                    view.retry_started(state, owner)
+                    retry_mod.wait(state)  # 退避期间可被 Esc 打断
+        finally:
+            view.retry_finished(owner)  # 成功或放弃都清掉重试态
+        if "message" in tail:
+            yield "message", tail["message"]
+        if "usage" in tail:
+            yield "usage", tail["usage"]
 
     def _stream_once(self, kwargs):
         """消费一次流式响应：边 yield 增量边累积，最后 yield 完整消息与用量。

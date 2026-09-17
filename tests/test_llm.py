@@ -50,6 +50,24 @@ def test_list_models_skips_items_without_id():
 # ---------- 流中断线自动重试 ----------
 
 
+class _FakeView:
+    """只记录重试相关调用的渲染后端（其余事件忽略）。"""
+
+    def __init__(self):
+        self.retries = []
+        self.finished = 0
+        self.warns = []
+
+    def retry_started(self, state, owner=None):
+        self.retries.append(state)
+
+    def retry_finished(self, owner=None):
+        self.finished += 1
+
+    def warn(self, text):
+        self.warns.append(text)
+
+
 def _streaming_client(stream_once):
     """绕过 __init__ 的流式客户端：只替换 _stream_once，固定请求头为空。"""
     llm = object.__new__(LLMClient)
@@ -58,17 +76,14 @@ def _streaming_client(stream_once):
     return llm
 
 
-def _patch_retry(monkeypatch, warnings: list[str], retries: int = 2):
+def _patch_retry(monkeypatch, view: _FakeView, retries: int = 2):
     monkeypatch.setattr(client_mod.config, "MAX_RETRIES", retries)
-    monkeypatch.setattr(client_mod.time, "sleep", lambda _: None)  # 不真的退避等待
-    monkeypatch.setattr(
-        "smithcode.renderer.current",
-        lambda: SimpleNamespace(warn=warnings.append),
-    )
+    monkeypatch.setattr(client_mod.retry_mod, "wait", lambda state: None)  # 不真的退避
+    monkeypatch.setattr("smithcode.renderer.current", lambda: view)
 
 
 def test_chat_stream_retries_incomplete_stream(monkeypatch):
-    """思考中流被掐断：自动重试，重试前把错误打印出来。"""
+    """思考中流被掐断：自动重试，退避前上报重试状态（含尝试序号与原因）。"""
     calls = []
 
     def fake_stream(kwargs):
@@ -79,8 +94,8 @@ def test_chat_stream_retries_incomplete_stream(monkeypatch):
         yield ("content", "答案")
         yield ("message", {"role": "assistant", "content": "答案"})
 
-    warnings: list[str] = []
-    _patch_retry(monkeypatch, warnings)
+    view = _FakeView()
+    _patch_retry(monkeypatch, view)
 
     events = list(_streaming_client(fake_stream).chat_stream(
         [{"role": "user", "content": "问题"}]
@@ -88,33 +103,50 @@ def test_chat_stream_retries_incomplete_stream(monkeypatch):
 
     assert len(calls) == 2  # 首次失败 + 一次重试成功
     assert [kind for kind, _ in events] == ["reasoning", "content", "message"]
-    assert len(warnings) == 1
-    assert "RemoteProtocolError" in warnings[0] and "重试" in warnings[0]
+    assert len(view.retries) == 1
+    state = view.retries[0]
+    assert state.attempt == 2 and state.total == 3
+    assert state.reason == "连接中断"
+    assert "正在重试 2/3" in state.text()
+    assert view.finished == 1  # 过程结束一定收口
 
 
-def test_chat_stream_no_retry_after_content(monkeypatch):
-    """已输出正文后断流：不重试（重放会重复打印），错误照常抛出。"""
+def test_chat_stream_retries_after_content(monkeypatch):
+    """**已输出正文后断流同样重试**（对齐 opencode / Codex）。
+
+    旧行为是"已打印正文就放弃"，导致一次读完超时报废整轮；现改为整请求重发，
+    两次尝试的正文都会实时上屏（由 Agent 按尝试累积进同一条消息）。
+    """
     calls = []
 
     def fake_stream(kwargs):
         calls.append(1)
-        yield ("content", "半句")
-        raise httpx2.RemoteProtocolError(DROP)
+        if len(calls) == 1:
+            yield ("content", "半句总结：改了 ")
+            raise httpx2.ReadTimeout("The read operation timed out")
+        yield ("content", "半句总结：改了 commands/base.py，Enter 已屏蔽。")
+        yield ("message", {"role": "assistant",
+                           "content": "半句总结：改了 commands/base.py，Enter 已屏蔽。"})
 
-    warnings: list[str] = []
-    _patch_retry(monkeypatch, warnings, retries=3)
+    view = _FakeView()
+    _patch_retry(monkeypatch, view, retries=3)
 
-    with pytest.raises(httpx2.RemoteProtocolError):
-        list(_streaming_client(fake_stream).chat_stream(
-            [{"role": "user", "content": "问题"}]
-        ))
+    events = list(_streaming_client(fake_stream).chat_stream(
+        [{"role": "user", "content": "问题"}]
+    ))
 
-    assert len(calls) == 1
-    assert warnings == []
+    assert len(calls) == 2  # 关键在于：正文已上屏仍然重试了
+    contents = [payload for kind, payload in events if kind == "content"]
+    assert contents == ["半句总结：改了 ", "半句总结：改了 commands/base.py，Enter 已屏蔽。"]
+    # message / usage 只放行最后一次尝试的，失败的尝试不会污染会话
+    messages = [payload for kind, payload in events if kind == "message"]
+    assert messages == [{"role": "assistant",
+                         "content": "半句总结：改了 commands/base.py，Enter 已屏蔽。"}]
+    assert view.retries[0].reason == "读取超时"
 
 
 def test_chat_stream_raises_after_retries_exhausted(monkeypatch):
-    """重试次数用尽仍失败：抛原错误，每次重试前的错误提示都已打印。"""
+    """重试次数用尽仍失败：抛原错误，每次退避前都已上报重试状态。"""
     calls = []
 
     def fake_stream(kwargs):
@@ -122,8 +154,8 @@ def test_chat_stream_raises_after_retries_exhausted(monkeypatch):
         yield from ()  # 保持生成器语义
         raise httpx2.RemoteProtocolError(DROP)
 
-    warnings: list[str] = []
-    _patch_retry(monkeypatch, warnings)
+    view = _FakeView()
+    _patch_retry(monkeypatch, view)
 
     with pytest.raises(httpx2.RemoteProtocolError):
         list(_streaming_client(fake_stream).chat_stream(
@@ -131,4 +163,47 @@ def test_chat_stream_raises_after_retries_exhausted(monkeypatch):
         ))
 
     assert len(calls) == 3  # 初次 + 2 次重试
-    assert len(warnings) == 2
+    assert [s.attempt for s in view.retries] == [2, 3]
+    assert view.finished == 1
+
+
+def test_chat_stream_does_not_retry_non_transient(monkeypatch):
+    """不可重试的错误（如 400 参数错误）一次就抛，不浪费预算。"""
+    from openai import BadRequestError
+
+    calls = []
+
+    def fake_stream(kwargs):
+        calls.append(1)
+        yield from ()
+        response = httpx2.Response(400, request=httpx2.Request("POST", "http://x"))
+        raise BadRequestError("bad", response=response, body=None)
+
+    view = _FakeView()
+    _patch_retry(monkeypatch, view, retries=3)
+
+    with pytest.raises(BadRequestError):
+        list(_streaming_client(fake_stream).chat_stream(
+            [{"role": "user", "content": "问题"}]
+        ))
+
+    assert len(calls) == 1
+    assert view.retries == []
+    assert view.finished == 1  # 即便没有重试也要收口，避免状态行挂在"重试中"
+
+
+def test_chat_stream_retry_finished_on_success_without_retry(monkeypatch):
+    """一次成功也要发 retry_finished：消费方据此清除可能残留的重试态。"""
+    def fake_stream(kwargs):
+        yield ("message", {"role": "assistant", "content": "好"})
+
+    view = _FakeView()
+    _patch_retry(monkeypatch, view)
+
+    events = list(_streaming_client(fake_stream).chat_stream(
+        [{"role": "user", "content": "问题"}]
+    ))
+
+    assert [kind for kind, _ in events] == ["message"]
+    assert view.retries == []
+    assert view.finished == 1

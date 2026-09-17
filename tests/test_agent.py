@@ -723,10 +723,14 @@ def test_run_with_skill_returns_body_in_tool_result(monkeypatch, tmp_path):
         skills.clear()
 
 
-# ---------- 响应流中途断开：部分正文入库 + 不重做 ----------
+# ---------- 响应流中途断开：重试预算用尽后的收尾 ----------
+#
+# 这里的假 LLM 直接替换 `LLMClient`，因此**不含客户端内部的重试循环**——覆盖的是
+# "重试用尽之后 Agent 怎么收尾"。"重试成功后两段正文同入一条消息"由
+# `test_retry_accumulates_both_attempts_in_one_message` 用真实客户端验证。
 
 class MidStreamTimeoutLLM:
-    """先正常吐一段正文，再抛读完超时（真实链路的模型静默超时）。"""
+    """先正常吐一段正文，再抛读完超时（重试预算耗尽前的每次尝试都如此）。"""
 
     def __init__(self):
         self.calls = 0
@@ -739,7 +743,7 @@ class MidStreamTimeoutLLM:
 
 
 def test_stream_timeout_keeps_partial_in_history(monkeypatch):
-    """流中断：状态为 stream_error，已上屏的部分正文必须写进会话历史。
+    """重试用尽：状态为 stream_error，已上屏的部分正文必须写进会话历史。
 
     否则下一轮模型看不到自己说过什么，会从头重做、再复述一遍（原始故障现象）。
     """
@@ -814,3 +818,60 @@ def test_stream_timeout_does_not_record_partial_twice(monkeypatch):
     assert result.text == "部分总结"
     contents = [m.get("content") for m in agent.session.messages]
     assert contents.count("部分总结") == 1  # 只落一次
+
+
+class _RecordingView:
+    """只记录重试事件的最小渲染后端。"""
+
+    def __init__(self):
+        self.retries = []
+        self.finished = 0
+
+    def retry_started(self, state, owner=None):
+        self.retries.append(state)
+
+    def retry_finished(self, owner=None):
+        self.finished += 1
+
+    def __getattr__(self, name):  # 其余事件忽略
+        return lambda *a, **k: None
+
+
+def test_retry_accumulates_both_attempts_in_one_message(monkeypatch):
+    """重试成功后：两次尝试的正文按顺序都在同一条 assistant 消息里（对齐 opencode）。
+
+    真实客户端（含重试循环）跑这条链，只把 `_stream_once` 换成脚本化的流。
+    屏幕上两段内容都出现过，历史里就必须都有——否则下一轮模型看到的历史与用户
+    看到的屏幕不一致（原始故障的另一半）。
+    """
+    from smithcode.llm.client import LLMClient
+
+    calls = []
+
+    def stream_once(kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            yield ("content", "已修改完成，")
+            raise httpx2.ReadTimeout("The read operation timed out")
+        yield ("content", "总结如下：改了 commands/base.py。")
+        yield ("message", {"role": "assistant",
+                           "content": "总结如下：改了 commands/base.py。"})
+
+    client = object.__new__(LLMClient)  # 绕过 __init__：不校验 key、不建连接
+    client._custom_headers = {}
+    client._stream_once = stream_once
+    monkeypatch.setattr("smithcode.agent.LLMClient", lambda: client)
+    monkeypatch.setattr("smithcode.llm.retry.wait", lambda state: None)  # 不真等退避
+    view = _RecordingView()
+    monkeypatch.setattr("smithcode.renderer.current", lambda: view)
+
+    agent = Agent(session=Session())
+    result = agent.run("改成只读面板")
+
+    assert result.status == "ok"
+    assert result.text == "已修改完成，总结如下：改了 commands/base.py。"  # 两段拼接
+    assert len(calls) == 2
+    assert len(view.retries) == 1 and view.finished == 1
+    assistant = [m for m in agent.session.messages if m["role"] == "assistant"]
+    assert len(assistant) == 1  # 一条消息，不是两条
+    assert assistant[0]["content"] == "已修改完成，总结如下：改了 commands/base.py。"

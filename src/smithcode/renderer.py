@@ -106,6 +106,25 @@ class Renderer:
     def title_changed(self, title: str) -> None:
         """会话标题变化（后台自动标题 / /rename / 新会话清空）：宿主可刷新状态栏。默认忽略。"""
 
+    def retry_started(self, state, owner: object | None = None) -> None:
+        """模型请求失败、即将退避重试（`llm.retry.RetryState`）：宿主显示重试进度。
+
+        state 带 attempt / total / reason / wait / next_at，宿主自行决定呈现——
+        TUI 放进输入框上方的运行动画行（含实时倒计时），其他后端默认降级为
+        一行 warn，保证不会"静默重试"。
+
+        owner 标识这次重试过程的发起方：后台小请求（会话标题）与前台任务可能
+        同时重试，宿主据此只清除自己那条的状态，不被对方的结束事件误清。
+        """
+        self.warn(f"↻ {state.summary()}")
+
+    def retry_finished(self, owner: object | None = None) -> None:
+        """重试过程结束（成功或彻底失败）：宿主清除对应的重试态。默认忽略。
+
+        与 `retry_started` 必然成对且 owner 相同（`RetryRunner` / `chat_stream`
+        在 finally 里发），消费方不需要计数器兜底。
+        """
+
     def turn_started(self) -> None:
         """一轮任务开始（含工具执行）：宿主可据此标记忙碌态。默认忽略。"""
 

@@ -14,6 +14,7 @@ from textual.widgets import Static
 import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
+from smithcode.llm import RetryState
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
 from smithcode.tui.bridge import TuiRenderer
@@ -3730,5 +3731,95 @@ def test_tui_stream_block_closed_after_timeout(monkeypatch):
             assert len(blocks) == 2, f"两轮内容应各占一块，实际 {blocks!r}"
             assert "第二轮正文" not in blocks[0]
             assert "已修改完成" not in blocks[1]
+
+    _run(_run_case())
+
+
+# ---------- 重试进度：落在输入框上方那一行 ----------
+
+def test_running_indicator_shows_retry_progress(monkeypatch):
+    """重试态显示为 Working 行后缀，含尝试序号与实时倒计时（opencode 同款位置）。
+
+    owner 用于区分发起方：后台标题的重试结束不得清掉前台任务的进度。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            running = app.query_one(RunningIndicator)
+            running.display = True
+            running.start()
+
+            state = RetryState(attempt=2, total=3, reason="读取超时", wait=8.0,
+                               next_at=time.monotonic() + 8.0)
+            app.ui_retry_start(state, owner="task")
+            await pilot.pause()
+            text = str(running.render())
+            assert "Working" in text
+            assert "正在重试 2/3" in text
+            assert "s 后" in text
+
+            # 另一个发起方（后台标题）结束：不得清掉前台任务的重试态
+            app.ui_retry_end(owner="title")
+            await pilot.pause()
+            assert "正在重试 2/3" in str(running.render())
+
+            app.ui_retry_end(owner="task")
+            await pilot.pause()
+            assert "正在重试" not in str(running.render())
+
+    _run(_run_case())
+
+
+def test_retry_marks_interrupted_stream_block(monkeypatch):
+    """重试开始：已上屏的那段正文被标记「已中断」，重试产出另起一块。
+
+    两段都保留（对齐 opencode 的 text part 累积），但必须能看出哪段是残缺的；
+    同时历史（Agent 侧）与屏幕一致，见 test_agent 的累积用例。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            chat = app.query_one(ChatView)
+            chat.begin_stream("content")
+            chat.append_stream("content", "已修改完成，")
+            app.ui_retry_start(
+                RetryState(attempt=2, total=3, reason="读取超时", wait=2.0,
+                           next_at=time.monotonic() + 2.0),
+                owner="task",
+            )
+            await pilot.pause()
+            first = chat.query_one(".assistant-stream")
+            assert "已中断" in first.raw
+            assert chat._kind is None  # 已收口：重试的增量会另起新块
+
+            chat.append_stream("content", "总结如下：改了 commands/base.py。")
+            await pilot.pause()
+            blocks = [b.raw for b in chat.query(".assistant-stream")]
+            assert len(blocks) == 2
+            assert "已中断" in blocks[0] and "已中断" not in blocks[1]
+
+    _run(_run_case())
+
+
+def test_retry_end_from_other_owner_keeps_state(monkeypatch):
+    """settle 事件的 owner 语义：不是自己发起的重试就不动当前显示。"""
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            running = app.query_one(RunningIndicator)
+            running.display = True
+            running.start()
+            state = RetryState(attempt=2, total=3, reason="连接中断", wait=4.0,
+                               next_at=time.monotonic() + 4.0)
+            app.ui_retry_start(state, owner="A")
+            app.ui_retry_end(owner="B")
+            await pilot.pause()
+            assert "正在重试" in str(running.render())
 
     _run(_run_case())
