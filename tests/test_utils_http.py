@@ -168,7 +168,7 @@ def _tls_handshake_probe(cert: str, key: str, client_ctx: ssl.SSLContext):
 
 
 def test_ssl_context_sends_no_alpn(tmp_path):
-    """回归：屏蔽 ALPN 是 DDG 反爬的触发点修复，且对照证明了观测手段有效。"""
+    """回归：屏蔽 ALPN 是为消除反爬指纹（历史触发点是 DDG），且对照证明了观测手段有效。"""
     cert, key = _self_signed_cert(tmp_path)
 
     ours = http_util.ssl_context()

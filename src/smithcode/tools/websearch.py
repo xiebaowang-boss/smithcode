@@ -5,14 +5,14 @@
 `utils/http.py` 的客户端工厂（httpx2 + 环境代理，含 socks5），代理语义一致。
 
 **为什么要多后端**：不同网络下各引擎的可达性与结果质量差异极大——实测同一条
-查询，无代理时 DuckDuckGo 域名不可达，走代理时 Bing 会对约 10% 的查询返回完全
+查询，无代理时部分引擎域名不可达，走代理时 Bing 会对约 10% 的查询返回完全
 无关的结果、而 Brave 稳定。单一后端在换网络后就可能整体失效，故支持
-`auto`（按 tavily → brave → bing → ddg 依次尝试，命中即用）与固定后端，见
+`auto`（按 tavily → brave → bing 依次尝试，命中即用）与固定后端，见
 `config.load_search_backend()`。
 
 **Tavily** 是唯一需要 key 的后端（免费 1000 次/月），返回结构化 JSON 而非
 HTML，结果质量最高且不受反爬影响；未配 key 时在 auto 模式下直接跳过（不算
-失败）。其余三个是抓 HTML 页面，各后端结构不同、各自一个解析函数。
+失败）。其余两个是抓 HTML 页面，各后端结构不同、各自一个解析函数。
 """
 from __future__ import annotations
 
@@ -37,12 +37,11 @@ MAX_RESULTS = 10  # 单次最多返回条数
 MAX_SNIPPET_LEN = 300  # 单条摘要展示上限
 
 _TAG_RE = re.compile(r"<[^>]+>")
-_ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
 
 # auto 模式的尝试顺序：Tavily（结构化、质量最好，需 key）→ Brave（免 key 里质量
-# 最好，但有速率限制）→ Bing（可达性最广，但对部分查询有软降级）→ DuckDuckGo
-# （反爬最严）。未配 Tavily key 时该项自动跳过。
-_AUTO_ORDER = ("tavily", "brave", "bing", "ddg")
+# 最好，但有速率限制）→ Bing（可达性最广，但对部分查询有软降级）。未配 Tavily
+# key 时该项自动跳过。
+_AUTO_ORDER = ("tavily", "brave", "bing")
 
 
 def _clean(text: str) -> str:
@@ -53,21 +52,10 @@ def _clean(text: str) -> str:
 
 
 def _get(url: str) -> str:
-    """GET 抓取页面文本（各后端共用；POST 表单的 DDG 单独实现）。"""
+    """GET 抓取页面文本（各后端共用）。"""
     with http_client(timeout=SEARCH_TIMEOUT,
                      headers={"User-Agent": _USER_AGENT}) as client, \
             client.stream("GET", url) as resp:
-        resp.raise_for_status()
-        charset = resp.charset_encoding or "utf-8"
-        raw = read_limited(resp, MAX_FETCH_BYTES)
-    return raw.decode(charset, errors="replace")
-
-
-def _post(url: str, data: dict) -> str:
-    """POST 表单抓取页面文本（DuckDuckGo HTML 版）。"""
-    with http_client(timeout=SEARCH_TIMEOUT,
-                     headers={"User-Agent": _USER_AGENT}) as client, \
-            client.stream("POST", url, data=data) as resp:
         resp.raise_for_status()
         charset = resp.charset_encoding or "utf-8"
         raw = read_limited(resp, MAX_FETCH_BYTES)
@@ -238,65 +226,17 @@ def _fetch_bing(query: str) -> str:
     return _get(f"{_BING}?{urllib.parse.urlencode({'q': query})}")
 
 
-# ---------- DuckDuckGo（HTML 版）----------
-
-_DDG = "https://html.duckduckgo.com/html/"
-_DDG_ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.IGNORECASE | re.DOTALL)
-_DDG_CHALLENGE_MARKERS = ("bots use duckduckgo too", "anomaly-modal", "select all squares")
-
-
-def _ddg_real_url(href: str) -> str:
-    """还原 DuckDuckGo 跳转链接为真实地址；普通地址原样返回。"""
-    href = html.unescape(href or "").strip()
-    if href.startswith("//"):
-        href = "https:" + href
-    elif href.startswith("/"):
-        href = "https://duckduckgo.com" + href
-    parsed = urllib.parse.urlparse(href)
-    if parsed.path.startswith("/l/"):
-        uddg = urllib.parse.parse_qs(parsed.query).get("uddg")
-        if uddg:
-            return uddg[0]
-    return href
-
-
-def _parse_ddg(page: str, limit: int) -> list:
-    """按文档顺序遍历锚点：result__a 开一条结果，紧随其后的 result__snippet 补摘要。"""
-    results: list = []
-    seen: set = set()
-    for match in _DDG_ANCHOR_RE.finditer(page):
-        attrs = dict(_ATTR_RE.findall(match.group(1)))
-        classes = attrs.get("class", "")
-        if "result__a" in classes:
-            url = _ddg_real_url(attrs.get("href", ""))
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            results.append({"title": _clean(match.group(2)), "url": url, "snippet": ""})
-        elif "result__snippet" in classes and results and not results[-1]["snippet"]:
-            results[-1]["snippet"] = _clean(match.group(2))[:MAX_SNIPPET_LEN]
-        if len(results) >= limit:
-            break
-    return results
-
-
-def _fetch_ddg(query: str) -> str:
-    return _post(_DDG, {"q": query})
-
-
 # ---------- 后端注册表与统一入口 ----------
 
 _BACKENDS = {
     "brave": (_fetch_brave, _parse_brave),
     "bing": (_fetch_bing, _parse_bing),
-    "ddg": (_fetch_ddg, _parse_ddg),
 }
 
 _DISPLAY_NAMES = {
     "tavily": "Tavily",
     "brave": "Brave",
     "bing": "Bing",
-    "ddg": "DuckDuckGo",
 }
 
 
@@ -340,8 +280,6 @@ def _try_backend(name: str, query: str, limit: int) -> tuple[list, str | None]:
     low = page.lower()
     if name == "bing" and _BING_RESULTS_CONTAINER not in low:
         return [], "Bing 返回反爬验证页"
-    if name == "ddg" and any(m in low for m in _DDG_CHALLENGE_MARKERS):
-        return [], "DuckDuckGo 返回反爬验证页"
     return [], None  # 页面正常、只是没有结果
 
 

@@ -59,12 +59,9 @@ budget = {budget}  # 上下文预算（token），建议不超过模型窗口大
 # max_catalog_chars = 8000  # 技能目录注入系统提示词的字符预算
 
 [search]
-# websearch 检索后端：auto（默认，按 Tavily → Brave → Bing → DuckDuckGo 依次尝试）
-# 或固定其一：tavily / brave / bing / ddg
+# websearch 检索后端：auto（默认，按 Tavily → Brave → Bing 依次尝试）
+# 或固定其一：tavily / brave / bing
 # backend = "auto"
-# Tavily API key（可选，免费 1000 次/月）；也可存 credentials.json 的 search.tavily_key
-# 或设环境变量 SMITHCODE_TAVILY_KEY。建议放凭据文件，别写在这里
-# tavily_key = ""
 
 # 工具调用的终端展示粒度：summary（默认）/ detail
 # tool_display = "summary"
@@ -86,17 +83,6 @@ def _ask_secret(current: str) -> str:
     return raw.strip() or current
 
 
-def _ask_optional_secret(prompt: str, current: str) -> str:
-    """读可选的 key（如 Tavily）：不回显；已有配置回车保留，未配置回车跳过。"""
-    suffix = "(已配置，回车保留)" if current else "(未配置，回车跳过)"
-    try:
-        raw = getpass.getpass(f"{prompt} {suffix}: ")
-    except Exception:  # noqa: BLE001
-        raw = input(f"{prompt} {suffix}: ")
-    raw = raw.strip()
-    return raw or current
-
-
 def _ask_int(prompt: str, current: int) -> int:
     """读数值：支持 128k / 64K 这类后缀写法；非法输入警告后保留当前值。"""
     raw = input(f"{prompt} [{current}]: ").strip()
@@ -113,9 +99,9 @@ def _ask_int(prompt: str, current: int) -> int:
         return current
 
 
-def _write_credentials(path, key: str, tavily_key: str = ""):
-    """把 key 写入 credentials.json（空值不动对应字段）；已有其他字段原样保留。"""
-    if not key and not tavily_key:
+def _write_credentials(path, key: str):
+    """把 key 写入 credentials.json（空值不动）；已有其他字段原样保留。"""
+    if not key:
         return
     data = {}
     if path.is_file():
@@ -125,14 +111,7 @@ def _write_credentials(path, key: str, tavily_key: str = ""):
                 data = existing
         except (OSError, json.JSONDecodeError):
             data = {}
-    if key:
-        data["key"] = key
-    if tavily_key:
-        search = data.get("search")
-        if not isinstance(search, dict):
-            search = {}
-        search["tavily_key"] = tavily_key
-        data["search"] = search
+    data["key"] = key
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         path.chmod(0o600)  # 仅本机可读；Windows 上尽力而为
@@ -168,11 +147,6 @@ def run_setup() -> int:
         model = _ask("模型名", config.MODEL)
         key = _ask_secret(config.KEY)
         budget = _ask_int("上下文预算 token", config.CONTEXT_TOKEN_BUDGET)
-        # Tavily 是 websearch 的可选后端（免费 1000 次/月），不进 LLM 配置，仅存 key
-        tavily_key = _ask_optional_secret(
-            "Tavily 搜索 API Key（websearch 用，可选，回车跳过）",
-            config.load_tavily_key(),
-        )
     except (EOFError, KeyboardInterrupt):
         print("\n已取消，未做任何修改。")
         return 1
@@ -181,7 +155,7 @@ def run_setup() -> int:
         home.mkdir(parents=True, exist_ok=True)
         credentials = home / "credentials.json"
         config_file = home / "config.toml"
-        _write_credentials(credentials, key, tavily_key)
+        _write_credentials(credentials, key)
         _write_config(config_file, url=url, model=model, budget=budget)
     except OSError as e:
         print(f"\n[错误] 写入失败：{e}")

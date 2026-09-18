@@ -270,7 +270,7 @@ run_command = { "*" = "ask", "git *" = "allow", "rm -rf*" = "deny" }
 | `[skills] project` | `ask` | 项目级技能信任策略：`ask` / `on` / `off` |
 | `[skills] max_catalog_chars` | 8000 | 技能目录注入系统提示词的字符预算 |
 | `[skills] disabled` | 空 | 按通配符禁用技能 |
-| `[search] backend` | `auto` | websearch 检索后端：`auto`（按 Tavily → Brave → Bing → DuckDuckGo 依次尝试）/ `tavily` / `brave` / `bing` / `ddg` |
+| `[search] backend` | `auto` | websearch 检索后端：`auto`（按 Tavily → Brave → Bing 依次尝试）/ `tavily` / `brave` / `bing` |
 | `[search] tavily_key` | 空 | Tavily API key（仅 `tavily` 后端需要；建议存 credentials.json 的 `search.tavily_key` 或设 `SMITHCODE_TAVILY_KEY`） |
 | `tool_display` | `summary` | 工具调用终端展示粒度：`summary` 只显示短摘要，`detail` 追加结果内容 |
 

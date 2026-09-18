@@ -77,16 +77,6 @@ BING_PAGE = (
     "</ol></body></html>"
 )
 
-DDG_PAGE = (
-    "<html><body>"
-    '<a rel="nofollow" class="result__a" '
-    'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=x">Example <b>A</b></a>'
-    '<a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa">'
-    "First <b>snippet</b> text.</a>"
-    "</body></html>"
-)
-
-
 def _ck_a(url: str) -> str:
     """构造 Bing 的 /ck/a 跳转链接（u 参数为 a1 + url-safe base64）。"""
     token = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
@@ -144,16 +134,6 @@ def test_parse_bing_prefers_lineclamp_snippet():
         "</li></ol>"
     )
     assert ws._parse_bing(page, ws.MAX_RESULTS)[0]["snippet"] == "真正的摘要"
-
-
-# ---------- DuckDuckGo 解析 ----------
-
-
-def test_parse_ddg_restores_redirect_and_snippet():
-    results = ws._parse_ddg(DDG_PAGE, ws.MAX_RESULTS)
-    assert results[0]["title"] == "Example A"
-    assert results[0]["url"] == "https://example.com/a"
-    assert results[0]["snippet"] == "First snippet text."
 
 
 # ---------- Tavily（JSON API，需 key）----------
@@ -331,17 +311,6 @@ def test_websearch_bing_challenge_page_is_reported(monkeypatch):
     assert out.startswith("错误") and "反爬" in out
 
 
-def test_websearch_ddg_challenge_page_is_reported(monkeypatch):
-    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "ddg")
-    _patch_client(monkeypatch, lambda request: _page(
-        "<html><body><h1>Unfortunately, bots use DuckDuckGo too.</h1>"
-        '<div class="anomaly-modal">Select all squares containing a duck</div>'
-        "</body></html>"
-    ))
-    out = ws.websearch("python")
-    assert out.startswith("错误") and "反爬" in out
-
-
 def test_websearch_no_results_when_page_is_normal(monkeypatch):
     """页面正常但确实没有结果 → 「（无搜索结果）」，而非反爬报错。"""
     _patch_client(monkeypatch, lambda request: _page("<html><body>nothing</body></html>"))
@@ -365,22 +334,6 @@ def test_websearch_gets_with_query_and_user_agent(monkeypatch):
     assert seen["method"] == "GET"
     assert "q=%E4%B8%AD%E6%96%87" in seen["url"]
     assert seen["ua"] == ws._USER_AGENT
-
-
-def test_websearch_ddg_uses_post_form(monkeypatch):
-    """DuckDuckGo 后端走 POST 表单（其余后端是 GET 查询串）。"""
-    monkeypatch.setenv("SMITHCODE_SEARCH_BACKEND", "ddg")
-    seen = {}
-
-    def handler(request):
-        seen["method"] = request.method
-        seen["body"] = request.content.decode()
-        return _page(DDG_PAGE)
-
-    _patch_client(monkeypatch, handler)
-    ws.websearch("中文")
-    assert seen["method"] == "POST"
-    assert "q=%E4%B8%AD%E6%96%87" in seen["body"]
 
 
 def test_websearch_network_error(monkeypatch):
@@ -440,9 +393,9 @@ def test_load_search_backend_from_toml(monkeypatch, tmp_path):
     monkeypatch.delenv("SMITHCODE_SEARCH_BACKEND", raising=False)
     home = tmp_path / "home"
     home.mkdir()
-    (home / "config.toml").write_text("[search]\nbackend = \"ddg\"\n", encoding="utf-8")
+    (home / "config.toml").write_text("[search]\nbackend = \"brave\"\n", encoding="utf-8")
     monkeypatch.setenv("SMITHCODE_HOME", str(home))
-    assert config.load_search_backend() == "ddg"
+    assert config.load_search_backend() == "brave"
 
     (home / "config.toml").write_text("[search]\nbackend = \"nope\"\n", encoding="utf-8")
     assert config.load_search_backend() == "auto"
@@ -475,18 +428,13 @@ def test_load_tavily_key_priority(monkeypatch, tmp_path):
     assert config.load_tavily_key() == "from-env"
 
 
-def test_write_credentials_preserves_llm_key(tmp_path):
-    """setup 写 Tavily key 时不能冲掉已有的 LLM key（同一文件不同字段）。"""
+def test_write_credentials_preserves_extra_fields(tmp_path):
+    """setup 写 LLM key 时不能冲掉已有其他字段（同一文件不同字段）。"""
     from smithcode import wizard
 
     path = tmp_path / "credentials.json"
-    wizard._write_credentials(path, "llm-key", "tavily-key")
+    path.write_text(json.dumps({"search": {"tavily_key": "tavily-key"}}), encoding="utf-8")
+    wizard._write_credentials(path, "llm-key")
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["key"] == "llm-key"
-    assert data["search"]["tavily_key"] == "tavily-key"
-
-    # 再次只更新 Tavily key：LLM key 仍在
-    wizard._write_credentials(path, "", "tavily-key-2")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["key"] == "llm-key"
-    assert data["search"]["tavily_key"] == "tavily-key-2"
+    assert data["search"] == {"tavily_key": "tavily-key"}

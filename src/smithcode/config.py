@@ -430,11 +430,11 @@ def load_allow_private_urls() -> bool:
     return False
 
 
-# websearch 的检索后端：auto 按内置顺序逐个尝试（Tavily → Brave → Bing →
-# DuckDuckGo），命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如
+# websearch 的检索后端：auto 按内置顺序逐个尝试（Tavily → Brave → Bing），
+# 命中即用；也可固定其一。不同网络下可达性与结果质量差异极大（如
 # 无代理时 Brave 不可达、走代理时 Bing 会返回无关结果），故开放配置而不写死。
 # tavily 需要 key（见 load_tavily_key），无 key 时在 auto 里直接跳过。
-SEARCH_BACKENDS = ("auto", "tavily", "brave", "bing", "ddg")
+SEARCH_BACKENDS = ("auto", "tavily", "brave", "bing")
 DEFAULT_SEARCH_BACKEND = "auto"
 
 
@@ -442,7 +442,7 @@ def load_search_backend() -> str:
     """websearch 使用哪个检索后端。
 
     优先级：SMITHCODE_SEARCH_BACKEND > config.toml 的 [search].backend > 默认 auto。
-    可选 auto / tavily / brave / bing / ddg；空串视为"没配"，非法值打印警告并降级为 auto。
+    可选 auto / tavily / brave / bing；空串视为"没配"，非法值打印警告并降级为 auto。
     """
     env = os.getenv("SMITHCODE_SEARCH_BACKEND", "").strip().lower()
     if env:

@@ -9,10 +9,11 @@ LLM 能连、搜索与抓取却连不上。
 在**构造客户端时**就急切校验 scheme 并抛 `ValueError: Unknown scheme for proxy
 URL`，故构造前必须先跑 `utils.proxy.normalize_proxy_env()`。
 
-另有一处与代理无关的坑：TLS 握手默认会带 ALPN 扩展 `["http/1.1"]`。此前
-websearch 走 DuckDuckGo 时，该指纹会被判定为机器人、直接返回反爬 challenge 页
+另有一处与代理无关的坑：TLS 握手默认会带 ALPN 扩展 `["http/1.1"]`。早期
+websearch 只走 DuckDuckGo 时，该指纹会被判定为机器人、直接返回反爬 challenge 页
 （实测：带 ALPN 被拦、不带则正常返回结果；改造前的 urllib 本就不发 ALPN），
-故这里统一屏蔽 ALPN，证书校验照常——Bing 对 ALPN 不敏感，屏蔽无害。
+故这里统一屏蔽 ALPN，证书校验照常。该后端已移除，此屏蔽作为历史对策保留——
+对现有后端无害，也省得日后新后端再踩同一个坑。
 """
 from __future__ import annotations
 

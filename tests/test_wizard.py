@@ -32,7 +32,7 @@ def _feed(monkeypatch, replies):
 
 
 def test_setup_writes_both_files(home, monkeypatch, capsys):
-    _feed(monkeypatch, ["", "", "sk-abc", "", ""])  # 仅填 LLM key，Tavily 跳过
+    _feed(monkeypatch, ["", "", "sk-abc", ""])  # 仅填 LLM key
     assert wizard.run_setup() == 0
 
     credentials = json.loads((home / "credentials.json").read_text(encoding="utf-8"))
@@ -46,7 +46,7 @@ def test_setup_writes_both_files(home, monkeypatch, capsys):
 
 
 def test_setup_custom_values_and_k_suffix(home, monkeypatch):
-    _feed(monkeypatch, ["https://api.moonshot.cn/v1", "kimi-k2", "sk-xyz", "128k", ""])
+    _feed(monkeypatch, ["https://api.moonshot.cn/v1", "kimi-k2", "sk-xyz", "128k"])
     assert wizard.run_setup() == 0
 
     toml_text = (home / "config.toml").read_text(encoding="utf-8")
@@ -73,7 +73,7 @@ def test_setup_rerun_preserves_sections_and_comments(home, monkeypatch):
     monkeypatch.setattr(config, "MODEL", "old-model")
     monkeypatch.setattr(config, "KEY", "sk-old")
     monkeypatch.setattr(config, "CONTEXT_TOKEN_BUDGET", 4096)
-    _feed(monkeypatch, ["", "", "", "", ""])  # 全部回车 = 什么都不改
+    _feed(monkeypatch, ["", "", "", ""])  # 全部回车 = 什么都不改
 
     assert wizard.run_setup() == 0
     toml_text = (home / "config.toml").read_text(encoding="utf-8")
@@ -90,34 +90,15 @@ def test_setup_empty_key_keeps_existing_credentials(home, monkeypatch):
     (home / "credentials.json").write_text(
         json.dumps({"key": "sk-old", "extra": 1}), encoding="utf-8"
     )
-    _feed(monkeypatch, ["", "", "", "", ""])  # key 一问回车 = 保留
+    _feed(monkeypatch, ["", "", "", ""])  # key 一问回车 = 保留
     assert wizard.run_setup() == 0
 
     credentials = json.loads((home / "credentials.json").read_text(encoding="utf-8"))
     assert credentials == {"key": "sk-old", "extra": 1}  # 未动文件，其他字段保留
 
 
-def test_setup_stores_tavily_key_alongside_llm_key(home, monkeypatch):
-    """Tavily 一问填了值：写入 credentials.json 的 search.tavily_key，LLM key 不受影响。"""
-    _feed(monkeypatch, ["", "", "sk-abc", "", "tvly-xyz"])
-    assert wizard.run_setup() == 0
-
-    credentials = json.loads((home / "credentials.json").read_text(encoding="utf-8"))
-    assert credentials["key"] == "sk-abc"
-    assert credentials["search"]["tavily_key"] == "tvly-xyz"
-
-
-def test_setup_empty_tavily_key_does_not_add_field(home, monkeypatch):
-    """Tavily 一问回车跳过：credentials.json 不产生 search 字段。"""
-    _feed(monkeypatch, ["", "", "sk-abc", "", ""])
-    assert wizard.run_setup() == 0
-
-    credentials = json.loads((home / "credentials.json").read_text(encoding="utf-8"))
-    assert credentials == {"key": "sk-abc"}
-
-
 def test_setup_non_numeric_budget_degrades(home, monkeypatch, capsys):
-    _feed(monkeypatch, ["", "", "sk-abc", "不是数字", ""])
+    _feed(monkeypatch, ["", "", "sk-abc", "不是数字"])
     assert wizard.run_setup() == 0
     assert "不是有效数字" in capsys.readouterr().out
     assert "budget = 65536" in (home / "config.toml").read_text(encoding="utf-8")
@@ -135,7 +116,7 @@ def test_setup_eof_cancels_without_writing(home, monkeypatch):
 
 def test_cli_dispatch_setup(home, monkeypatch, capsys):
     """`smith setup` 走向导并以向导退出码结束，不进入 Agent 构建。"""
-    _feed(monkeypatch, ["", "", "sk-cli", "", ""])
+    _feed(monkeypatch, ["", "", "sk-cli", ""])
     from smithcode.cli import main
 
     with pytest.raises(SystemExit) as excinfo:
