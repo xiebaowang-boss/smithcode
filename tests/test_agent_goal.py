@@ -1,5 +1,6 @@
-"""Agent.run_with_goal 续跑循环测试：自动接续、空转刹车、预算收尾与中断语义。"""
+"""AgentSession.run_with_goal 续跑循环测试：自动接续、空转刹车、预算收尾与中断语义。"""
 
+import asyncio
 import json
 
 import pytest
@@ -61,14 +62,14 @@ def _make_agent(monkeypatch, script):
 
 def test_run_records_tools_used(monkeypatch):
     agent = _make_agent(monkeypatch, [_todo_step(), _text("完成")])
-    result = agent.run("任务")
+    result = asyncio.run(agent.run("任务"))
     assert result.status == "ok"
     assert result.tools_used == ("todo_write",)
 
 
 def test_run_with_goal_without_goal_is_plain_run(monkeypatch):
     agent = _make_agent(monkeypatch, [_text("你好")])
-    result = agent.run_with_goal("你好")
+    result = asyncio.run(agent.session_owner.run_with_goal("你好"))
     assert result.text == "你好"
     assert not goal.is_set()
 
@@ -85,7 +86,7 @@ def test_run_with_goal_auto_continues_until_complete(monkeypatch, capsys):
     )
     goal.set("测试目标", max_turns=10)
 
-    result = agent.run_with_goal("开始")
+    result = asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     assert result.text == "目标完成"
     current = goal.current()
@@ -101,7 +102,7 @@ def test_run_with_goal_pauses_on_toolless_turn(monkeypatch, capsys):
     agent = _make_agent(monkeypatch, [_text("好的")])
     goal.set("测试目标")
 
-    agent.run_with_goal("开始")
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     current = goal.current()
     assert current.status == goal.PAUSED
@@ -116,7 +117,7 @@ def test_run_with_goal_pauses_on_toolless_continuation(monkeypatch):
     )
     goal.set("测试目标", max_turns=10)
 
-    agent.run_with_goal("开始")
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     current = goal.current()
     assert current.status == goal.PAUSED
@@ -127,7 +128,7 @@ def test_run_with_goal_budget_limited_wraps_up(monkeypatch, capsys):
     agent = _make_agent(monkeypatch, [_todo_step(), _text("第一轮"), _text("收尾总结")])
     goal.set("测试目标", max_turns=1)
 
-    result = agent.run_with_goal("开始")
+    result = asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     assert result.text == "收尾总结"
     current = goal.current()
@@ -147,7 +148,7 @@ def test_run_with_goal_unlimited_budget_keeps_going(monkeypatch):
     goal.set("测试目标")  # 未指定预算 → 取配置默认 -1（不限）
     assert goal.current().unlimited
 
-    agent.run_with_goal("开始")
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     current = goal.current()
     assert current.status == goal.COMPLETE
@@ -156,20 +157,28 @@ def test_run_with_goal_unlimited_budget_keeps_going(monkeypatch):
 
 def test_run_with_goal_keeps_active_on_interrupt(monkeypatch):
     agent = _make_agent(monkeypatch, [])
-    monkeypatch.setattr(agent, "run", lambda text: RunResult("interrupted"))
+
+    async def fake_run(_text):
+        return RunResult("interrupted")
+
+    monkeypatch.setattr(agent, "run", fake_run)
     goal.set("测试目标")
 
-    agent.run_with_goal("开始")
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     assert goal.is_active()  # 用户主动中断：目标保留，可 resume
 
 
 def test_run_with_goal_pauses_on_denied(monkeypatch):
     agent = _make_agent(monkeypatch, [])
-    monkeypatch.setattr(agent, "run", lambda text: RunResult("denied", "任务已停止"))
+
+    async def fake_run(_text):
+        return RunResult("denied", "任务已停止")
+
+    monkeypatch.setattr(agent, "run", fake_run)
     goal.set("测试目标")
 
-    agent.run_with_goal("开始")
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
 
     current = goal.current()
     assert current.status == goal.PAUSED

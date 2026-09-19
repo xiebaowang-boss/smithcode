@@ -4,11 +4,13 @@
 - 结果按提交顺序收集（与模型请求 tool_calls 的顺序一致）
 - 可并行工具真正并发执行（Barrier 同步验证）
 - serial 工具作为顺序屏障：后面的并行工具能看到它的副作用
-- MAX_TOOL_CONCURRENCY=1 时退化为纯串行（全在主线程）
+- MAX_TOOL_CONCURRENCY=1 时退化为纯串行（工具不重叠执行）
 - 权限被拒发生在执行之前：已过预检的计划不执行、补占位结果
 """
 
+import asyncio
 import threading
+import time
 
 import pytest
 
@@ -65,7 +67,7 @@ def test_results_kept_in_submission_order(monkeypatch):
     monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
     agent = _make_agent(monkeypatch, calls)
 
-    agent.run("顺序")
+    asyncio.run(agent.run("顺序"))
 
     msgs = _tool_messages(agent)
     assert [m["content"] for m in msgs] == ["ok", "ok", "ok"]
@@ -91,7 +93,7 @@ def test_parallel_tools_run_concurrently(monkeypatch):
     monkeypatch.setitem(FUNCTIONS, "par_b", make_tool("B"))
     agent = _make_agent(monkeypatch, calls)
 
-    agent.run("并发")
+    asyncio.run(agent.run("并发"))
     msgs = _tool_messages(agent)
     assert [m["content"] for m in msgs] == ["A", "B"]
     assert not any("错误" in m["content"] for m in msgs)
@@ -114,7 +116,7 @@ def test_serial_tool_is_order_barrier(monkeypatch):
     monkeypatch.setitem(SERIAL, "fake_writer", True)
     agent = _make_agent(monkeypatch, calls)
 
-    agent.run("屏障")
+    asyncio.run(agent.run("屏障"))
     msgs = _tool_messages(agent)
     assert [m["content"] for m in msgs] == ["旧值", "写好了", "新值"]
 
@@ -127,36 +129,46 @@ def test_serial_registry_declares_stateful_tools():
 
 # ---------- 退化与兼容 ----------
 
-def test_concurrency_1_runs_in_main_thread(monkeypatch):
-    """MAX_TOOL_CONCURRENCY=1 退化为纯串行：不启用线程池，主线程执行。"""
+def test_concurrency_1_serializes_tool_execution(monkeypatch):
+    """MAX_TOOL_CONCURRENCY=1 退化为纯串行：两个工具不重叠执行。
+
+    异步化之前这里断言的是「在主线程序」——那是线程池的实现细节；改断言真正
+    的不变量：同一时刻只有一个工具在执行（I7 的意图）。
+    """
     calls = [_tc("fake_tool", call_id="1"), _tc("fake_tool", call_id="2")]
-    threads = []
+    active = 0
+    overlapped: list[bool] = []
 
     def tool():
-        threads.append(threading.current_thread() is threading.main_thread())
+        nonlocal active
+        active += 1
+        overlapped.append(active > 1)
+        time.sleep(0.03)
+        active -= 1
         return "ok"
 
     monkeypatch.setitem(FUNCTIONS, "fake_tool", tool)
     monkeypatch.setattr(config, "MAX_TOOL_CONCURRENCY", 1)
     agent = _make_agent(monkeypatch, calls)
 
-    agent.run("单线程")
-    assert threads == [True, True]
+    asyncio.run(agent.run("单线程"))
+    assert overlapped == [False, False]
+    assert [m["content"] for m in _tool_messages(agent)] == ["ok", "ok"]
 
 
-def test_single_plan_runs_in_main_thread(monkeypatch):
-    """单计划快速路径（不开线程池）在主线程执行。"""
+def test_single_plan_executes_without_overlap(monkeypatch):
+    """单计划快速路径（不并发）：照常执行并按序回传结果。"""
     holder = {}
 
     def tool():
-        holder["main"] = threading.current_thread() is threading.main_thread()
+        holder["executed"] = True
         return "ok"
 
     monkeypatch.setitem(FUNCTIONS, "fake_tool", tool)
     agent = _make_agent(monkeypatch, [])
 
-    agent._execute_batch([_tc("fake_tool")])
-    assert holder["main"] is True
+    asyncio.run(agent._execute_batch([_tc("fake_tool")]))
+    assert holder["executed"] is True
     assert _tool_messages(agent)[0]["content"] == "ok"
 
 
@@ -186,7 +198,7 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
 
     monkeypatch.setattr(agent.permission, "check", check)
 
-    result = agent.run("拒绝")
+    result = asyncio.run(agent.run("拒绝"))
     assert "权限" in result.text
     assert executed == []  # 第一个工具也未执行
 
@@ -231,7 +243,7 @@ def test_serial_executes_before_later_preflight(monkeypatch, tmp_path):
         return True
 
     monkeypatch.setattr(agent.permission, "check", check)
-    agent.run("流式")
+    asyncio.run(agent.run("流式"))
 
     assert events.index(("run", "cmd1")) < events.index(("check", "cmd2"))
 
@@ -268,7 +280,7 @@ def test_wave_runs_before_serial_barrier(monkeypatch, tmp_path):
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
-    agent.run("屏障")
+    asyncio.run(agent.run("屏障"))
 
     assert order.index(("run", "a")) < order.index(("run", "c"))
     assert order.index(("run", "b")) < order.index(("run", "c"))
@@ -297,7 +309,7 @@ def test_denied_after_executed_serial_keeps_partial(monkeypatch, tmp_path):
         lambda name, args, content=None: seen.append(name) or name == "cmd_tool",
     )
 
-    result = agent.run("拒绝")
+    result = asyncio.run(agent.run("拒绝"))
     assert "权限" in result.text
     assert executed == ["cmd"]  # 串行工具已执行、保留（不回滚）
 
@@ -348,7 +360,7 @@ def test_tool_start_events_precede_ordered_results(monkeypatch):
             pass
 
     monkeypatch.setattr("smithcode.renderer._current", CapRenderer())
-    agent.run("契约")
+    asyncio.run(agent.run("契约"))
 
     kinds = [kind for kind, _ in events]
     last_start = max(i for i, kind in enumerate(kinds) if kind == "start")
@@ -407,7 +419,7 @@ def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
     cap = _CapRenderer()
     monkeypatch.setattr("smithcode.renderer._current", cap)
 
-    agent.run("拒绝")
+    asyncio.run(agent.run("拒绝"))
 
     # 计划 1（tool_id=1）被跳过 → SKIPPED；计划 2（tool_id=2）被拒 → DENIED
     assert cap.results[0] == (1, "（未执行：权限请求被拒绝，任务已中止）")
@@ -437,7 +449,7 @@ def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
     cap = _CapRenderer()
     monkeypatch.setattr("smithcode.renderer._current", cap)
 
-    agent.run("中断")
+    asyncio.run(agent.run("中断"))
 
     # 三个计划都已预检（各建了 pending 块）、都未执行 → 一律 INTERRUPTED 收尾
     assert [r[0] for r in cap.results] == [1, 2, 3]

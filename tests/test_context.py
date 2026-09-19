@@ -1,5 +1,7 @@
 """上下文计量测试：token 估算、分桶报告与锚点/提醒逻辑，不依赖真实 API。"""
 
+import asyncio
+
 from smithcode import config
 from smithcode.agent import Agent
 from smithcode.context import (
@@ -200,7 +202,7 @@ def _over_threshold_agent(monkeypatch):
 def test_run_compacts_when_over_threshold(monkeypatch, capsys):
     agent = _over_threshold_agent(monkeypatch)
 
-    agent.run("继续")
+    asyncio.run(agent.run("继续"))
 
     msgs = agent.session.messages
     assert agent.context.compact_count == 1
@@ -249,7 +251,7 @@ def test_compact_prunes_skills_lost_from_context(monkeypatch, capsys, tmp_path):
         )
         agent = Agent(session=session)
 
-        assert agent.compact() is True
+        assert asyncio.run(agent.compact()) is True
 
         assert skills.active_names() == []  # 正文已不在上下文：剔除
         notice = agent.session.messages[-1]
@@ -272,7 +274,7 @@ def test_compact_aborts_silently_when_cancelled(monkeypatch, capsys):
     reset = activate_token(token)
     token.cancel()
     try:
-        assert agent.compact() is False
+        assert asyncio.run(agent.compact()) is False
     finally:
         reset()
 
@@ -295,7 +297,7 @@ def test_compact_aborts_when_summary_invalid_twice(monkeypatch, capsys):
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
 
-    assert agent.run("继续").text == "最终回复"  # 压缩失败不中断任务
+    assert asyncio.run(agent.run("继续")).text == "最终回复"  # 压缩失败不中断任务
 
     assert agent.context.compact_count == 0
     assert len(agent.session.messages) == 6  # 原 4 条 + 本轮 user + assistant，原样保留
@@ -320,7 +322,7 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
 
-    assert agent.run("继续").text == "重试后回复"
+    assert asyncio.run(agent.run("继续")).text == "重试后回复"
 
     assert agent.context.compact_count == 1
     assert "上下文溢出" in capsys.readouterr().out
@@ -339,7 +341,7 @@ def test_compact_manual_compacts_and_reports_ok(monkeypatch):
     """compact_manual 自建令牌执行压缩，成功后返回 ok。"""
     agent = _compactable_agent(monkeypatch)
 
-    assert agent.compact_manual() == "ok"
+    assert asyncio.run(agent.compact_manual()) == "ok"
     assert agent.context.compact_count == 1
     assert agent._token is None  # 令牌已复位，不残留到下一次任务
 
@@ -354,7 +356,7 @@ def test_compact_manual_reports_empty_when_nothing_to_compact(monkeypatch):
     ]
     agent = Agent(session=session)
 
-    assert agent.compact_manual() == "empty"
+    assert asyncio.run(agent.compact_manual()) == "empty"
     assert len(agent.session.messages) == 2
 
 
@@ -363,14 +365,14 @@ def test_compact_manual_reports_cancelled_when_interrupted(monkeypatch):
     agent = _compactable_agent(monkeypatch)
     calls: list = []
 
-    def on_complete(request):
+    def on_complete(request, model=None):
         calls.append(1)
         agent.interrupt()  # 模拟摘要请求期间用户中断
         return ""
 
     monkeypatch.setattr(agent, "_complete", on_complete)
 
-    assert agent.compact_manual() == "cancelled"
+    assert asyncio.run(agent.compact_manual()) == "cancelled"
     assert calls == [1]  # 第二次重试前查令牌，不再发请求
     assert agent.context.compact_count == 0
 
@@ -391,6 +393,6 @@ def test_agent_run_records_anchor(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
 
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
 
     assert agent.context.last_actual == 77

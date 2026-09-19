@@ -18,7 +18,7 @@ from prompt_toolkit.filters import has_focus
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 
-from .. import commands, config
+from .. import config
 
 _SESSION: PromptSession | None = None
 
@@ -31,6 +31,11 @@ class SlashCompleter(Completer):
         text = document.text_before_cursor
         if not text.startswith("/") or " " in text:
             return
+        # 延迟导入：`commands` 反过来经渲染器引用本模块，顶层导入成环
+        # （utils.terminal → commands → renderer → utils.terminal），此前靠
+        # "谁先被导入"的偶然顺序维持，换个入口就报 partially initialized module
+        from .. import commands
+
         for cmd in commands.complete_commands(text[1:]):
             yield Completion(
                 "/" + cmd.name,

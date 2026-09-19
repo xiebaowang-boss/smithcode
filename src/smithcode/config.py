@@ -616,6 +616,50 @@ def load_instructions_config() -> InstructionsConfig:
     )
 
 
+# ---------- 排队（Queue） ----------
+
+QUEUE_DELIVERIES = ("follow", "steer")
+QUEUE_MODES = ("one-at-a-time", "all")
+
+
+@dataclass(frozen=True)
+class QueueConfig:
+    """[queue] 段的解析结果；非法项警告后回退默认值。
+
+    `delivery` 决定**运行中**提交的输入怎么投递：`follow`（默认）等本轮跑完再送，
+    `steer` 在当前工具批结束后立即插话。抽水策略（`*_mode`）决定每个投递点取几条。
+    """
+
+    delivery: str = "follow"
+    steering_mode: str = "one-at-a-time"
+    follow_up_mode: str = "one-at-a-time"
+
+
+def _resolve_choice(section: str, key: str, allowed: tuple[str, ...], default: str) -> str:
+    """取一个枚举型配置项；非法值打印警告并回退默认（不中断程序）。"""
+    value = (_read_config_file().get(section) or {}).get(key, default)
+    if value in allowed:
+        return str(value)
+    print(
+        f"[警告] config.toml 的 {section}.{key} = {value!r} 无效"
+        f"（可选 {' / '.join(allowed)}），已用默认值 {default}"
+    )
+    return default
+
+
+def load_queue_config() -> QueueConfig:
+    """读取 [queue] 段：delivery / steering_mode / follow_up_mode。"""
+    data = _read_config_file().get("queue") or {}
+    if not isinstance(data, dict):
+        print("[警告] config.toml 的 [queue] 段不是表，已忽略")
+        return QueueConfig()
+    return QueueConfig(
+        delivery=_resolve_choice("queue", "delivery", QUEUE_DELIVERIES, "follow"),
+        steering_mode=_resolve_choice("queue", "steering_mode", QUEUE_MODES, "one-at-a-time"),
+        follow_up_mode=_resolve_choice("queue", "follow_up_mode", QUEUE_MODES, "one-at-a-time"),
+    )
+
+
 # ---------- 会话（Sessions） ----------
 
 @dataclass(frozen=True)

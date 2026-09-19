@@ -6,6 +6,10 @@ from contextlib import closing
 from openai import BadRequestError, OpenAI
 
 from .. import config, renderer
+
+# 直接导入子模块：经包门面 `from ..agent import ...` 会惰性转发拉起整条重链（成环）
+from ..agent.emitter import emit as emit_event
+from ..agent.status import StatusChanged, StatusCleared
 from ..cancel import current_token
 from ..utils.proxy import normalize_proxy_env
 from . import retry as retry_mod
@@ -141,10 +145,17 @@ class LLMClient:
             yield from self._stream_once(kwargs)
 
         def on_retry(state) -> None:
-            view.retry_started(state, owner)
+            # 优先走事件通道（前端可订阅 StatusChanged）；没有通道（单测直接调
+            # 客户端、无 Agent 的调用方）则退回渲染器直调，两者可观测结果一致。
+            if not emit_event(StatusChanged(
+                kind="retry", text=state.text(), owner=owner, payload=state,
+            )):
+                view.retry_started(state, owner)
 
         def on_settled() -> None:
-            view.retry_finished(owner)  # 成功或放弃都清掉重试态
+            # 成功或放弃都清掉重试态（owner 保证只清自己那条）
+            if not emit_event(StatusCleared(kind="retry", owner=owner)):
+                view.retry_finished(owner)
 
         yield from retry_mod.stream_with_retry(
             attempt, policy, on_retry=on_retry, on_settled=on_settled,

@@ -4,13 +4,19 @@
 
 - Agent 经渲染后端发事件——`title_changed`（会话标题变化）/ `turn_started` /
   `turn_finished`（忙闲）；
-- 阻塞（等用户确认/回答）由 `Relay` 在 ask 类方法进出时上报，与忙闲分开计数：
-  等待态优先于运行态，标题前缀由 `◐` 换成 `!`——切到别的窗口再回来，一眼能
-  看出 agent 是卡在等自己，而不是还在跑；
-- `TerminalTitlePresenter` 消费事件，合成品牌化标题（`Smith · 重构会话管理`，
-  运行中加 `◐` 前缀、等待确认时加 `!` 前缀），并管理窗口标题栈的压栈 / 出栈生命周期；
-- 装配入口分两个：终端宿主用 `attach()`（总线 + 接管标题，再提供 sink 往哪写），
-  只想要事件的 GUI 前端用 `bus()`（纯总线，不碰终端标题）。见 docs/architecture.md。
+- 阻塞（等用户确认/回答）订阅 `PromptStarted` / `PromptFinished` 事件对：
+  **按 id 配对**而不是计数——`open_prompts` 非空即「在等」，先结束的那一个不会
+  把还在等的那一个抹掉（旧实现用标量计数规避这一点，代价是消费者不知道是谁
+  结束了）。等待态优先于运行态，标题前缀由 `◐` 换成 `!`——切到别的窗口再回来，
+  一眼能看出 agent 是卡在等自己，而不是还在跑；
+- `TerminalTitlePresenter` **订阅 Agent 事件**（`on_agent_event`），合成品牌化标题
+  （`Smith · 重构会话管理`，运行中加 `◐` 前缀、等待确认时加 `!` 前缀），并管理窗口
+  标题栈的压栈 / 出栈生命周期；
+- 装配入口只有 `attach()`：接管标题 + 订阅事件，并提供 sink 决定往哪写。
+  （原来还有一个渲染后端装饰器 `Relay`：它在 ask 方法进出时广播等待信号，并把
+  标题/忙闲事件转给呈现器。事件层补齐后两件事都有正式通道——等待是
+  `PromptStarted/Finished`、标题与忙闲是 `TitleChanged` / `TurnStart` / `TurnEnd`，
+  于是 `Relay` 与 `bus()` 一并删除。）
 
 退出恢复用终端的窗口标题栈（xterm XTWINOPS：`CSI 22;2t` 压栈、`CSI 23;2t`
 出栈），不读回原标题——读回要抢 stdin 解析终端应答，而 stdin 归
@@ -19,16 +25,20 @@ prompt_toolkit / Textual 独占，代价远大于收益。
 from __future__ import annotations
 
 import atexit
-import contextlib
 import os
 import re
 import signal
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import config
-from .renderer import Renderer
+from .agent.events import TitleChanged, TurnEnd, TurnStart
+from .agent.interactions import PromptFinished, PromptStarted
 from .utils.terminal import stdout_is_tty, write_terminal_control
+
+if TYPE_CHECKING:  # 仅用于 attach 的类型注解（Relay 删除后不再继承 Renderer）
+    from .renderer import Renderer
 
 BRAND = "Smith"
 """标题里的品牌词：对齐 welcome.LOGO 与权限模式名。"""
@@ -67,12 +77,14 @@ def default_workspace() -> str:
 
 
 class TitleState:
-    """标题状态（纯数据）：会话标题 + 忙闲计数 + 等待计数 + 品牌 / 回退名。
+    """标题状态（纯数据）：会话标题 + 忙闲计数 + 未结束的提问 + 品牌 / 回退名。
 
     忙闲用计数而非布尔：`run_with_goal` 的多回合里，内层 `run()` 结束会发
     `turn_finished`，而外层仍在推进——计数 >0 期间保持忙碌，回合切换不闪烁。
-    等待同样用计数：ask 可能嵌套（内层结束不代表外层结束），用布尔会在先
-    结束的那次把等待态提前抹掉。
+
+    等待改用**id 配对**：`open_prompts` 里还有条目就是「在等」。旧实现用标量
+    计数，为的是「内层结束不代表外层结束」；id 配对既能保证这一点，又能回答
+    「是谁结束了」——嵌套或并发提问时，先结束的那个不会误清另一个。
     """
 
     def __init__(self, brand: str = BRAND, workspace: str = "") -> None:
@@ -80,7 +92,12 @@ class TitleState:
         self.workspace = workspace
         self.title = ""
         self.busy = 0
-        self.waiting = 0
+        self.open_prompts: dict[str, PromptStarted] = {}
+
+    @property
+    def waiting(self) -> int:
+        """未结束的提问数（0 = 没在等用户）；顺序 = 发起顺序，最外层在前。"""
+        return len(self.open_prompts)
 
     def base(self) -> str:
         """标题主体：会话标题 > 工作区目录名 > 品牌词。"""
@@ -140,16 +157,34 @@ class TerminalTitlePresenter:
             self._state.busy = max(0, self._state.busy - 1)
             self._flush()
 
-    def on_waiting_started(self) -> None:
-        """开始等待用户输入（权限确认 / 提问面板弹出）。"""
+    def on_agent_event(self, event) -> None:
+        """Agent 事件订阅入口：标题 / 忙闲 / 等待态全部从这一条通道来。
+
+        （`Relay` 删除后，原先经渲染后端转发的 `title_changed` / `turn_started` /
+        `turn_finished` 改由事件驱动；`turn_waiting_*` 是无载荷信号、本来就无法
+        配对，改由带 id 的提问事件对承担。）
+        """
+        if isinstance(event, PromptStarted):
+            self.on_prompt_started(event)
+        elif isinstance(event, PromptFinished):
+            self.on_prompt_finished(event)
+        elif isinstance(event, TitleChanged):
+            self.on_title_changed(event.title)
+        elif isinstance(event, TurnStart):
+            self.on_turn_started()
+        elif isinstance(event, TurnEnd):
+            self.on_turn_finished(event.status)
+
+    def on_prompt_started(self, event: PromptStarted) -> None:
+        """开始等待用户输入（权限确认 / 技能信任 / 提问面板弹出）。"""
         with self._lock:
-            self._state.waiting += 1
+            self._state.open_prompts[event.id] = event
             self._flush()
 
-    def on_waiting_finished(self) -> None:
-        """等待结束（用户作答、取消或确认框异常退出）。"""
+    def on_prompt_finished(self, event: PromptFinished) -> None:
+        """该次提问结束（作答 / 取消 / 前端故障都成对收口）。"""
         with self._lock:
-            self._state.waiting = max(0, self._state.waiting - 1)
+            self._state.open_prompts.pop(event.id, None)
             self._flush()
 
     # ---------- 生命周期（宿主主线程） ----------
@@ -299,16 +334,6 @@ def reset() -> None:
     _hooks_installed = False
 
 
-def bus(inner: Renderer) -> Renderer:
-    """只建事件总线，不接管终端标题：GUI 前端（desktop / web）的装配入口。
-
-    事件照常送进内层后端，但既不创建标题呈现器、也不装退出钩子、更不写任何
-    控制序列——前端覆盖 `turn_waiting_*` 等方法即可自行消费。需要终端标题的
-    宿主用 `attach()`。
-    """
-    return Relay(inner)
-
-
 def enable_title(sink=None, workspace: str = "") -> TerminalTitlePresenter:
     """接管终端标题：注入写入通道、装退出钩子、压栈并写出当前标题（幂等）。
 
@@ -322,144 +347,16 @@ def enable_title(sink=None, workspace: str = "") -> TerminalTitlePresenter:
     return target
 
 
-def attach(inner: Renderer, sink=None, workspace: str = "") -> Renderer:
-    """终端宿主的组合根装配：`bus()` + `enable_title()`，返回包装后的渲染后端。"""
-    return Relay(inner, enable_title(sink, workspace))
+def attach(inner: Renderer, sink=None, workspace: str = "", agent=None) -> Renderer:
+    """终端宿主的组合根装配：接管窗口标题 + 订阅 Agent 事件，返回**原样**的后端。
 
+    曾经这里会包一层 `Relay` 装饰器来转发标题/等待事件；事件层补齐后不需要中间
+    层了（见模块 docstring），因此现在只做两件事：`enable_title()` 与
+    `agent.subscribe(...)`，后端保持原对象——调用方拿到的仍是自己的渲染后端。
 
-class Relay(Renderer):
-    """渲染后端装饰器：透传全部事件，并充当标题事件的订阅转发层。
-
-    订阅者可省略（`target=None`）——此时它就是一条**纯事件总线**，只把事件
-    交给内层后端，不碰终端标题（`bus()` 即此形态）；终端宿主用 `attach()`，
-    总线与标题接管一起装。
-
-    标题三类事件总是上报给终端宿主（title_changed / turn_started /
-    turn_finished）；纯总线形态（`bus()`）不接管终端标题，只转发事件。
-
-    另有一处拦截：ask 类方法（确认 / 提问）前后广播总线事件
-    `turn_waiting_started` / `turn_waiting_finished`。这些方法本就同步阻塞等用户，
-    包住它们等于覆盖了全部阻塞入口——权限确认、越界授权、技能信任确认、
-    ask_user 提问，调用点无需改动。事件同时喂给呈现器与内层后端，故任何前端
-    （TUI / 未来 desktop、web）覆盖 `turn_waiting_*` 即可当消费者。
+    `agent` 不传时只装配标题（命令层自建宿主、测试等场景）。
     """
-
-    def __init__(self, inner: Renderer,
-                 target: TerminalTitlePresenter | None = None) -> None:
-        super().__init__()
-        self._inner = inner
-        self._presenter = target
-
-    # ----- 标题相关事件（拦截后转发） -----
-
-    def _notify(self, event: str, *args) -> None:
-        """把事件喂给标题订阅者；纯总线模式（无订阅者）下静默跳过。
-
-        订阅者只需实现自己关心的事件回调：基类事件是前端可订阅的总线，新增事件
-        不能让既有订阅者（如只关心标题的 `TerminalTitlePresenter`）直接抛
-        `AttributeError`——那会被 Agent 的流异常处理误判成"流中断"。没有对应
-        回调即视为不关心。
-        """
-        if self._presenter is None:
-            return
-        handler = getattr(self._presenter, event, None)
-        if handler is not None:
-            handler(*args)
-
-    def title_changed(self, title: str) -> None:
-        self._notify("on_title_changed", title)
-        self._inner.title_changed(title)  # TUI 侧边栏标题等仍照常刷新
-
-    def turn_started(self) -> None:
-        self._notify("on_turn_started")
-        self._inner.turn_started()
-
-    def turn_finished(self, status: str = "ok") -> None:
-        self._notify("on_turn_finished", status)
-        self._inner.turn_finished(status)
-
-    def retry_started(self, state, owner: object | None = None) -> None:
-        """重试开始：纯透传给内层（终端标题不关心重试进度）与订阅者。"""
-        self._notify("on_retry_started", state, owner)
-        self._inner.retry_started(state, owner)
-
-    def retry_finished(self, owner: object | None = None) -> None:
-        """重试结束：纯透传（与 retry_started 成对、owner 相同）。"""
-        self._notify("on_retry_finished", owner)
-        self._inner.retry_finished(owner)
-
-    # ----- 等待用户输入（总线：呈现器与内层后端都收） -----
-
-    def turn_waiting_started(self) -> None:
-        self._notify("on_waiting_started")
-        self._inner.turn_waiting_started()
-
-    def turn_waiting_finished(self) -> None:
-        self._notify("on_waiting_finished")
-        self._inner.turn_waiting_finished()
-
-    @contextlib.contextmanager
-    def _waiting(self):
-        """ask 类方法的公共包装：进出发总线事件，异常路径同样收尾。"""
-        self.turn_waiting_started()
-        try:
-            yield
-        finally:
-            self.turn_waiting_finished()
-
-    # ----- 其余事件（透传） -----
-
-    def stream(self, kind: str, chunk: str) -> None:
-        self._inner.stream(kind, chunk)
-
-    def stream_done(self) -> None:
-        self._inner.stream_done()
-
-    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
-        return self._inner.tool_call(line, display, name)
-
-    def tool_preview(self, tool_id: int | None, detail: str) -> None:
-        self._inner.tool_preview(tool_id, detail)
-
-    def tool_result(self, result: str, tool_id: int | None = None,
-                    expand: bool = False) -> None:
-        self._inner.tool_result(result, tool_id, expand)
-
-    def plan(self, summary: str, rendered: str, *, created: bool = False,
-             tool_id: int | None = None) -> None:
-        self._inner.plan(summary, rendered, created=created, tool_id=tool_id)
-
-    def info(self, text: str) -> None:
-        self._inner.info(text)
-
-    def success(self, text: str) -> None:
-        self._inner.success(text)
-
-    def warn(self, text: str) -> None:
-        self._inner.warn(text)
-
-    def error(self, text: str) -> None:
-        self._inner.error(text)
-
-    def ask_text(self, question: str) -> str:
-        with self._waiting():
-            return self._inner.ask_text(question)
-
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None) -> str:
-        with self._waiting():
-            return self._inner.ask_choice(question, options, multiple, descriptions)
-
-    def ask_form(self, questions: list[dict]) -> list[str]:
-        with self._waiting():
-            return self._inner.ask_form(questions)
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str,
-                       detail: list[str] | None = None,
-                       descriptions: dict[str, str] | None = None,
-                       content: str | None = None) -> str:
-        with self._waiting():
-            return self._inner.confirm_choice(
-                prompt, valid, hint, detail=detail, descriptions=descriptions,
-                content=content,
-            )
+    target = enable_title(sink, workspace)
+    if agent is not None:
+        agent.subscribe(target.on_agent_event)
+    return inner

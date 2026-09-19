@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import sys
 import threading
 from pathlib import Path
@@ -76,9 +77,14 @@ def build_parser():
 
 
 def _run_agent_task(agent: Agent, text: str) -> None:
-    """后台线程执行一次任务：结果/错误在流式过程中实时打印。"""
+    """后台线程执行一次任务：结果/错误在流式过程中实时打印。
+
+    每次任务用自己的事件循环（`asyncio.run`）：循环随任务起落，取消仍走
+    `Agent.interrupt()` 的协作式令牌（线程安全），主线程继续专职做 Ctrl+C
+    通道（`_wait_for_task`）——线程结构不变，只是循环内部换了驱动方式。
+    """
     try:
-        result = agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
+        result = asyncio.run(agent.session_owner.run_with_goal(text))  # 无目标时等价 run
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         return
@@ -91,7 +97,7 @@ def _run_agent_task(agent: Agent, text: str) -> None:
 def _run_compact_task(agent: Agent) -> None:
     """后台线程执行手动压缩：完成后打印结果（主线程留作 Ctrl+C 取消通道）。"""
     try:
-        status = agent.compact_manual()
+        status = asyncio.run(agent.compact_manual())
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] 压缩失败: {type(e).__name__}: {e}")
         return
@@ -208,7 +214,7 @@ def _run_wizard(agent, wizard) -> None:
 
 def run_once(agent: Agent, task: str):
     try:
-        result = agent.run_with_goal(task)  # 回复已在流式过程中实时打印
+        result = asyncio.run(agent.session_owner.run_with_goal(task))  # 回复已在流式过程中实时打印
     except Exception as e:  # noqa: BLE001
         print(f"\n[错误] {type(e).__name__}: {e}")
         sys.exit(1)
@@ -316,8 +322,8 @@ def main(argv=None):
     interactive = not args.task and confirmations_available()
     if interactive:
         # 尽早接管窗口标题：`--name` / 恢复会话的标题事件发生在宿主启动之前，
-        # 由 title.Relay 转给呈现器暂存，宿主首屏时统一写出（非 tty 自动失效）
-        renderer.set_renderer(title.attach(renderer.current()))
+        # 由标题呈现器暂存，宿主首屏时统一写出（非 tty 自动失效）
+        renderer.set_renderer(title.attach(renderer.current(), agent=agent))
     if restoring:
         _resume_session(agent, args.continue_session, args.resume)
     if args.name:

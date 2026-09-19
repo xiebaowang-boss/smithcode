@@ -1,5 +1,7 @@
 """ask_user 工具测试：复数入参归一化、单/多题回传、交互提问、非交互 fail-closed、
 空回答、权限放行。"""
+import asyncio
+
 import pytest
 
 from smithcode import config
@@ -73,7 +75,7 @@ def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
     agent = Agent(session=Session())
     call = {"function": {"name": "ask_user", "arguments": json.dumps(
         {"questions": [{"question": "确认？"}]})}}
-    agent._execute_batch([call])
+    asyncio.run(agent._execute_batch([call]))
     assert agent.session.messages[-1]["content"] == "继续"
 
 

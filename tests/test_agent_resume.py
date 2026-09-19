@@ -1,5 +1,6 @@
 """Agent 会话恢复：持久化往返、崩溃修复、投影恢复与安全例外。"""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -59,7 +60,7 @@ def _make_agent(monkeypatch, **kwargs) -> Agent:
 
 def test_run_persists_and_resume_roundtrip(monkeypatch):
     agent = _make_agent(monkeypatch)
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     store = agent.session.store
     assert store.path.is_file()
     first_line = store.path.read_text(encoding="utf-8").splitlines()[0]
@@ -76,7 +77,7 @@ def test_run_persists_and_resume_roundtrip(monkeypatch):
     assert assistant_texts[-1] == "最终回复"
 
     # 恢复后继续对话：新消息追加到同一转录
-    resumed.run("继续")
+    asyncio.run(resumed.run("继续"))
     reloaded = load(summary_from_path(store.path))
     assert reloaded.messages[-1]["content"] == "最终回复"
     assert any(m.get("content") == "继续" for m in reloaded.messages)
@@ -122,7 +123,7 @@ def test_fsync_checkpoints_bracket_tool_execution(monkeypatch):
     # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
-    agent.run("跑个工具")
+    asyncio.run(agent.run("跑个工具"))
 
     assert "tool" in events, "工具应当被执行"
     assert events[: events.index("tool")] == ["fsync"], "工具执行前必须先 fsync"
@@ -134,9 +135,9 @@ def test_run_records_model_and_resume_reports_it(monkeypatch):
     """每轮把实际模型写进 t=model；恢复把「上次使用模型」交回宿主且不改全局模型。"""
     monkeypatch.setattr(config, "MODEL", "model-a")
     agent = _make_agent(monkeypatch)
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     monkeypatch.setattr(config, "MODEL", "model-b")  # 中途 /model 切换
-    agent.run("再问")
+    asyncio.run(agent.run("再问"))
     store = agent.session.store
     store.close()
 
@@ -201,7 +202,7 @@ def test_resume_restores_state_but_resets_authorizations(monkeypatch, tmp_path):
 
 def test_new_session_keeps_old_transcript(monkeypatch):
     agent = _make_agent(monkeypatch)
-    agent.run("第一轮")
+    asyncio.run(agent.run("第一轮"))
     old_id = agent.session.store.id
     old_path = agent.session.store.path
 
@@ -215,7 +216,7 @@ def test_new_session_keeps_old_transcript(monkeypatch):
 
 def test_rename_sets_user_title_and_auto_cannot_override(monkeypatch):
     agent = _make_agent(monkeypatch)
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     assert agent.rename_session("重构会话管理") is True
     agent.session.set_title("自动标题", source="auto")  # 用户标题优先
     assert agent.session.title == "重构会话管理"
@@ -230,7 +231,7 @@ def test_no_persistence_by_default(monkeypatch, tmp_path):
     """persist=False（测试与 --no-session-persistence）不产生任何文件。"""
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     agent = Agent(session=Session())
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     assert agent.session.store is None
     projects = tmp_path / "home" / "projects"
     assert not projects.exists() or not any(projects.rglob("*.jsonl"))
@@ -252,11 +253,11 @@ def test_instructions_load_once_per_session_and_reload_on_new(monkeypatch):
     (workspace / "AGENTS.md").write_text("约定 v1", encoding="utf-8")
 
     agent = _make_agent(monkeypatch)
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     assert "约定 v1" in agent.session.messages[0]["content"]
 
     _rewrite(workspace / "AGENTS.md", "约定 v2")
-    agent.run("继续")
+    asyncio.run(agent.run("继续"))
     assert "约定 v2" not in agent.session.messages[0]["content"]
 
     agent.new_session()
@@ -270,7 +271,7 @@ def test_resume_reloads_instructions(monkeypatch):
     (workspace / "AGENTS.md").write_text("恢复前约定", encoding="utf-8")
 
     agent = _make_agent(monkeypatch)
-    agent.run("你好")
+    asyncio.run(agent.run("你好"))
     store_id = agent.session.store.id
     assert "恢复前约定" in agent.session.messages[0]["content"]
 

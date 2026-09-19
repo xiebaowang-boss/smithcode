@@ -1,8 +1,9 @@
-"""终端窗口标题测试：合成 / 净化 / 事件 → 写入 / 压栈出栈 / 退出钩子 / Relay 转发。
+"""终端窗口标题测试：合成 / 净化 / 事件 → 写入 / 压栈出栈 / 退出钩子 / 装配与订阅。
 
 不触摸真实终端：sink 一律换成记录器，退出钩子的 atexit / signal 注册在本文件里
 统一打桩（避免测试进程真装信号处理器）。
 """
+import asyncio
 import signal
 
 import pytest
@@ -10,9 +11,22 @@ import pytest
 import smithcode.renderer as renderer_module
 from smithcode import title
 from smithcode.agent import Agent
-from smithcode.llm import RetryState
+from smithcode.agent.interactions import (
+    InteractionBridge,
+    PromptFinished,
+    PromptRequest,
+    PromptStarted,
+)
 from smithcode.renderer import Renderer
 from smithcode.session import Session
+
+
+def _prompt(prompt_id: str, kind: str = "permission", title: str = "允许执行 x?"):
+    return PromptStarted(id=prompt_id, kind=kind, title=title)
+
+
+def _finished(prompt_id: str, outcome: str = "answered"):
+    return PromptFinished(id=prompt_id, kind="permission", outcome=outcome)
 
 
 class Recorder:
@@ -26,7 +40,7 @@ class Recorder:
 
 
 class FakeRenderer(Renderer):
-    """记录收到的调用，用于断言 Relay 的拦截与透传。"""
+    """记录收到的调用，用于断言事件经迁移桥到达后端。"""
 
     def __init__(self):
         super().__init__()
@@ -112,9 +126,10 @@ def test_compose_waiting_beats_busy():
     """等待用户输入优先于运行中：任务是停住的，`!` 要盖住 `◐`。"""
     state = title.TitleState(workspace="smithcode")
     state.busy = 1
-    state.waiting = 1
+    state.open_prompts["p1"] = _prompt("p1")
+    assert state.waiting == 1
     assert state.compose() == "! Smith · smithcode"
-    state.waiting = 0
+    state.open_prompts.clear()
     assert state.compose() == "◐ Smith · smithcode"
 
 
@@ -171,28 +186,29 @@ def test_busy_counter_survives_nested_turns():
     assert sink.writes[-1] == "\x1b]0;Smith · smithcode\x07"
 
 
-def test_waiting_counter_survives_overlapping_asks():
-    """确认可能嵌套：先结束的那次不能提前摘掉 `!`。"""
+def test_waiting_survives_overlapping_prompts():
+    """提问可能重叠：先结束的那次不能提前摘掉 `!`（按 id 配对，而不是计数）。"""
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
     p.on_turn_started()
-    p.on_waiting_started()
-    p.on_waiting_started()
+    p.on_agent_event(_prompt("outer"))
+    p.on_agent_event(_prompt("inner"))
     assert sink.writes[-1] == "\x1b]0;! Smith · smithcode\x07"
-    p.on_waiting_finished()
-    assert sink.writes[-1] == "\x1b]0;! Smith · smithcode\x07"  # 仍在等，不熄灭
-    p.on_waiting_finished()
+    p.on_agent_event(_finished("inner"))  # 内层先结束
+    assert sink.writes[-1] == "\x1b]0;! Smith · smithcode\x07"  # 外层还在等，不熄灭
+    p.on_agent_event(_finished("outer"))
     assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"  # 回到运行态
     p.on_turn_finished()
     assert sink.writes[-1] == "\x1b]0;Smith · smithcode\x07"
 
 
-def test_waiting_never_goes_negative():
+def test_prompt_finished_with_unknown_id_is_ignored():
+    """没见过的 id 结束事件：忽略即可（不再有"计数被压成负数"这种状态）。"""
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
-    p.on_waiting_finished()  # 多余的一次结束不得把计数压成负数
+    p.on_agent_event(_finished("不存在"))
     assert sink.writes[-1] == "\x1b]0;Smith · smithcode\x07"
 
 
@@ -313,62 +329,81 @@ def test_chain_handler_respects_ignored_signal(monkeypatch):
     assert calls == ["release"]
 
 
-# ---------- Relay：解耦与转发 ----------
+# ---------- 装配：attach 只做「接管标题 + 订阅事件」 ----------
 
 
-def test_relay_covers_renderer_api():
-    """转发清单必须覆盖基类全部公开方法：以后新增事件方法不会静默漏转发。"""
-    public = {name for name in dir(Renderer) if not name.startswith("_")}
-    forwarded = set(title.Relay.__dict__)
-    assert public, "基类公开方法集合不应为空"
-    assert public - forwarded == set()
+def test_attach_returns_the_same_backend_and_enables_title(monkeypatch):
+    """attach 不再包一层装饰器：返回原后端对象，同时接管窗口标题。
+
+    （原来返回的是 `Relay(inner, presenter)`；等待/标题事件都有正式事件通道后，
+    中间层被删除——调用方拿到的就是自己传进去的那个渲染后端。）
+    """
+    sink = Recorder()
+    inner = FakeRenderer()
+    returned = title.attach(inner, sink=sink, workspace="proj")
+    assert returned is inner
+    assert sink.writes == ["\x1b[22;2t", "\x1b]0;Smith · proj\x07"]
 
 
-def test_relay_intercepts_title_events_and_forwards_rest():
+def test_attach_subscribes_presenter_to_agent_events(monkeypatch):
+    """传了 agent 就订阅：标题/忙闲/等待三类事件都能驱动标题。"""
+    from smithcode.agent.events import TitleChanged
+
+    sink = Recorder()
+    inner = FakeRenderer()
+    monkeypatch.setattr(renderer_module, "_current", None, raising=False)
+    renderer_module.set_renderer(inner)  # 迁移桥送达的是「当前后端」
+    agent = Agent(session=Session(), persist=False)
+    title.attach(inner, sink=sink, workspace="proj", agent=agent)
+
+    agent.emit(TitleChanged("新标题"))
+
+    assert sink.writes[-1] == "\x1b]0;Smith · 新标题\x07"
+    assert inner.calls == [("title", "新标题")]  # 迁移桥照常送达后端
+
+
+def test_presenter_ignores_events_it_does_not_handle():
+    """不认识的事件不得抛异常（回归：新增事件曾让每轮都误报「输出中断」）。
+
+    旧实现用 `getattr(self._presenter, "on_" + name)` 转发，未实现的方法直接抛
+    `AttributeError`。现在按类型分派，未知事件天然是空操作——这条锁住该性质，
+    顺带确认已知事件仍照常处理。
+    """
+    from smithcode.agent.status import StatusChanged
+
+    sink = Recorder()
+    p = _make_presenter(sink)
+    p.enable()
+
+    p.on_agent_event(StatusChanged(kind="retry", text="重试 1/3"))  # 不关心，不报错
+    p.on_agent_event(object())  # 完全未知
+    p.on_turn_started()
+
+    assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"
+
+
+# ---------- 阻塞（等待用户输入）：交互桥事件对 → 标题 ----------
+
+
+def test_prompt_events_mark_waiting_in_title():
+    """提问期间标题打 `!`，作答后回到运行态——切走窗口再回来能看出卡在等人。
+
+    等待态由 `InteractionBridge` 在提问进出两侧发 `PromptStarted` /
+    `PromptFinished`（id 配对），呈现器订阅这两个事件（不再经 Relay 拦截 ask）。
+    """
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
     inner = FakeRenderer()
-    relay = title.Relay(inner, p)
-    relay.title_changed("新标题")
-    relay.turn_started()
-    relay.turn_finished("ok")
-    relay.info("hi")
-    assert "\x1b]0;Smith · 新标题\x07" in sink.writes
-    assert "\x1b]0;◐ Smith · 新标题\x07" in sink.writes
-    assert inner.calls == [
-        ("title", "新标题"),
-        ("started",),
-        ("finished", "ok"),
-        ("info", "hi"),
-    ]
+    bridge = InteractionBridge(p.on_agent_event)
+    p.on_turn_started()
 
+    answer = bridge.request(
+        PromptRequest(kind="permission", title="允许执行 x?"),
+        lambda: inner.confirm_choice("允许执行 x?", "yn", "y / n"),
+    )
 
-def test_attach_returns_relay_and_enables(monkeypatch):
-    sink = Recorder()
-    inner = FakeRenderer()
-    relay = title.attach(inner, sink=sink, workspace="proj")
-    assert isinstance(relay, title.Relay)
-    relay.turn_started()
-    assert sink.writes == [
-        "\x1b[22;2t",
-        "\x1b]0;Smith · proj\x07",
-        "\x1b]0;◐ Smith · proj\x07",
-    ]
-
-
-# ---------- Relay：阻塞（等待用户输入）上报 ----------
-
-
-def test_relay_marks_waiting_during_confirm():
-    """确认期间标题打 `!`，作答后回到运行态——切走窗口再回来能看出卡在等人。"""
-    sink = Recorder()
-    p = _make_presenter(sink)
-    p.enable()
-    inner = FakeRenderer()
-    relay = title.Relay(inner, p)
-    relay.turn_started()
-    assert relay.confirm_choice("允许执行 x?", "yn", "y / n") == "y"
+    assert answer == "y"
     assert sink.writes == [
         "\x1b[22;2t",
         "\x1b]0;Smith · smithcode\x07",
@@ -376,95 +411,27 @@ def test_relay_marks_waiting_during_confirm():
         "\x1b]0;! Smith · smithcode\x07",
         "\x1b]0;◐ Smith · smithcode\x07",
     ]
-    assert inner.calls == [
-        ("started",),
-        ("waiting_started",),
-        ("confirm", "允许执行 x?"),
-        ("waiting_finished",),
-    ]
+    assert bridge.open_prompts == {}  # 成对收口
+    assert inner.calls == [("confirm", "允许执行 x?")]
 
 
-def test_relay_marks_waiting_during_ask_form():
-    sink = Recorder()
-    p = _make_presenter(sink)
-    p.enable()
-    inner = FakeRenderer()
-    relay = title.Relay(inner, p)
-    relay.turn_started()
-    relay.ask_form([{"question": "选哪个?"}])
-    assert "\x1b]0;! Smith · smithcode\x07" in sink.writes
-    assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"
-
-
-def test_relay_waiting_cleared_when_ask_raises():
+def test_prompt_waiting_cleared_when_ask_raises():
     """确认框异常退出也要摘掉等待态——否则标题永远停在 `!`。"""
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
     inner = BrokenAskRenderer()
-    relay = title.Relay(inner, p)
-    relay.turn_started()
+    bridge = InteractionBridge(p.on_agent_event)
+    p.on_turn_started()  # 任务在跑：等待态摘掉后应回到 `◐`
+
     with pytest.raises(RuntimeError):
-        relay.confirm_choice("允许执行 x?", "yn", "y / n")
+        bridge.request(
+            PromptRequest(kind="permission", title="允许执行 x?"),
+            lambda: inner.confirm_choice("允许执行 x?", "yn", "y / n"),
+        )
+
     assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"
-
-
-# ---------- 纯总线装配（GUI 前端路径） ----------
-
-
-def test_bus_forwards_to_inner_without_creating_presenter():
-    """`bus()` 只建总线：事件照进内层后端，但不创建标题呈现器。"""
-    inner = FakeRenderer()
-    relay = title.bus(inner)
-    relay.title_changed("X")
-    relay.turn_started()
-    relay.turn_waiting_started()
-    relay.turn_waiting_finished()
-    relay.turn_finished("ok")
-    relay.confirm_choice("允许执行 x?", "yn", "y / n")
-    assert inner.calls == [
-        ("title", "X"),
-        ("started",),
-        ("waiting_started",),
-        ("waiting_finished",),
-        ("finished", "ok"),
-        ("waiting_started",),  # confirm_choice 自身的一对
-        ("confirm", "允许执行 x?"),
-        ("waiting_finished",),
-    ]
-    assert title._presenter is None  # 没碰标题单例
-
-
-def test_bus_has_no_terminal_side_effects(monkeypatch):
-    """纯总线模式一个字节都不写、也不装退出钩子（GUI 宿主无终端）。"""
-    writes, hooks = [], []
-    monkeypatch.setattr(title, "write_terminal_control", writes.append)
-    monkeypatch.setattr(title.atexit, "register", hooks.append)
-    relay = title.bus(FakeRenderer())
-    relay.turn_started()
-    relay.turn_waiting_started()
-    relay.turn_waiting_finished()
-    relay.turn_finished()
-    assert writes == []
-    assert hooks == []
-
-
-def test_relay_without_presenter_does_not_crash():
-    """省略订阅者且 report_title=True（最易踩的组合）：五处喂事件都要短路。"""
-    inner = FakeRenderer()
-    relay = title.Relay(inner)
-    relay.title_changed("X")
-    relay.turn_started()
-    relay.turn_finished()
-    relay.turn_waiting_started()
-    relay.turn_waiting_finished()
-    relay.confirm_choice("允许执行 x?", "yn", "y / n")
-    relay.ask_form([{"question": "选哪个?"}])
-    # 显式一对 + confirm_choice 与 ask_form 各自的一对
-    assert inner.calls.count(("waiting_started",)) == 3
-    assert inner.calls.count(("waiting_finished",)) == 3
-    assert ("confirm", "允许执行 x?") in inner.calls
-    assert ("ask_form",) in inner.calls
+    assert bridge.open_prompts == {}
 
 
 def test_enable_title_is_separable_and_idempotent():
@@ -476,20 +443,17 @@ def test_enable_title_is_separable_and_idempotent():
     assert sink.writes == ["\x1b[22;2t", "\x1b]0;Smith · proj\x07"]
 
 
-def test_attach_equals_bus_plus_enable_title():
-    """`attach` 就是两者的组合：写入序列与手工拼装逐字节一致。"""
+def test_attach_equals_enable_title_for_side_effects():
+    """`attach` 的副作用就是 `enable_title()`：写入序列逐字节一致。"""
     sink_a, sink_b = Recorder(), Recorder()
     inner_a, inner_b = FakeRenderer(), FakeRenderer()
     combined = title.attach(inner_a, sink=sink_a, workspace="proj")
-    title.reset()  # 复位单例，手工拼装同一场景
-    manual = title.Relay(inner_b, title.enable_title(sink=sink_b, workspace="proj"))
-    for relay in (combined, manual):
-        relay.turn_started()
-        relay.turn_waiting_started()
-        relay.turn_waiting_finished()
-        relay.turn_finished()
+    title.reset()  # 复位单例，手工装配同一场景
+    manual = title.enable_title(sink=sink_b, workspace="proj")
+    assert combined is inner_a  # 不再包装后端
+    assert isinstance(manual, title.TerminalTitlePresenter)
     assert sink_a.writes == sink_b.writes
-    assert inner_a.calls == inner_b.calls
+    assert inner_a.calls == inner_b.calls == []
 
 
 # ---------- Agent 事件发射 ----------
@@ -503,29 +467,39 @@ class FakeLLM:
 
 
 def _install_recording_backend(monkeypatch):
-    """把全局渲染后端换成「记录器 + 呈现器」，并返回两者。"""
+    """把全局渲染后端换成记录器并启用标题呈现器；返回 (inner, sink, presenter)。
+
+    呈现器与 Agent 的连接由调用方用 `_wire()` 建立——这就是 Relay 删除后的装配
+    方式：订阅事件（而不是经渲染后端转发）。
+    """
     inner = FakeRenderer()
     sink = Recorder()
     presenter = _make_presenter(sink)
     presenter.enable()
     monkeypatch.setattr(renderer_module, "_current", None, raising=False)
-    renderer_module.set_renderer(title.Relay(inner, presenter))
-    return inner, sink
+    renderer_module.set_renderer(inner)
+    return inner, sink, presenter
+
+
+def _wire(agent, presenter) -> None:
+    agent.subscribe(presenter.on_agent_event)
 
 
 def test_agent_run_emits_turn_events(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
-    inner, sink = _install_recording_backend(monkeypatch)
+    inner, sink, presenter = _install_recording_backend(monkeypatch)
     agent = Agent(session=Session(), persist=False)
-    agent.run("你好")
+    _wire(agent, presenter)
+    asyncio.run(agent.run("你好"))
     assert inner.calls == [("started",), ("finished", "ok")]
     # 收尾回到空闲态（回退名取自工作区目录名，故不断言具体字符串）
     assert sink.writes[-1].startswith("\x1b]0;Smith · ") and sink.writes[-1].endswith("\x07")
 
 
 def test_agent_new_session_emits_empty_title(monkeypatch):
-    inner, sink = _install_recording_backend(monkeypatch)
+    inner, sink, presenter = _install_recording_backend(monkeypatch)
     agent = Agent(session=Session(), persist=False)
+    _wire(agent, presenter)
     agent.rename_session("旧标题")
     agent.new_session()
     assert ("title", "") in inner.calls
@@ -533,34 +507,8 @@ def test_agent_new_session_emits_empty_title(monkeypatch):
 
 
 def test_agent_rename_pushes_title_to_terminal(monkeypatch):
-    _inner, sink = _install_recording_backend(monkeypatch)
+    _inner, sink, presenter = _install_recording_backend(monkeypatch)
     agent = Agent(session=Session(), persist=False)
+    _wire(agent, presenter)
     assert agent.rename_session("数据库迁移") is True
     assert sink.writes[-1] == "\x1b]0;Smith · 数据库迁移\x07"
-
-
-def test_relay_tolerates_presenter_without_new_event_callbacks():
-    """订阅者没有某个事件的回调时不能抛异常——新增事件不得打断任务。
-
-    回归：`Relay.retry_finished` 广播 `on_retry_finished`，而
-    `TerminalTitlePresenter` 只实现标题相关回调，`getattr(...)` 直接抛
-    `AttributeError`；该异常被 Agent 的流异常处理捕获后，每一轮都被误判成
-    `stream_error`（用户侧：每次回复结尾都显示「输出中断」）。
-    """
-    sink = Recorder()
-    p = _make_presenter(sink)
-    p.enable()
-    inner = FakeRenderer()
-    relay = title.Relay(inner, p)
-    presenter_api = {name for name in dir(p) if name.startswith("on_")}
-    assert "on_retry_started" not in presenter_api  # 前提：标题呈现器不关心重试
-    assert "on_retry_finished" not in presenter_api
-
-    state = RetryState(attempt=2, total=3, reason="读取超时", wait=2.0, next_at=0.0)
-    relay.retry_started(state, "owner")  # 不得抛 AttributeError
-    relay.retry_finished("owner")
-    relay.info("继续")
-
-    kinds = [call[0] for call in inner.calls]
-    assert "warn" in kinds  # retry_started 照常透传（基类默认降级为一行 warn）
-    assert inner.calls[-1] == ("info", "继续")  # 后续事件不受影响

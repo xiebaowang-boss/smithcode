@@ -6,6 +6,32 @@ from smithcode import config
 from smithcode.cli import main
 from smithcode.utils.terminal import prompt_choice, read_user_input
 
+# ---------- 后台任务入口：事件循环与既有线程结构的接线 ----------
+
+def test_run_agent_task_drives_coroutine_through_event_loop(monkeypatch, capsys):
+    """REPL 的后台任务入口用 `asyncio.run` 驱动协程，正常完成并打印正文。
+
+    阶段 3 把任务入口改成协程后，`_run_agent_task` 是唯一把事件
+    循环与既有「后台线程 + 主线程 Ctrl+C 通道」结构接起来的地方；本用例锁住
+    这条接线（协程没被 await 时这里会静默什么都不做）。
+    """
+    from smithcode.agent import Agent
+    from smithcode.cli import _run_agent_task
+    from smithcode.session import Session
+
+    class FakeLLM:
+        def chat_stream(self, messages, tools=None):
+            yield ("content", "你好")
+            yield ("message", {"role": "assistant", "content": ""})
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
+    agent = Agent(session=Session())
+
+    _run_agent_task(agent, "打个招呼")
+
+    assert "你好" in capsys.readouterr().out
+    assert agent.session.messages[-1] == {"role": "assistant", "content": "你好"}
+
 # ---------- 启动时缺配置：优雅退出而非裸 traceback ----------
 
 def test_main_exits_gracefully_on_config_error(monkeypatch, capsys):
@@ -212,7 +238,7 @@ def test_run_compact_task_prints_result(capsys):
     from smithcode.cli import _run_compact_task
 
     class FakeAgent:
-        def compact_manual(self):
+        async def compact_manual(self):
             return "ok"
 
     _run_compact_task(FakeAgent())
@@ -224,7 +250,7 @@ def test_run_compact_task_reports_error(capsys):
     from smithcode.cli import _run_compact_task
 
     class FakeAgent:
-        def compact_manual(self):
+        async def compact_manual(self):
             raise RuntimeError("接口超时")
 
     _run_compact_task(FakeAgent())

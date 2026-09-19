@@ -1,5 +1,6 @@
 """Agent × MCP 集成测试：工具进入请求 schema、调用执行与默认权限语义。"""
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -86,7 +87,7 @@ def test_mcp_tool_visible_and_executed(monkeypatch):
         assert agent.mcp.status()[0].state == "connected"
         agent.permission.user_rules = [("mcp__fake__echo", "*", "allow")]
 
-        result = agent.run("call echo")
+        result = asyncio.run(agent.run("call echo"))
 
         assert result.status == "ok"
         names = [tool["name"] for tool in agent.llm.seen_tools]
@@ -102,7 +103,7 @@ def test_mcp_tool_requires_confirmation_by_default(monkeypatch):
     agent = _prepare(monkeypatch)
     try:
         # 测试环境 stdin 非 TTY：ask 走 fail-closed 拒绝，任务终止
-        result = agent.run("call echo")
+        result = asyncio.run(agent.run("call echo"))
 
         assert result.status == "denied"
         tool_messages = [m for m in agent.session.messages if m["role"] == "tool"]

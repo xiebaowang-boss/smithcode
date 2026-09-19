@@ -1,5 +1,6 @@
 """Agent 主循环测试：用假 LLM 验证流式消费、循环与终止逻辑，不依赖真实 API。"""
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -46,14 +47,14 @@ def _make_agent(monkeypatch) -> Agent:
 
 def test_run_returns_final_content(monkeypatch):
     agent = _make_agent(monkeypatch)
-    result = agent.run("打个招呼")
+    result = asyncio.run(agent.run("打个招呼"))
     assert result.status == "ok"
     assert result.text == "最终回复"
 
 
 def test_run_records_messages(monkeypatch):
     agent = _make_agent(monkeypatch)
-    agent.run("打个招呼")
+    asyncio.run(agent.run("打个招呼"))
     roles = [m["role"] for m in agent.session.messages]
     assert roles == ["system", "user", "assistant"]
 
@@ -63,7 +64,7 @@ def test_run_pins_turn_snapshot(monkeypatch):
     monkeypatch.setattr(config, "MODEL", "m-turn")
     monkeypatch.setattr(config, "REASONING_EFFORT", "low")
     agent = _make_agent(monkeypatch)
-    agent.run("打个招呼")
+    asyncio.run(agent.run("打个招呼"))
     assert agent.last_turn is not None
     assert (agent.last_turn.model, agent.last_turn.effort) == ("m-turn", "low")
 
@@ -100,7 +101,7 @@ def test_turn_snapshot_frozen_within_run(monkeypatch):
 
     try:
         agent = Agent(session=Session())
-        agent.run("多轮任务")
+        asyncio.run(agent.run("多轮任务"))
     finally:
         monkeypatch.setattr(config, "MODEL", "m-pinned")
         monkeypatch.setattr(config, "REASONING_EFFORT", "low")
@@ -114,10 +115,10 @@ def test_next_run_repins_snapshot(monkeypatch):
     """下一轮重新 pin：上一轮的值不污染，中断轮也不留旧值。"""
     monkeypatch.setattr(config, "MODEL", "m-one")
     agent = _make_agent(monkeypatch)
-    agent.run("第一轮")
+    asyncio.run(agent.run("第一轮"))
     assert agent.last_turn.model == "m-one"
     monkeypatch.setattr(config, "MODEL", "m-two")
-    agent.run("第二轮")
+    asyncio.run(agent.run("第二轮"))
     assert agent.last_turn.model == "m-two"
 
 
@@ -142,7 +143,7 @@ def test_agent_loop_caps_and_wraps_up(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolCallLoopLLM)
     agent = Agent(session=Session(), max_iterations=2)
-    result = agent.run("死循环")
+    result = asyncio.run(agent.run("死循环"))
     assert result.status == "max_iterations"
     assert result.text == "总结：已完成 X，剩余 Y"
     assert agent.llm.tool_turns == 2  # 只执行配置的 2 轮工具
@@ -166,7 +167,7 @@ def test_agent_loop_unlimited_by_default(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", LongLoopLLM)
     agent = Agent(session=Session())
     assert agent.max_iterations == -1
-    result = agent.run("多轮任务")
+    result = asyncio.run(agent.run("多轮任务"))
     assert result.status == "ok"
     assert result.text == "终于完成"
 
@@ -184,7 +185,7 @@ def test_wrap_up_strips_unexpected_tool_calls(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", StubbornLLM)
     agent = Agent(session=Session(), max_iterations=1)
-    result = agent.run("顽固")
+    result = asyncio.run(agent.run("顽固"))
     assert result.status == "max_iterations"
     assert result.text == "部分总结"
     last = agent.session.messages[-1]
@@ -214,7 +215,7 @@ def test_run_stops_when_permission_denied(monkeypatch, tmp_path):
     agent = Agent(session=Session())
     agent.permission.user_rules = [("read_file", "*", "deny")]
 
-    result = agent.run("测试拒绝流程")
+    result = asyncio.run(agent.run("测试拒绝流程"))
     assert result.status == "denied"
     assert "权限" in result.text
 
@@ -262,7 +263,7 @@ def test_run_truncates_oversized_tool_result(monkeypatch):
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
-    agent.run("大输出")
+    asyncio.run(agent.run("大输出"))
 
     # 消息顺序: system, user, assistant(工具调用), tool(结果), assistant(最终回复)
     tool_msg = agent.session.messages[-2]
@@ -282,7 +283,7 @@ def test_reasoning_shown_but_not_persisted(monkeypatch, capsys):
     monkeypatch.setattr("smithcode.agent.LLMClient", ReasoningLLM)
     agent = Agent(session=Session())
 
-    assert agent.run("打个招呼").text == "你好"
+    assert asyncio.run(agent.run("打个招呼")).text == "你好"
 
     out = capsys.readouterr().out
     assert "先想想" in out
@@ -302,7 +303,7 @@ def test_reasoning_and_content_on_separate_lines(monkeypatch, capsys):
     monkeypatch.setattr("smithcode.agent.LLMClient", ThinkThenAnswerLLM)
     agent = Agent(session=Session())
 
-    msg, usage, interrupted = agent._chat()
+    msg, usage, interrupted = asyncio.run(agent._chat())
     assert msg == {"role": "assistant", "content": "答案"}
     assert usage is None  # 假 LLM 没发 usage 事件
     assert interrupted is False
@@ -364,8 +365,8 @@ def test_run_accumulates_usage(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
     agent = Agent(session=Session())
 
-    agent.run("第一条")
-    agent.run("第二条")
+    asyncio.run(agent.run("第一条"))
+    asyncio.run(agent.run("第二条"))
 
     assert agent.session.usage.current_session.get("total_tokens") == 30
     assert agent.session.usage.since_start.get("total_tokens") == 30
@@ -378,7 +379,7 @@ def test_run_accumulates_usage(monkeypatch):
 def test_run_without_usage_keeps_counters_clean(monkeypatch):
     """服务商不返回 usage（无 usage 事件）时，统计静默为空、主流程不受影响。"""
     agent = _make_agent(monkeypatch)
-    agent.run("打个招呼")
+    asyncio.run(agent.run("打个招呼"))
     assert agent.session.usage.since_start.calls == 0
 
 
@@ -401,7 +402,7 @@ def _outside_agent(monkeypatch, tmp_path):
 
 def _run_call(agent: Agent, call: dict) -> str:
     """跑单个工具调用并返回其结果文本（批量路径的单调用用法，结果在最后一条 tool 消息）。"""
-    agent._execute_batch([call])
+    asyncio.run(agent._execute_batch([call]))
     return agent.session.messages[-1]["content"]
 
 
@@ -528,7 +529,7 @@ def test_interrupt_during_stream_keeps_partial_content(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
     agent = Agent(session=Session())
 
-    result = agent.run("写首诗")
+    result = asyncio.run(agent.run("写首诗"))
     assert result.status == "interrupted"
     assert result.partial is True
     msgs = agent.session.messages
@@ -552,7 +553,7 @@ def test_interrupt_writes_context_note_without_new_call(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
     agent = Agent(session=Session())
 
-    result = agent.run("做点事")
+    result = asyncio.run(agent.run("做点事"))
     assert result.status == "interrupted"
     assert len(calls) == 1  # 回写上下文没有触发新的模型调用
     note = agent.session.messages[-1]
@@ -561,7 +562,7 @@ def test_interrupt_writes_context_note_without_new_call(monkeypatch):
 
     # 下一轮提问：注释仍在历史里（模型可见），新输入追加在其后
     agent.llm = FakeLLM()
-    agent.run("继续")
+    asyncio.run(agent.run("继续"))
     assert any("中断" in m.get("content", "") for m in agent.session.messages)
 
 
@@ -584,7 +585,7 @@ def test_interrupt_before_tool_batch_fills_placeholders(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", StreamThenCancelLLM)
     agent = Agent(session=Session())
 
-    result = agent.run("中断测试")
+    result = asyncio.run(agent.run("中断测试"))
     assert result.status == "interrupted"
     tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
     assert len(tool_msgs) == 2
@@ -619,7 +620,7 @@ def test_interrupt_mid_batch_stops_remaining(monkeypatch):
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
-    result = agent.run("中断批处理")
+    result = asyncio.run(agent.run("中断批处理"))
     assert result.status == "interrupted"
     assert executed == [True]  # list_dir 未再执行
     tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
@@ -664,7 +665,7 @@ def test_interrupt_during_preflight_skips_remaining(monkeypatch):
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", check)
 
-    result = agent.run("中断预检")
+    result = asyncio.run(agent.run("中断预检"))
     assert result.status == "interrupted"
     assert asked == ["step_tool"]  # 第 2 个未再预检（确认框只弹过一次）
     assert executed == []  # 已确认的也未执行
@@ -702,7 +703,7 @@ def test_interrupt_during_confirmation_overrides_denied(monkeypatch):
     agent = Agent(session=Session())
     monkeypatch.setattr(agent.permission, "check", check)
 
-    result = agent.run("确认中中断")
+    result = asyncio.run(agent.run("确认中中断"))
     assert result.status == "interrupted"
     assert executed == []
     tool_msgs = [m for m in agent.session.messages if m["role"] == "tool"]
@@ -720,10 +721,10 @@ def test_session_reusable_after_interrupt(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", InterruptingLLM)
     agent = Agent(session=Session())
-    agent.run("第一条")
+    asyncio.run(agent.run("第一条"))
 
     agent.llm = FakeLLM()  # 换回正常假 LLM（Agent 构造时已绑定实例，事后 patch 类不生效）
-    result = agent.run("继续")
+    result = asyncio.run(agent.run("继续"))
     assert result.status == "ok"
     assert result.text == "最终回复"
 
@@ -773,7 +774,7 @@ def test_run_with_skill_returns_body_in_tool_result(monkeypatch, tmp_path):
         agent = Agent(session=Session())
         agent.refresh_skills()
 
-        result = agent.run("用技能处理")
+        result = asyncio.run(agent.run("用技能处理"))
 
         assert result.status == "ok"
         first_prompt = agent.llm.requests[0][0]["content"]
@@ -815,7 +816,7 @@ def test_stream_timeout_keeps_partial_in_history(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", MidStreamTimeoutLLM)
     agent = Agent(session=Session())
 
-    result = agent.run("改一下")
+    result = asyncio.run(agent.run("改一下"))
 
     assert result.status == "stream_error"
     assert result.text == "已修改完成，总结如下："
@@ -838,7 +839,7 @@ def test_stream_timeout_before_content_leaves_no_empty_assistant(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", FailFirstTokenLLM)
     agent = Agent(session=Session())
 
-    result = agent.run("改一下")
+    result = asyncio.run(agent.run("改一下"))
 
     assert result.status == "stream_error"
     assert result.text == ""
@@ -878,7 +879,7 @@ def test_stream_timeout_does_not_record_partial_twice(monkeypatch):
     ]
     agent = Agent(session=session)
 
-    result = agent.run("改一下")
+    result = asyncio.run(agent.run("改一下"))
 
     assert result.status == "stream_error"
     assert result.text == "部分总结"
@@ -931,7 +932,7 @@ def test_retry_accumulates_both_attempts_in_one_message(monkeypatch):
     monkeypatch.setattr("smithcode.renderer.current", lambda: view)
 
     agent = Agent(session=Session())
-    result = agent.run("改成只读面板")
+    result = asyncio.run(agent.run("改成只读面板"))
 
     assert result.status == "ok"
     assert result.text == "已修改完成，总结如下：改了 commands/base.py。"  # 两段拼接
@@ -988,7 +989,7 @@ def test_renderer_failure_is_not_reported_as_stream_error(monkeypatch):
     agent = Agent(session=Session())
 
     with pytest.raises(RendererError) as err:
-        agent.run("hello")
+        asyncio.run(agent.run("hello"))
 
     assert "渲染后端异常" in str(err.value)
     assert "AttributeError" in str(err.value)

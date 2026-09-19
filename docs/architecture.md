@@ -54,7 +54,7 @@ SmithCode 是一个 mini coding agent，核心是 **Agent 循环（Agentic Loop�
 
 ### 对话区消息模型（TUI）
 
-TUI 对话区的全部内容经**唯一入口** `ChatView.apply(item)` 挂载/更新，item 为 `tui/chat.py` 的纯数据语义消息（`User` / `Assistant` / `Notice` / `Block` / `Footer` / `Welcome` / `StreamDelta` / `Thinking*` / `Tool*`）。生产者（`TuiRenderer` 事件桥、命令输出、宿主回显、欢迎横幅、历史回放、任务异常兜底）只表达**语义与级别**，缩进 / 着色 / 图标 / 间距统一由渲染层与集中 CSS 决定：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源，用户消息左边框占 1 列故 padding-left 为 2，正文左对齐）；通知按 `Level`（info / success / warning / error / retry）着色并带固定 1 格图标，正文左起点不随级别漂移。`Renderer` 提供 `info()` / `warn()` / `error()` 三个语义方法（`ConsoleRenderer` 保持纯文本打印、TUI 映射到通知级别），命令层旧的 `style` 字符串由集中映射兼容。工具块映射与思考块引用收归 `ChatView`，宿主 `SmithTUI` 只做事件路由。
+TUI 对话区的全部内容经**唯一入口** `ChatView.apply(item)` 挂载/更新，item 为 `tui/chat.py` 的纯数据语义消息（`User` / `Assistant` / `Notice` / `Block` / `Footer` / `Welcome` / `StreamDelta` / `Thinking*` / `Tool*`）。生产者（`TuiRenderer` 事件桥、命令输出、宿主回显、欢迎横幅、历史回放、任务异常兜底）只表达**语义与级别**，缩进 / 着色 / 图标 / 间距统一由渲染层与 tui/app.tcss 决定：所有顶层消息带 `.chat-item`（缩进 3 / 上间距 1 的唯一来源，用户消息左边框占 1 列故 padding-left 为 2，正文左对齐）；通知按 `Level`（info / success / warning / error / retry）着色并带固定 1 格图标，正文左起点不随级别漂移。`Renderer` 提供 `info()` / `warn()` / `error()` 三个语义方法（`ConsoleRenderer` 保持纯文本打印、TUI 映射到通知级别），命令层旧的 `style` 字符串由集中映射兼容。工具块映射与思考块引用收归 `ChatView`，宿主 `SmithTUI` 只做事件路由。
 
 正文块（`widgets.MessageBody`）与工具正文（`widgets._ToolBody`）同为**动态宽度**渲染：正文经 rich 渲染后折行会固化进 `Text`，`Static.update()` 一次定型的内容在窗口缩放时无法重排，故二者都在 `render()` 里按 `self.size.width` 实时生成，宽度变化即整体重排（缓存按宽度失效）。其余块（用户消息、通知、工具头等）直接上屏原始文本，折行交给 Textual，天然随容器自适应。
 

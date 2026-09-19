@@ -9,7 +9,8 @@ Agent 在后台线程同步运行，TuiRenderer 用 post_message（线程安全�
 这里（cli 负责分流），仍用 ConsoleRenderer。
 
 本文件只负责「接线」：控件在 widgets.py、弹窗面板在 panels.py、线程桥在
-bridge.py、纯函数工具在 render.py。样式（CSS）集中在本文件的 SmithTUI.CSS。
+bridge.py、纯函数工具在 render.py。样式集中在本目录的 app.tcss（经 SmithTUI.CSS_PATH
+加载），本文件不再内嵌 CSS。
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from .. import (
     welcome,
 )
 from ..agent import format_stream_interrupted
+from ..agent.events import QueueChanged, QueuedPromptDelivered
 from ..mcp.errors import McpConfigError
 from ..mcp.wizard import McpWizard, apply_plan
 from . import clipboard
@@ -74,6 +76,7 @@ from .widgets import (
     ChatInput,
     ChatView,
     CommandMenu,
+    QueuePanel,
     RunningIndicator,
     Sidebar,
     UiAction,
@@ -107,228 +110,9 @@ def _message_text(content) -> str:
 
 
 class SmithTUI(App):
-    CSS = """
-    Screen { layout: horizontal; }
-    #main { width: 1fr; height: 100%; layout: horizontal; }
-    #chat-col { width: 1fr; height: 100%; background: #0a0a0a; }
-    #chat {
-        height: 1fr;
-        padding: 1 2 1 2;
-        background: #0a0a0a;
-        /* Claude Code 式：不画滚动条（滚动功能不受影响）。
-           注意不能配 scrollbar-gutter: stable——两者同用会让 virtual_size 塌缩、滚动失效 */
-        scrollbar-size-vertical: 0;
-    }
-    #sidebar {
-        height: 100%;
-        width: 40;
-        padding: 1 2 1 2;
-        background: #141414;
-    }
-    #input-wrap {
-        height: auto;
-        margin: 0 2;
-        /* 左侧竖线不再画在容器上：容器内还有运行动画行，画在这里会连动画行一起框住 */
-    }
-    #command-menu {
-        /* 悬浮层：dock 到聊天列底部，再上移「输入区高 + 底行高」，锚在输入框正上方、
-           向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小。
-           offset 只是初始值：输入框高度随内容自适应（1-12 行），实际锚点由
-           _anchor_command_menu 按实时几何计算，写死行数会随高度变化错位 */
-        dock: bottom;
-        offset: 0 -5;
-        layer: command-menu;
-        margin: 0 2;
-        height: auto;
-        max-height: 8;  /* 固定展示行数，与 widgets.MENU_VISIBLE_ITEMS 一致，超出滚动 */
-        padding: 0 2;
-        background: #1e1e1e;
-        overflow: hidden auto;
-        /* 隐藏滚动条：候选超出时仍可用滚轮 / 键盘滚动，只是不绘制（与聊天区一致） */
-        scrollbar-size-vertical: 0;
-    }
-    #command-menu.running {
-        /* 兜底锚点：运行动画可见时输入框上方多占一行。
-           实际 offset 由 _anchor_command_menu 按实时几何内联设置（输入框高度可变），
-           此处仅在尚未计算过时兜底 */
-        offset: 0 -6;
-    }
-    #command-menu .menu-item {
-        width: 1fr;  /* 拉满整行，选中项的高亮底色才贯通 */
-        height: 1;
-    }
-    #input {
-        /* 高度随内容自适应：1 行时间距与原来一致（min-height 3），多行时向上长高，
-           封顶 max-height 后不再变高、改为内部滚动。
-           padding 上下对称（1 2 1 2）：此前底部为 0，单行时靠 min-height 撑出的空行
-           看着像底部留白，内容一到 2 行就被填满、留白"消失"；显式给底部 padding 后
-           每行都有稳定留白 */
-        height: auto;
-        min-height: 3;
-        max-height: 13;
-        padding: 1 2 1 2;
-        /* 左竖线画在输入框自身：只框住输入框自身的行，上面的运行动画行不跟着被框。
-        heavy 用 ┃，比默认 solid 的细线 │ 粗一档（Textual 边框固定 1 格宽，只能改字形） */
-        border: none;
-        border-left: heavy #23d18b;
-        background: #1e1e1e;
-        /* 与聊天区 / 命令菜单一致：不绘制滚动条，滚动功能不受影响 */
-        scrollbar-size-vertical: 0;
-    }
-    #input:focus {
-        border: none;
-        border-left: heavy #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
-    }
-    #input .text-area--cursor-line {
-        background: transparent;
-    }
-    #bottom {
-        height: 2;
-        layout: horizontal;
-        padding: 0 0 1 0;
-        background: transparent;
-    }
-    #composer-mode, #composer-model, #composer-thinking, #composer-goal {
-        width: auto;
-        padding: 0 0 0 2;
-    }
-    /* 运行动画：位于 #input-wrap 内、输入框上方，左竖线只画在输入框上；
-       宽度按文案自适应（_spin 用 layout=False，宽度恒定免重排）。
-       padding-left 3 = 输入框边框 1 + 输入框内缩进 2，与键入文字左对齐 */
-    #running {
-        color: #fab283;
-        width: auto;
-        height: 1;
-        padding: 0 3;
-    }
-    #status {
-        width: 1fr;
-        color: #808080;
-        content-align: right middle;
-        padding: 0 2;
-    }
-
-    /* 对话区统一布局：所有顶层消息带 .chat-item，缩进 / 间距只在此定义一次，
-       避免各调用点各自 print 导致格式漂移。左起点 = 3；用户消息的左边框占 1 列，
-       故其 padding-left 设为 2，正文同样落到列 3，与其它消息左对齐。
-       顶层块之间留一行（margin-top），不用 margin-bottom，避免相邻块双倍间隔。 */
-    .chat-item { padding-left: 3; margin-top: 1; }
-    /* 欢迎横幅（Logo + 问候）：保持原样的齐左版式，不参与消息缩进 */
-    .chat-item.welcome { padding-left: 0; margin-top: 0; }
-    .chat-item.user-msg {
-        background: #141414;
-        /* 与输入框左竖线同款同粗细（heavy 的 ┃），保持视觉一致 */
-        border-left: heavy #23d18b;
-        padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
-    }
-    ToolCall { height: auto; }
-    /* 摘要超列宽时按宽度省略，不折成第二行——工具行恒占一行（Agent 侧已保证无换行） */
-    ToolCall .tool-header {
-        color: #808080;
-        text-wrap: nowrap;
-        text-overflow: ellipsis;
-    }
-    ToolCall .tool-header.tool-error { color: #f7768e; }
-    ToolCall .tool-body { color: #808080; margin-left: 2; }
-    ToolCall .tool-body.tool-error { color: #f7768e; }
-    ContextGroup { height: auto; }
-    ContextGroup .group-header { color: #808080; }
-    /* Vertical 默认 height: 1fr，会让展开的汇总块撑满可用高度；明细区须按内容自适应 */
-    ContextGroup .group-body { height: auto; margin-left: 2; }
-    ContextGroup ToolCall { padding-left: 0; margin-top: 0; }
-    ThinkingBlock { height: auto; }
-    ThinkingBlock .think-header { color: #808080; }
-    ThinkingBlock .think-body { color: #808080; margin-left: 2; }
-    QuestionPanel {
-        height: auto;
-        margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
-        padding: 1 2 1 2;
-        background: #141414;
-        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
-    }
-    QuestionPanel .ask-title { color: #fab283; margin-bottom: 1; }
-    QuestionPanel .ask-hint { color: #808080; }
-    /* opencode 式自定义回答：单行、无边框，嵌在选项列表末尾 */
-    QuestionPanel Input {
-        border: none;
-        height: 1;
-        padding: 0 0 0 1;
-        background: #1e1e2e;
-    }
-    /* 自定义回答输入框：缩进对齐选项文字（"1. " 之后） */
-    QuestionPanel Input.custom-answer { padding: 0 0 0 4; }
-    PermissionPanel {
-        height: auto;
-        margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
-        padding: 1 2 1 2;
-        background: #141414;
-        border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
-    }
-    PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
-    PermissionPanel .perm-detail { color: #a9b1d6; }
-    PermissionPanel .ask-hint { color: #808080; }
-    /* 通用选择弹窗：居中卡片（遮罩/变暗由 SelectionScreen 的 ModalScreen 背景负责）。
-       宽度按档位取定值，由调用方经 CommandSelect.size 声明（默认 medium）；
-       面板不测量内容，选项过长由各命令自行控制（暂无截断）。
-       max-width 兜住窄终端：档位再宽也不会超出屏宽 90%。 */
-    SelectionPanel {
-        width: 64;        /* medium（默认档） */
-        max-width: 90%;
-        height: auto;
-        min-height: 16;   /* 比内容高，短列表也保持足够高度 */
-        max-height: 70%;
-        background: #1e1e1e;
-        padding: 1 2;
-    }
-    SelectionPanel.size-small { width: 40; }
-    SelectionPanel.size-large { width: 88; }
-    SelectionPanel.size-xlarge { width: 116; }
-    SelectionPanel .selection-title {
-        color: #fab283;
-        text-style: bold;
-        padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
-        margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
-    }
-    /* 行区：单个自渲染控件（SelectionRows，定义在 panels.py），每行内容由
-       render_line 直接产出，故不再有 .selection-row/.selection-label/.selection-trailing
-       等逐行规则；选中反白 / 表头蓝等配色见 panels.py 顶部的 _ACCENT / _HEADER_FG
-       （Python 侧样式无法从 CSS 取值，两处需同步改）。滚动条与聊天区一致
-       不绘制——它只影响滚动快慢路径的观感，与逐键渲染次数无关 */
-    SelectionPanel .selection-rows {
-        height: 1fr;
-        scrollbar-size-vertical: 0;
-    }
-    SelectionPanel .selection-hint { color: #808080; dock: bottom; }
-    /* MCP 添加向导：居中卡片，选择步骤复用选择面板的配色语义 */
-    McpWizardPanel {
-        width: 88;
-        max-width: 90%;
-        height: auto;
-        max-height: 80%;
-        background: #1e1e1e;
-        padding: 1 2;
-    }
-    McpWizardPanel .wizard-title {
-        color: #fab283;
-        text-style: bold;
-        padding-left: 2;
-        margin-bottom: 1;
-    }
-    McpWizardPanel .wizard-scroll {
-        height: auto;
-        max-height: 22;
-        scrollbar-size-vertical: 0;  /* 同聊天区：不绘制滚动条 */
-    }
-    McpWizardPanel .wizard-body { color: #a9b1d6; }
-    McpWizardPanel Input {
-        border: none;
-        height: 1;
-        padding: 0 0 0 1;
-        background: #1e1e2e;
-        margin-top: 1;
-    }
-    McpWizardPanel .wizard-hint { color: #808080; margin-top: 1; }
-    """
+    # 全部样式集中在同目录的 app.tcss（Textual 的 CSS_PATH，相对本文件解析），
+    # 本文件只管布局接线。
+    CSS_PATH: ClassVar[str] = "app.tcss"
 
     BINDINGS: ClassVar = [
         Binding("ctrl+q", "quit", "退出"),
@@ -337,8 +121,6 @@ class SmithTUI(App):
     ]
     SIDEBAR_BREAKPOINT: ClassVar[int] = 120
     """终端宽度 >= 此值才显示侧边栏（40 列侧边栏 + 约 80 列聊天区）。"""
-    CONTEXT_BAR_CELLS: ClassVar[int] = 10
-    """底栏上下文占用条的格数：█ 填充 + ░ 空位，一格约 10%。"""
 
     def __init__(self, agent):
         super().__init__()
@@ -383,6 +165,8 @@ class SmithTUI(App):
                 # 输入框（自身带左侧竖线，框内上方为运行动画）+ 底行（最左：权限模式·模型·思考·目标，最右：git/上下文）
                 with Vertical(id="input-wrap"):
                     yield RunningIndicator(id="running")
+                    # 排队面板：运行动画之下、输入框之上（计划 §5(4)）；空则隐藏
+                    yield QueuePanel(id="queued")
                     yield ChatInput(id="input")
                 with Horizontal(id="bottom"):
                     yield Static(id="composer-mode")
@@ -402,8 +186,12 @@ class SmithTUI(App):
             title.attach(
                 TuiRenderer(self),
                 sink=driver.write if driver is not None else None,
+                agent=self.agent,
             )
         )
+        # 队列变化走事件订阅（阶段 4 起核心只发事件）：面板持久显示当前排队状态
+        self.agent.subscribe(self._on_agent_event)
+        self.query_one("#queued").display = False  # 排队面板：空则隐藏
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
         self.query_one(CommandMenu).hide_menu()  # 命令菜单默认隐藏
@@ -512,6 +300,7 @@ class SmithTUI(App):
         if self._busy:
             self.agent.interrupt()
             self.ui_running_stopping()
+            self._recall_queue()  # 中止即把排队内容取回输入框（计划 §5(3)）
             return
         if (self.query(PermissionPanel) or self.query(QuestionPanel)
                 or self.command_menu_open or isinstance(self.screen, ModalScreen)):
@@ -772,14 +561,9 @@ class SmithTUI(App):
         """占用率对应颜色：绿（健康）→ 琥珀（偏高）→ 红（接近压缩阈值）。"""
         return "#f7768e" if pct >= 90 else "#fab283" if pct >= 70 else "#23d18b"
 
-    def _context_bar(self, pct: int) -> Text:
-        """底栏上下文占用条：█ 填充 + ░ 空位，占用率越高颜色 绿→琥珀→红。"""
-        bar = Text()
-        filled = round(pct / 100 * self.CONTEXT_BAR_CELLS)
-        bar.append("█" * filled, style=self._context_color(pct))
-        bar.append("░" * (self.CONTEXT_BAR_CELLS - filled), style="#333333")
-        bar.append(f" {pct}%")
-        return bar
+    def _context_text(self, est: int, pct: int) -> Text:
+        """底栏上下文占用（文字形式）：`12.3K(10%)`，颜色随底栏默认灰，不做着色。"""
+        return Text(f"{human_tokens(est)}({pct}%)")
 
     def _sidebar_usage(self) -> tuple[Text, Text]:
         """「用量」卡：(标题, 正文)。标题 = Usage（有调用时附 · Calls N）；正文 = In/Out（缓存命中另起一行）。"""
@@ -806,7 +590,7 @@ class SmithTUI(App):
         title.append(f"{pct}%", style=self._context_color(pct))
         body = Text()
         body.append("Used ", style="#808080")
-        body.append(f"{human_tokens(est)} / Budget {human_tokens(budget)}", style="#eeeeee")
+        body.append(f"{human_tokens(est)} / {human_tokens(budget)}", style="#eeeeee")
         if self.agent.context.compact_count:
             body.append(f" · Compacted {self.agent.context.compact_count}", style="#808080")
         return title, body
@@ -845,13 +629,13 @@ class SmithTUI(App):
         return Text(title, style="#7dcfff")
 
     def _status_text(self) -> Text:
-        """底部状态栏：git 分支 / 上下文占用条（模型与思考强度已移入输入框内）。"""
+        """底部状态栏：git 分支 / 上下文占用文字（模型与思考强度已移入输入框内）。"""
         pieces = []
         branch = git_branch(config.WORKSPACE_ROOT)
         if branch:
             pieces.append(Text(branch))
-        _, _, pct = self._context_stats()
-        pieces.append(self._context_bar(pct))
+        est, _, pct = self._context_stats()
+        pieces.append(self._context_text(est, pct))
         result = Text()
         for piece in pieces:
             if result:
@@ -868,13 +652,83 @@ class SmithTUI(App):
         self.query_one(ChatInput).clear()
         if text.startswith("/"):
             self.handle_command(text)
-        else:
-            self._chat().apply(User(text))  # 回显用户消息，避免"发出去没反应"
+            return
+        if self._busy:
+            # 运行中提交 = 入队（默认 follow）：**不回显到对话区**——它还没被投递，
+            # 只属于排队面板；投递时由 QueuedPromptDelivered 落到对话区（本轮结束
+            # 或工具批之间）。回显在这里会让用户以为已经发出去了，而模型还没看到。
             self.start_task(text)
+            return
+        self._chat().apply(User(text))  # 非运行态：回显用户消息，避免"发出去没反应"
+        self.start_task(text)
+
+    def _on_agent_event(self, event) -> None:
+        """Agent 事件订阅（可能在 agent 线程上被调用）：只接排队变化，转发到主线程。"""
+        if isinstance(event, QueueChanged):
+            self.post_message(UiAction("queue", event))
+        elif isinstance(event, QueuedPromptDelivered):
+            # 排队输入被投递：现在才落到对话区（入队时只在面板里）
+            self.post_message(UiAction("queued_delivered", event.text))
+
+    def edit_queued(self, item_id: str) -> None:
+        """把某条排队输入取回输入框去改（面板行的 `edit` 按钮）。
+
+        与 Esc 的区别是**不碰当前任务**：Esc 会先中断正在跑的任务，而改一条排队
+        里的错别字不该付这个代价。取回后这条出队、文本拼到现有草稿之后、光标到末尾，
+        改完按 Enter 重新排队。
+        """
+        item = self.agent.take_queued(item_id)
+        if item is None:
+            return
+        found = self.query("#input")
+        if not found:
+            return
+        editor = found.first()
+        joiner = "\n" if editor.text.strip() else ""
+        editor.text = joiner.join([editor.text, item.text]).lstrip("\n")
+        editor.move_cursor(editor.document.end)
+        editor.focus()
+
+    def _recall_queue(self) -> None:
+        """把排队内容取回输入框并清空队列（既有 Esc 路径，不新增按键）。
+
+        与编辑器里已键入的内容拼接（换行分隔），对齐 pi 的「queued + currentText」。
+        """
+        steering, follow_up = self.agent.clear_queue()
+        texts = steering + follow_up
+        if not texts:
+            return
+        found = self.query("#input")
+        if not found:
+            return
+        editor = found.first()
+        joiner = "\n" if editor.text.strip() else ""
+        editor.text = joiner.join([editor.text, *texts]).lstrip("\n")
+        editor.move_cursor(editor.document.end)
+        editor.focus()
+
+    def ui_queued_delivered(self, text: str) -> None:
+        """排队输入被投递（本轮结束 / 工具批之间）：补上对话区的用户消息。"""
+        self._chat().apply(User(text))
+
+    def ui_queue(self, event) -> None:
+        """排队变化：重建面板（主线程）。空队列整块隐藏，锚点随高度重算。"""
+        found = self.query("#queued")
+        if not found:
+            return
+        found.first().show_items(
+            event.steering, event.follow_up,
+            on_cancel=self.agent.cancel_queued,
+            on_edit=self.edit_queued,
+        )
+        self.call_after_refresh(self.anchor_command_menu)
 
     def start_task(self, text: str) -> None:
         if self._busy:
-            self.ui_notice("（上一条任务还在运行，请等待）", "warning")
+            # 运行中提交 = 入队（默认 follow，见 [queue].delivery）；不新增按键。
+            # 不在这里打 notice：面板本身就是反馈，而 notice 会把原文重复印进
+            # 对话区，看起来像"已经发出去了"。
+            self.agent.enqueue(text)
             return
         self._busy = True
         self._turn_start = time.monotonic()
@@ -882,13 +736,16 @@ class SmithTUI(App):
         running.display = True
         running.start()
         self._sync_command_menu_anchor(running=True)
-        threading.Thread(target=self._run_task, args=(text,), daemon=True).start()
+        # 任务本身跑在事件循环上（Textual worker），不再另起线程：
+        # 阻塞型工作（LLM 流 / 预检 / 工具执行）由 Agent 侧下放到 to_thread，
+        # 所以循环始终能处理按键与重绘。见 tui/bridge.py 的线程不变量说明。
+        self.run_worker(self._run_task(text), name="agent-task", group="agent")
 
-    def _run_task(self, text: str) -> None:
+    async def _run_task(self, text: str) -> None:
         status = "ok"
         result = None
         try:
-            result = self.agent.run_with_goal(text)  # 目标激活时自动续跑，无目标等价 run
+            result = await self.agent.session_owner.run_with_goal(text)  # 无目标时等价 run
             status = result.status
         except Exception as e:  # noqa: BLE001
             self.post_message(
@@ -918,12 +775,12 @@ class SmithTUI(App):
         running.display = True
         running.start()
         self._sync_command_menu_anchor(running=True)
-        threading.Thread(target=self._run_compact, daemon=True).start()
+        self.run_worker(self._run_compact(), name="agent-compact", group="agent")
 
-    def _run_compact(self) -> None:
-        """后台线程执行一次手动压缩，结果经 UiAction 回主线程渲染。"""
+    async def _run_compact(self) -> None:
+        """执行一次手动压缩（与任务同一条事件循环），结果经 UiAction 回渲染。"""
         try:
-            status = self.agent.compact_manual()
+            status = await self.agent.compact_manual()
         except Exception as e:  # noqa: BLE001
             self.post_message(UiAction("notice", f"压缩失败：{type(e).__name__}: {e}", "error"))
         else:

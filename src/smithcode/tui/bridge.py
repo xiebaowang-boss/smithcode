@@ -1,7 +1,17 @@
-"""TUI 渲染后端：把 Agent 的终端交互桥接到 Textual 界面（从 worker 线程调用）。
+"""TUI 渲染后端：把 Agent 的终端交互桥接到 Textual 界面。
 
-流式/工具/信息类更新用 post_message 即发即走（不阻塞 worker、异常不会被
-吞）；弹窗类（confirm / ask）需要结果，仍用 call_from_thread + Event 阻塞。
+**线程不变量（承重，改动前先读）**：Agent 的任务本身跑在 Textual 的事件循环
+上（`app.run_worker`），但**所有会弹窗的调用都来自 Agent 下放的 worker 线程**——
+预检（权限确认 / 越界授权）与工具执行（`ask_user` / 技能信任）都经
+`asyncio.to_thread` 执行（见 `agent/tools_run.py`）。因此：
+
+- 即发即走的更新用 `post_message`：线程安全，从循环线程或 worker 线程都可以；
+- 需要结果的弹窗用 `call_from_thread` + `Event`：**只能从 worker 线程调用**
+  （Textual 在同一个线程上调用它会直接抛 `RuntimeError`，这也是上一条不变量的
+  自动保护）。
+
+若将来把预检/工具执行搬回循环线程，这两处会立刻炸——那正是我们想要的信号：
+那时必须改成 `push_screen_wait`（异步等待），而不是让 `Event.wait()` 冻住循环。
 """
 from __future__ import annotations
 

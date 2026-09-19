@@ -27,6 +27,20 @@ def _isolate_terminal_title(monkeypatch):
     title.reset()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_interaction_bridge():
+    """交互桥挂在 ContextVar 上（`Agent.start` 在主线程挂载）：用完复位。
+
+    不复位会把上一个用例的 Agent 泄漏给同线程的下一个用例——那时权限确认
+    会朝一个已经结束的 Agent 发事件。
+    """
+    from smithcode.agent import interactions
+
+    token = interactions.activate(None)
+    yield
+    interactions.reset(token)
+
+
 # ---------- 本地假 HTTP 代理（网络工具的环境代理回归用例） ----------
 
 _PROXY_PAGE_BODY = "<html><body><p>来自代理 {path}</p></body></html>"

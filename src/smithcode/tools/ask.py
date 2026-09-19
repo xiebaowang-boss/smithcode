@@ -12,6 +12,9 @@ multiple=True 表示该题可多选（可同时勾选多个选项，并与自定
 from __future__ import annotations
 
 from .. import renderer
+
+# 直接导入子模块：经包门面 `from ..agent import interactions` 会惰性拉起重链
+from ..agent.interactions import ask as ask_prompt
 from ..utils.terminal import confirmations_available
 from .base import register
 
@@ -127,5 +130,16 @@ def ask_user(questions: list[dict]) -> str:
     normalized = _normalize(questions)
     if not normalized:
         return _BAD_ARGS
-    answers = renderer.current().ask_form(normalized)
+    answers = ask_prompt(
+        "ask_user",
+        title=normalized[0]["question"] if normalized else "",
+        # normalized 里每题是 {question, options: [label...], …}（见 _normalize）
+        options=tuple(
+            label for question in normalized for label in question.get("options", [])
+        ),
+        payload={"question_count": len(normalized)},
+        # 整组答案全为空 = 用户取消了这次提问（每题空串表示该题取消）
+        outcome_of=lambda values: "cancelled" if all(not value for value in values) else "answered",
+        run=lambda: renderer.current().ask_form(normalized),
+    )
     return _format(normalized, answers)

@@ -1,0 +1,233 @@
+Screen { layout: horizontal; }
+#main { width: 1fr; height: 100%; layout: horizontal; }
+#chat-col { width: 1fr; height: 100%; background: #0a0a0a; }
+#chat {
+    height: 1fr;
+    padding: 1 2 1 2;
+    background: #0a0a0a;
+    /* Claude Code 式：不画滚动条（滚动功能不受影响）。
+       注意不能配 scrollbar-gutter: stable——两者同用会让 virtual_size 塌缩、滚动失效 */
+    scrollbar-size-vertical: 0;
+}
+#sidebar {
+    height: 100%;
+    width: 40;
+    padding: 1 2 1 2;
+    background: #141414;
+}
+#input-wrap {
+    height: auto;
+    margin: 0 2;
+    /* 左侧竖线不再画在容器上：容器内还有运行动画行，画在这里会连动画行一起框住 */
+}
+#command-menu {
+    /* 悬浮层：dock 到聊天列底部，再上移「输入区高 + 底行高」，锚在输入框正上方、
+       向上展开盖住聊天区底部，弹出/收起不改变输入框与聊天区大小。
+       offset 只是初始值：输入框高度随内容自适应（1-12 行），实际锚点由
+       _anchor_command_menu 按实时几何计算，写死行数会随高度变化错位 */
+    dock: bottom;
+    offset: 0 -5;
+    layer: command-menu;
+    margin: 0 2;
+    height: auto;
+    max-height: 8;  /* 固定展示行数，与 widgets.MENU_VISIBLE_ITEMS 一致，超出滚动 */
+    padding: 0 2;
+    background: #1e1e1e;
+    overflow: hidden auto;
+    /* 隐藏滚动条：候选超出时仍可用滚轮 / 键盘滚动，只是不绘制（与聊天区一致） */
+    scrollbar-size-vertical: 0;
+}
+#command-menu.running {
+    /* 兜底锚点：运行动画可见时输入框上方多占一行。
+       实际 offset 由 _anchor_command_menu 按实时几何内联设置（输入框高度可变），
+       此处仅在尚未计算过时兜底 */
+    offset: 0 -6;
+}
+#command-menu .menu-item {
+    width: 1fr;  /* 拉满整行，选中项的高亮底色才贯通 */
+    height: 1;
+}
+#input {
+    /* 高度随内容自适应：1 行时间距与原来一致（min-height 3），多行时向上长高，
+       封顶 max-height 后不再变高、改为内部滚动。
+       padding 上下对称（1 2 1 2）：此前底部为 0，单行时靠 min-height 撑出的空行
+       看着像底部留白，内容一到 2 行就被填满、留白"消失"；显式给底部 padding 后
+       每行都有稳定留白 */
+    height: auto;
+    min-height: 3;
+    max-height: 13;
+    padding: 1 2 1 2;
+    /* 左竖线画在输入框自身：只框住输入框自身的行，上面的运行动画行不跟着被框。
+    heavy 用 ┃，比默认 solid 的细线 │ 粗一档（Textual 边框固定 1 格宽，只能改字形） */
+    border: none;
+    border-left: heavy #23d18b;
+    background: #1e1e1e;
+    /* 与聊天区 / 命令菜单一致：不绘制滚动条，滚动功能不受影响 */
+    scrollbar-size-vertical: 0;
+}
+#input:focus {
+    border: none;
+    border-left: heavy #23d18b;  /* 伪类选择器优先级更高，须重复声明 */
+}
+#input .text-area--cursor-line {
+    background: transparent;
+}
+#bottom {
+    height: 2;
+    layout: horizontal;
+    padding: 0 0 1 0;
+    background: transparent;
+}
+#composer-mode, #composer-model, #composer-thinking, #composer-goal {
+    width: auto;
+    padding: 0 0 0 2;
+}
+/* 运行动画：位于 #input-wrap 内、输入框上方，左竖线只画在输入框上；
+   宽度按文案自适应（_spin 用 layout=False，宽度恒定免重排）。
+   padding-left 3 = 输入框边框 1 + 输入框内缩进 2，与键入文字左对齐 */
+#running {
+    color: #fab283;
+    width: auto;
+    height: 1;
+    padding: 0 3;
+}
+/* 排队面板：排队中才显示（display 由 QueuePanel 控制），逐条一行、超宽省略；
+   padding-left 3 与输入框正文左对齐（1 边框 + 2 内缩进）。
+   无表头行；每行末尾是投递方式（Follow / Steer）+ 撤销 ✕，配色由 QueueRow
+   逐段内联（正文灰 / Steer 橙 / ✕ 暗灰），这里只管版式。 */
+#queued {
+    height: auto;
+    /* 宽度必须显式撑满：`width: auto` 时面板宽度取自子控件，而子控件宽度又
+       取决于面板宽度——这个循环会把面板塌成 0 宽（连带 0 高），屏幕上就是
+       "排队了但什么都看不到"。面板本就该占满输入区宽度。 */
+    width: 1fr;
+    padding: 0 3;
+    color: #808080;
+}
+#status {
+    width: 1fr;
+    color: #808080;
+    content-align: right middle;
+    padding: 0 2;
+}
+
+/* 对话区统一布局：所有顶层消息带 .chat-item，缩进 / 间距只在此定义一次，
+   避免各调用点各自 print 导致格式漂移。左起点 = 3；用户消息的左边框占 1 列，
+   故其 padding-left 设为 2，正文同样落到列 3，与其它消息左对齐。
+   顶层块之间留一行（margin-top），不用 margin-bottom，避免相邻块双倍间隔。 */
+.chat-item { padding-left: 3; margin-top: 1; }
+/* 欢迎横幅（Logo + 问候）：保持原样的齐左版式，不参与消息缩进 */
+.chat-item.welcome { padding-left: 0; margin-top: 0; }
+.chat-item.user-msg {
+    background: #141414;
+    /* 与输入框左竖线同款同粗细（heavy 的 ┃），保持视觉一致 */
+    border-left: heavy #23d18b;
+    padding: 1 1 1 2;   /* 左边框 1 列 + padding 2 = 正文列 3 */
+}
+ToolCall { height: auto; }
+/* 摘要超列宽时按宽度省略，不折成第二行——工具行恒占一行（Agent 侧已保证无换行） */
+ToolCall .tool-header {
+    color: #808080;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+ToolCall .tool-header.tool-error { color: #f7768e; }
+ToolCall .tool-body { color: #808080; margin-left: 2; }
+ToolCall .tool-body.tool-error { color: #f7768e; }
+ContextGroup { height: auto; }
+ContextGroup .group-header { color: #808080; }
+/* Vertical 默认 height: 1fr，会让展开的汇总块撑满可用高度；明细区须按内容自适应 */
+ContextGroup .group-body { height: auto; margin-left: 2; }
+ContextGroup ToolCall { padding-left: 0; margin-top: 0; }
+ThinkingBlock { height: auto; }
+ThinkingBlock .think-header { color: #808080; }
+ThinkingBlock .think-body { color: #808080; margin-left: 2; }
+QuestionPanel {
+    height: auto;
+    margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
+    padding: 1 2 1 2;
+    background: #141414;
+    border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
+}
+QuestionPanel .ask-title { color: #fab283; margin-bottom: 1; }
+QuestionPanel .ask-hint { color: #808080; }
+/* opencode 式自定义回答：单行、无边框，嵌在选项列表末尾 */
+QuestionPanel Input {
+    border: none;
+    height: 1;
+    padding: 0 0 0 1;
+    background: #1e1e2e;
+}
+/* 自定义回答输入框：缩进对齐选项文字（"1. " 之后） */
+QuestionPanel Input.custom-answer { padding: 0 0 0 4; }
+PermissionPanel {
+    height: auto;
+    margin: 0 2;               /* 与 #input-wrap 同缩进，左右对齐输入框 */
+    padding: 1 2 1 2;
+    background: #141414;
+    border-left: heavy #fab283;  /* 与输入框/user 面板同粗细（heavy 的 ┃），仅颜色区分语义 */
+}
+PermissionPanel .perm-title { color: #fab283; margin-bottom: 1; }
+PermissionPanel .perm-detail { color: #a9b1d6; }
+PermissionPanel .ask-hint { color: #808080; }
+/* 通用选择弹窗：居中卡片（遮罩/变暗由 SelectionScreen 的 ModalScreen 背景负责）。
+   宽度按档位取定值，由调用方经 CommandSelect.size 声明（默认 medium）；
+   面板不测量内容，选项过长由各命令自行控制（暂无截断）。
+   max-width 兜住窄终端：档位再宽也不会超出屏宽 90%。 */
+SelectionPanel {
+    width: 64;        /* medium（默认档） */
+    max-width: 90%;
+    height: auto;
+    min-height: 16;   /* 比内容高，短列表也保持足够高度 */
+    max-height: 70%;
+    background: #1e1e1e;
+    padding: 1 2;
+}
+SelectionPanel.size-small { width: 40; }
+SelectionPanel.size-large { width: 88; }
+SelectionPanel.size-xlarge { width: 116; }
+SelectionPanel .selection-title {
+    color: #fab283;
+    text-style: bold;
+    padding-left: 2;    /* 与选项文字对齐（选项行首为 2 列标记位） */
+    margin-bottom: 1;   /* 标题与选项区之间留一行间隔 */
+}
+/* 行区：单个自渲染控件（SelectionRows，定义在 panels.py），每行内容由
+   render_line 直接产出，故不再有 .selection-row/.selection-label/.selection-trailing
+   等逐行规则；选中反白 / 表头蓝等配色见 panels.py 顶部的 _ACCENT / _HEADER_FG
+   （Python 侧样式无法从 CSS 取值，两处需同步改）。滚动条与聊天区一致
+   不绘制——它只影响滚动快慢路径的观感，与逐键渲染次数无关 */
+SelectionPanel .selection-rows {
+    height: 1fr;
+    scrollbar-size-vertical: 0;
+}
+SelectionPanel .selection-hint { color: #808080; dock: bottom; }
+/* MCP 添加向导：居中卡片，选择步骤复用选择面板的配色语义 */
+McpWizardPanel {
+    width: 88;
+    max-width: 90%;
+    height: auto;
+    max-height: 80%;
+    background: #1e1e1e;
+    padding: 1 2;
+}
+McpWizardPanel .wizard-title {
+    color: #fab283;
+    text-style: bold;
+    padding-left: 2;
+    margin-bottom: 1;
+}
+McpWizardPanel .wizard-scroll {
+    height: auto;
+    max-height: 22;
+    scrollbar-size-vertical: 0;  /* 同聊天区：不绘制滚动条 */
+}
+McpWizardPanel .wizard-body { color: #a9b1d6; }
+McpWizardPanel Input {
+    border: none;
+    height: 1;
+    padding: 0 0 0 1;
+    background: #1e1e2e;
+    margin-top: 1;
+}
+McpWizardPanel .wizard-hint { color: #808080; margin-top: 1; }

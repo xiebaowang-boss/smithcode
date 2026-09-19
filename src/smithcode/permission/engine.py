@@ -21,6 +21,11 @@ import fnmatch
 from pathlib import Path
 
 from .. import config, renderer
+
+# 直接导入子模块而不是 `from ..agent import interactions`：后者会经包门面的
+# `__getattr__` 惰性转发把 `agent/agent.py` 整条重链拉进来，而本模块正是那条链上
+# 的一环（成环）。`agent/interactions.py` 只依赖标准库，单向安全。
+from ..agent.interactions import ask as ask_prompt
 from ..tools import PATTERN_ARGS, PATTERN_FAMILIES
 from ..utils.terminal import confirmations_available
 from . import shell_policy
@@ -347,11 +352,18 @@ class Permission:
             "a": _clip(f"本会话信任目录: {root}"),
             "n": _clip("拒绝本次访问"),
         }
-        answer = r.confirm_choice(
-            f"{title} [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
-            "yan",
-            "y / a / n",
-            descriptions=descriptions,
+        answer = ask_prompt(
+            "outside_access",
+            title=title,
+            detail=tuple(descriptions.values()),
+            options=("once", "always", "deny"),
+            payload={"path": str(target), "root": str(root)},
+            run=lambda: r.confirm_choice(
+                f"{title} [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
+                "yan",
+                "y / a / n",
+                descriptions=descriptions,
+            ),
         )
         if answer == "y":
             return "once", root
@@ -456,12 +468,19 @@ class Permission:
         else:
             prompt = f"{title} [y]本次 / [n]拒绝: "
             options, hint = "yn", "y / n"
-        answer = r.confirm_choice(
-            prompt,
-            options,
-            hint,
-            content=_clip(content) if content else content,
-            descriptions=descriptions,
+        answer = ask_prompt(
+            "permission",
+            title=title,
+            detail=tuple(descriptions.values()),
+            options=tuple(options),
+            payload={"tool_name": tool_name, "patterns": tuple(patterns)},
+            run=lambda: r.confirm_choice(
+                prompt,
+                options,
+                hint,
+                content=_clip(content) if content else content,
+                descriptions=descriptions,
+            ),
         )
         if answer == "a":
             for _, key in proposals:

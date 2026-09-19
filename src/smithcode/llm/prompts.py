@@ -15,6 +15,7 @@
 import platform
 import sys
 import time
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 
@@ -156,17 +157,14 @@ _PROJECT_SECTIONS = [
 _SECTIONS = _BEHAVIOR_SECTIONS + _PROJECT_SECTIONS
 
 
-def build_system_prompt(
-    instructions_section: str = "",
-    skills_section: str = "",
-    goal_section: str = "",
-) -> str:
-    """拼装系统提示词；动态段非空时按序追加。
+def build_system_prompt(dynamic_sections: Sequence[str] = ()) -> str:
+    """拼装系统提示词；动态段非空时**按传入顺序**追加。
 
-    动态段由 session.sync_system() 传入（instructions.render_section() /
-    skills.render_section() / goal.render_section()），顺序即优先级阶梯：
-    base → 项目约定 → 技能目录 → 目标（越具体/越使命性越靠后）。技能正文不在这
-    里（它随加载进对话历史），各段只在自身内容变化时变化，普通回合保持逐字节稳定。
+    动态段由 `agent/transcript.py` 的注册表按 order 排好传入（项目约定 → 技能目录
+    → 目标，越具体/越使命性越靠后）。改成"收一个有序序列"而不是三个具名参数：
+    新增一段只需在注册表里注册，不必同时改本函数与 session.py——这正是方案 §9 要
+    的性质。技能正文不在这里（它随加载进对话历史），各段只在自身内容变化时变化，
+    普通回合保持逐字节稳定（宿主侧有断言）。
     """
     sections = "\n\n".join(_SECTIONS)
     prompt = f"""{_HEAD.rstrip()}
@@ -175,10 +173,7 @@ def build_system_prompt(
 {_env_info()}
 
 {sections}"""
-    if instructions_section:
-        prompt += "\n\n" + instructions_section
-    if skills_section:
-        prompt += "\n\n" + skills_section
-    if goal_section:
-        prompt += "\n\n" + goal_section
+    for section in dynamic_sections:
+        if section:
+            prompt += "\n\n" + section
     return prompt

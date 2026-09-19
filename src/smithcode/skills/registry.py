@@ -262,6 +262,7 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
     if key in _session_trusted or bool(load_trust().get(key)):
         return True
     # 延迟导入：utils.terminal 导入 commands，而 commands 导入 skills，顶层导入会成环
+    from ..agent.interactions import ask as ask_prompt
     from ..utils.terminal import confirmations_available
 
     if not confirmations_available():
@@ -277,9 +278,16 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
         f"- {skill.name}: {skill.description[:60]}" for skill in preview
     ]
     descriptions = {"y": "仅本次会话加载", "a": "始终信任此项目（落盘记录）", "n": "跳过本项目的技能"}
-    answer = r.confirm_choice(
-        "加载项目技能? [y]仅本次 / [a]始终信任此项目 / [n]跳过: ", "yan", "y / a / n",
-        detail=detail, descriptions=descriptions,
+    answer = ask_prompt(
+        "skill_trust",
+        title="加载项目技能?",
+        detail=tuple(detail),
+        options=("once", "always", "skip"),
+        payload={"project": key, "skills": tuple(skill.name for skill in preview)},
+        run=lambda: r.confirm_choice(
+            "加载项目技能? [y]仅本次 / [a]始终信任此项目 / [n]跳过: ", "yan", "y / a / n",
+            detail=detail, descriptions=descriptions,
+        ),
     )
     if answer in ("y", "a"):
         if answer == "a":

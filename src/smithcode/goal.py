@@ -3,7 +3,7 @@
 借鉴 Codex CLI 的 /goal：目标在多个回合间存活，模型围绕目标推进，直到逐条
 核验真实证据后调用 goal_update 声明完成（或同一阻碍连续多回合后声明受阻），
 或（配置了回合预算时）预算用尽由系统收尾。目标存于本模块的进程内单例（会话口径，/new 时
-reset()）；Agent.run_with_goal() 在每轮任务结束后检查状态，必要时注入续跑
+reset()）；AgentSession.run_with_goal() 在每轮任务结束后检查状态，必要时注入续跑
 提示词自动开启下一回合——续跑只在宿主空闲、目标 active 且上一轮正常结束
 且有实际推进（用过工具）时发生，避免空转。
 
@@ -351,149 +351,208 @@ class Goal:
         )
 
 
-# ---------- 会话级单例（/new 时 reset） ----------
+# ---------- 会话级状态（/new 时 reset） ----------
 
-_current: Goal | None = None
+
+class GoalState:
+    """一个会话的持久目标状态（原模块级单例 `_current`）。
+
+    目标明确属于会话（`/new` 清空、恢复时按 `t=state` 读回），所以状态要能随会话
+    存续——模块单例做不到"同时存在两个会话"（恢复/切换时会串味）。实例由
+    `AgentSession` 持有并通过 `bind()` 生效。
+    """
+
+    def __init__(self) -> None:
+        self.current: Goal | None = None
+
+    def inherit(self, other: GoalState) -> None:
+        """接管另一个实例的当前目标（会话建立时从默认实例接过来）。
+
+        为什么需要：`/goal set` 之类的调用可能发生在会话对象建立之前（命令层直接
+        调 `goal.set`，那时绑定的是默认实例）。新会话若从这里从空开始，用户刚设的
+        目标就凭空消失了。接过来是"会话建立前设的状态属于随后建立的这个会话"。
+        """
+        self.current = other.current
+
+
+    def reset(self) -> None:
+        """清空当前会话的目标（/new 时调用）。"""
+        self.current = None
+
+    def snapshot(self) -> dict | None:
+        """会话级目标快照（持久化投影缓存用；不含回合计数与 token 基线）。"""
+        if self.current is None:
+            return None
+        return {
+            "objective": self.current.objective,
+            "status": self.current.status,
+            "max_turns": self.current.max_turns,
+            "evidence": self.current.evidence,
+            "note": self.current.note,
+        }
+
+    def restore(self, data) -> None:
+        """从快照恢复目标（原地重建单例）；回合计数与 token 基线有意重置。
+    
+        对齐 Claude Code：活跃目标跨进程存活，但回合数/计时/用量从零重新开始，
+        避免恢复后立即触发预算收尾。非法数据等同于清空。
+        """
+        if not isinstance(data, dict) or not str(data.get("objective") or "").strip():
+            self.current = None
+            return
+        try:
+            budget = int(data.get("max_turns"))
+        except (TypeError, ValueError):
+            budget = config.GOAL_MAX_TURNS
+        restored = Goal(
+            objective=str(data["objective"]).strip(),
+            max_turns=budget,
+        )
+        status = data.get("status")
+        restored.status = status if status in STATUSES else ACTIVE
+        restored.evidence = str(data.get("evidence") or "")
+        restored.note = str(data.get("note") or "")
+        if restored.status != ACTIVE:
+            restored.ended_at = time.time()
+        self.current = restored
+
+# 进程级默认实例：没有会话绑定时的落点（直接调本模块的测试、无 Agent 的路径）
+_default_state = GoalState()
+_active_state = _default_state
+
+
+def bind(state: GoalState | None) -> None:
+    """切换本模块函数作用的状态实例（`None` = 回到默认实例）。
+
+    调用点太多（session.py、commands/*、agent/*、tui/*），逐个改成
+    `session.goal_state.xxx()` 不如让既有函数指向"当前实例"。**局限**：同一进程
+    同时跑两个会话会互相覆盖——与改造前的单例行为一致；TUI/REPL 是一个进程一个会话。
+    """
+    global _active_state
+    _active_state = state if state is not None else _default_state
 
 
 def current() -> Goal | None:
-    return _current
+    return _active_state.current
 
 
 def is_set() -> bool:
-    return _current is not None
+    return _active_state.current is not None
 
 
 def is_active() -> bool:
-    return _current is not None and _current.status == ACTIVE
+    return _active_state.current is not None and _active_state.current.status == ACTIVE
 
 
 def set(objective: str, max_turns: int | None = None, tokens_at_start: int = 0) -> Goal:
     """设定（或替换）当前目标；max_turns 缺省取配置 GOAL_MAX_TURNS（默认 -1 不限）。"""
-    global _current
-    _current = Goal(
+    _active_state.current = Goal(
         objective=str(objective).strip(),
         max_turns=config.GOAL_MAX_TURNS if max_turns is None else int(max_turns),
         tokens_at_start=int(tokens_at_start or 0),
     )
-    return _current
+    return _active_state.current
 
 
 def pause(note: str = "") -> bool:
-    if _current is None or _current.status != ACTIVE:
+    if _active_state.current is None or _active_state.current.status != ACTIVE:
         return False
-    _current.pause(note)
+    _active_state.current.pause(note)
     return True
 
 
 def resume() -> bool:
-    return _current.resume() if _current is not None else False
+    return _active_state.current.resume() if _active_state.current is not None else False
 
 
 def clear() -> bool:
-    global _current
-    if _current is None:
+    if _active_state.current is None:
         return False
-    _current = None
+    _active_state.current = None
     return True
 
 
 def complete(evidence: str = "") -> bool:
-    if _current is None:
+    if _active_state.current is None:
         return False
-    _current.complete(evidence)
+    _active_state.current.complete(evidence)
     return True
 
 
 def budget_limited() -> bool:
-    if _current is None or _current.status != ACTIVE:
+    if _active_state.current is None or _active_state.current.status != ACTIVE:
         return False
-    _current.budget_limited()
+    _active_state.current.budget_limited()
     return True
 
 
 def try_block(reason: str) -> tuple[bool, str]:
-    if _current is None:
+    if _active_state.current is None:
         return False, "错误: 当前没有持久目标，不要调用 goal_update。"
-    return _current.try_block(reason)
+    return _active_state.current.try_block(reason)
 
 
 def begin_turn() -> int:
-    if _current is None:
+    if _active_state.current is None:
         return 0
-    return _current.begin_turn()
+    return _active_state.current.begin_turn()
 
 
 def note_run(tools_used=(), total_tokens: int | None = None) -> None:
-    if _current is not None:
-        _current.note_run(tools_used, total_tokens)
+    if _active_state.current is not None:
+        _active_state.current.note_run(tools_used, total_tokens)
 
 
 def set_budget(max_turns: int) -> bool:
-    if _current is None:
+    if _active_state.current is None:
         return False
-    _current.max_turns = int(max_turns)
+    _active_state.current.max_turns = int(max_turns)
     return True
 
 
 def render_status() -> str:
-    return _current.render_status() if _current is not None else "当前没有持久目标。"
+    return _active_state.current.render_status() if _active_state.current is not None else "当前没有持久目标。"
 
 
 def render_section() -> str:
-    return _current.render_section() if _current is not None else ""
+    return _active_state.current.render_section() if _active_state.current is not None else ""
 
 
 def marker() -> str:
-    return _current.marker() if _current is not None else ""
+    return _active_state.current.marker() if _active_state.current is not None else ""
 
 
 def sidebar() -> tuple | None:
     """侧边栏目标卡片内容；无目标返回 None（宿主隐藏该卡片）。"""
-    return _current.sidebar() if _current is not None else None
+    return _active_state.current.sidebar() if _active_state.current is not None else None
 
 
-def reset() -> None:
-    """清空当前会话的目标（/new 时调用）。"""
-    global _current
-    _current = None
 
 
-def snapshot() -> dict | None:
-    """会话级目标快照（持久化投影缓存用；不含回合计数与 token 基线）。"""
-    if _current is None:
-        return None
-    return {
-        "objective": _current.objective,
-        "status": _current.status,
-        "max_turns": _current.max_turns,
-        "evidence": _current.evidence,
-        "note": _current.note,
-    }
+
+def reset(*args, **kwargs):
+    """对**当前绑定的实例**做 reset（见 `bind`）；会话内的等价调用用
+    `AgentSession` 持有的实例，避免依赖绑定状态。"""
+    return _active_state.reset(*args, **kwargs)
 
 
-def restore(data) -> None:
-    """从快照恢复目标（原地重建单例）；回合计数与 token 基线有意重置。
+def snapshot(*args, **kwargs):
+    """对**当前绑定的实例**做 snapshot（见 `bind`）；会话内的等价调用用
+    `AgentSession` 持有的实例，避免依赖绑定状态。"""
+    return _active_state.snapshot(*args, **kwargs)
 
-    对齐 Claude Code：活跃目标跨进程存活，但回合数/计时/用量从零重新开始，
-    避免恢复后立即触发预算收尾。非法数据等同于清空。
-    """
-    global _current
-    if not isinstance(data, dict) or not str(data.get("objective") or "").strip():
-        _current = None
-        return
-    try:
-        budget = int(data.get("max_turns"))
-    except (TypeError, ValueError):
-        budget = config.GOAL_MAX_TURNS
-    restored = Goal(
-        objective=str(data["objective"]).strip(),
-        max_turns=budget,
-    )
-    status = data.get("status")
-    restored.status = status if status in STATUSES else ACTIVE
-    restored.evidence = str(data.get("evidence") or "")
-    restored.note = str(data.get("note") or "")
-    if restored.status != ACTIVE:
-        restored.ended_at = time.time()
-    _current = restored
+
+def restore(*args, **kwargs):
+    """对**当前绑定的实例**做 restore（见 `bind`）；会话内的等价调用用
+    `AgentSession` 持有的实例，避免依赖绑定状态。"""
+    return _active_state.restore(*args, **kwargs)
+
+
+def default_state() -> GoalState:
+    """进程级默认实例（无会话绑定时的作用对象，会话建立时从其继承）。"""
+    return _default_state
+
+
+def active_state() -> GoalState:
+    """当前绑定生效的实例（会话建立时从它接管状态，见 AgentSession）。"""
+    return _active_state

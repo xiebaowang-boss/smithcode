@@ -808,7 +808,7 @@ class SelectionPanel(Vertical):
     行，键盘导航只在可选项中循环。面板内部先算一份「行计划」（表头 / 空行 / 选项），
     渲染、刷新与滚动定位都基于它，行数与 item 数不再一一对应。
 
-    宽度按 size 档位取定值（宽度值定义在 SmithTUI.CSS 的 `.size-*` 规则里），
+    宽度按 size 档位取定值（宽度值定义在 tui/app.tcss 的 `.size-*` 规则里），
     面板不测量内容；未知档位回退 DEFAULT_SIZE，避免调用方写错档位把面板撑坏。
     """
 

@@ -194,14 +194,15 @@ def test_tui_mount_wires_terminal_title(monkeypatch):
     captured = {"writes": []}
     real_attach = title_module.attach
 
-    def spy_attach(inner, sink=None, workspace=""):
+    def spy_attach(inner, sink=None, workspace="", agent=None):
         captured["inner"] = inner
         captured["sink"] = sink
+        captured["agent"] = agent  # 等待态靠订阅 Agent 事件（见 on_agent_event）
 
         def recording_sink(seq):
             captured["writes"].append(seq)
 
-        return real_attach(inner, sink=recording_sink, workspace=workspace)
+        return real_attach(inner, sink=recording_sink, workspace=workspace, agent=agent)
 
     monkeypatch.setattr(title_module, "attach", spy_attach)
 
@@ -938,9 +939,10 @@ def test_tui_compact_runs_in_background_with_feedback(monkeypatch):
         app = SmithTUI(agent)
         started, release = threading.Event(), threading.Event()
 
-        def fake_compact_manual():
+        async def fake_compact_manual():
             started.set()
-            release.wait(2)  # 卡住后台线程，模拟耗时的摘要请求
+            # 卡住后台线程的协程（用线程事件等待，模拟耗时的摘要请求）
+            await asyncio.to_thread(release.wait, 2)
             return "ok"
 
         monkeypatch.setattr(agent, "compact_manual", fake_compact_manual)
@@ -1131,7 +1133,7 @@ def test_tui_sidebar_usage_section(monkeypatch):
             assert context_title.startswith("Context · ")
             assert "%" in context_title
             context = str(sidebar.query_one(".context-body").content)
-            assert "Used" in context and "Budget" in context
+            assert "Used" in context and "Budget" not in context
             # 有调用后：用量卡标题变为「Usage · Calls N」，正文只剩 In/Out
             app.agent.session.usage.add({"prompt_tokens": 1234, "completion_tokens": 567})
             app.ui_status()
@@ -1186,15 +1188,16 @@ def test_tui_status_bar(monkeypatch):
             await pilot.press("y")
             await pilot.pause()
             assert app.query_one("#input-wrap").display is True
-            # 底部状态栏：上下文占用条 + git 分支（不再含模型/思考强度/「上下文」「git」字样）
+            # 底部状态栏：上下文占用文字 + git 分支（不再含模型/思考强度/「上下文」「git」字样）
             status = str(app.query_one("#status").content)
             assert config.MODEL not in status
             assert "思考" not in status
             assert "项目" not in status
             assert "上下文" not in status
             assert "git" not in status
-            assert "%" in status
-            assert "█" in status or "░" in status  # 进度条字符（0% 或 100% 时可能只有一种）
+            # 上下文为纯文字 `12.3K(10%)`，不再有 █░ 进度条
+            assert "(0%)" in status
+            assert "█" not in status and "░" not in status
 
     _run(_run_case())
 
@@ -2823,7 +2826,7 @@ def test_selection_panel_renders_with_no_color(monkeypatch):
 
 
 def test_selection_panel_size_tiers_and_fallback():
-    """size 档位落到 CSS 类（宽度值在 SmithTUI.CSS）；未知档位回退默认 medium。"""
+    """size 档位落到 CSS 类（宽度值在 tui/app.tcss）；未知档位回退默认 medium。"""
 
     def make(size=None):
         kwargs = {} if size is None else {"size": size}
@@ -3735,8 +3738,8 @@ def test_tui_stream_block_closed_after_timeout(monkeypatch):
     agent.llm = fake  # 同一实例供两轮调用（第一轮断流，第二轮正常）
 
     def _drive():
-        first = agent.run("第一轮")
-        second = agent.run("第二轮")
+        first = asyncio.run(agent.run("第一轮"))
+        second = asyncio.run(agent.run("第二轮"))
         return first, second
 
     async def _run_case():

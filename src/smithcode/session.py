@@ -14,8 +14,8 @@ import json
 import time
 from pathlib import Path
 
-from . import config, goal, instructions, skills
-from .llm.prompts import build_system_prompt
+from . import config
+from .agent.transcript import assemble_system_prompt
 from .llm.usage import UsageTracker
 
 
@@ -97,11 +97,7 @@ class Session:
         `instructions.render_section()`。
         兼容 load() 读回的旧历史：首段是 system 时同样按最新内容校准。
         """
-        content = build_system_prompt(
-            instructions_section=instructions.render_section(),
-            skills_section=skills.render_section(),
-            goal_section=goal.render_section(),
-        )
+        content = assemble_system_prompt()  # 段与顺序见 agent/transcript.py 的注册表
         if self._messages and self._messages[0].get("role") == "system":
             if self._messages[0].get("content") != content:
                 self._messages[0]["content"] = content

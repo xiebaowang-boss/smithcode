@@ -1,4 +1,5 @@
 """任务拆分与分步骤执行测试：plan 状态模块与 todo_write 工具。"""
+import asyncio
 import json
 
 import pytest
@@ -232,7 +233,7 @@ def test_agent_executes_todo_write_and_renders(monkeypatch, capsys):
         ),
     )
     agent = Agent(session=Session())
-    assert agent.run("多步任务").text == "完成"
+    assert asyncio.run(agent.run("多步任务")).text == "完成"
     out = capsys.readouterr().out
     assert "[计划]" in out
     assert "步骤一" in out
@@ -318,7 +319,7 @@ def test_agent_prints_plan_only_when_created(monkeypatch, capsys):
         ),
     )
     agent = Agent(session=Session())
-    assert agent.run("多步任务").text == "完成"
+    assert asyncio.run(agent.run("多步任务")).text == "完成"
     out = capsys.readouterr().out
     assert out.count("[计划]") == 1
     assert out.count("步骤一") == 1
@@ -339,7 +340,7 @@ def test_agent_skips_tool_row_on_plan_update(monkeypatch):
     monkeypatch.setattr("smithcode.renderer._current", cap)
 
     agent = Agent(session=Session())
-    agent.run("多步任务")
+    asyncio.run(agent.run("多步任务"))
 
     todo_rows = [display for name, display in cap.tool_calls if name == "todo_write"]
     assert todo_rows == ["block"]  # 仅新建时上屏，且为可折叠详情块
@@ -358,7 +359,7 @@ def test_agent_todo_write_denied_by_user_rule(monkeypatch, tmp_path):
             "arguments": json.dumps({"todos": [{"title": "x", "status": "pending"}]}),
         }
     }
-    agent._execute_batch([call])
+    asyncio.run(agent._execute_batch([call]))
     assert agent.session.messages[-1]["content"] == "用户拒绝了此操作"
     assert plan.current().items == []
 

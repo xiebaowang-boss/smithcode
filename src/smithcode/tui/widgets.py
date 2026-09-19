@@ -6,6 +6,7 @@ post_message 向上通信），可独立测试；样式集中在 app.py 的 Smit
 from __future__ import annotations
 
 import time
+import unicodedata
 from pathlib import Path
 from typing import ClassVar
 
@@ -446,7 +447,7 @@ class ChatView(VerticalScroll):
         self.end_stream()
 
     def _mk(self, renderable, classes: str | None = None) -> Static:
-        # 所有顶层消息统一带 chat-item：缩进 / 间距的唯一来源（见 app.py 的 CSS）
+        # 所有顶层消息统一带 chat-item：缩进 / 间距的唯一来源（见 tui/app.tcss）
         block = Static(renderable, classes="chat-item" if not classes else f"chat-item {classes}")
         block.can_focus = False
         self._mount_block(block)
@@ -584,6 +585,151 @@ class RunningIndicator(Static):
         if self._retry is not None:
             return text + " · " + self._retry.text()
         return text
+
+
+# ---------- 运行中排队面板 ----------
+
+
+class QueueRow(Static):
+    """排队面板的一行：正文左对齐，**编辑 / 撤销两个图标**右对齐成固定列组。
+
+    版式（`✕` 贴最后一列）：
+
+        ↳ <正文……>                                            ✎   ✕
+
+    - 行首 `↳` 表示这些行是**挂在上方运行动画之下的续行**（与 `↳` 在别处的用法
+      一致：续行/子项）；它不承担投递方式的信息（方式见 `QueueRow` 上方说明）。
+      与已占用的字形不冲突：`▸`/`▾` 是折叠箭头、`○`/`●`/`✓`/`✗` 是计划清单与
+      通知的图标、`┃` 是用户块边框；`↳` 是单宽度字形；
+    - 不显示投递方式（默认配置下它是常量，写出来只占宽度）；也不写 `edit` /
+      `cancel` 文字——**整词在面板里太抢眼**（用户实机反馈），改成图标，语义靠颜色
+      与位置区分：`✎` 蓝（动作）/ `✕` 红（破坏性）；
+    - **图标小、命中区大**：图标各占 1 格，但命中区分别给 5 格与 3 格（见
+      `_icon_zones`），终端里点得中比长得大更重要；
+    - 正文按**显示宽度**（CJK 占 2 列）截断，中文长句不会截歪。
+    """
+
+    can_focus = False
+    MARKER = "↳"  # 行首标记：挂在运行动画之下的续行（用户实机选定）
+    ICON_EDIT = "✎"
+    ICON_CANCEL = "✕"
+    ICON_GAP = 3  # 两个图标之间的间距（归右图标的命中区，避免两区间歧义）
+    BODY_STYLE = "#808080"
+    MARKER_STYLE = "#606060"
+    EDIT_STYLE = "#7aa2f7"    # 动作色（与 retry 同色）
+    CANCEL_STYLE = "#f7768e"  # 破坏性（与错误同色）
+
+    def __init__(self, item, *, on_cancel=None, on_edit=None, **kwargs):
+        kwargs.setdefault("markup", False)
+        super().__init__(**kwargs)
+        self.item = item
+        self._on_cancel = on_cancel
+        self._on_edit = on_edit
+
+    def _buttons(self) -> str:
+        icons = []
+        if self._on_edit is not None:
+            icons.append(self.ICON_EDIT)
+        if self._on_cancel is not None:
+            icons.append(self.ICON_CANCEL)
+        return (" " * self.ICON_GAP).join(icons)
+
+    def _icon_zones(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """(edit 区间, cancel 区间) 的半开**列区间**，两者不相交、右端贴最后一列。
+
+        命中区比图标宽：`✕` 占 1 格但给它 3 格，`✎` 占 1 格但给它 5 格——终端里
+        1 格宽的目标基本点不中。两个区间相邻不重叠，判定时从右往左。
+        """
+        end = self.size.width
+        cancel = (max(0, end - 3), end)
+        edit = (max(0, cancel[0] - 5), cancel[0])
+        return edit, cancel
+
+    def render(self) -> Text:
+        width = self.size.width or 40
+        buttons = self._buttons()
+        buttons_w = display_width(buttons)
+        prefix = self.MARKER + " "
+        room = width - buttons_w - display_width(prefix) - 1  # -1：正文与图标间至少一格
+        body = " ".join(str(self.item.text).split())
+        if display_width(body) > room:
+            body = clip_to_width(body, room)
+        gap = max(1, width - display_width(prefix) - display_width(body) - buttons_w)
+        spans: list[tuple[str, str]] = [
+            (prefix, self.MARKER_STYLE),
+            (body, self.BODY_STYLE),
+            (" " * gap, ""),
+        ]
+        if self._on_edit is not None:
+            spans.append((self.ICON_EDIT, self.EDIT_STYLE))
+            if self._on_cancel is not None:
+                spans.append((" " * self.ICON_GAP, ""))
+        if self._on_cancel is not None:
+            spans.append((self.ICON_CANCEL, self.CANCEL_STYLE))
+        return Text.assemble(*spans)
+
+    def on_click(self, event) -> None:
+        """点图标才生效：`✎` 取回编辑、`✕` 撤销；点正文不做任何事。
+
+        点正文不做事是刻意的——留给选中 / 复制，误触撤销的代价是重打一遍。
+        """
+        if event is None:
+            return
+        edit_zone, cancel_zone = self._icon_zones()
+        if self._on_cancel is not None and cancel_zone[0] <= event.x < cancel_zone[1]:
+            self._on_cancel(self.item.id)
+            return
+        if self._on_edit is not None and edit_zone[0] <= event.x < edit_zone[1]:
+            self._on_edit(self.item.id)
+
+
+def display_width(text: str) -> int:
+    """终端显示宽度：CJK 全角按 2 列计（列位计算用，避免中文错位）。
+
+    与 `tools/files.py` 的同类实现保持同一规则（那里是私有名，且工具层不该被
+    UI 反向依赖）。两处都只有一个表达式，真出现第三处再抽公共模块。
+    """
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def clip_to_width(text: str, room: int) -> str:
+    """按显示宽度截断并补省略号（中文长句按格数截，不按字符数）。"""
+    out = ""
+    for ch in text:
+        if display_width(out + ch) > max(1, room) - 1:
+            break
+        out += ch
+    return out + "…"
+
+
+class QueuePanel(Vertical):
+    """运行中排队面板：`#running` 之下、输入框之上（计划 §5(4) 的摆放位置）。
+
+    队列为空时整块隐藏（`display = False`），因此不占高度；有内容时逐条列出
+    （**没有表头行**：条数由行数本身表达，投递方式写在每行末尾，见 `QueueRow`），
+    命令菜单的锚点由 `#input-wrap` 的实时高度重算，无需为它单独改锚点逻辑。
+    """
+
+    can_focus = False
+
+    def show_items(self, steering, follow_up, *, on_cancel=None, on_edit=None) -> None:
+        """按当前队列快照重建面板；空则隐藏。"""
+        items = list(steering) + list(follow_up)
+        for child in list(self.children):
+            child.remove()
+        if not items:
+            self.display = False
+            return
+        # **先显示、再挂子控件**，最后显式让父链重算布局。
+        # 反过来（挂完再 display=True）会得到 display 为真但尺寸仍是 0×0 的面板：
+        # 面板此前 `display=False`，布局阶段被跳过，父容器 `#input-wrap`（height:auto）
+        # 的高度里就没算这一块——挂上子控件也不会自动补算，而"display 为真、高 0"
+        # 在终端上就是**什么都看不到**（用户报的"入队后面板没出现"正是这个形态）。
+        self.display = True
+        for item in items:
+            self.mount(QueueRow(item, on_cancel=on_cancel, on_edit=on_edit,
+                                classes="queue-row"))
+        self.refresh(layout=True)
 
 
 def _tick_spinner(widget: Static, text: str, *, column: int = 0) -> None:

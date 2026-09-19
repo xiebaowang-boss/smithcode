@@ -30,5 +30,9 @@ smith = "smithcode.cli:main"
 where = ["src"]
 include = ["smithcode*"]
 
+# 非 .py 资源：TUI 样式表（Textual CSS_PATH 加载），不声明则 wheel 里会缺失
+[tool.setuptools.package-data]
+smithcode = ["tui/*.tcss"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

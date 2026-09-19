@@ -1,5 +1,6 @@
 """工具调用终端展示测试：describe 短摘要、summary/detail 两种模式、配置降级。"""
 
+import asyncio
 import json
 
 import pytest
@@ -148,7 +149,7 @@ def _run_tool(monkeypatch, tmp_path, name, args_dict, display=None) -> Agent:
     if display:
         monkeypatch.setattr(config, "load_tool_display", lambda: display)
     agent = Agent(session=Session())
-    agent.run("工具测试")
+    asyncio.run(agent.run("工具测试"))
     return agent
 
 
@@ -227,7 +228,8 @@ def test_edit_file_shows_diff(monkeypatch, tmp_path, capsys):
 
     (tmp_path / "c.txt").write_text("x = 1\n", encoding="utf-8")
     # Agent.__init__ 会清空已读记录，这里禁用清空以便预置"已读"状态
-    monkeypatch.setattr("smithcode.agent.reset_read_tracking", lambda: None)
+    # 包化后 Agent 实现位于 smithcode.agent.agent，patch 必须打在实际调用点上
+    monkeypatch.setattr("smithcode.agent.agent.reset_read_tracking", lambda: None)
     files_mod.READ_FILES.add(str((tmp_path / "c.txt").resolve()))
     monkeypatch.setattr("builtins.input", lambda _: "y")
     _run_tool(
@@ -245,7 +247,8 @@ def test_edit_result_confirmation_shown_after_execution(monkeypatch, tmp_path, c
     import smithcode.tools.files as files_mod
 
     (tmp_path / "c.txt").write_text("x = 1\n", encoding="utf-8")
-    monkeypatch.setattr("smithcode.agent.reset_read_tracking", lambda: None)
+    # 包化后 Agent 实现位于 smithcode.agent.agent，patch 必须打在实际调用点上
+    monkeypatch.setattr("smithcode.agent.agent.reset_read_tracking", lambda: None)
     files_mod.READ_FILES.add(str((tmp_path / "c.txt").resolve()))
     monkeypatch.setattr("builtins.input", lambda _: "y")
     _run_tool(
@@ -320,23 +323,18 @@ def test_finish_expands_write_edit_tools_only(monkeypatch, tmp_path, capsys):
     """
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     from smithcode import agent as agent_mod
+    from smithcode.agent.events import ToolEnd
 
     captured = []
-
-    class CapRenderer:
-        def tool_result(self, result, tool_id=None, expand=False):
-            captured.append(expand)
-
-        def info(self, text):
-            pass
-
-        warn = info
-        error = info
-
-    monkeypatch.setattr(agent_mod.renderer, "current", lambda: CapRenderer())
     bare = agent_mod.Agent.__new__(agent_mod.Agent)
-    agent_mod.Agent._finish(bare, "已写入", None, "write_file")
-    agent_mod.Agent._finish(bare, "已应用", None, "apply_patch")
-    agent_mod.Agent._finish(bare, "乙", None, "ask_user")
-    agent_mod.Agent._finish(bare, "ok", None, "run_command")
-    assert captured == [True, True, True, False]
+    bare._emit = captured.append  # 只关心发出去的事件
+
+    agent_mod.Agent._finish(bare, "已写入", "call-1", "write_file")
+    agent_mod.Agent._finish(bare, "已应用", "call-2", "apply_patch")
+    agent_mod.Agent._finish(bare, "乙", "call-3", "ask_user")
+    agent_mod.Agent._finish(bare, "ok", "call-4", "run_command")
+
+    assert [event.expand for event in captured] == [True, True, True, False]
+    assert all(isinstance(event, ToolEnd) for event in captured)
+    # tool_call_id 原样带走：事件模型里它就是配对的键（旧式整型 id 由桥分配）
+    assert [event.tool_call_id for event in captured] == ["call-1", "call-2", "call-3", "call-4"]

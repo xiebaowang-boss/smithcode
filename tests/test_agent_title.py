@@ -2,6 +2,7 @@
 
 标题请求在后台 daemon 线程里跑，这里用同步假 `_complete` + join 消除不确定性。
 """
+import asyncio
 import threading
 
 import pytest
@@ -196,11 +197,11 @@ def test_run_triggers_title_retry_across_turns(agent, monkeypatch, capsys):
     replies = [RuntimeError("网络抖动"), '{"title": "跨轮补试"}']
     _patch_complete(agent, monkeypatch, replies)
 
-    agent.run("第一轮")
+    asyncio.run(agent.run("第一轮"))
     _wait_title_threads()
     assert agent.session.title == ""
 
-    agent.run("第二轮")
+    asyncio.run(agent.run("第二轮"))
     _wait_title_threads()
     assert agent.session.title == "跨轮补试"
     assert agent.session.title_source == "auto"
