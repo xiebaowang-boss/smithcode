@@ -375,7 +375,11 @@ def list_dir(path: str = ".") -> str:
             continue
         # lstat 语义：符号链接目录按链接本身处理，不跟随到目标——
         # 否则指向仓外的 dirlink 会泄漏目标的目录性 / 大小 / mtime。
-        is_dir = item.is_dir(follow_symlinks=False)
+        # 写成「先 is_symlink 再 is_dir」而不是 `is_dir(follow_symlinks=False)`：
+        # 后者的关键字是 **Python 3.13** 才加到 `Path.is_dir()` 上的，而本项目
+        # 声明 `requires-python >= 3.10`（3.10–3.12 上传关键字直接 TypeError，
+        # list_dir 整个工具崩溃）。`is_symlink()` 走 lstat，全版本可用。
+        is_dir = not item.is_symlink() and item.is_dir()
         size, mtime = "", ""
         try:
             st = item.stat(follow_symlinks=False)
