@@ -51,6 +51,50 @@ def test_events_are_declared_only_in_the_catalog():
     assert not offenders, f"事件声明只能写在 event/catalog.py：{offenders}"
 
 
+def test_session_events_declare_an_aggregate():
+    """会话事件必须声明 `aggregate="session_id"`：没有它就无法按会话路由/回放。
+
+    多客户端要靠它把事件分给正确的连接，持久日志要靠它分段——漏声明的后果
+    不会立刻显形（单会话跑得好好的），所以必须静态锁住。
+    """
+    from smithcode.event import registry
+
+    offenders = []
+    for cls in registry.declared_classes():
+        if cls.__module__ != "smithcode.event.catalog":
+            continue
+        info = registry.meta(cls)
+        if info.type.startswith("session.") and info.aggregate != "session_id":
+            offenders.append(f"{cls.__name__}（{info.type}）")
+    assert not offenders, f"会话事件必须声明 aggregate=session_id：{offenders}"
+
+
+def test_durable_events_are_serializable():
+    """持久事件的载荷必须能 JSON 化（阶段 E 要落盘、将来要跨进程）。
+
+    易失事件允许携带进程内对象（如 RetryState）；持久事件不允许——一旦带上，
+    写日志时才会炸，而那时数据已经半写。
+    """
+    import json
+    from dataclasses import fields
+
+    from smithcode.event import catalog, registry
+    from smithcode.event.envelope import payload_to_dict
+
+    offenders = []
+    for cls in registry.declared_classes():
+        if cls.__module__ != "smithcode.event.catalog" or not registry.meta(cls).durable:
+            continue
+        # 用一个"空实例"试序列化：字段级类型检查比构造实例更省事
+        for field in fields(cls):
+            hint = str(field.type)
+            if "Mapping" in hint or "Any" in hint or "object" in hint:
+                offenders.append(f"{cls.__name__}.{field.name}: {hint}")
+    assert not offenders, f"持久事件的字段必须是可序列化的具体形状：{offenders}"
+    # 顺带证明现有持久载荷真的能 JSON 化
+    json.dumps(payload_to_dict(catalog.ExecutionSucceeded(status="ok", text="好")))
+
+
 # ---------- 2. 一个发布口 ----------
 
 

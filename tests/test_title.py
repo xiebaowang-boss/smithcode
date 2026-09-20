@@ -427,15 +427,19 @@ class RecordingSubscriber:
         self.calls: list = []
 
     def __call__(self, env) -> None:
-        from smithcode.event.catalog import TitleChanged, TurnEnd, TurnStart
+        from smithcode.event.catalog import (
+            ExecutionStarted,
+            ExecutionSucceeded,
+            TitleChanged,
+        )
 
         data = env.data
         if isinstance(data, TitleChanged):
             self.calls.append(("TitleChanged", data.title))
-        elif isinstance(data, TurnStart):
-            self.calls.append(("TurnStart",))
-        elif isinstance(data, TurnEnd):
-            self.calls.append(("TurnEnd", data.status))
+        elif isinstance(data, ExecutionStarted):
+            self.calls.append(("ExecutionStarted",))
+        elif isinstance(data, ExecutionSucceeded):
+            self.calls.append(("ExecutionSucceeded", data.status))
 
 
 def _install_presenter():
@@ -454,13 +458,13 @@ def _wire(agent, presenter, recorder=None) -> None:
         agent.events.subscribe(recorder)
 
 
-def test_agent_run_emits_turn_events(monkeypatch):
+def test_agent_run_emits_execution_events(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     recorder, sink, presenter = _install_presenter()
     agent = Agent(session=Session(), persist=False)
     _wire(agent, presenter, recorder)
     asyncio.run(agent.run("你好"))
-    assert recorder.calls == [("TurnStart",), ("TurnEnd", "ok")]
+    assert recorder.calls == [("ExecutionStarted",), ("ExecutionSucceeded", "ok")]
     # 收尾回到空闲态（回退名取自工作区目录名，故不断言具体字符串）
     assert sink.writes[-1].startswith("\x1b]0;Smith · ") and sink.writes[-1].endswith("\x07")
 

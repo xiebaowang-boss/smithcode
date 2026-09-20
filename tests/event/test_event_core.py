@@ -48,9 +48,13 @@ def test_every_catalog_event_is_declared():
     for cls in (
         catalog.MessageStart, catalog.MessageUpdate, catalog.MessageEnd,
         catalog.ToolStart, catalog.ToolPreview, catalog.ToolEnd,
-        catalog.PlanUpdate, catalog.Notice, catalog.QueueChanged,
-        catalog.QueuedPromptDelivered, catalog.TitleChanged, catalog.TurnStart,
-        catalog.TurnEnd, catalog.AgentEnd, catalog.StatusChanged,
+        catalog.PlanUpdate, catalog.Notice, catalog.TitleChanged, catalog.AgentEnd,
+        catalog.InboxEnqueued, catalog.InboxDelivered, catalog.InboxCancelled,
+        catalog.InboxCleared, catalog.Idle, catalog.UsageChanged,
+        catalog.CompactionStarted, catalog.CompactionEnded, catalog.CompactionFailed,
+        catalog.ExecutionStarted, catalog.ExecutionSucceeded,
+        catalog.ExecutionFailed, catalog.ExecutionInterrupted,
+        catalog.StepStarted, catalog.StepEnded, catalog.StatusChanged,
         catalog.StatusCleared, catalog.PromptStarted, catalog.PromptFinished,
     ):
         assert cls in declared, f"{cls.__name__} 未声明"
@@ -111,7 +115,7 @@ def test_wrap_fills_identity_from_declaration():
          session_id="sess-9")
     assert env.type == "session.tool.started"
     assert env.version == 1
-    assert env.durable is False  # 阶段 A：持久性尚未填实
+    assert env.durable is True  # 工具起止是持久骨架（可回放）
     assert env.session_id == "sess-9"
     assert env.seq is None
     assert env.id and len(env.id) == 32
@@ -120,12 +124,12 @@ def test_wrap_fills_identity_from_declaration():
 
 def test_payload_to_dict_is_json_shaped():
     """载荷 → 可 JSON 化的结构：dataclass 展开、tuple 变 list、嵌套项也跟着展开。"""
-    env = wrap(catalog.QueueChanged(
-        steering=(catalog.QueueItem(id="q1", text="继续", kind="steer"),)
+    env = wrap(catalog.InboxEnqueued(
+        item=catalog.QueueItem(id="q1", text="继续", kind="steer")
     ))
     record = env.to_record()
-    assert record["data"]["steering"] == [{"id": "q1", "text": "继续", "kind": "steer",
-                                           "images": None, "created_at": 0.0}]
+    assert record["data"]["item"] == {"id": "q1", "text": "继续", "kind": "steer",
+                                      "images": None, "created_at": 0.0}
     assert isinstance(payload_to_dict(catalog.Notice("hi")), dict)
 
 
@@ -156,7 +160,7 @@ def test_subscribe_type_filters_by_type_name(bus):
     only_notice = []
     bus.subscribe_type("session.notice", only_notice.append)
     publish(catalog.Notice("通知"))
-    publish(catalog.TurnStart())
+    publish(catalog.ExecutionStarted())
     assert [e.type for e in only_notice] == ["session.notice"]
 
 
@@ -164,7 +168,7 @@ def test_publish_injects_session_id_from_bus(bus):
     """会话标识由总线注入，调用方不手写——多客户端按会话路由的前提。"""
     seen = []
     bus.subscribe(seen.append)
-    publish(catalog.TurnStart())
+    publish(catalog.ExecutionStarted())
     assert seen[0].session_id == "sess-1"
 
 

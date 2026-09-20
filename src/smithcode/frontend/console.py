@@ -19,14 +19,29 @@ import time
 
 from .. import config
 from ..event.catalog import (
+    CompactionEnded,
+    CompactionFailed,
+    CompactionStarted,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionStarted,
+    ExecutionSucceeded,
+    Idle,
+    InboxCancelled,
+    InboxCleared,
+    InboxDelivered,
+    InboxEnqueued,
     MessageEnd,
     MessageUpdate,
     Notice,
     PlanUpdate,
     StatusChanged,
+    StepEnded,
+    StepStarted,
     ToolEnd,
     ToolPreview,
     ToolStart,
+    UsageChanged,
 )
 from ..event.envelope import Envelope
 from ..utils.terminal import flush_pending_input, prompt_choice, read_user_input
@@ -66,6 +81,17 @@ class ConsoleFrontend:
             case StatusChanged(kind="retry", text=text):
                 # 重试进度在终端是一行文本（TUI 才有运行动画行）
                 self._notice(text, "info")
+            case (
+                ExecutionStarted() | ExecutionSucceeded() | ExecutionFailed()
+                | ExecutionInterrupted() | StepStarted() | StepEnded() | Idle()
+                | UsageChanged() | CompactionStarted() | CompactionEnded()
+                | CompactionFailed() | InboxEnqueued() | InboxDelivered()
+                | InboxCancelled() | InboxCleared()
+            ):
+                # 执行 / 步骤边界、压缩态、排队变更：终端按"内容与工具块"呈现，
+                # 排队是 TUI 的面板概念（终端里入队即排队等待，无需额外呈现）。
+                # 显式列出（而不是交给 `case _`）意味着新增事件时会被这里提醒。
+                return
             case _:
                 return
 

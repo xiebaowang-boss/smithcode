@@ -37,6 +37,11 @@ T = TypeVar("T")
 # 未显式给出原因时的默认值。用户可见文案，保持与既有实现一致。
 DEFAULT_ABORT_REASON = "用户中断"
 
+#: 与文案并列的**机器可读**原因码：事件（`ExecutionInterrupted.reason`）按它分类，
+#: 前端据此决定提示文案。取值对齐 opencode 的 interrupted.reason；新增来源
+#: （进程退出 / 被新任务取代 / 空闲超时）时同步扩展这里。
+DEFAULT_ABORT_CODE = "user"
+
 
 class Cancelled(Exception):
     """`throw_if_aborted()` 在已中止时抛出。
@@ -56,8 +61,9 @@ class AbortSignal:
     同一实例是**一次性**的：一旦中止就永远保持中止状态（`abort()` 幂等）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, code: str = DEFAULT_ABORT_CODE) -> None:
         self._event = threading.Event()
+        self._code = code
         self._reason: str | None = None
         self._listeners: list[Callable[[], None]] = []
         # (loop, future)：abort 可能来自别的线程，必须经 call_soon_threadsafe 唤醒
@@ -81,12 +87,20 @@ class AbortSignal:
 
     # ---------- 发起中止 ----------
 
-    def abort(self, reason: str = DEFAULT_ABORT_REASON) -> None:
+    @property
+    def code(self) -> str:
+        """机器可读的中止原因（`reason` 是给人看的文案）。"""
+        return self._code
+
+    def abort(self, reason: str = DEFAULT_ABORT_REASON,
+              code: str | None = None) -> None:
         """请求中止（幂等、线程安全）：通知已登记的回调，并唤醒所有异步等待者。"""
         with self._lock:
             if self._event.is_set():
                 return
             self._reason = reason
+            if code is not None:
+                self._code = code
             self._event.set()
             callbacks, self._listeners = self._listeners, []
             waiters, self._waiters = self._waiters, []

@@ -90,13 +90,25 @@ def test_both_frontends_handle_every_declared_event():
     console = (SRC / "frontend" / "console.py").read_text(encoding="utf-8")
     tui = (SRC / "tui" / "frontend.py").read_text(encoding="utf-8")
 
-    # 事件类名 → 声明（排除纯词汇：类型别名与 QueueItem 不是事件）
+    # 只取**目录里**声明的事件：注册表是进程级的，测试自己也会往里放临时类型
+    # （见 tests/event/test_event_core.py 的版本解析用例），不能算进契约面
     names = [
         cls.__name__ for cls in registry.declared_classes()
+        if cls.__module__ == "smithcode.event.catalog"
     ]
+    def handled(source: str, name: str) -> bool:
+        """该类型是否出现在某个 `case` 模式里。
+
+        模式可能跨行（`case (\n  A() | B()\n):`），所以按 `case ...:` 整段取，
+        而不是逐行匹配。
+        """
+        return any(
+            f"{name}(" in chunk for chunk in re.findall(r"case\b(.*?):", source, re.DOTALL)
+        )
+
     missing = {
-        "console": [n for n in names if f"case {n}(" not in console],
-        "tui": [n for n in names if f"case {n}(" not in tui],
+        "console": [n for n in names if not handled(console, n)],
+        "tui": [n for n in names if not handled(tui, n)],
     }
     # 允许存在刻意不处理的类型：两侧都必须显式列出，避免"悄悄漏掉"
     intentionally_ignored = {

@@ -12,7 +12,7 @@ import json
 import pytest
 
 from smithcode.agent import Agent
-from smithcode.event.catalog import QueueChanged
+from smithcode.event.catalog import InboxDelivered
 from smithcode.session import Session
 
 
@@ -94,8 +94,8 @@ def test_steering_is_delivered_after_the_current_turn(monkeypatch):
     assert "顺便看下 README" not in llm.seen[0]  # 第一轮看不到（还没插）
     assert "顺便看下 README" in llm.seen[1]  # 第二轮看得到
     assert agent.steering_queue.count == 0  # 投递即出队
-    changes = [env.data for env in seen_events if isinstance(env.data, QueueChanged)]
-    assert changes[-1].steering == ()  # 投递发了 QueueChanged
+    delivered = [env.data for env in seen_events if isinstance(env.data, InboxDelivered)]
+    assert [event.item.text for event in delivered] == ["顺便看下 README"]  # 投递发了事件
 
 
 def test_follow_up_continues_instead_of_stopping(monkeypatch):

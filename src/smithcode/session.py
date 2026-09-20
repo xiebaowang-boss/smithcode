@@ -41,7 +41,9 @@ class MessageLog(list):
 
 class Session:
     def __init__(self, store=None):
-        config.new_session_id()  # 每次会话开始轮换会话 id，供 {$session} 请求头占位符使用
+        # 会话 id 由**会话对象**持有：事件信封、`{$session}` 占位符、转录文件名都取这一份。
+        # （`config.use_session_id` 只是占位符解析点，不再是"当前会话"的真相。）
+        self.id = config.new_session_id()
         self._store = None
         self._messages = MessageLog(on_append=self._hook)
         self.created_at = time.time()
@@ -55,10 +57,14 @@ class Session:
     # ---------- 持久化绑定 ----------
 
     def bind_store(self, store) -> None:
-        """绑定 / 解绑会话转录；绑定时采用 store 的会话 id。"""
+        """绑定 / 解绑会话转录；绑定时采用 store 的会话 id。
+
+        恢复既有会话时二者必须一致——id 就是同一份东西（转录文件名即会话 id）。
+        """
         self._store = store
         if store is not None:
-            config.use_session_id(store.id)
+            self.id = store.id
+            config.use_session_id(store.id)  # `{$session}` 请求头占位符解析用
 
     @property
     def store(self):

@@ -55,7 +55,10 @@ def breakdown(messages: list[dict]) -> dict[str, int]:
     """按角色分桶统计估算 token，供 /context 展示占用构成。"""
     buckets = dict.fromkeys(_LABELS, 0)
     for msg in messages:
-        buckets[msg["role"]] += estimate_message(msg)
+        # 畸形/半截消息（没有 role）不该让计量崩掉：前端在跑动中随时会读这份统计
+        role = msg.get("role")
+        if role in buckets:
+            buckets[role] += estimate_message(msg)
     return buckets
 
 

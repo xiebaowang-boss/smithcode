@@ -268,7 +268,7 @@ def test_delivered_queued_prompt_lands_in_the_chat(monkeypatch):
 
 def test_steering_delivery_marks_the_event(monkeypatch):
     """投递事件带得动"是插话还是续跑"：前端不必自己猜（具体事件，不靠类型推断）。"""
-    from smithcode.event.catalog import QueuedPromptDelivered
+    from smithcode.event.catalog import InboxDelivered
 
     agent = _make_agent(monkeypatch)
     seen: list = []
@@ -279,8 +279,11 @@ def test_steering_delivery_marks_the_event(monkeypatch):
     agent.get_steering_messages()
     agent.get_follow_up_messages()
 
-    delivered = [env.data for env in seen if isinstance(env.data, QueuedPromptDelivered)]
-    assert [(e.text, e.steering) for e in delivered] == [("插话", True), ("续跑", False)]
+    delivered = [env.data for env in seen if isinstance(env.data, InboxDelivered)]
+    # 事件带完整项（含 kind）：前端不必自己推断"是插话还是续跑"
+    assert [(e.item.text, e.item.kind) for e in delivered] == [
+        ("插话", "steer"), ("续跑", "follow_up"),
+    ]
 
 
 class BlockingLLM:

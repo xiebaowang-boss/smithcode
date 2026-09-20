@@ -106,17 +106,26 @@ def test_drain_on_empty_queue_does_not_notify():
 
 
 def test_every_mutation_notifies_once():
-    """增 / 删 / 清 / 投四个动作各发一次变更通知——UI 靠它刷新面板。"""
-    calls: list[str] = []
-    queue = _queue(notify=lambda: calls.append("changed"))
+    """增 / 删 / 清三个动作各发一次变更通知，且带**动作名**与项。
+
+    投递（`drain`）刻意不发通知：只有调用方知道这次取走是"投递"（要进历史、要
+    上屏），所以投递事件由调用方发（见 `Agent._deliver`）——在这里发会让同一次
+    投递被通知两遍（面板与对话区各多一条）。
+    """
+    calls: list[tuple] = []
+    queue = _queue(notify=lambda action, item: calls.append((action, item)))
     item = queue.enqueue("一")  # 1 增
     queue.enqueue("二")  # 2 增
     queue.remove(item.id)  # 3 删
     queue.clear()  # 4 清（此时还有「二」，内容确实变了）
     queue.enqueue("三")  # 5 增
-    queue.drain()  # 6 投
+    queue.drain()  # 投：不发通知（由调用方发）
 
-    assert len(calls) == 6
+    assert [action for action, _ in calls] == [
+        "enqueued", "enqueued", "cancelled", "cleared", "enqueued",
+    ]
+    assert calls[0][1].text == "一"
+    assert calls[2][1].id == item.id
 
 
 def test_mode_is_switchable_and_validated():

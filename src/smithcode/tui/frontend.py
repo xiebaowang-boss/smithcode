@@ -26,18 +26,31 @@ from typing import TYPE_CHECKING
 
 from .. import config
 from ..event.catalog import (
+    CompactionEnded,
+    CompactionFailed,
+    CompactionStarted,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionStarted,
+    ExecutionSucceeded,
+    Idle,
+    InboxCancelled,
+    InboxCleared,
+    InboxDelivered,
+    InboxEnqueued,
     MessageEnd,
     MessageUpdate,
     Notice,
     PlanUpdate,
-    QueueChanged,
-    QueuedPromptDelivered,
     StatusChanged,
     StatusCleared,
+    StepEnded,
+    StepStarted,
     TitleChanged,
     ToolEnd,
     ToolPreview,
     ToolStart,
+    UsageChanged,
 )
 from ..event.envelope import Envelope
 from .widgets import UiAction
@@ -96,10 +109,24 @@ class TuiFrontend:
                 self._post("retry_start", state, owner)
             case StatusCleared(kind="retry", owner=owner):
                 self._post("retry_end", owner)
-            case QueueChanged():
-                self.app.post_message(UiAction("queue", data))
-            case QueuedPromptDelivered(text=text):
-                self.app.post_message(UiAction("queued_delivered", text))
+            case (
+                ExecutionStarted() | ExecutionSucceeded() | ExecutionFailed()
+                | ExecutionInterrupted() | StepStarted() | StepEnded() | Idle()
+                | CompactionStarted() | CompactionEnded() | CompactionFailed()
+            ):
+                # 执行 / 步骤边界与压缩态：界面按内容、工具块与忙闲行呈现，
+                # 这些事件本身不额外呈现。显式列出以便新增事件时被提醒。
+                return
+            case UsageChanged():
+                # 用量变化：侧边栏据此刷新（界面不再去读会话内部状态）
+                self._post("usage", data)
+            case InboxEnqueued(item=item) | InboxDelivered(item=item):
+                self._post("inbox_add" if isinstance(data, InboxEnqueued) else "inbox_deliver",
+                           item)
+            case InboxCancelled(item_id=item_id):
+                self._post("inbox_cancel", item_id)
+            case InboxCleared():
+                self._post("inbox_clear")
             case _:
                 return
 

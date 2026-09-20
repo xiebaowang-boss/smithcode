@@ -48,13 +48,18 @@ class QueueItem:
 
 
 class MessageQueue:
-    """单条队列。增删清投四个动作都会触发 `on_change`（内容真的变了才触发）。"""
+    """单条队列。增删清投四个动作都会触发 `on_change`（内容真的变了才触发）。
+
+    `on_change(action, item)` 带**动作与项**：消费方据此更新自己的视图，而不是
+    每次都收到一份完整快照再自己算差异。动作取
+    `enqueued` / `cancelled` / `cleared` / `delivered`。
+    """
 
     def __init__(
         self,
         kind: QueueItemKind,
         mode: QueueMode = "one-at-a-time",
-        on_change: Callable[[], None] | None = None,
+        on_change: Callable[[str, QueueItem | None], None] | None = None,
     ) -> None:
         if mode not in ("all", "one-at-a-time"):
             raise ValueError(f"未知的抽水策略: {mode!r}")
@@ -88,18 +93,18 @@ class MessageQueue:
         )
         with self._lock:
             self._items.append(item)
-        self._notify()
+        self._notify("enqueued", item)
         return item
 
     def remove(self, item_id: str) -> bool:
         """按 id 撤销一条。返回是否真的删掉了（UI 的逐条撤销用）。"""
         with self._lock:
-            before = len(self._items)
-            self._items = [item for item in self._items if item.id != item_id]
-            changed = len(self._items) != before
-        if changed:
-            self._notify()
-        return changed
+            removed = next((item for item in self._items if item.id == item_id), None)
+            if removed is not None:
+                self._items = [item for item in self._items if item.id != item_id]
+        if removed is not None:
+            self._notify("cancelled", removed)
+        return removed is not None
 
     def take(self, item_id: str) -> QueueItem | None:
         """摘出某一项并返回（UI 的「取回编辑」：要出队，但内容得还给用户）。
@@ -114,7 +119,7 @@ class MessageQueue:
         # 队列的 `list()`，而 `self._lock` 不是可重入锁——在锁内通知会当场自锁死
         # （真实 UI 上表现为点 `edit` 整个界面卡住不响应）。
         if taken is not None:
-            self._notify()
+            self._notify("cancelled", taken)
         return taken
 
     def clear(self) -> list[QueueItem]:
@@ -122,13 +127,17 @@ class MessageQueue:
         with self._lock:
             removed, self._items = self._items, []
         if removed:
-            self._notify()
+            self._notify("cleared", None)
         return removed
 
     def drain(self) -> list[QueueItem]:
         """按 `mode` 取走待投递的项（投递点调用）。
 
         `all` 全部取走；`one-at-a-time` 只取最早一条，剩下的留到下一个投递点。
+
+        **不发通知**：只有调用方知道这次取走是"投递"（要进历史、要上屏）还是别的
+        用途，所以投递事件由调用方发（`Agent._deliver`）。在这里发会让同一次投递
+        被通知两遍（面板与对话区各多一条）。
         """
         with self._lock:
             if self.mode == "all":
@@ -136,12 +145,10 @@ class MessageQueue:
             else:
                 taken = self._items[:1]
                 self._items = self._items[1:]
-        if taken:
-            self._notify()
         return taken
 
     # ---------- 内部 ----------
 
-    def _notify(self) -> None:
+    def _notify(self, action: str, item: QueueItem | None) -> None:
         if self._on_change is not None:
-            self._on_change()
+            self._on_change(action, item)

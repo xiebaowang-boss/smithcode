@@ -108,6 +108,34 @@ def _message_text(content) -> str:
     return ""
 
 
+class _InboxView:
+    """排队面板的视图状态：由 `Inbox*` 事件维护（增 / 投递 / 撤销 / 清空）。
+
+    面板需要的是"当前排着什么"，而事件是"发生了什么"——这一层就是两者的转换点
+    （事件溯源里的投影）。放在 app 侧而不是 frontend：它服务于这一个界面。
+    """
+
+    def __init__(self) -> None:
+        self._by_id: dict = {}
+
+    def add(self, item) -> None:
+        self._by_id[item.id] = item
+
+    def pop(self, item_id: str) -> None:
+        self._by_id.pop(item_id, None)
+
+    def clear(self) -> None:
+        self._by_id.clear()
+
+    @property
+    def steering(self) -> list:
+        return [i for i in self._by_id.values() if i.kind == "steer"]
+
+    @property
+    def follow_up(self) -> list:
+        return [i for i in self._by_id.values() if i.kind == "follow_up"]
+
+
 class SmithTUI(App):
     # 全部样式集中在同目录的 app.tcss（Textual 的 CSS_PATH，相对本文件解析），
     # 本文件只管布局接线。
@@ -131,6 +159,9 @@ class SmithTUI(App):
         # 弹窗等待方，见 TuiFrontend.abandon_pending
         self._frontend: TuiFrontend | None = None
         self._attached = None  # frontend.attach 的两枚复位令牌（收尾用）
+        self._usage = None  # 最新一条 UsageChanged（侧边栏只从事件渲染）
+        # 排队面板的视图：由 Inbox* 事件维护（前端不再收快照、自己算差异）
+        self._inbox = _InboxView()
         # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
         # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
         self._select_stack: list = []
@@ -579,19 +610,29 @@ class SmithTUI(App):
         """底栏上下文占用（文字形式）：`12.3K(10%)`，颜色随底栏默认灰，不做着色。"""
         return Text(f"{human_tokens(est)}({pct}%)")
 
+    def ui_usage(self, usage) -> None:
+        """收到用量事件（`UsageChanged`）：存下最新口径并刷新侧边栏。
+
+        界面**只从事件渲染**：不读会话内部状态，所以多客户端/远程接入时
+        这一块天然可用（事件带 session_id，谁订阅谁看得到）。
+        """
+        self._usage = usage
+        self.ui_status()
+
     def _sidebar_usage(self) -> tuple[Text, Text]:
-        """「用量」卡：(标题, 正文)。标题 = Usage（有调用时附 · Calls N）；正文 = In/Out（缓存命中另起一行）。"""
-        usage = self.agent.session.usage.current_session
+        """「用量」卡：(标题, 正文)。标题 = Usage（有调用时附 · Calls N）；正文 = In/Out + Cache。"""
+        usage = self._usage
         title = Text("Usage", style="#808080")
-        if usage.calls:
+        calls = usage.calls if usage is not None else 0
+        if calls:
             title.append(" · Calls ", style="#808080")
-            title.append(str(usage.calls), style="#eeeeee")
+            title.append(str(calls), style="#eeeeee")
         body = Text()
         body.append("In ", style="#808080")
-        body.append(human_tokens(usage.get("prompt_tokens")), style="#eeeeee")
+        body.append(human_tokens(usage.total_input if usage else 0), style="#eeeeee")
         body.append(" · Out ", style="#808080")
-        body.append(human_tokens(usage.get("completion_tokens")), style="#eeeeee")
-        cache = usage.cache_hit()
+        body.append(human_tokens(usage.total_output if usage else 0), style="#eeeeee")
+        cache = usage.cached_tokens if usage is not None else 0
         if cache:
             body.append("\nCache ", style="#808080")
             body.append(human_tokens(cache), style="#eeeeee")
@@ -713,17 +754,35 @@ class SmithTUI(App):
         editor.move_cursor(editor.document.end)
         editor.focus()
 
-    def ui_queued_delivered(self, text: str) -> None:
-        """排队输入被投递（本轮结束 / 工具批之间）：补上对话区的用户消息。"""
-        self._chat().apply(User(text))
+    def ui_inbox_add(self, item) -> None:
+        """入队：面板多一行（它还没进对话区）。"""
+        self._inbox.add(item)
+        self._refresh_queue_panel()
 
-    def ui_queue(self, event) -> None:
-        """排队变化：重建面板（主线程）。空队列整块隐藏，锚点随高度重算。"""
+    def ui_inbox_deliver(self, item) -> None:
+        """投递：从面板移除 + 补上对话区的用户消息（入队时只在面板里）。"""
+        self._inbox.pop(item.id)
+        self._refresh_queue_panel()
+        self._chat().apply(User(item.text))
+
+    def ui_inbox_cancel(self, item_id: str) -> None:
+        """撤销 / 取回编辑：从面板移除。"""
+        self._inbox.pop(item_id)
+        self._refresh_queue_panel()
+
+    def ui_inbox_clear(self) -> None:
+        """全部清空（Esc 中止时取回编辑器）。"""
+        self._inbox.clear()
+        self._refresh_queue_panel()
+
+    def _refresh_queue_panel(self) -> None:
+        """按当前排队状态重建面板（空队列整块隐藏，锚点随高度重算）。"""
         found = self.query("#queued")
         if not found:
             return
         found.first().show_items(
-            event.steering, event.follow_up,
+            tuple(self._inbox.steering),
+            tuple(self._inbox.follow_up),
             on_cancel=self.agent.cancel_queued,
             on_edit=self.edit_queued,
         )

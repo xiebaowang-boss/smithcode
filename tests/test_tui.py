@@ -1139,9 +1139,10 @@ def test_tui_sidebar_usage_section(monkeypatch):
             assert "%" in context_title
             context = str(sidebar.query_one(".context-body").content)
             assert "Used" in context and "Budget" not in context
-            # 有调用后：用量卡标题变为「Usage · Calls N」，正文只剩 In/Out
+            # 有调用后：用量卡标题变为「Usage · Calls N」，正文只剩 In/Out。
+            # 界面只从**事件**渲染——所以这里发一条 UsageChanged（与生产同路）。
             app.agent.session.usage.add({"prompt_tokens": 1234, "completion_tokens": 567})
-            app.ui_status()
+            app.agent.events.publish(app.agent._usage_event())
             await pilot.pause()
             assert str(sidebar.query_one(".usage-card .section-title").content) == "Usage · Calls 1"
             usage = str(sidebar.query_one(".usage-body").content)

@@ -15,7 +15,7 @@
 - 装配入口只有 `attach()`：接管标题 + 订阅事件，并提供 sink 决定往哪写。
   （原来还有一个渲染后端装饰器 `Relay`：它在 ask 方法进出时广播等待信号，并把
   标题/忙闲事件转给呈现器。事件层补齐后两件事都有正式通道——等待是
-  `PromptStarted/Finished`、标题与忙闲是 `TitleChanged` / `TurnStart` / `TurnEnd`，
+  `PromptStarted/Finished`、标题与忙闲是 `TitleChanged` / `Execution*`，
   于是 `Relay` 与 `bus()` 一并删除。）
 
 退出恢复用终端的窗口标题栈（xterm XTWINOPS：`CSI 22;2t` 压栈、`CSI 23;2t`
@@ -33,11 +33,13 @@ from pathlib import Path
 
 from . import config
 from .event.catalog import (
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionStarted,
+    ExecutionSucceeded,
     PromptFinished,
     PromptStarted,
     TitleChanged,
-    TurnEnd,
-    TurnStart,
 )
 from .utils.terminal import stdout_is_tty, write_terminal_control
 
@@ -153,7 +155,11 @@ class TerminalTitlePresenter:
             self._flush()
 
     def on_turn_finished(self, status: str = "ok") -> None:
-        """一轮任务结束，status 取 RunResult.status（供未来前端细分展示）。"""
+        """执行结束（成功 / 失败 / 中断都算）：忙闲计数减一。
+
+        `status` 保留参数位是为了兼容调用点；三种结局在前端无需区分——运行时
+        动画只看"还在不在跑"。
+        """
         with self._lock:
             self._state.busy = max(0, self._state.busy - 1)
             self._flush()
@@ -172,10 +178,11 @@ class TerminalTitlePresenter:
             self.on_prompt_finished(event)
         elif isinstance(event, TitleChanged):
             self.on_title_changed(event.title)
-        elif isinstance(event, TurnStart):
+        elif isinstance(event, ExecutionStarted):
             self.on_turn_started()
-        elif isinstance(event, TurnEnd):
-            self.on_turn_finished(event.status)
+        elif isinstance(event, (ExecutionSucceeded, ExecutionFailed, ExecutionInterrupted)):
+            # 三种终止结局都收掉忙闲计数（成对：ExecutionStarted 一个，终止一个）
+            self.on_turn_finished()
 
     def on_prompt_started(self, event: PromptStarted) -> None:
         """开始等待用户输入（权限确认 / 技能信任 / 提问面板弹出）。"""

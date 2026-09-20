@@ -25,23 +25,34 @@ from ..event import Bus
 from ..event.catalog import (
     AgentEnd,
     AgentEvent,
+    CompactionEnded,
+    CompactionFailed,
+    CompactionStarted,
+    ExecutionFailed,
+    ExecutionInterrupted,
+    ExecutionStarted,
+    ExecutionSucceeded,
+    Idle,
+    InboxCancelled,
+    InboxCleared,
+    InboxDelivered,
+    InboxEnqueued,
     MessageEnd,
     MessageUpdate,
     Notice,
     PlanUpdate,
-    QueueChanged,
-    QueuedPromptDelivered,
     QueueItem,
-    StatusChanged,
-    StatusCleared,
+    StepEnded,
+    StepFinish,
+    StepStarted,
+    StepUsage,
     TitleChanged,
     ToolEnd,
     ToolPreview,
     ToolStart,
-    TurnEnd,
-    TurnStart,
+    UsageChanged,
 )
-from ..event.envelope import wrap
+from ..event.envelope import new_id, wrap
 from ..event.stream import EventStream, agent_event_stream
 from ..llm import LLMClient as _RealLLMClient
 from ..llm.models import (
@@ -213,7 +224,8 @@ class Agent:
         # 前端订阅它取事件、`event.publish` 从深层调用点发事件。
         # `_loop` 是「本轮 run 所在的事件循环」——UI 线程 / 后台线程发的事件要转回
         # 它，否则 push 会跨线程碰 EventStream 的内部状态。
-        self.events = Bus()
+        # 事件总线按**会话**实例化：会话标识随会话对象来（见 _emit 的刷新）
+        self.events = Bus(session_id=self.session.id)
         self._stream: EventStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # 运行中排队的两条队列（见 queues.py）：变更即发 QueueChanged。
@@ -321,9 +333,13 @@ class Agent:
 
         装一次信封，喂本轮流 + 投递给总线订阅者：**同一条事件的两个消费者看到
         的是同一个信封**（同一个 id / 会话标识），不存在两份真相。
+
+        会话标识取自会话对象（`Session.id`）：`/new`、恢复会话都会换 id，
+        所以这里按当前值刷新总线的归属，而不是只在首次填一次。
         """
-        if self.events.session_id is None:
-            self.events.session_id = self.session_id()
+        current_id = self.session_id()
+        if self.events.session_id != current_id:
+            self.events.session_id = current_id
         env = wrap(data, session_id=self.events.session_id)
         stream = self._stream
         if stream is not None and not stream.done:
@@ -336,13 +352,21 @@ class Agent:
             # 被报成「输出中断」（那会把排查方向引到网络上）。
             raise SubscriberError(f"订阅者异常: {type(e).__name__}: {e}") from e
 
-    def session_id(self) -> str | None:
-        """本会话的标识（供事件信封注入）。
+    def _usage_event(self, step: StepUsage | None = None) -> UsageChanged:
+        """构造一条用量事件（会话累计口径 + 可选的本步增量）。"""
+        totals = self.session.usage.current_session
+        return UsageChanged(
+            calls=totals.calls,
+            total_input=totals.get("prompt_tokens"),
+            total_output=totals.get("completion_tokens"),
+            total_tokens=totals.get("total_tokens"),
+            cached_tokens=totals.cache_hit(),
+            step=step or StepUsage(),
+        )
 
-        会话 id 目前仍由转录存储持有（见 `sessions/store.py`）；阶段 B 会把它
-        收敛到会话对象上，届时这里改为直接读会话字段。
-        """
-        return getattr(getattr(self.session, "store", None), "id", None)
+    def session_id(self) -> str:
+        """本会话的标识（供事件信封注入）：只有一个来源——会话对象。"""
+        return self.session.id
 
     # ---------- 钩子调用（未配置时返回默认值，行为与没有钩子时一致） ----------
 
@@ -517,7 +541,8 @@ class Agent:
         for item in items:
             kwargs = {"images": list(item.images)} if item.images else {}
             self.session.add("user", item.text, **kwargs)
-            self._emit(QueuedPromptDelivered(text=item.text, steering=queue.kind == "steer"))
+            # 投递那一刻才把它落到对话区（入队时只在排队面板里）
+            self._emit(InboxDelivered(item=item))
         return items
 
     def _drain_queue(self, queue: MessageQueue) -> bool:
@@ -537,14 +562,20 @@ class Agent:
         """两条队列的待投递总数（UI 的「排队中 N」）。"""
         return self.steering_queue.count + self.follow_up_queue.count
 
-    def _on_queue_changed(self) -> None:
-        """队列变更回调：可能在 UI 线程上触发，统一走线程安全的事件入口。"""
-        self.emit(
-            QueueChanged(
-                steering=tuple(self.steering_queue.list()),
-                follow_up=tuple(self.follow_up_queue.list()),
-            )
-        )
+    def _on_queue_changed(self, action: str, item: QueueItem | None) -> None:
+        """队列变更回调（可能在 UI 线程触发）：把动作翻成语义事件。
+
+        发的是**变更**而不是快照：前端按 `enqueued/delivered/cancelled/cleared`
+        自行维护面板，事件也因此可回放（快照是状态，"谁做了什么"才是事实）。
+        """
+        if action == "enqueued" and item is not None:
+            self.emit(InboxEnqueued(item=item))
+        elif action == "delivered" and item is not None:
+            self.emit(InboxDelivered(item=item))
+        elif action == "cancelled" and item is not None:
+            self.emit(InboxCancelled(item_id=item.id))
+        elif action == "cleared":
+            self.emit(InboxCleared())
 
     def start(self) -> None:
         """启动期装载模型目录、技能目录与项目指令：模型未配置时后台拉取 `/models`。
@@ -586,6 +617,7 @@ class Agent:
         reset_read_tracking()
         for part in self._state_registry():
             part.reset()
+        self.emit(self._usage_event())  # 用量清零也发事件（前端不停留在旧数字）
         self._last_state = None
         self._title_attempts = 0
         self._title_cooldown = 0
@@ -648,6 +680,7 @@ class Agent:
         instructions.refresh()  # 会话边界：恢复即按磁盘最新内容重建项目约定段
         self.session.sync_system()  # system 段按当前提示词立即重建
         self.emit(TitleChanged(self.session.title))  # 标题随恢复的会话同步
+        self.emit(self._usage_event())  # 恢复的用量也同步（前端纯靠事件渲染）
 
         return ResumeReport(
             path=loaded.path,
@@ -861,7 +894,7 @@ class Agent:
         reset_token = activate_token(token)
         emitter_token = emitter.activate(self.emit)  # 深层模块（llm 层）也能发事件
         status = "error"
-        self._emit(TurnStart())
+        self._emit(ExecutionStarted())
         try:
             result = await self._run_loop(token)
             status = result.status
@@ -878,7 +911,7 @@ class Agent:
             self._token = None
             reset_token()
             emitter.reset(emitter_token)
-            self._emit(TurnEnd(status))
+            self._emit_execution_end(status, result, token)
         if owner:
             self._close_stream(None, result)
         self._persist_turn()  # 状态投影缓存落盘（无变化不写）
@@ -887,7 +920,31 @@ class Agent:
             self._maybe_generate_title()  # 本轮结束后自动标题（后台，失败下轮补试）
         if result.status == "interrupted":
             self._note_interrupted()  # 回写上下文但不发请求，供下一轮模型看到
+        if owner:
+            self._emit(Idle())  # 本层拥有事件流 = 本层是最后一次执行：会话归空闲
         return result
+
+    def _emit_execution_end(self, status: str, result: RunResult | None,
+                            token: AbortSignal | None) -> None:
+        """执行结束：按结局发三种终止事件之一（成功 / 失败 / 中断）。
+
+        中断原因取自取消令牌（`AbortSignal.reason`）：用户按 Esc、进程退出、
+        被新任务取代。失败带 `status` 与 `reason`，供前端区分"权限被拒"与
+        "输出中断"——只报"结束了"不够用。
+        """
+        if status == "ok":
+            self._emit(ExecutionSucceeded(
+                status=status, text=(result.text if result is not None else "")
+            ))
+        elif status == "interrupted":
+            reason = getattr(token, "code", None) or "user"  # 机器可读原因码
+            self._emit(ExecutionInterrupted(
+                reason=reason, partial=bool(result.partial) if result is not None else False
+            ))
+        else:
+            self._emit(ExecutionFailed(
+                status=status, reason=(result.reason if result is not None else "")
+            ))
 
     def _note_interrupted(self) -> None:
         """把「用户中断」事件作为 user 消息写进会话历史（不触发新请求）。
@@ -907,19 +964,22 @@ class Agent:
         if owner:
             self._loop = asyncio.get_running_loop()
             self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
-        self._emit(TurnStart())
+        self._emit(ExecutionStarted())
         return owner
 
     def outer_turn_end(self, owner: bool, result: RunResult | None,
                        exc: BaseException | None = None) -> None:
-        """外层回合收尾：发 `TurnEnd`；异常路径也要收口事件流。"""
-        self._emit(TurnEnd(result.status if result is not None else "error"))
+        """外层回合收尾：发执行的结束事件；异常路径也要收口事件流。"""
+        self._emit_execution_end(
+            result.status if result is not None else "error", result, current_token()
+        )
         if exc is not None:
             if owner:
                 self._close_stream(exc)
             return
         if owner:
             self._close_stream(None, result)
+            self._emit(Idle())  # 目标续跑的最外层结束：会话归空闲
 
     def note_goal_run(self, result: RunResult) -> None:
         """把一轮结果同步给目标状态机：推进动作重置阻碍连击、累计 token 用量。"""
@@ -945,23 +1005,46 @@ class Agent:
                 TurnContext(tool_results=tuple(self._last_batch_results),
                             tools_used=tuple(tools_used), iteration=iteration)
             )
-            msg, usage, interrupted = await self._chat_with_recovery()
-            self._record_model_call(msg, usage)
+            # 一步 = 一次模型往返（对齐 opencode 的 step）。step 起止成对：
+            # `finally` 保证异常/取消路径也收口，否则消费者会一直以为"这一步还在跑"。
+            step_id = new_id()
+            step_index = iteration + 1
+            finish: StepFinish = "error"
+            usage: dict | None = None
+            called = False  # 本步是否真发起了模型调用（未发起则不记用量）
+            self._emit(StepStarted(step_id=step_id, index=step_index))
+            try:
+                msg, usage, interrupted = await self._chat_with_recovery()
+                self._record_model_call(msg, usage)
+                called = True
 
-            if interrupted:
-                return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
+                if interrupted:
+                    finish = "interrupted"
+                    return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
 
-            if not msg.get("tool_calls"):
-                # 抽水点 3：本要停时取 follow-up（对齐 pi 的 `agent-loop.ts:267-272`）——
-                # 还有排队输入就接着跑，而不是先把这轮结束掉
-                if self._drain_queue(self.follow_up_queue):
-                    continue
-                return RunResult("ok", msg.get("content", ""), tools_used=tuple(tools_used))
+                if not msg.get("tool_calls"):
+                    # 抽水点 3：本要停时取 follow-up（对齐 pi 的 `agent-loop.ts:267-272`）——
+                    # 还有排队输入就接着跑，而不是先把这轮结束掉
+                    if self._drain_queue(self.follow_up_queue):
+                        finish = "tool_calls"  # 还有下一步
+                        continue
+                    finish = "stop"
+                    return RunResult("ok", msg.get("content", ""), tools_used=tuple(tools_used))
 
-            if token.cancelled:
-                # 流刚好走完时才取消：这批 tool_calls 一个都未执行，补占位后停止
-                self._interrupt_batch([], msg.get("tool_calls", []))
-                return RunResult("interrupted", tools_used=tuple(tools_used))
+                if token.cancelled:
+                    # 流刚好走完时才取消：这批 tool_calls 一个都未执行，补占位后停止
+                    self._interrupt_batch([], msg.get("tool_calls", []))
+                    finish = "interrupted"
+                    return RunResult("interrupted", tools_used=tuple(tools_used))
+
+                finish = "tool_calls"  # 本步的产物是工具调用，回灌成下一步
+            finally:
+                step_usage = StepUsage.from_raw(usage)
+                self._emit(StepEnded(step_id=step_id, index=step_index, finish=finish,
+                                     usage=step_usage))
+                if called:
+                    # 用量事件跟在步骤之后：前端看到「这一步结束了，会话累计变成了多少」
+                    self._emit(self._usage_event(step=step_usage))
 
             for tc in msg["tool_calls"]:
                 name = tc.get("function", {}).get("name", "")
@@ -1000,7 +1083,10 @@ class Agent:
             store.append_model(turn.model, turn.effort)
             if usage:
                 store.append_usage(usage)
-        self.session.messages.append(msg)
+        if msg:
+            # 空消息（首块之前就中断）不入库：正文本就没收到，占位说明由
+            # `_note_stream_interrupted` 单独写——留一个 {} 会让消费者读 role 时崩
+            self.session.messages.append(msg)
 
     def _checkpoint(self) -> None:
         """崩溃持久化屏障：把已追加的记录 fsync 到磁盘（无持久化时无操作）。
@@ -1029,15 +1115,26 @@ class Agent:
         self.session.add("user", MAX_ITERATIONS_WRAPUP)
         self.session.sync_system()
         await self._compact_if_needed()
-        msg, usage, interrupted = await self._chat_with_recovery(use_tools=False)
-        text = msg.get("content") or ""
-        if msg.get("tool_calls"):
-            # 收尾轮不执行工具：剥离残缺工具调用，只保留正文
-            msg = {"role": "assistant", "content": text}
-        self._record_model_call(msg, usage)
-        if interrupted:
-            return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
-        return RunResult("max_iterations", text, tools_used=tuple(tools_used))
+        # 收尾轮也是一次模型往返 → 也是一步（否则用量与会话累计对不上）
+        step_id = new_id()
+        finish: StepFinish = "error"
+        self._emit(StepStarted(step_id=step_id, index=self.max_iterations + 1))
+        try:
+            msg, usage, interrupted = await self._chat_with_recovery(use_tools=False)
+            text = msg.get("content") or ""
+            if msg.get("tool_calls"):
+                # 收尾轮不执行工具：剥离残缺工具调用，只保留正文
+                msg = {"role": "assistant", "content": text}
+            self._record_model_call(msg, usage)
+            finish = "interrupted" if interrupted else "stop"
+            if interrupted:
+                return RunResult("interrupted", partial=True, tools_used=tuple(tools_used))
+            return RunResult("max_iterations", text, tools_used=tuple(tools_used))
+        finally:
+            step_usage = StepUsage.from_raw(usage)
+            self._emit(StepEnded(step_id=step_id, index=self.max_iterations + 1,
+                                 finish=finish, usage=step_usage))
+            self._emit(self._usage_event(step=step_usage))
 
     async def _chat_with_recovery(self, use_tools: bool = True) -> tuple[dict, dict | None, bool]:
         """一次模型调用；上下文溢出时压缩后重试一次（opencode 的溢出恢复）。
@@ -1098,7 +1195,7 @@ class Agent:
         summary = None
         # 压缩要发一次摘要请求（数秒到数十秒）：用状态事件告知前端「在压缩」，
         # 而不是混进对话区的一行 info（TUI 的忙碌行可以据此显示，见 status.py）
-        self._emit(StatusChanged(kind="compaction", text="正在压缩上下文…"))
+        self._emit(CompactionStarted(before_tokens=before))
         for _ in range(2):  # 摘要缺必需标题时重试一次
             token = current_token()
             if token is not None and token.cancelled:
@@ -1108,7 +1205,7 @@ class Agent:
                 summary = text
                 break
         if summary is None:
-            self._emit(StatusCleared(kind="compaction"))
+            self._emit(CompactionFailed(reason="摘要未按模板生成"))
             self._emit(Notice("[context] 摘要未按模板生成，放弃本次压缩，原样继续"))
             return False
 
@@ -1126,7 +1223,9 @@ class Agent:
             self.session.add("user", skills.render.compacted_notice(dropped))
             self._persist_turn()  # 剔除结果立即落进 t=state，恢复时不与转录打架
         self.context.compact_count += 1
-        self._emit(StatusCleared(kind="compaction"))
+        self._emit(CompactionEnded(
+            before_tokens=before, after_tokens=total_tokens(self.session.messages)
+        ))
         self._emit(Notice(
             f"[context] 已压缩: {before:,} → {total_tokens(self.session.messages):,} tokens"
         ))

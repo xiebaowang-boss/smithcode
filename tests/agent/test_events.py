@@ -17,8 +17,8 @@ from smithcode.event import registry
 from smithcode.event.catalog import (
     AgentEnd,
     AgentEvent,
+    ExecutionStarted,
     MessageStart,
-    TurnStart,
 )
 from smithcode.event.envelope import wrap
 from smithcode.event.stream import EventStream, agent_event_stream
@@ -146,14 +146,14 @@ def test_stream_without_terminal_event_reports_error():
 def test_agent_event_stream_terminates_on_agent_end():
     async def scenario():
         stream = agent_event_stream()
-        stream.push(wrap(TurnStart()))
+        stream.push(wrap(ExecutionStarted()))
         stream.push(wrap(AgentEnd(result=RunResult("ok", "正文"))))
         seen = [env.data async for env in stream]
         return seen, await stream.result()
 
     seen, result = run(scenario)
     # 流里走的是**信封**（订阅者与流看到同一个 id / 会话标识），载荷在 env.data
-    assert [type(payload) for payload in seen] == [TurnStart, AgentEnd]
+    assert [type(payload) for payload in seen] == [ExecutionStarted, AgentEnd]
     assert result.status == "ok"
     assert result.text == "正文"
 

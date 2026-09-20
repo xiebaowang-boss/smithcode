@@ -143,11 +143,10 @@ def test_compact_emits_status_pair(monkeypatch):
     assert asyncio.run(agent.compact()) is True
 
     kinds = [type(env.data).__name__ for env in seen]
-    # 压缩的进度文案现在也走事件（Notice），与忙碌态（StatusChanged/Cleared）分开：
-    # 前者是"说了什么"，后者是"忙不忙"，前端各自消费。顺序是「开始忙 → 不忙了 → 结果文案」。
-    assert kinds == ["StatusChanged", "StatusCleared", "Notice"]
-    assert seen[0].data.kind == seen[1].data.kind == "compaction"
-    assert "压缩" in seen[0].data.text
+    # 压缩有专属的起止事件（对齐 opencode 的 `session.compaction.*`），
+    # 「说了什么」仍走 Notice：结构事件与文案分开，前端各自消费。
+    assert kinds == ["CompactionStarted", "CompactionEnded", "Notice"]
+    assert seen[0].data.before_tokens > seen[1].data.after_tokens  # 确实压小了
     assert "已压缩" in seen[2].data.text
 
 
@@ -159,10 +158,11 @@ def test_compact_failure_still_clears_the_status(monkeypatch):
 
     assert asyncio.run(agent.compact()) is False
 
-    # 放弃压缩：忙碌态照样摘掉（否则前端一直显示"正在压缩"），并说明为什么放弃
+    # 放弃压缩：也要发终止事件（否则前端一直显示"正在压缩"），并说明为什么放弃
     assert [type(env.data).__name__ for env in seen] == [
-        "StatusChanged", "StatusCleared", "Notice",
+        "CompactionStarted", "CompactionFailed", "Notice",
     ]
+    assert seen[1].data.reason  # 放弃的原因
     assert "放弃本次压缩" in seen[2].data.text
 
 
