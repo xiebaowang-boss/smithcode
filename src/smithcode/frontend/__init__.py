@@ -28,28 +28,22 @@ from typing import Protocol, runtime_checkable
 
 from ..event import activate as activate_bus
 from ..event import reset as reset_bus
+from ..event.asks import AskAnswer, AskRequest
 
 
 @runtime_checkable
 class Asker(Protocol):
-    """询问端口：前端必须实现的四个阻塞入口。
+    """询问端口：前端只实现**一个异步方法**。
 
-    返回值的既有语义逐字保留：`confirm_choice` 返回小写选择键（无法询问时
-    fail-closed 拒绝，即 "n"）；`ask_form` 返回与问题对齐的答案列表
-    （空串 = 该题取消）。
+    `AskRequest.payload` 带各 kind 的专属数据、`options` 带选项键；**怎么问**
+    （编号选择还是方向键、单面板还是逐题）完全由前端决定——所以终端交互的差异
+    不会散落到权限引擎这类调用点里。
+
+    返回值语义与改造前逐字一致：没作答（`outcome != "answered"`）一律按
+    fail-closed 收尾——权限确认即拒绝、提问即取消。
     """
 
-    def ask_text(self, question: str) -> str: ...
-
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None) -> str: ...
-
-    def ask_form(self, questions: list[dict]) -> list[str]: ...
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str,
-                       detail: list[str] | None = None,
-                       descriptions: dict[str, str] | None = None,
-                       content: str | None = None) -> str: ...
+    async def ask(self, request: AskRequest) -> AskAnswer: ...
 
 
 class _UnavailableAsker:
@@ -59,21 +53,8 @@ class _UnavailableAsker:
     `activate(_UNAVAILABLE)` 显式挂上——它与「未挂载时的终端兜底」是两回事。
     """
 
-    def ask_text(self, question: str) -> str:
-        return ""
-
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None) -> str:
-        return ""
-
-    def ask_form(self, questions: list[dict]) -> list[str]:
-        return ["" for _ in questions]
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str,
-                       detail: list[str] | None = None,
-                       descriptions: dict[str, str] | None = None,
-                       content: str | None = None) -> str:
-        return "n"
+    async def ask(self, request: AskRequest) -> AskAnswer:
+        return AskAnswer(outcome="cancelled")
 
 
 _UNAVAILABLE = _UnavailableAsker()

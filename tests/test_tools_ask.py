@@ -5,9 +5,40 @@ import asyncio
 import pytest
 
 from smithcode import config
+from smithcode.event.asks import AskAnswer, AskPort, AskRequest
 from smithcode.frontend.console import ConsoleFrontend
 from smithcode.permission import evaluate
-from smithcode.tools.ask import ask_user
+from smithcode.tools import ask as ask_mod
+
+
+def ask_user(questions):
+    """同步调用（`ask_user` 现在是协程：提问要 await 前端作答）。"""
+    return asyncio.run(ask_mod.ask_user(questions))
+
+
+def fake_frontend(seen: dict, values, *, key: str = "questions"):
+    """替身前端：挂到 `frontend.current()`，记录收到的请求并按脚本作答。"""
+
+    class _Recorder:
+        async def ask(self, request):
+            seen[key] = list(request.payload["questions"])
+            return AskAnswer(outcome="answered", values=tuple(values))
+
+    return _Recorder()
+
+
+@pytest.fixture(autouse=True)
+def _ask_port():
+    """提问经询问端口：给每个用例挂一个（用完复位）。
+
+    前端沿用未挂载时的终端兜底（读 stdin），所以既有的
+    `smithcode.frontend.console.read_user_input` 打桩照旧生效。
+    """
+    from smithcode.event import asks as ask_port
+
+    token = ask_port.activate(AskPort(session_id="t"))
+    yield
+    ask_port.reset(token)
 
 
 @pytest.fixture(autouse=True)
@@ -58,7 +89,7 @@ def test_ask_user_can_be_denied():
 
     perm = Permission()
     perm.user_rules = [("ask_user", "*", "deny")]
-    assert perm.check("ask_user", {"questions": [{"question": "x"}]}) is False
+    assert asyncio.run(perm.check("ask_user", {"questions": [{"question": "x"}]})) is False
 
 
 def test_ask_user_works_in_agent_loop(monkeypatch, tmp_path):
@@ -89,11 +120,21 @@ def _inputs(monkeypatch, answers):
     monkeypatch.setattr("smithcode.frontend.console.read_user_input", lambda prompt="": seq.pop(0))
 
 
+def _ask_choice(question, options, multiple=False, descriptions=None):
+    """按提问形状调终端前端（`ask_user` 的选项提问路径），同步取结果。"""
+    questions = [{"question": question, "options": options,
+                  "descriptions": descriptions or [], "multiple": multiple}]
+    answer = asyncio.run(ConsoleFrontend().ask(
+        AskRequest(kind="ask_user", title=question, payload={"questions": tuple(questions)})
+    ))
+    return answer.values[0] if answer.values else ""
+
+
 def test_ask_choice_single_pick(monkeypatch, capsys):
     """单选：编号即答，返回所选项。"""
 
     _inputs(monkeypatch, ["2"])
-    out = ConsoleFrontend().ask_choice("用哪个？", ["A", "B"], False)
+    out = _ask_choice("用哪个？", ["A", "B"], False)
     assert out == "B"
     text = capsys.readouterr().out
     assert "[提问] 用哪个？" in text and "1. A" in text and "2. B" in text
@@ -103,28 +144,28 @@ def test_ask_choice_custom_text(monkeypatch):
     """直接输入非编号文本 = 自定义回答原样返回。"""
 
     _inputs(monkeypatch, ["改成紫色"])
-    assert ConsoleFrontend().ask_choice("颜色？", ["红", "蓝"], False) == "改成紫色"
+    assert _ask_choice("颜色？", ["红", "蓝"], False) == "改成紫色"
 
 
 def test_ask_choice_multiple_numbers(monkeypatch):
     """多选：逗号分隔编号，返回逗号拼接的 label。"""
 
     _inputs(monkeypatch, ["1,3"])
-    assert ConsoleFrontend().ask_choice("吃啥？", ["面", "饭", "粥"], True) == "面, 粥"
+    assert _ask_choice("吃啥？", ["面", "饭", "粥"], True) == "面, 粥"
 
 
 def test_ask_choice_empty_cancels(monkeypatch):
     """空输入 = 取消，返回空串由调用方兜底。"""
 
     _inputs(monkeypatch, [""])
-    assert ConsoleFrontend().ask_choice("确定？", ["是", "否"], False) == ""
+    assert _ask_choice("确定？", ["是", "否"], False) == ""
 
 
 def test_ask_choice_invalid_number_reasks(monkeypatch, capsys):
     """超范围编号提示无效并重新询问。"""
 
     _inputs(monkeypatch, ["9", "1"])
-    assert ConsoleFrontend().ask_choice("选一个", ["A", "B"], False) == "A"
+    assert _ask_choice("选一个", ["A", "B"], False) == "A"
     assert "无效编号" in capsys.readouterr().out
 
 
@@ -132,18 +173,18 @@ def test_ask_choice_invalid_number_reasks(monkeypatch, capsys):
 
 
 def test_ask_user_passes_normalized_questions(monkeypatch):
-    """ask_user 把 options 拍平成 labels + descriptions 对齐后交给 renderer.ask_form。"""
+    """ask_user 把 options 拍平成 labels + descriptions 对齐后交给前端（AskRequest）。"""
     from smithcode import frontend
-    from smithcode.tools import ask as ask_mod
 
     seen = {}
 
-    def fake_ask_form(questions):
-        seen["questions"] = questions
-        return ["A", "B"]
+    class _Recorder:
+        async def ask(self, request):
+            seen["questions"] = list(request.payload["questions"])
+            return AskAnswer(outcome="answered", values=("A", "B"))
 
-    monkeypatch.setattr(frontend.current(), "ask_form", fake_ask_form)
-    out = ask_mod.ask_user([
+    monkeypatch.setattr(frontend, "current", lambda: _Recorder())
+    out = ask_user([
         {"question": "Q1", "options": [{"label": "甲", "description": "说明"}, {"label": "乙"}]},
         {"question": "Q2", "multiple": True},
     ])
@@ -157,16 +198,11 @@ def test_ask_user_passes_normalized_questions(monkeypatch):
 def test_ask_user_clamps_options_to_five(monkeypatch):
     """强制遵守 1-5 个选项：模型多给时按上限截断。"""
     from smithcode import frontend
-    from smithcode.tools import ask as ask_mod
 
     seen = {}
 
-    def fake_ask_form(questions):
-        seen["questions"] = questions
-        return ["A"]
-
-    monkeypatch.setattr(frontend.current(), "ask_form", fake_ask_form)
-    ask_mod.ask_user([{
+    monkeypatch.setattr(frontend, "current", lambda: fake_frontend(seen, ["A"]))
+    ask_user([{
         "question": "选一个",
         "options": [{"label": f"O{i}"} for i in range(1, 9)],  # 8 项
     }])
@@ -177,44 +213,41 @@ def test_ask_user_clamps_options_to_five(monkeypatch):
 def test_ask_user_single_question_returns_answer(monkeypatch):
     """单题直接返回答案（与旧行为一致，不做编号包裹）。"""
     from smithcode import frontend
-    from smithcode.tools import ask as ask_mod
 
-    monkeypatch.setattr(frontend.current(), "ask_form", lambda questions: ["是的"])
-    assert ask_mod.ask_user([{"question": "继续？"}]) == "是的"
+    monkeypatch.setattr(frontend, "current", lambda: fake_frontend({}, ["是的"]))
+    assert ask_user([{"question": "继续？"}]) == "是的"
 
 
 def test_ask_user_multiple_marks_unanswered(monkeypatch):
     """多题中未答（取消）的项标记为「已取消」。"""
     from smithcode import frontend
-    from smithcode.tools import ask as ask_mod
 
-    monkeypatch.setattr(frontend.current(), "ask_form", lambda questions: ["A", ""])
-    out = ask_mod.ask_user([{"question": "Q1"}, {"question": "Q2"}])
+    monkeypatch.setattr(frontend, "current", lambda: fake_frontend({}, ["A", ""]))
+    out = ask_user([{"question": "Q1"}, {"question": "Q2"}])
     assert out == "1. Q1 → A\n2. Q2 → （已取消）"
 
 
 def test_ask_user_empty_questions_returns_error(monkeypatch):
     """空入参 / 缺题干的项不抛异常，返回可操作的报错文本。"""
-    from smithcode.tools import ask as ask_mod
 
-    assert ask_mod.ask_user([]).startswith("错误:")
-    assert ask_mod.ask_user(None).startswith("错误:")
-    assert ask_mod.ask_user([{"options": [{"label": "x"}]}]).startswith("错误:")
+    assert ask_user([]).startswith("错误:")
+    assert ask_user(None).startswith("错误:")
+    assert ask_user([{"options": [{"label": "x"}]}]).startswith("错误:")
 
 
 def test_ask_user_multiple_flag_passed_through(monkeypatch):
     """每题 multiple 标志透传到归一化结果。"""
     from smithcode import frontend
-    from smithcode.tools import ask as ask_mod
 
     seen = {}
 
-    def fake_ask_form(questions):
-        seen["q"] = questions
-        return ["A, B"]
+    class _Recorder:
+        async def ask(self, request):
+            seen["q"] = list(request.payload["questions"])
+            return AskAnswer(outcome="answered", values=("A, B",))
 
-    monkeypatch.setattr(frontend.current(), "ask_form", fake_ask_form)
-    ask_mod.ask_user([{"question": "？", "options": [{"label": "A"}, {"label": "B"}], "multiple": True}])
+    monkeypatch.setattr(frontend, "current", lambda: _Recorder())
+    ask_user([{"question": "？", "options": [{"label": "A"}, {"label": "B"}], "multiple": True}])
     assert seen["q"][0]["multiple"] is True
 
 
@@ -222,11 +255,15 @@ def test_console_ask_form_loops_questions(monkeypatch, capsys):
     """CLI 默认实现逐题串行提问，多题带 (i/n) 前缀。"""
 
     _inputs(monkeypatch, ["1", "要"])
-    out = ConsoleFrontend().ask_form([
-        {"question": "端口？", "options": ["本地", "远程"], "descriptions": ["", ""], "multiple": False},
+    questions = [
+        {"question": "端口？", "options": ["本地", "远程"], "descriptions": ["", ""],
+         "multiple": False},
         {"question": "鉴权？", "options": [], "descriptions": [], "multiple": False},
-    ])
-    assert out == ["本地", "要"]
+    ]
+    answer = asyncio.run(ConsoleFrontend().ask(
+        AskRequest(kind="ask_user", title="端口？", payload={"questions": tuple(questions)})
+    ))
+    assert list(answer.values) == ["本地", "要"]
     text = capsys.readouterr().out
     assert "（1/2）端口？" in text
     assert "（2/2）鉴权？" in text

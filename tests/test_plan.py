@@ -360,4 +360,5 @@ def test_todo_write_can_be_denied():
 
     perm = Permission()
     perm.user_rules = [("todo_write", "*", "deny")]
-    assert perm.check("todo_write", {"todos": [{"title": "x"}]}) is False
+    # 权限检查是协程（提问要 await 前端作答）
+    assert asyncio.run(perm.check("todo_write", {"todos": [{"title": "x"}]})) is False

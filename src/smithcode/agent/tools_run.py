@@ -107,10 +107,11 @@ class BatchScheduler:
                     self._collect_blocked(tool_calls[i], blocked.reason)
                     i += 1
                     continue
-            # 预检含权限确认（读 stdin / 等弹窗，纯阻塞）→ 下放线程
-            tool_plan, denied = await asyncio.to_thread(
-                self._agent._preflight_safe, tool_calls[i]
-            )
+            # 预检含权限确认：提问是 `await` 的（等前端作答），所以**在循环上**跑
+            # ——不再下放线程。这既让 TUI 的面板可以原地 await（不需要
+            # call_from_thread），也消掉了"等待方卡在非 daemon 线程里"的退出卡死。
+            # 只有读文件的 diff 快照仍下放线程（见 Agent._preflight）。
+            tool_plan, denied = await self._agent._preflight_safe(tool_calls[i])
             if self._cancelled():  # 预检（含权限确认）期间中断：当前项也不执行
                 return self._abort_interrupted(self._wave + [tool_plan], tool_calls[i + 1:])
             if denied:

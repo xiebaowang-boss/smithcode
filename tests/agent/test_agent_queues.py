@@ -44,8 +44,12 @@ def _register_fake_tool(monkeypatch, executed: list[str]) -> None:
         return f"已执行 {path}"
 
     monkeypatch.setitem(FUNCTIONS, "fake_tool", fake)
-    monkeypatch.setattr(Permission, "check", lambda self, *a, **k: True)
-    monkeypatch.setattr(Permission, "check_paths", lambda self, *a, **k: True)
+
+    async def _allow(self, *args, **kwargs):  # 权限检查是协程（提问要 await 前端）
+        return True
+
+    monkeypatch.setattr(Permission, "check", _allow)
+    monkeypatch.setattr(Permission, "check_paths", _allow)
 
 
 class SteeringLLM:
@@ -69,7 +73,13 @@ class SteeringLLM:
 
 def _agent(monkeypatch, llm) -> Agent:
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: llm)
-    return Agent(session=Session())
+    agent = Agent(session=Session())
+    # 工具权限检查经询问端口提问；这里挂上（run 内部本来也会挂，但用例直接
+    # 检查了不少中间状态，显式挂更好读）
+    from smithcode.event import asks as ask_port
+
+    ask_port.activate(agent.asks)
+    return agent
 
 
 def test_steering_is_delivered_after_the_current_turn(monkeypatch):

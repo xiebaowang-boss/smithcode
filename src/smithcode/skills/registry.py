@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config, frontend
+from .. import config
 from ..event import publish
 from ..event.catalog import Notice
 from . import frontmatter
@@ -264,7 +264,8 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
     if key in _session_trusted or bool(load_trust().get(key)):
         return True
     # 延迟导入：utils.terminal 导入 commands，而 commands 导入 skills，顶层导入会成环
-    from ..event.asks import ask as ask_prompt
+    from ..event import asks as ask_port
+    from ..event.asks import AskRequest
     from ..utils.terminal import confirmations_available
 
     if not confirmations_available():
@@ -275,22 +276,25 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
         ))
         return False
 
-    r = frontend.current()
     detail = ["发现项目技能（随仓库分发，可能不可信）:"] + [
         f"- {skill.name}: {skill.description[:60]}" for skill in preview
     ]
     descriptions = {"y": "仅本次会话加载", "a": "始终信任此项目（落盘记录）", "n": "跳过本项目的技能"}
-    answer = ask_prompt(
-        "skill_trust",
-        title="加载项目技能?",
+    # 命令层是同步的（`commands.dispatch`），所以这里走端口的**同步等法**：
+    # 它借运行中的循环把协程投回去（TUI 面板必须等在 app 自己的循环上）。
+    reply = ask_port.require().ask_sync(AskRequest(
+        kind="skill_trust",
+        title="加载项目技能? [y]仅本次 / [a]始终信任此项目 / [n]跳过: ",
         detail=tuple(detail),
-        options=("once", "always", "skip"),
-        payload={"project": key, "skills": tuple(skill.name for skill in preview)},
-        run=lambda: r.confirm_choice(
-            "加载项目技能? [y]仅本次 / [a]始终信任此项目 / [n]跳过: ", "yan", "y / a / n",
-            detail=detail, descriptions=descriptions,
-        ),
-    )
+        options=("y", "a", "n"),
+        payload={
+            "project": key,
+            "skills": tuple(skill.name for skill in preview),
+            "hint": "y / a / n",
+            "descriptions": descriptions,
+        },
+    ))
+    answer = reply.value if reply.answered else "n"
     if answer in ("y", "a"):
         if answer == "a":
             remember_project(key)

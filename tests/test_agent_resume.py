@@ -121,7 +121,9 @@ def test_fsync_checkpoints_bracket_tool_execution(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", _ToolThenAnswerLLM)
     agent = Agent(session=Session(), persist=True)
     # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+    async def _fake_check(name, args, content=None):
+        return True
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     asyncio.run(agent.run("跑个工具"))
 

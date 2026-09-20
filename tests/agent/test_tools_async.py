@@ -47,8 +47,11 @@ def _register(monkeypatch, name: str, func) -> None:
     from smithcode.tools import FUNCTIONS
 
     monkeypatch.setitem(FUNCTIONS, name, func)
-    monkeypatch.setattr(Permission, "check", lambda self, *a, **k: True)
-    monkeypatch.setattr(Permission, "check_paths", lambda self, *a, **k: True)
+    async def _allow(self, *args, **kwargs):  # 权限检查是协程（提问要 await 前端）
+        return True
+
+    monkeypatch.setattr(Permission, "check", _allow)
+    monkeypatch.setattr(Permission, "check_paths", _allow)
 
 
 def _agent(monkeypatch, script) -> Agent:

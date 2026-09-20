@@ -1,4 +1,4 @@
-﻿"""Agent 批量工具执行的两阶段并发测试：预检串行、波次执行、顺序保证。
+"""Agent 批量工具执行的两阶段并发测试：预检串行、波次执行、顺序保证。
 
 用假 LLM + 假工具验证，不依赖真实 API：
 - 结果按提交顺序收集（与模型请求 tool_calls 的顺序一致）
@@ -33,6 +33,10 @@ def _console_agent(**kwargs):
     """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例用 capsys 读输出。"""
     agent = Agent(session=Session(), **kwargs)
     frontend.attach(agent.events, ConsoleFrontend())
+    # 直接调内部入口（绕过 run）时也要有活动端口：提问是经它 await 前端的
+    from smithcode.event import asks as _ask_port
+
+    _ask_port.activate(agent.asks)
     return agent
 
 
@@ -61,7 +65,9 @@ def _make_agent(monkeypatch, batches):
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(batches))
     agent = _console_agent()
     # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+    async def _fake_check(name, args, content=None):
+        return True
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
     return agent
 
 
@@ -202,7 +208,7 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
 
     seen = []
 
-    def check(name, args, content=None):
+    async def check(name, args, content=None):
         seen.append(name)
         return len(seen) == 1  # 第一次放行，第二次拒绝
 
@@ -248,7 +254,7 @@ def test_serial_executes_before_later_preflight(monkeypatch, tmp_path):
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
     agent = _console_agent()
 
-    def check(name, args, content=None):
+    async def check(name, args, content=None):
         events.append(("check", args.get("tag")))
         return True
 
@@ -288,7 +294,9 @@ def test_wave_runs_before_serial_barrier(monkeypatch, tmp_path):
     ]
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
     agent = _console_agent()
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+    async def _fake_check(name, args, content=None):
+        return True
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     asyncio.run(agent.run("屏障"))
 
@@ -314,10 +322,12 @@ def test_denied_after_executed_serial_keeps_partial(monkeypatch, tmp_path):
     agent = _console_agent()
 
     seen = []
-    monkeypatch.setattr(
-        agent.permission, "check",
-        lambda name, args, content=None: seen.append(name) or name == "cmd_tool",
-    )
+
+    async def _fake_check(name, args, content=None):
+        seen.append(name)
+        return name == "cmd_tool"  # 只放行串行工具
+
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     result = asyncio.run(agent.run("拒绝"))
     assert "权限" in result.text
@@ -385,10 +395,12 @@ def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
     agent = _console_agent()
 
     seen = []
-    monkeypatch.setattr(
-        agent.permission, "check",
-        lambda name, args, content=None: seen.append(name) or len(seen) == 1,  # 第二次拒绝
-    )
+
+    async def _fake_check(name, args, content=None):
+        seen.append(name)
+        return len(seen) == 1  # 第一次放行，第二次拒绝
+
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
     cap = _CapSubscriber()
     agent.events.subscribe(cap)
 
@@ -412,7 +424,7 @@ def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
 
     seen = []
 
-    def check(name, args, content=None):
+    async def check(name, args, content=None):
         seen.append(name)
         if len(seen) == 3:  # 预检第 3 个时用户按 Esc
             agent.interrupt()

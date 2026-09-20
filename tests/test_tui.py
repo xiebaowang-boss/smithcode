@@ -12,7 +12,10 @@ from textual.geometry import Region
 from textual.widgets import Static
 
 from smithcode import __version__, config
+from smithcode import frontend as _frontend_mod
 from smithcode.agent import Agent
+from smithcode.event import asks as ask_port
+from smithcode.event.asks import AskRequest
 from smithcode.event.catalog import PlanUpdate, TitleChanged
 from smithcode.llm import RetryState
 from smithcode.llm.request import TurnConfig
@@ -86,6 +89,30 @@ def publish_plan(app, summary: str = "共 1 步", *, created: bool = False,
         titles=plan_mod.render_titles(color=True),
         created=created, tool_call_id=tool_call_id,
     ))
+
+def _done(on_done):
+    """面板完成信号：既接受 threading.Event，也接受回调。"""
+    return on_done.set if hasattr(on_done, "set") else on_done
+
+
+def _show_permission(app, prompt, valid, hint, result, on_done, detail=None,
+                     descriptions=None, content=None):
+    """测试辅助：按旧签名挂权限面板（内部转成 `AskRequest`）。"""
+    app.show_ask_panel(
+        AskRequest(kind="permission", title=prompt, options=tuple(valid),
+                   detail=tuple(detail or ()),
+                   payload={"hint": hint, "descriptions": descriptions or {},
+                            "content": content}),
+        result, _done(on_done),
+    )
+
+
+def _show_questions(app, questions, result, on_done):
+    """测试辅助：按旧签名挂提问面板（内部转成 `AskRequest`）。"""
+    app.show_ask_panel(
+        AskRequest(kind="ask_user", title="", payload={"questions": tuple(questions)}),
+        result, _done(on_done),
+    )
 
 def _make_agent(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
@@ -345,7 +372,7 @@ def test_choice_modal_resolves(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
             )
             await pilot.pause()
@@ -367,7 +394,7 @@ def test_permission_panel_escape_denies(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许? [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ", "yan", "y / a / n", result, evt
             )
             await pilot.pause()
@@ -387,7 +414,7 @@ def test_permission_panel_arrow_keys_do_not_answer(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
             )
             await pilot.pause()
@@ -411,7 +438,7 @@ def test_permission_panel_shows_option_descriptions(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许执行 run_command? [y]本次 / [n]拒绝 / [a]总是允许: ",
                 "yna", "y / n / a", result, evt,
                 None,
@@ -443,7 +470,7 @@ def test_question_panel_shows_option_descriptions(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel(
+            _show_questions(app, 
                 [{"question": "用哪个？", "options": ["甲", "乙"],
                   "descriptions": ["甲说明", "乙说明"], "multiple": False}], result, evt,
             )
@@ -489,7 +516,7 @@ def test_question_panel_resolves(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([{"question": "要继续吗?"}], result, evt)
+            _show_questions(app, [{"question": "要继续吗?"}], result, evt)
             await pilot.pause()
             assert app.query_one("#input-wrap").display is False  # 输入框（含框内状态行）被替换
             await pilot.press("是")
@@ -725,7 +752,7 @@ def test_question_panel_question_markup_not_parsed(monkeypatch):
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
             question = "访问 [link=https://raw.githubusercontent.com/x] 吗？"
-            app.show_question_panel([{"question": question}], result, evt)
+            _show_questions(app, [{"question": question}], result, evt)
             await pilot.pause()
             title = str(app.query_one(".ask-title").content)
             assert question in title
@@ -1186,7 +1213,7 @@ def test_tui_status_bar(monkeypatch):
             assert any(s.style == "#e0af68" for s in thinking.spans)  # 思考黄色（span）
             # 提问/权限面板替换输入框时，输入框隐藏
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
             )
             await pilot.pause()
@@ -1439,7 +1466,7 @@ def test_tui_cycle_permission_mode(monkeypatch):
             assert str(app.query_one("#composer-mode").content) == "Smith"
             # 权限面板弹出（瞬时态）期间不响应切换
             result, evt = {}, threading.Event()
-            app.show_permission_panel(
+            _show_permission(app, 
                 "允许? [y]本次 / [n]拒绝 / [a]总是允许该模式: ", "yna", "y / n / a", result, evt
             )
             await pilot.pause()
@@ -1796,7 +1823,7 @@ def test_question_choice_modal_single_pick(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel(
+            _show_questions(app, 
                 [{"question": "用哪个？", "options": ["甲", "乙"],
                   "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -1820,7 +1847,7 @@ def test_question_choice_modal_multiple_toggle(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel(
+            _show_questions(app, 
                 [{"question": "选特征", "options": ["红", "大", "圆"],
                   "descriptions": [], "multiple": True}], result, evt)
             await pilot.pause()
@@ -1847,7 +1874,7 @@ def test_question_choice_modal_multiple_empty_submits_skipped(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel(
+            _show_questions(app, 
                 [{"question": "选特征", "options": ["红", "大", "圆"],
                   "descriptions": [], "multiple": True}], result, evt)
             await pilot.pause()
@@ -1870,7 +1897,7 @@ def test_question_choice_modal_multiple_empty_advances(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "选特征", "options": ["红", "大"], "descriptions": [],
                  "multiple": True},
                 {"question": "用哪个？", "options": ["甲", "乙"], "descriptions": [],
@@ -1902,7 +1929,7 @@ def test_question_choice_modal_custom_answer(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel(
+            _show_questions(app, 
                 [{"question": "颜色？", "options": ["红", "蓝"],
                   "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -1932,7 +1959,7 @@ def test_question_panel_custom_esc_exits_input_then_reenter(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "颜色？", "options": ["红", "蓝"],
                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -1970,7 +1997,7 @@ def test_question_panel_pure_input_esc_exits_not_cancel(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "随便说点什么", "options": [],
                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -2005,7 +2032,7 @@ def test_question_panel_pure_input_typing_refocuses(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q", "options": [],
                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -2033,7 +2060,7 @@ def test_question_panel_pure_input_second_esc_cancels(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q", "options": [],
                  "descriptions": [], "multiple": False}], result, evt)
             await pilot.pause()
@@ -2056,7 +2083,7 @@ def test_question_panel_switch_into_pure_input_keeps_focus_on_list(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A", "B"], "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": [], "descriptions": [], "multiple": False},
                 {"question": "Q3", "options": ["C", "D"], "descriptions": [], "multiple": False},
@@ -2096,7 +2123,7 @@ def test_question_panel_switch_back_keeps_focus_on_list(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["红", "蓝"],
                  "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["C", "D"],
@@ -2141,7 +2168,7 @@ def test_question_panel_multiple_with_custom_merges(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "想用哪些？", "options": ["A", "B", "C"],
                  "descriptions": [], "multiple": True},
             ], result, evt)
@@ -2176,7 +2203,7 @@ def test_question_panel_switch_resets_cursor_to_first_option(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A1", "A2", "A3"],
                  "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["B1", "B2"],
@@ -2205,7 +2232,7 @@ def test_question_panel_multi_questions_auto_advance(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "端口？", "options": ["8000", "3000"],
                  "descriptions": [], "multiple": False},
                 {"question": "鉴权？", "options": ["要", "不要"],
@@ -2236,7 +2263,7 @@ def test_question_panel_review_page_navigation(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A1", "A2"],
                  "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["B1", "B2"],
@@ -2278,7 +2305,7 @@ def test_question_panel_revisit_middle_advances_to_next(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A1", "A2"],
                  "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["B1", "B2"],
@@ -2316,7 +2343,7 @@ def test_question_panel_manual_switch_revisit(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A1", "A2"],
                  "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["B1", "B2"],
@@ -2362,7 +2389,7 @@ def test_question_panel_multi_escape_cancels_group(monkeypatch):
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
             result, evt = {}, threading.Event()
-            app.show_question_panel([
+            _show_questions(app, [
                 {"question": "Q1", "options": ["A", "B"], "descriptions": [], "multiple": False},
                 {"question": "Q2", "options": ["C", "D"], "descriptions": [], "multiple": False},
             ], result, evt)
@@ -3878,70 +3905,68 @@ def test_stream_error_footer_carries_reason(monkeypatch):
 
 # ---------- 界面收尾：挂起的弹窗等待方必须被放行 ----------
 #
-# 失败模式是「永久阻塞」，故这两条用例把同步等待放进 asyncio.wait_for（回归表现为
-# 5s 超时断言失败），并在 finally 里手动放行线程——否则断言虽然失败，收尾仍会卡在
-# join 那个线程上，整套测试要等 asyncio 的 300s join 上限才结束。
-
-
-def _release_pending(frontend) -> None:
-    """测试兜底：直接放行全部挂起等待，避免回归时把测试套件拖住。"""
-    with frontend._pending_lock:
-        pending = list(frontend._pending)
-    for evt in pending:
-        evt.set()
+# 失败模式是「那一轮永远不结束」（等待方停在 await 上），故这两条用例把等待放进
+# `asyncio.wait_for`（回归表现为 5s 超时失败）——现在没有阻塞线程，收尾不会被拖住。
 
 
 def test_unanswered_panel_exit_releases_waiter(monkeypatch):
-    """面板未作答就退出界面：等待方被唤醒，并按 fail-closed 走默认值（拒绝）。
+    """面板未作答就退出界面：等待方被放行，并按 fail-closed 收口（取消/拒绝）。
 
-    为什么必须唤醒：等待线程跑在 asyncio 默认线程池里（非 daemon），收尾时会 join
-    它——asyncio 侧上限 300s（`shutdown_default_executor`），解释器退出时
-    `concurrent.futures` 的 atexit join 没有上限，进程回不到 shell。
+    为什么必须放行：等待方是**事件循环上的一个 await**（不再有阻塞线程），界面
+    卸载后没人能作答，任其悬挂就意味着这一轮永远不结束、进程回不到收尾路径。
+    放行口是 `AskPort.cancel_in_flight`（`SmithTUI.on_unmount` 会调它）。
     """
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
-        frontend = None
-        ask = None
-        try:
-            async with app.run_test() as pilot:
-                frontend = app._frontend
-                # 与生产同形：询问经 to_thread（默认池）下放，阻塞等面板作答
-                ask = asyncio.create_task(asyncio.to_thread(
-                    frontend.confirm_choice,
-                    "允许执行 run_command? [y]本次 / [n]拒绝: ", "yn", "y / n",
+        async with app.run_test() as pilot:
+            port = app.agent.asks
+            port.bind_loop(asyncio.get_running_loop())
+            token = ask_port.activate(port)
+            frontend_token = _frontend_mod.activate(app._frontend)
+            try:
+                task = asyncio.ensure_future(port.ask(
+                    AskRequest(kind="permission", title="允许执行 run_command? [y]本次 / [n]拒绝: ",
+                               options=("y", "n"), payload={"hint": "y / n"})
                 ))
                 for _ in range(200):
                     await pilot.pause(0.02)
                     if app.query(PermissionPanel):
                         break
                 assert app.query(PermissionPanel), "权限面板应已弹出"
-                assert not ask.done()  # 确实停在等待上（无人作答）
-            # 界面收尾（on_unmount 已跑）之后才断言：靠的就是 on_unmount 的放行
-            assert await asyncio.wait_for(ask, timeout=5) == "n"
-        finally:
-            if frontend is not None:
-                _release_pending(frontend)  # 回归兜底：别把测试套件拖在 join 上
+                assert not task.done()  # 确实停在等待上（无人作答）
+            finally:
+                _frontend_mod.reset(frontend_token)
+                ask_port.reset(token)
+        # 界面收尾（on_unmount 已跑）之后才断言：靠的就是那里的取消
+        answer = await asyncio.wait_for(task, timeout=5)
+        assert answer.outcome == "cancelled"  # fail-closed：按拒绝/取消收口
 
     _run(_run_case())
 
 
 def test_ask_after_unmount_returns_default_without_blocking(monkeypatch):
-    """界面已收尾后到达的询问（在飞的任务收尾时才问到）：直接走默认值，不进等待。"""
+    """界面已收尾后到达的询问：直接走 fail-closed 默认值，不挂面板、不阻塞。"""
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test():
-            frontend = app._frontend
+            pass  # 挂载又卸载：界面已收尾
+        port = app.agent.asks
+        port.bind_loop(asyncio.get_running_loop())
+        token = ask_port.activate(port)
+        frontend_token = _frontend_mod.activate(app._frontend)
         try:
-            denied = await asyncio.wait_for(asyncio.to_thread(
-                frontend.confirm_choice,
-                "允许? [y]本次 / [n]拒绝: ", "yn", "y / n",
+            denied = await asyncio.wait_for(port.ask(
+                AskRequest(kind="permission", title="允许? [y]本次 / [n]拒绝: ",
+                           options=("y", "n"))
             ), timeout=5)
-            assert denied == "n"
-            answers = await asyncio.wait_for(asyncio.to_thread(
-                frontend.ask_form, [{"question": "用哪个？", "options": ["甲", "乙"]}],
+            assert not denied.answered  # 拒绝/取消，且立刻返回
+            answers = await asyncio.wait_for(port.ask_user_questions(
+                [{"question": "用哪个？", "options": ["甲", "乙"]}]
             ), timeout=5)
-            assert answers == [""]  # 空串 = 取消
+            assert not answers.answered and not answers.values
         finally:
-            _release_pending(frontend)
+            _frontend_mod.reset(frontend_token)
+            ask_port.reset(token)
 
     _run(_run_case())
+

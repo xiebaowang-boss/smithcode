@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import re
-import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -70,7 +70,7 @@ class PermissionPanel(Vertical):
     ]
 
     def __init__(self, prompt: str, valid: str, hint: str, result: dict,
-                 evt: threading.Event, detail: list[str] | None = None,
+                 on_done: Callable[[], None], detail: list[str] | None = None,
                  descriptions: dict[str, str] | None = None,
                  content: str | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -81,7 +81,7 @@ class PermissionPanel(Vertical):
         self._descriptions = dict(descriptions or {})
         self._content = content
         self._selected = 0
-        self._result, self._evt = result, evt
+        self._result, self._on_done = result, on_done
         self._body: Static | None = None
         self._footer: Static | None = None
 
@@ -165,8 +165,8 @@ class PermissionPanel(Vertical):
 
     def _finish(self, value: str) -> None:
         self._result["value"] = value
-        self._evt.set()
         self.app.close_composer_panel(self)
+        self._on_done()  # 先收面板再唤醒等待方：唤醒方看到的是收尾后的界面
 
 
 # 多选题一道未勾选时提交的答案标记。空串在全局表示「取消」（见 bridge.ask_form），
@@ -215,8 +215,8 @@ class QuestionPanel(Vertical):
         Binding("escape", "cancel", "取消", show=False),
     ]
 
-    def __init__(self, questions: list[dict], result: dict, evt: threading.Event,
-                 **kwargs):
+    def __init__(self, questions: list[dict], result: dict,
+                 on_done: Callable[[], None], **kwargs):
         super().__init__(**kwargs)
         self._questions = list(questions or [])
         self._total = len(self._questions)
@@ -229,7 +229,7 @@ class QuestionPanel(Vertical):
         self._editing: list[bool] = [
             not (q.get("options") or []) for q in self._questions
         ]
-        self._result, self._evt = result, evt
+        self._result, self._on_done = result, on_done
         self._review = False  # 多问题答完后进入的确认页（循环里的最后一「页」）
         self._title: Static | None = None
         self._body: Static | None = None
@@ -610,8 +610,8 @@ class QuestionPanel(Vertical):
         if cancel:
             self._answers = [""] * self._total
         self._result["values"] = list(self._answers)
-        self._evt.set()
         self.app.close_composer_panel(self)
+        self._on_done()
 
 
 # ---------- 通用选择面板（居中弹窗） ----------

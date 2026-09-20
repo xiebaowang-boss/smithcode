@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
 from .. import config
+from ..event.asks import AskAnswer, AskRequest
 from ..event.catalog import (
     CompactionEnded,
     CompactionFailed,
@@ -163,7 +165,19 @@ class ConsoleFrontend:
 
     # ----- 询问面：读终端 -----
 
-    def ask_form(self, questions: list[dict]) -> list[str]:
+    async def ask(self, request: AskRequest) -> AskAnswer:
+        """终端作答：按 kind 呈现，读 stdin（阻塞读下放线程，不冻事件循环）。
+
+        fail-closed 由调用点保证（权限引擎 / ask_user 会先看 `confirmations_available()`），
+        所以这里不必自己判断非交互——读不到输入时返回的取消/空答案天然是拒绝。
+        """
+        if request.kind == "ask_user":
+            return await asyncio.to_thread(self._ask_questions, list(
+                request.payload.get("questions") or []
+            ))
+        return await asyncio.to_thread(self._ask_choice, request)
+
+    def _ask_questions(self, questions: list[dict]) -> AskAnswer:
         """逐题串行提问（终端天然如此），题面带 (i/n) 序号。"""
         total = len(questions)
         answers: list[str] = []
@@ -173,21 +187,48 @@ class ConsoleFrontend:
                 question = f"（{index}/{total}）{question}"
             options = item.get("options") or []
             if options:
-                answers.append(self.ask_choice(
+                answers.append(self._choose(
                     question, options, item.get("multiple", False),
                     descriptions=item.get("descriptions"),
                 ))
             else:
-                answers.append(self.ask_text(question))
-        return answers
+                answers.append(self._read_text(question))
+        if not answers:
+            return AskAnswer(outcome="cancelled")
+        values = tuple(answers)
+        # 整组全空 = 用户取消（每题空串表示该题取消）
+        return AskAnswer(
+            outcome="cancelled" if all(not value for value in values) else "answered",
+            values=values,
+        )
 
-    def ask_text(self, question: str) -> str:
+    def _ask_choice(self, request: AskRequest) -> AskAnswer:
+        """确认框：先打说明行，再按选项键问一次。"""
+        payload = request.payload or {}
+        flush_pending_input()  # 丢弃提前键入的排队内容，防止被误当成回答
+        lines = list(request.detail or [])
+        content = payload.get("content")
+        if content:
+            lines.append(str(content))
+        for key, desc in (payload.get("descriptions") or {}).items():
+            if desc:
+                lines.append(f"[{key}] {desc}")
+        if lines:
+            print()
+            for line in lines:
+                print(f"   {line}", flush=True)
+        answer = prompt_choice(
+            request.title, "".join(request.options), str(payload.get("hint") or "")
+        )
+        return AskAnswer(outcome="answered", value=answer)
+
+    def _read_text(self, question: str) -> str:
         flush_pending_input()  # 丢弃缓冲区内提前键入/粘贴的内容，防止被误当成回答
         print(f"\n[提问] {question}")
         return read_user_input(prompt="回答> ").strip() or "（用户未输入内容）"
 
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None) -> str:
+    def _choose(self, question: str, options: list[str], multiple: bool = False,
+                descriptions: list[str] | None = None) -> str:
         """opencode 式编号选择：数字=选项，直接打字=自定义回答，空输入=取消。"""
         flush_pending_input()
         print(f"\n[提问] {question}")
@@ -210,22 +251,5 @@ class ConsoleFrontend:
             if picked:
                 return ", ".join(picked)
             print("   无效编号，请重新选择")
-            return self.ask_choice(question, options, multiple, descriptions)
+            return self._choose(question, options, multiple, descriptions)
         return answer  # 非数字输入视为自定义回答
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str,
-                       detail: list[str] | None = None,
-                       descriptions: dict[str, str] | None = None,
-                       content: str | None = None) -> str:
-        flush_pending_input()  # 丢弃提前键入的排队内容，防止被误当成回答
-        lines = list(detail or [])
-        if content:
-            lines.append(content)
-        for key, desc in (descriptions or {}).items():
-            if desc:
-                lines.append(f"[{key}] {desc}")
-        if lines:
-            print()
-            for line in lines:
-                print(f"   {line}", flush=True)
-        return prompt_choice(prompt, valid, hint)

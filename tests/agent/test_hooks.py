@@ -80,8 +80,11 @@ def _register_fake_tool(monkeypatch, executed: list[str]) -> None:
         return f"已执行 {path}"
 
     monkeypatch.setitem(FUNCTIONS, "fake_tool", fake)
-    monkeypatch.setattr(Permission, "check", lambda self, *a, **k: True)
-    monkeypatch.setattr(Permission, "check_paths", lambda self, *a, **k: True)
+    async def _allow(self, *args, **kwargs):  # 权限检查是协程（提问要 await 前端）
+        return True
+
+    monkeypatch.setattr(Permission, "check", _allow)
+    monkeypatch.setattr(Permission, "check_paths", _allow)
 
 
 def _agent(monkeypatch, script, hooks=None) -> Agent:

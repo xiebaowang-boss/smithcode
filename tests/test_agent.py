@@ -25,6 +25,10 @@ def _console_agent(**kwargs):
     """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例用 capsys 读输出。"""
     agent = Agent(session=Session(), **kwargs)
     frontend.attach(agent.events, ConsoleFrontend())
+    # 直接调内部入口（绕过 run）时也要有活动端口：提问是经它 await 前端的
+    from smithcode.event import asks as _ask_port
+
+    _ask_port.activate(agent.asks)
     return agent
 
 
@@ -273,7 +277,9 @@ def test_run_truncates_oversized_tool_result(monkeypatch):
     # 把上限调小，避免测试里塞几万字符
     monkeypatch.setattr("smithcode.config.MAX_TOOL_OUTPUT", 1000)
     agent = _console_agent()
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+    async def _fake_check(name, args, content=None):
+        return True
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     asyncio.run(agent.run("大输出"))
 
@@ -423,7 +429,9 @@ def test_tool_summary_flattened_to_single_line(monkeypatch, capsys):
     多行命令（heredoc 等）的换行会把终端里的工具行撑成多行。"""
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     agent = _console_agent()
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: False)
+    async def _fake_check(name, args, content=None):
+        return False
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     command = "python - <<'PY'\nprint('hi')\nPY"
     _run_call(agent, _fake_tool_call("run_command", json.dumps({"command": command})))
@@ -630,7 +638,9 @@ def test_interrupt_mid_batch_stops_remaining(monkeypatch):
 
     monkeypatch.setattr("smithcode.agent.LLMClient", ToolThenCancelLLM)
     agent = _console_agent()
-    monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
+    async def _fake_check(name, args, content=None):
+        return True
+    monkeypatch.setattr(agent.permission, "check", _fake_check)
 
     result = asyncio.run(agent.run("中断批处理"))
     assert result.status == "interrupted"
@@ -652,7 +662,7 @@ def test_interrupt_during_preflight_skips_remaining(monkeypatch):
         executed.append(True)
         return "第一步完成"
 
-    def check(name, args, content=None):
+    async def check(name, args, content=None):
         if not asked:
             agent.interrupt()  # 模拟确认第 1 个工具时用户按 Esc
         asked.append(name)
@@ -694,7 +704,7 @@ def test_interrupt_during_confirmation_overrides_denied(monkeypatch):
         executed.append(True)
         return "不应执行"
 
-    def check(name, args, content=None):
+    async def check(name, args, content=None):
         agent.interrupt()  # 确认框弹出期间用户按 Esc
         return False       # 随后答 n——按中断语义优先，不转 denied
 

@@ -20,9 +20,10 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
-from .. import config, frontend
+from .. import config
+from ..event import asks as ask_port
 from ..event import publish
-from ..event.asks import ask as ask_prompt
+from ..event.asks import AskRequest
 from ..event.catalog import Notice
 from ..tools import PATTERN_ARGS, PATTERN_FAMILIES
 from ..utils.terminal import confirmations_available
@@ -252,7 +253,8 @@ class Permission:
         保证未声明 family 的既有工具行为完全不变。"""
         return tuple(dict.fromkeys((tool_name, PATTERN_FAMILIES.get(tool_name, tool_name))))
 
-    def check(self, tool_name: str, args: dict | None = None, content: str | None = None) -> bool:
+    async def check(self, tool_name: str, args: dict | None = None,
+                    content: str | None = None) -> bool:
         """判断一次工具调用是否放行。deny 直接拒绝；ask 弹出交互确认（非交互 fail-closed 拒绝）。
 
         content 为该工具的展示摘要（Agent 的 describe 行），统一渲染在确认框标题
@@ -271,7 +273,7 @@ class Permission:
         if action == DENY:
             publish(Notice(f"已被权限规则拒绝: {tool_name}（模式 {pattern}）", level="error"))
             return False
-        return self._dispatch_ask(tool_name, asked, remember, content)
+        return await self._dispatch_ask(tool_name, asked, remember, content)
 
     def _eval_segment(self, keys: tuple, segment: str) -> str:
         """单段命令求值：用户/会话规则优先，命中即按其裁决（可收紧为 ask/deny，
@@ -306,7 +308,8 @@ class Permission:
             return ASK, list(segments), False
         return ALLOW, [], True
 
-    def check_paths(self, tool_name: str, paths: list[str], content: str | None = None) -> bool:
+    async def check_paths(self, tool_name: str, paths: list[str],
+                          content: str | None = None) -> bool:
         """多路径工具（如 apply_patch）的聚合检查：任一路径 deny → 拒绝；任一 ask → 询问；
         全部放行 → 放行。路径归一化与单路径一致（相对命中授权根）。
         "总是允许"按每个待确认路径的精确模式逐条记忆（而非一次性宽泛放行），
@@ -326,10 +329,11 @@ class Permission:
             if self.mode == "accept_edits" and PATTERN_FAMILIES.get(tool_name) in EDIT_FAMILIES:
                 return True
             asked = sorted({pat for pat, a in zip(patterns, actions) if a == ASK})
-            return self._ask(tool_name, asked, content=content)
+            return await self._ask(tool_name, asked, content=content)
         return True
 
-    def ask_outside_access(self, raw_path: str, target: Path) -> tuple[str, Path | None]:
+    async def ask_outside_access(self, raw_path: str,
+                                 target: Path) -> tuple[str, Path | None]:
         """路径预检发现目标在授权目录之外时的确认。
 
         -y（approved_all）：静默放行本次访问，视为"仅本次"授权，不弹确认、不写入会话级信任。
@@ -343,26 +347,24 @@ class Permission:
         if not confirmations_available():
             publish(Notice(f"非交互模式，无法确认越界访问，已拒绝: {raw_path}", level="error"))
             return "deny", None
-        r = frontend.current()
-        title = f"允许访问授权目录之外的路径 {raw_path}?"
         descriptions = {
             "y": _clip(f"仅本次访问 {target}"),
             "a": _clip(f"本会话信任目录: {root}"),
             "n": _clip("拒绝本次访问"),
         }
-        answer = ask_prompt(
-            "outside_access",
-            title=title,
-            detail=tuple(descriptions.values()),
-            options=("once", "always", "deny"),
-            payload={"path": str(target), "root": str(root)},
-            run=lambda: r.confirm_choice(
-                f"{title} [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: ",
-                "yan",
-                "y / a / n",
-                descriptions=descriptions,
-            ),
-        )
+        reply = await ask_port.require().ask(AskRequest(
+            kind="outside_access",
+            title=(f"允许访问授权目录之外的路径 {raw_path}?"
+                   " [y]仅本次 / [a]本会话总是信任该目录 / [n]拒绝: "),
+            options=("y", "a", "n"),
+            payload={
+                "path": str(target),
+                "root": str(root),
+                "hint": "y / a / n",
+                "descriptions": descriptions,
+            },
+        ))
+        answer = reply.value if reply.answered else "n"
         if answer == "y":
             return "once", root
         if answer == "a":
@@ -398,8 +400,8 @@ class Permission:
                 return p.relative_to(root).as_posix()
         return raw
 
-    def _dispatch_ask(self, tool_name: str, patterns: list[str],
-                      remember: bool = True, content: str | None = None) -> bool:
+    async def _dispatch_ask(self, tool_name: str, patterns: list[str],
+                            remember: bool = True, content: str | None = None) -> bool:
         """按当前权限模式分派 ask 请求。
 
         auto：全部自动放行（原 -y 语义）。accept_edits：编辑族（edit_file /
@@ -411,7 +413,7 @@ class Permission:
             return True
         if self.mode == "accept_edits" and PATTERN_FAMILIES.get(tool_name) in EDIT_FAMILIES:
             return True
-        return self._ask(tool_name, patterns, remember, content)
+        return await self._ask(tool_name, patterns, remember, content)
 
     def _remember_proposals(self, tool_name: str, patterns: list) -> list:
         """生成"总是允许"的记忆候选：[(展示文本, 规则键), ...]，按键去重。
@@ -437,8 +439,8 @@ class Permission:
                 unique.append((display, key))
         return unique
 
-    def _ask(self, tool_name: str, patterns: list[str],
-             remember: bool = True, content: str | None = None) -> bool:
+    async def _ask(self, tool_name: str, patterns: list[str],
+                   remember: bool = True, content: str | None = None) -> bool:
         """交互确认；patterns 为本次待确认的模式列表（命令工具为待确认的段）。
 
         标题统一为「允许执行 <工具名>?」，目标内容（工具摘要，如 `command git status`
@@ -448,14 +450,17 @@ class Permission:
         CONFIRM_LIMIT，长命令 / 长记忆候选不再全量打印。选"总是允许"时按候选逐条
         记入会话规则：命令工具记 argv 前缀（或精确串），其余工具记模式串，保证记忆
         能被后续命中。remember=False 时只提供 y/n。变更预览（diff）不在这里展示——
-        它由 Agent 在确认前推送到工具调用块，与权限框解耦。"""
+        它由 Agent 在确认前推送到工具调用块，与权限框解耦。
+
+        询问本身是 `await` 的（`AskRequest` 交给当前前端）：所以本方法必须在
+        **事件循环上**调用——预检因此不再下放线程（见 `agent/tools_run.py`）。
+        """
         if not confirmations_available():
             publish(Notice(
                 f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）",
                 level="error",
             ))
             return False
-        r = frontend.current()
         proposals = self._remember_proposals(tool_name, patterns) if remember else []
         title = f"允许执行 {tool_name}?"
         descriptions = {"y": "仅本次执行", "n": "拒绝并跳过该操作"}
@@ -467,20 +472,19 @@ class Permission:
         else:
             prompt = f"{title} [y]本次 / [n]拒绝: "
             options, hint = "yn", "y / n"
-        answer = ask_prompt(
-            "permission",
-            title=title,
-            detail=tuple(descriptions.values()),
+        reply = await ask_port.require().ask(AskRequest(
+            kind="permission",
+            title=prompt,
             options=tuple(options),
-            payload={"tool_name": tool_name, "patterns": tuple(patterns)},
-            run=lambda: r.confirm_choice(
-                prompt,
-                options,
-                hint,
-                content=_clip(content) if content else content,
-                descriptions=descriptions,
-            ),
-        )
+            payload={
+                "tool_name": tool_name,
+                "patterns": tuple(patterns),
+                "hint": hint,
+                "descriptions": descriptions,
+                "content": _clip(content) if content else content,
+            },
+        ))
+        answer = reply.value if reply.answered else "n"
         if answer == "a":
             for _, key in proposals:
                 self.session_rules.append((tool_name, key, ALLOW))

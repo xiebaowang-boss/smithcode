@@ -184,6 +184,56 @@ def test_session_id_is_adopted_in_one_place():
     assert not offenders, f"会话 id 只能由 session.py 采纳：{offenders}"
 
 
+# ---------- 7. 询问只经端口（asked → replied） ----------
+
+
+def test_asking_goes_through_the_port_only():
+    """`frontend.current()` 只能在询问端口里出现：别处提问必须走端口。
+
+    端口负责发 `PromptStarted` / `PromptFinished`、绑定会话标识、以及在收尾时
+    统一取消挂起询问。绕过它直接调前端，这三件事就全丢了（远程客户端也收不到）。
+    """
+    offenders = []
+    for path in _python_files():
+        if path.parent.name == "event" or path.relative_to(SRC).parts[0] in FRONTEND_DIRS:
+            continue
+        for number, line in _lines(path):
+            if "frontend.current()" in line or "frontend.current().ask" in line:
+                offenders.append(f"{path.relative_to(SRC)}:{number}")
+    assert not offenders, f"询问只能经 event.asks 端口：{offenders}"
+
+
+def test_old_blocking_ask_methods_are_gone():
+    """旧的四方法（ask_text/ask_choice/ask_form/confirm_choice）不得复活。
+
+    它们是"同步阻塞 + 每个调用点自己拼呈现参数"的形态：前端已被统一成
+    `async ask(AskRequest) -> AskAnswer`，复活它们等于同时复活两套询问语义。
+    """
+    legacy = re.compile(r"(?<![_\w])(ask_text|ask_choice|ask_form|confirm_choice)\(")
+    offenders = []
+    for path in _python_files():
+        if path.name == "test_single_event_path.py":
+            continue
+        for number, line in _lines(path):
+            if line.strip().startswith(("assert", "#", '"', "'")):
+                continue
+            found = legacy.search(line)
+            if found:
+                offenders.append(f"{path.relative_to(SRC)}:{number}: {found.group(1)}")
+    assert not offenders, f"旧的阻塞询问方法不得复活：{offenders}"
+
+
+def test_preflight_is_not_pushed_to_a_thread():
+    """权限预检不得再下放线程：提问要 await 前端作答（面板必须在循环上）。
+
+    下放线程的后果不只是慢：等待方会卡在非 daemon 池线程里，收尾 join 它 → 进程
+    回不到 shell（退出卡死故障的形态）。读文件的 diff 快照仍是例外。
+    """
+    tools_run = (SRC / "agent" / "tools_run.py").read_text(encoding="utf-8")
+    assert "to_thread(self._agent._preflight_safe" not in tools_run
+    assert "await self._agent._preflight_safe(" in tools_run
+
+
 # ---------- 6. 删除即删除（无兼容层、无转发壳）----------
 
 

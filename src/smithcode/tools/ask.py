@@ -11,10 +11,8 @@ multiple=True 表示该题可多选（可同时勾选多个选项，并与自定
 """
 from __future__ import annotations
 
-from .. import frontend
-
 # 直接导入子模块：经包门面 `from ..agent import interactions` 会惰性拉起重链
-from ..event.asks import ask as ask_prompt
+from ..event import asks as ask_port
 from ..utils.terminal import confirmations_available
 from .base import register
 
@@ -124,22 +122,18 @@ def _format(questions: list[dict], answers: list[str]) -> str:
         },
     }
 )
-def ask_user(questions: list[dict]) -> str:
+async def ask_user(questions: list[dict]) -> str:
+    """向用户提问（工具入口）：一次提交 1-N 个问题，回来的是与问题对齐的答案。
+
+    提问走询问端口（`ask`），所以本函数是**协程**——工具执行层已支持 awaitable
+    返回值（见 `agent/tools_run.py` 的 `_run_plan`），调用点无需感知。
+    """
     if not confirmations_available():
         return _CANCELLED
     normalized = _normalize(questions)
     if not normalized:
         return _BAD_ARGS
-    answers = ask_prompt(
-        "ask_user",
-        title=normalized[0]["question"] if normalized else "",
-        # normalized 里每题是 {question, options: [label...], …}（见 _normalize）
-        options=tuple(
-            label for question in normalized for label in question.get("options", [])
-        ),
-        payload={"question_count": len(normalized)},
-        # 整组答案全为空 = 用户取消了这次提问（每题空串表示该题取消）
-        outcome_of=lambda values: "cancelled" if all(not value for value in values) else "answered",
-        run=lambda: frontend.current().ask_form(normalized),
-    )
+    reply = await ask_port.require().ask_user_questions(normalized)
+    # 取消（没作答）时回一个空答案列表——`_format` 的既有语义不变
+    answers = list(reply.values) if reply.answered else ["" for _ in normalized]
     return _format(normalized, answers)

@@ -193,23 +193,17 @@ def test_resources_listing_excludes_skill_md(isolated):
 # ---------- 项目级信任门控 ----------
 
 class _DummyAsker:
-    """假询问端口：回答固定，并记下收到的提示（技能信任确认用）。"""
+    """假前端：回答固定，并记下收到的请求（技能信任确认用）。"""
 
     def __init__(self, answer="n"):
         self.answer = answer
-        self.infos = []
+        self.requests = []
 
-    def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
-        return self.answer
+    async def ask(self, request):
+        from smithcode.event.asks import AskAnswer
 
-    def ask_form(self, questions):
-        return ["" for _ in questions]
-
-    def ask_text(self, question):
-        return ""
-
-    def ask_choice(self, question, options, multiple=False, descriptions=None):
-        return ""
+        self.requests.append(request)
+        return AskAnswer(outcome="answered", value=self.answer)
 
 
 def _project_preview(isolated):
@@ -244,6 +238,17 @@ def test_trust_ask_non_interactive_fails_closed(isolated, monkeypatch):
 
     assert registry.resolve_project_trust(config.SkillsConfig(), preview, diagnostics) is False
     assert any("非交互模式" in d for d in diagnostics)
+
+
+@pytest.fixture(autouse=True)
+def _ask_port():
+    """技能信任确认经询问端口提问（命令层用同步等法）：挂一个用完复位。"""
+    from smithcode.event import asks as ask_port
+    from smithcode.event.asks import AskPort
+
+    token = ask_port.activate(AskPort(session_id="t"))
+    yield
+    ask_port.reset(token)
 
 
 def test_trust_ask_always_persists(isolated, monkeypatch):

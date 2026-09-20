@@ -10,6 +10,7 @@ import pytest
 
 from smithcode import title
 from smithcode.agent import Agent
+from smithcode.event.asks import AskAnswer, AskRequest
 from smithcode.event.catalog import PromptFinished, PromptStarted
 from smithcode.session import Session
 
@@ -311,16 +312,32 @@ def test_presenter_ignores_events_it_does_not_handle():
 
 
 def _ask_with_presenter(presenter, *, run):
-    """在一条总线上提问一次，让呈现器看到 started / finished 事件对。"""
+    """在一条总线上提问一次，让呈现器看到 started / finished 事件对。
+
+    提问经询问端口（asked → 前端作答）；`run` 是替身前端的作答（或抛错）。
+    """
+    from smithcode import frontend
     from smithcode.event import Bus, activate, reset
-    from smithcode.event.asks import ask
+    from smithcode.event.asks import AskPort
+    from smithcode.event.asks import activate as activate_port
+    from smithcode.event.asks import reset as reset_port
+
+    class _Asker:
+        async def ask(self, request):
+            return run()
 
     bus = Bus(session_id="s")
     bus.subscribe(presenter.on_agent_event)
     token = activate(bus)
+    asker_token = frontend.activate(_Asker())
+    port_token = activate_port(AskPort(session_id="s"))
     try:
-        return ask("permission", title="允许执行 x?", run=run)
+        return asyncio.run(AskPort(session_id="s").ask(
+            AskRequest(kind="permission", title="允许执行 x?")
+        ))
     finally:
+        reset_port(port_token)
+        frontend.reset(asker_token)
         reset(token)
 
 
@@ -335,9 +352,9 @@ def test_prompt_events_mark_waiting_in_title():
     p.enable()
     p.on_turn_started()
 
-    answer = _ask_with_presenter(p, run=lambda: "y")
+    answer = _ask_with_presenter(p, run=lambda: AskAnswer(outcome="answered", value="y"))
 
-    assert answer == "y"
+    assert answer.value == "y"
     assert sink.writes == [
         "\x1b[22;2t",
         "\x1b]0;Smith · smithcode\x07",
@@ -354,7 +371,7 @@ def test_prompt_waiting_cleared_when_ask_raises():
     p.enable()
     p.on_turn_started()  # 任务在跑：等待态摘掉后应回到 ◐
 
-    def boom() -> str:
+    def boom():
         raise RuntimeError("面板挂了")
 
     with pytest.raises(RuntimeError):
@@ -384,11 +401,7 @@ def test_frontend_attach_subscribes_presenter_and_activates_asker():
     class FakeAsker:
         def on_event(self, env): pass  # 订阅事件：本用例只关心装配与询问端口
 
-        def ask_text(self, question): return ""
-        def ask_choice(self, question, options, multiple=False, descriptions=None): return ""
-        def ask_form(self, questions): return ["" for _ in questions]
-        def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None,
-                           content=None): return "y"
+        async def ask(self, request): return AskAnswer(outcome="answered", value="y")
 
     sink = Recorder()
     presenter = _make_presenter(sink)
@@ -400,7 +413,8 @@ def test_frontend_attach_subscribes_presenter_and_activates_asker():
     try:
         agent.emit(TitleChanged("新标题"))
         assert sink.writes[-1] == "\x1b]0;Smith · 新标题\x07"
-        assert frontend.current().confirm_choice("允许?", "yn", "y / n") == "y"
+        answer = asyncio.run(frontend.current().ask(AskRequest(kind="permission", title="允许?")))
+        assert answer.value == "y"
     finally:
         attached.detach()
     # detach 后回到**终端兜底**（与旧 renderer.current() 一致）；fail-closed 由调用点的

@@ -14,7 +14,6 @@ bridge.py、纯函数工具在 render.py。样式集中在本目录的 app.tcss�
 """
 from __future__ import annotations
 
-import threading
 import time
 from typing import ClassVar
 
@@ -162,6 +161,7 @@ class SmithTUI(App):
         self._usage = None  # 最新一条 UsageChanged（侧边栏只从事件渲染）
         # 排队面板的视图：由 Inbox* 事件维护（前端不再收快照、自己算差异）
         self._inbox = _InboxView()
+        self._open_panel = None  # 当前打开的提问/权限面板（收尾时要关掉）
         # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
         # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
         self._select_stack: list = []
@@ -235,15 +235,17 @@ class SmithTUI(App):
         self.ui_status()
 
     def on_unmount(self) -> None:
-        """界面下线（Ctrl+Q / `/exit` / 测试收尾）：唤醒全部挂起的弹窗等待方。
+        """界面下线（Ctrl+Q / `/exit` / 测试收尾）：取消本会话所有挂起询问。
 
-        面板已不可能再被作答，任其悬挂会让等待线程一直停在 `Event.wait()` 上；
-        那些线程跑在 asyncio 默认线程池里（非 daemon），收尾时会被 join——asyncio
-        侧上限 300s，解释器退出时没有上限，进程回不到 shell。唤醒后各询问按各自
-        默认值返回（权限确认即拒绝），见 `TuiRenderer.abandon_pending`。
+        面板已不可能再被作答；取消让等待方按 fail-closed 兜底收口（权限确认即
+        拒绝），否则那一轮会永远停在"在等"上——退出卡死那个故障的根因就是它
+        （见 `AskPort.cancel_in_flight`）。
         """
         if self._frontend is not None:
             self._frontend.abandon_pending()
+        self.close_open_panel()
+        if self.agent is not None:
+            self.agent.cancel_pending_asks()
 
     def _replay_history(self) -> None:
         """恢复会话后回放历史：user / assistant 文本走既有渲染路径静态上屏。
@@ -445,36 +447,42 @@ class SmithTUI(App):
     def ui_focus_input(self) -> None:
         self.query_one(ChatInput).focus()
 
-    def show_question_panel(
-        self, questions: list[dict], result: dict, evt: threading.Event
-    ) -> None:
-        """提问面板原地替换输入框（含框内状态行），一次承载 1-N 个问题，答完由
-        close_composer_panel 换回。questions 为已归一化的
-        {question, options, descriptions, multiple} 列表。"""
-        self.query_one("#input-wrap").display = False
-        self.mount(
-            QuestionPanel(questions, result, evt),
-            before=self.query_one("#input-wrap"),
-        )
+    def show_ask_panel(self, request, result: dict, on_done) -> None:
+        """挂提问/权限面板（原地替换输入框，含框内状态行），答完由面板回调收尾。
 
-    def show_permission_panel(self, prompt: str, valid: str, hint: str,
-                              result: dict, evt: threading.Event,
-                              detail: list[str] | None = None,
-                              descriptions: dict[str, str] | None = None,
-                              content: str | None = None) -> None:
-        """权限申请面板原地替换输入框（含框内状态行），答完由 close_composer_panel 换回。
-
-        detail 为标题下的说明行；descriptions 为按选项键索引的小字说明；
-        content 为跟在标题后的工具摘要（同排、小字灰色）。"""
+        一个入口承载所有 kind：面板形状按 `request.kind` 与 `payload` 决定，
+        调用点（权限引擎 / ask_user / 技能信任）不需要知道终端怎么问。
+        """
         self.query_one("#input-wrap").display = False
-        self.mount(
-            PermissionPanel(prompt, valid, hint, result, evt,
-                            detail or [], descriptions or {}, content),
-            before=self.query_one("#input-wrap"),
-        )
+        payload = dict(request.payload or {})
+        if request.kind == "ask_user":
+            questions = list(payload.get("questions") or [])
+            panel = QuestionPanel(questions, result, on_done)
+        else:
+            panel = PermissionPanel(
+                request.title,
+                "".join(request.options),
+                str(payload.get("hint") or ""),
+                result,
+                on_done,
+                list(request.detail or []),
+                dict(payload.get("descriptions") or {}),
+                payload.get("content"),
+            )
+        self._open_panel = panel
+        self.mount(panel, before=self.query_one("#input-wrap"))
+
+    def close_open_panel(self) -> None:
+        """收掉当前打开的面板（会话/界面收尾时调用）：面板不在，等待方已被取消。"""
+        panel = getattr(self, "_open_panel", None)
+        if panel is not None and panel.is_attached:
+            self.close_composer_panel(panel)
+        self._open_panel = None
 
     def close_composer_panel(self, panel: Vertical) -> None:
         """关闭提问/权限面板，恢复输入框（含框内状态行）并聚焦（composer 位三态的归位动作）。"""
+        if getattr(self, "_open_panel", None) is panel:
+            self._open_panel = None
         panel.remove()
         self.query_one("#input-wrap").display = True
         chat_input = self.query_one(ChatInput)

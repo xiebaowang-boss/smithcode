@@ -21,7 +21,8 @@ from ..context import (
     truncate_output,
     validate_summary,
 )
-from ..event import Bus
+from ..event import Bus, asks
+from ..event.asks import AskPort
 from ..event.catalog import (
     AgentEnd,
     AgentEvent,
@@ -226,6 +227,8 @@ class Agent:
         # 它，否则 push 会跨线程碰 EventStream 的内部状态。
         # 事件总线按**会话**实例化：会话标识随会话对象来（见 _emit 的刷新）
         self.events = Bus(session_id=self.session.id)
+        # 询问端口（每会话一个）：提问经它发 asked 事件 + 等前端作答
+        self.asks = AskPort(session_id=self.session.id)
         self._stream: EventStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # 运行中排队的两条队列（见 queues.py）：变更即发 QueueChanged。
@@ -340,6 +343,7 @@ class Agent:
         current_id = self.session_id()
         if self.events.session_id != current_id:
             self.events.session_id = current_id
+            self.asks.session_id = current_id
         env = wrap(data, session_id=self.events.session_id)
         stream = self._stream
         if stream is not None and not stream.done:
@@ -363,6 +367,13 @@ class Agent:
             cached_tokens=totals.cache_hit(),
             step=step or StepUsage(),
         )
+
+    def cancel_pending_asks(self) -> int:
+        """取消本会话所有挂起提问（界面收尾 / `/new` / 进程退出），返回条数。
+
+        等待方按 fail-closed 兜底收口（拒绝 / 取消），不会留下"永远在等"的提问。
+        """
+        return self.asks.cancel_in_flight()
 
     def session_id(self) -> str:
         """本会话的标识（供事件信封注入）：只有一个来源——会话对象。"""
@@ -610,6 +621,7 @@ class Agent:
         """
         if self.session.store is not None:
             self.session.store.close()  # 旧转录闭合；从未物化则不产生文件
+        self.cancel_pending_asks()  # 换会话：旧会话的挂起提问一并作废
         self.session.reset()
         self.permission.new_session()
         config.SESSION_EXTRA_ROOTS.clear()
@@ -819,6 +831,7 @@ class Agent:
 
     def close(self) -> None:
         """进程退出前收尾：关闭 MCP 连接 + flush + 关闭转录句柄。"""
+        self.cancel_pending_asks()  # 退出前放行所有挂起提问（否则等待方永远不醒）
         self.mcp.stop()
         if self.session.store is not None:
             self.session.store.close()
@@ -891,8 +904,10 @@ class Agent:
         if owner:
             self._loop = asyncio.get_running_loop()
             self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
+            self.asks.bind_loop(self._loop)  # ask_sync 靠它把协程投回来
         reset_token = activate_token(token)
         emitter_token = emitter.activate(self.emit)  # 深层模块（llm 层）也能发事件
+        asks_token = asks.activate(self.asks)  # 深层模块（权限预检 / ask_user）也能提问
         status = "error"
         self._emit(ExecutionStarted())
         try:
@@ -911,6 +926,7 @@ class Agent:
             self._token = None
             reset_token()
             emitter.reset(emitter_token)
+            asks.reset(asks_token)
             self._emit_execution_end(status, result, token)
         if owner:
             self._close_stream(None, result)
@@ -964,6 +980,7 @@ class Agent:
         if owner:
             self._loop = asyncio.get_running_loop()
             self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
+            self.asks.bind_loop(self._loop)
         self._emit(ExecutionStarted())
         return owner
 
@@ -1355,24 +1372,24 @@ class Agent:
             msg = {**msg, "content": "".join(parts)}  # 多尝试累积的正文以 parts 为准
         return msg, usage, False
 
-    def _preflight_safe(self, tc: dict) -> tuple[ToolPlan, bool]:
+    async def _preflight_safe(self, tc: dict) -> tuple[ToolPlan, bool]:
         """预检的兜底包装：预检自身的意外异常转为该工具的错误结果，不外抛。
 
         旧实现里权限确认与执行同处一个 try 块，交互层异常（如终端不可用）
         只体现为该工具的错误结果、循环继续；这里保持同样的容错边界。
         """
         try:
-            return self._preflight(tc)
+            return await self._preflight(tc)
         except Exception as e:  # noqa: BLE001
             name = tc["function"]["name"]
             text = f"错误: {type(e).__name__}: {e}"
             return ToolPlan(tc, name, lambda: text, rendered=False), False
 
-    def _preflight(self, tc: dict) -> tuple[ToolPlan, bool]:
+    async def _preflight(self, tc: dict) -> tuple[ToolPlan, bool]:
         """预检一个工具调用：解析参数、渲染摘要、路径预检与权限检查。
 
-        全部在主线程按接收顺序进行——交互确认与权限规则的会话级写入
-        不容并发。返回 (计划, 是否权限被拒)；被拒时计划的 run() 返回
+        全部在事件循环线程按接收顺序进行——交互确认（等前端作答）与权限规则的
+        会话级写入都不容并发，所以**不再下放线程**（提问是 await 的）。返回 (计划, 是否权限被拒)；被拒时计划的 run() 返回
         DENIED_RESULT，由 _execute_batch 终止任务。解析失败、路径解析
         失败等错误不视为被拒，同样封装成计划（run() 直接返回错误文本），
         保证结果收集路径统一。
@@ -1417,15 +1434,17 @@ class Agent:
 
             widened = []
             for raw in paths:
-                pre = self._preflight_path(raw)
+                pre = await self._preflight_path(raw)
                 if pre == "deny":
                     return denied_plan, True
                 if isinstance(pre, Path):
                     widened.append(pre)
-            if not self.permission.check_paths(name, paths, content=line):
+            if not await self.permission.check_paths(name, paths, content=line):
                 return denied_plan, True
 
-            snapshot = _diff_preview(name, args)  # 执行前快照（apply_patch 暂无 preview，为空串）
+            # 执行前快照（apply_patch 暂无 preview，为空串）：读文件下放线程，
+            # 免得大文件把事件循环冻住（问答已在循环上，这里不能阻塞）
+            snapshot = await asyncio.to_thread(_diff_preview, name, args)
             if snapshot:
                 self._emit(ToolPreview(tool_call_id=tc.get("id"), detail=snapshot))
 
@@ -1435,7 +1454,7 @@ class Agent:
                              self._make_runner(name, args, widened), serial=bool(widened)), False
 
         if name == "todo_write":
-            if not self.permission.check(name, args, content=line):
+            if not await self.permission.check(name, args, content=line):
                 return denied_plan, True
             created = not todo_update  # 此前无未完结步骤 → 本次新建清单
 
@@ -1459,15 +1478,17 @@ class Agent:
 
         # 单路径/无路径工具：变更预览（diff）在路径预检 / 权限确认 / 执行之前
         # 推送到工具调用块：审核时改动内容已经可见，权限框保持纯净
-        snapshot = _diff_preview(name, args)
+        snapshot = await asyncio.to_thread(_diff_preview, name, args)
         if snapshot:
             self._emit(ToolPreview(tool_call_id=tc.get("id"), detail=snapshot))
 
         # 路径预检：目标在授权目录之外时先请用户确认（目录信任 → 操作权限，两道关卡有序）
-        preflight = self._preflight_outside_path(args, read_only=name in READ_ONLY_TOOLS)
+        preflight = await self._preflight_outside_path(
+            args, read_only=name in READ_ONLY_TOOLS
+        )
         if preflight == "deny":
             return denied_plan, True
-        if not self.permission.check(name, args, content=line):
+        if not await self.permission.check(name, args, content=line):
             return denied_plan, True
 
         # 注册为 serial 的工具（shell / 写文件 / 交互确认等）与需要临时放行的
@@ -1585,7 +1606,8 @@ class Agent:
             return describe(args)
         return f"[Tool] {name}({json.dumps(args, ensure_ascii=False)[:80]})"
 
-    def _preflight_path(self, raw: str, read_only: bool = False) -> Path | str | None:
+    async def _preflight_path(self, raw: str,
+                              read_only: bool = False) -> Path | str | None:
         """检查单个路径是否落在授权目录之外；之外时先交互确认。
 
         返回 "deny"（用户拒绝本次访问）、Path（"仅本次"，执行时需临时放行该信任根）、
@@ -1599,12 +1621,13 @@ class Agent:
             return None
         if read_only and any(target.is_relative_to(r) for r in config.skill_roots()):
             return None
-        action, root = self.permission.ask_outside_access(str(raw), target)
+        action, root = await self.permission.ask_outside_access(str(raw), target)
         if action == "deny":
             return "deny"
         return root if action == "once" else None
 
-    def _preflight_outside_path(self, args: dict, read_only: bool = False) -> Path | str | None:
+    async def _preflight_outside_path(self, args: dict,
+                                      read_only: bool = False) -> Path | str | None:
         """单路径工具（path 参数）的越界预检入口。"""
         raw = args.get("path")
-        return self._preflight_path(raw, read_only=read_only) if raw else None
+        return await self._preflight_path(raw, read_only=read_only) if raw else None

@@ -4,27 +4,18 @@
 逻辑，只有「呈现」不同——本类把事件投成 `UiAction` 交给 Textual 主线程，把询问
 交给面板。
 
-**线程不变量（承重，改动前先读）**：Agent 的任务跑在 Textual 的事件循环上
-（`app.run_worker`），但**所有会弹窗的调用都来自 worker 线程**——预检
-（权限确认 / 越界授权）与工具执行（`ask_user` / 技能信任）都经 `asyncio.to_thread`
-执行（见 `agent/tools_run.py`）。因此：
-
-- 即发即走的通知用 `post_message`：线程安全，从循环线程或 worker 线程都可以；
-- 需要结果的弹窗用 `call_from_thread` + `Event`：**只能从 worker 线程调用**
-  （Textual 在同一个线程上调用它会直接抛 `RuntimeError`，这也是上一条不变量的
-  自动保护）。
-
-阶段 C 会把询问改成事件化的请求-应答（`asked → replied`），届时这里换成
-`push_screen_wait`，`call_from_thread` 与 `Event` 一起退场。
+**线程不变量**：通知是即发即走的 `post_message`（线程安全，从循环线程或 worker
+线程都可以）；询问是 `await` 一个 Future（面板挂在事件循环上，答案从面板回来），
+**不再有 `call_from_thread` + `Event`**——提问方与面板在同一线程上，天然不会挂死。
 """
 
 from __future__ import annotations
 
-import threading
-from collections.abc import Callable
+import asyncio
 from typing import TYPE_CHECKING
 
 from .. import config
+from ..event.asks import AskAnswer, AskRequest
 from ..event.catalog import (
     CompactionEnded,
     CompactionFailed,
@@ -65,10 +56,7 @@ class TuiFrontend:
     def __init__(self, app: SmithTUI):
         self.app = app
         self._thinking: int | None = None  # 正在思考时累计的字符数
-        # 挂起中的弹窗等待：{就绪事件: 结果槽}。唤醒口见 abandon_pending
-        self._pending: dict[threading.Event, dict] = {}
-        self._pending_lock = threading.Lock()
-        self._closed = False  # 界面已收尾：此后的询问直接走默认值，不进等待
+        self._closed = False  # 界面已收尾：此后的询问不再挂面板（走 fail-closed 兜底）
 
     # ----- 通知面：事件订阅者 -----
 
@@ -147,84 +135,53 @@ class TuiFrontend:
 
     # ----- 询问面：面板 -----
 
-    def ask_form(self, questions: list[dict]) -> list[str]:
-        """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
-        result = self._await_panel(
-            lambda slot, evt: self.app.call_from_thread(
-                self.app.show_question_panel, questions, slot, evt
-            )
-        )
-        values = result.get("values")
-        if not values:
-            return [""] * len(questions)  # 空串 = 用户取消（含未作答）
-        return [str(value) for value in values]
+    async def ask(self, request: AskRequest) -> AskAnswer:
+        """把一次提问交给面板，等用户作答（**在事件循环上** await）。
 
-    def ask_text(self, question: str) -> str:
-        answer = self.ask_form([{"question": question}])
-        return answer[0] or "（用户未输入内容）"
-
-    def ask_choice(self, question: str, options: list[str], multiple: bool = False,
-                   descriptions: list[str] | None = None) -> str:
-        answer = self.ask_form([{
-            "question": question,
-            "options": options,
-            "descriptions": descriptions or [],
-            "multiple": multiple,
-        }])
-        return answer[0]  # 空串 = 用户取消
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str,
-                       detail: list[str] | None = None,
-                       descriptions: dict[str, str] | None = None,
-                       content: str | None = None) -> str:
-        result = self._await_panel(
-            lambda slot, evt: self.app.call_from_thread(
-                self.app.show_permission_panel, prompt, valid, hint, slot, evt,
-                detail or [], descriptions or {}, content,
-            )
-        )
-        return result.get("value", "n")  # 未作答 / 异常兜底按拒绝处理
-
-    def _await_panel(self, mount: Callable[[dict, threading.Event], None]) -> dict:
-        """挂面板并等作答，返回结果槽；槽为空表示没拿到答案（调用方走默认值）。
-
-        等待期间登记在 `_pending`：界面收尾时由 `abandon_pending` 唤醒。不登记的
-        话，等待线程会永远停在 `Event.wait()` 上——那不只是泄漏一个线程，见
-        `abandon_pending` 的说明。
+        不再用 `call_from_thread` + `threading.Event`：提问本身是异步的，等的是
+        一个 Future——所以面板在哪个线程挂、答案从哪个线程回来都不需要手工搬运
+        （阶段 C 的目标）。
         """
-        result: dict = {}
-        evt = threading.Event()
-        with self._pending_lock:
-            if self._closed:
-                return result  # 界面已收尾：不进等待，直接走默认值
-            self._pending[evt] = result
+        if self._closed:
+            # 界面已收尾：不再挂面板（挂上去也没人能答），按 fail-closed 收口
+            return AskAnswer(outcome="cancelled")
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        slot: dict = {}
+        self.app.show_ask_panel(request, slot, lambda: _finish(future, slot))
         try:
-            mount(result, evt)
-            evt.wait()
-        finally:
-            with self._pending_lock:
-                self._pending.pop(evt, None)
-        return result
+            result = await future
+        except asyncio.CancelledError:
+            self.app.close_open_panel()  # 收尾：面板也要收掉（会话取消 / 退出）
+            raise
+        return _answer_of(request, result)
 
     def abandon_pending(self) -> None:
-        """界面收尾（`SmithTUI.on_unmount`）：唤醒全部挂起的弹窗等待方。
+        """界面收尾（`SmithTUI.on_unmount`）：标记"此后不再挂面板"。
 
-        结果槽一律留空，各调用方按既有 fail-closed 语义兜底（权限确认 → "n"，
-        提问 → 空串即取消），此后新到的询问也不再进入等待。
-
-        为什么必须唤醒：这些等待线程跑在 `asyncio.to_thread` 的默认线程池里，
-        而默认池是非 daemon 的，收尾时会被 join——
-        - `asyncio.run` 收尾：`shutdown_default_executor`，上限 `THREAD_JOIN_TIMEOUT`
-          （300s），期间界面已卸载、终端已还原，用户看到的是「退了但 shell 不回来」；
-        - 解释器退出：`concurrent.futures` 的 atexit join **没有上限**，进程直接卡死。
-        实测（最小 Textual 应用 + 默认池里永久阻塞的线程）：`app.run()` 12s 内不返回；
-        把线程放行后立即返回。
-
-        先置位、后清表：等待方被唤醒后会自己在 finally 里摘掉登记，这里清表是为了
-        此后新到的询问能被 `_await_panel` 的 `_closed` 分支挡住（不再进等待）。
+        真正的取消在 `AskPort.cancel_in_flight`（`SmithTUI.on_unmount` 会调它）：
+        等待方由那里统一放行，所以这里只置位——此后新到的询问直接走 fail-closed
+        兜底，不会再去 mount 一个已经卸载的界面。
         """
-        with self._pending_lock:
-            self._closed = True
-            pending = list(self._pending)
-        for evt in pending:
-            evt.set()
+        self._closed = True
+
+
+def _finish(future: asyncio.Future, slot: dict) -> None:
+    """面板答完：把结果交给等待中的 `ask()`（同线程，直接 set_result）。"""
+    if not future.done():
+        future.set_result(slot)
+
+
+def _answer_of(request: AskRequest, result: dict) -> AskAnswer:
+    """面板结果 → `AskAnswer`（各 kind 的形状差异只在这里解释一次）。"""
+    if request.kind == "ask_user":
+        values = result.get("values")
+        if not values:
+            return AskAnswer(outcome="cancelled")
+        answers = tuple(str(value) for value in values)
+        # 整组全空 = 用户取消了这次提问（每题空串表示该题取消）
+        outcome = "cancelled" if all(not value for value in answers) else "answered"
+        return AskAnswer(outcome=outcome, values=answers)
+    value = result.get("value")
+    if not value:
+        return AskAnswer(outcome="cancelled")
+    return AskAnswer(outcome="answered", value=str(value))
