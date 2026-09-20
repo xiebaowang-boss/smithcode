@@ -128,6 +128,9 @@ class SmithTUI(App):
         self._busy = False
         self._turn_start: float | None = None
         self._turn_reason = ""  # 本轮 stream_error 的失败原因（页脚带出，便于排障）
+        # 本界面的渲染后端（on_mount 装配后填入）：界面收尾时要靠它唤醒挂起的
+        # 弹窗等待方，见 TuiRenderer.abandon_pending
+        self._frontend: TuiRenderer | None = None
         # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
         # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
         self._select_stack: list = []
@@ -182,9 +185,10 @@ class SmithTUI(App):
         # 窗口标题：sink 换成 Textual 的写入队列（整条序列由 writer 线程落盘，
         # 与帧输出不交错）；标题状态与压栈已在 cli.main 装配时接管
         driver = self._driver
+        self._frontend = TuiRenderer(self)
         renderer.set_renderer(
             title.attach(
-                TuiRenderer(self),
+                self._frontend,
                 sink=driver.write if driver is not None else None,
                 agent=self.agent,
             )
@@ -199,6 +203,17 @@ class SmithTUI(App):
         if getattr(self.agent.session, "messages", None):
             self._replay_history()  # 启动时恢复的会话：回放历史
         self.ui_status()
+
+    def on_unmount(self) -> None:
+        """界面下线（Ctrl+Q / `/exit` / 测试收尾）：唤醒全部挂起的弹窗等待方。
+
+        面板已不可能再被作答，任其悬挂会让等待线程一直停在 `Event.wait()` 上；
+        那些线程跑在 asyncio 默认线程池里（非 daemon），收尾时会被 join——asyncio
+        侧上限 300s，解释器退出时没有上限，进程回不到 shell。唤醒后各询问按各自
+        默认值返回（权限确认即拒绝），见 `TuiRenderer.abandon_pending`。
+        """
+        if self._frontend is not None:
+            self._frontend.abandon_pending()
 
     def _replay_history(self) -> None:
         """恢复会话后回放历史：user / assistant 文本走既有渲染路径静态上屏。

@@ -3868,3 +3868,74 @@ def test_stream_error_footer_carries_reason(monkeypatch):
             assert "读取超时" in text
 
     _run(_run_case())
+
+
+# ---------- 界面收尾：挂起的弹窗等待方必须被放行 ----------
+#
+# 失败模式是「永久阻塞」，故这两条用例把同步等待放进 asyncio.wait_for（回归表现为
+# 5s 超时断言失败），并在 finally 里手动放行线程——否则断言虽然失败，收尾仍会卡在
+# join 那个线程上，整套测试要等 asyncio 的 300s join 上限才结束。
+
+
+def _release_pending(frontend) -> None:
+    """测试兜底：直接放行全部挂起等待，避免回归时把测试套件拖住。"""
+    with frontend._pending_lock:
+        pending = list(frontend._pending)
+    for evt in pending:
+        evt.set()
+
+
+def test_unanswered_panel_exit_releases_waiter(monkeypatch):
+    """面板未作答就退出界面：等待方被唤醒，并按 fail-closed 走默认值（拒绝）。
+
+    为什么必须唤醒：等待线程跑在 asyncio 默认线程池里（非 daemon），收尾时会 join
+    它——asyncio 侧上限 300s（`shutdown_default_executor`），解释器退出时
+    `concurrent.futures` 的 atexit join 没有上限，进程回不到 shell。
+    """
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        frontend = None
+        ask = None
+        try:
+            async with app.run_test() as pilot:
+                frontend = app._frontend
+                # 与生产同形：询问经 to_thread（默认池）下放，阻塞等面板作答
+                ask = asyncio.create_task(asyncio.to_thread(
+                    frontend.confirm_choice,
+                    "允许执行 run_command? [y]本次 / [n]拒绝: ", "yn", "y / n",
+                ))
+                for _ in range(200):
+                    await pilot.pause(0.02)
+                    if app.query(PermissionPanel):
+                        break
+                assert app.query(PermissionPanel), "权限面板应已弹出"
+                assert not ask.done()  # 确实停在等待上（无人作答）
+            # 界面收尾（on_unmount 已跑）之后才断言：靠的就是 on_unmount 的放行
+            assert await asyncio.wait_for(ask, timeout=5) == "n"
+        finally:
+            if frontend is not None:
+                _release_pending(frontend)  # 回归兜底：别把测试套件拖在 join 上
+
+    _run(_run_case())
+
+
+def test_ask_after_unmount_returns_default_without_blocking(monkeypatch):
+    """界面已收尾后到达的询问（在飞的任务收尾时才问到）：直接走默认值，不进等待。"""
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test():
+            frontend = app._frontend
+        try:
+            denied = await asyncio.wait_for(asyncio.to_thread(
+                frontend.confirm_choice,
+                "允许? [y]本次 / [n]拒绝: ", "yn", "y / n",
+            ), timeout=5)
+            assert denied == "n"
+            answers = await asyncio.wait_for(asyncio.to_thread(
+                frontend.ask_form, [{"question": "用哪个？", "options": ["甲", "乙"]}],
+            ), timeout=5)
+            assert answers == [""]  # 空串 = 取消
+        finally:
+            _release_pending(frontend)
+
+    _run(_run_case())

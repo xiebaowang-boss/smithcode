@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .. import config, plan, renderer
@@ -34,6 +35,10 @@ class TuiRenderer(renderer.Renderer):
         super().__init__()
         self.app = app
         self._thinking: int | None = None  # 正在思考时累计的字符数
+        # 挂起中的弹窗等待：{就绪事件: 结果槽}。唤醒口见 abandon_pending
+        self._pending: dict[threading.Event, dict] = {}
+        self._pending_lock = threading.Lock()
+        self._closed = False  # 界面已收尾：此后的询问直接走默认值，不进等待
 
     def _post(self, action: str, *args) -> None:
         self.app.post_message(UiAction(action, *args))
@@ -114,12 +119,14 @@ class TuiRenderer(renderer.Renderer):
 
     def ask_form(self, questions: list[dict]) -> list[str]:
         """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""
-        result, evt = {}, threading.Event()
-        self.app.call_from_thread(self.app.show_question_panel, questions, result, evt)
-        evt.wait()
+        result = self._await_panel(
+            lambda slot, evt: self.app.call_from_thread(
+                self.app.show_question_panel, questions, slot, evt
+            )
+        )
         values = result.get("values")
         if not values:
-            return [""] * len(questions)  # 空串 = 用户取消
+            return [""] * len(questions)  # 空串 = 用户取消（含未作答）
         return [str(value) for value in values]
 
     def ask_text(self, question: str) -> str:
@@ -140,10 +147,54 @@ class TuiRenderer(renderer.Renderer):
                        detail: list[str] | None = None,
                        descriptions: dict[str, str] | None = None,
                        content: str | None = None) -> str:
-        result, evt = {}, threading.Event()
-        self.app.call_from_thread(
-            self.app.show_permission_panel, prompt, valid, hint, result, evt,
-            detail or [], descriptions or {}, content,
+        result = self._await_panel(
+            lambda slot, evt: self.app.call_from_thread(
+                self.app.show_permission_panel, prompt, valid, hint, slot, evt,
+                detail or [], descriptions or {}, content,
+            )
         )
-        evt.wait()
-        return result.get("value", "n")  # 异常兜底按拒绝处理
+        return result.get("value", "n")  # 未作答 / 异常兜底按拒绝处理
+
+    def _await_panel(self, mount: Callable[[dict, threading.Event], None]) -> dict:
+        """挂面板并等作答，返回结果槽；槽为空表示没拿到答案（调用方走默认值）。
+
+        等待期间登记在 `_pending`：界面收尾时由 `abandon_pending` 唤醒。不登记的
+        话，等待线程会永远停在 `Event.wait()` 上——那不只是泄漏一个线程，见
+        `abandon_pending` 的说明。
+        """
+        result: dict = {}
+        evt = threading.Event()
+        with self._pending_lock:
+            if self._closed:
+                return result  # 界面已收尾：不进等待，直接走默认值
+            self._pending[evt] = result
+        try:
+            mount(result, evt)
+            evt.wait()
+        finally:
+            with self._pending_lock:
+                self._pending.pop(evt, None)
+        return result
+
+    def abandon_pending(self) -> None:
+        """界面收尾（`SmithTUI.on_unmount`）：唤醒全部挂起的弹窗等待方。
+
+        结果槽一律留空，各调用方按既有 fail-closed 语义兜底（权限确认 → "n"，
+        提问 → 空串即取消），此后新到的询问也不再进入等待。
+
+        为什么必须唤醒：这些等待线程跑在 `asyncio.to_thread` 的默认线程池里，
+        而默认池是非 daemon 的，收尾时会被 join——
+        - `asyncio.run` 收尾：`shutdown_default_executor`，上限 `THREAD_JOIN_TIMEOUT`
+          （300s），期间界面已卸载、终端已还原，用户看到的是「退了但 shell 不回来」；
+        - 解释器退出：`concurrent.futures` 的 atexit join **没有上限**，进程直接卡死。
+        实测（最小 Textual 应用 + 默认池里永久阻塞的线程）：`app.run()` 12s 内不返回；
+        把线程放行后立即返回。
+
+        先置位、后清表：等待方被唤醒后会自己在 finally 里摘掉登记，这里清表是为了
+        此后新到的询问能被 `_await_panel` 的 `_closed` 分支挡住（不再进等待）。
+        """
+        with self._pending_lock:
+            self._closed = True
+            pending = list(self._pending)
+        for evt in pending:
+            evt.set()
