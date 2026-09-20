@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextvars import ContextVar, Token
 
-from .events import AgentEvent
+from ..event.catalog import AgentEvent
 
 _emitter: ContextVar[Callable[[AgentEvent], None] | None] = ContextVar(
     "smithcode_emitter", default=None

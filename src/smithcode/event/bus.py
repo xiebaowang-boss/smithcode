@@ -77,19 +77,22 @@ class Bus:
         """投递一个已装好信封的事件（线程安全）。"""
         loop = self._loop
         if loop is None or loop.is_closed():
-            self._deliver(env)
+            self.deliver(env)
             return
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
         if running is loop:
-            self._deliver(env)
+            self.deliver(env)
             return
-        loop.call_soon_threadsafe(self._deliver, env)
+        loop.call_soon_threadsafe(self.deliver, env)
 
-    def _deliver(self, env: Envelope) -> None:
-        """在事件循环线程上按注册顺序投递；订阅者异常不吞。"""
+    def deliver(self, env: Envelope) -> None:
+        """在事件循环线程上按注册顺序投递；订阅者异常不吞。
+
+        调用方已确保处于循环线程时可直接用它（如 `Agent._emit` 同时要喂本轮流）。
+        """
         with self._lock:
             targets = list(self._listeners) + list(self._by_type.get(env.type, ()))
         for listener in targets:

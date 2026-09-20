@@ -56,7 +56,7 @@ def test_session_facade_shares_the_agent_state(monkeypatch):
     assert session.session is agent.session  # 不是复制：消息历史只有一份
     assert session.permission is agent.permission
     assert session.mcp is agent.mcp
-    assert session.interactions is agent.interactions
+    assert session.events is agent.events  # 事件总线也只有一条
     assert session.steering_queue is agent.steering_queue
     assert session.follow_up_queue is agent.follow_up_queue
 

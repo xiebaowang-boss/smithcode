@@ -21,8 +21,8 @@ from smithcode.agent import (
     TITLE_MAX_ATTEMPTS,
     TITLE_RETRY_ROUNDS,
     Agent,
-    RendererError,
     ResumeReport,
+    SubscriberError,
     _diff_preview,
     format_stream_interrupted,
 )
@@ -34,7 +34,7 @@ def test_frozen_surface_is_importable_from_package():
     assert callable(Agent)
     assert callable(_diff_preview)
     assert callable(format_stream_interrupted)
-    assert isinstance(RendererError, type)
+    assert isinstance(SubscriberError, type)
     assert isinstance(ResumeReport, type)
     assert (TITLE_MAX_ATTEMPTS, TITLE_RETRY_ROUNDS) == (3, 5)
     assert INTERRUPTED_NOTE and STREAM_INTERRUPTED_NOTE
@@ -42,8 +42,8 @@ def test_frozen_surface_is_importable_from_package():
 
 
 def test_unknown_attributes_forward_to_implementation_module():
-    """包级未列举的名字转发到实现模块（如 `agent_mod.renderer`）。"""
-    assert agent_mod.renderer is implementation.renderer
+    """包级未列举的名字转发到实现模块（如 `agent_mod.emitter`）。"""
+    assert agent_mod.emitter is implementation.emitter
     assert agent_mod.Agent is implementation.Agent
 
 

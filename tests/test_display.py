@@ -5,8 +5,9 @@ import json
 
 import pytest
 
-from smithcode import config
+from smithcode import config, frontend
 from smithcode.agent import MAX_SUMMARY_LEN, Agent
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 from smithcode.tools import DESCRIBERS
 
@@ -149,6 +150,8 @@ def _run_tool(monkeypatch, tmp_path, name, args_dict, display=None) -> Agent:
     if display:
         monkeypatch.setattr(config, "load_tool_display", lambda: display)
     agent = Agent(session=Session())
+    # 装配终端前端（订阅事件 + 接受询问）：工具块的呈现走事件，与生产一致
+    frontend.attach(agent.events, ConsoleFrontend())
     asyncio.run(agent.run("工具测试"))
     return agent
 
@@ -323,7 +326,7 @@ def test_finish_expands_write_edit_tools_only(monkeypatch, tmp_path, capsys):
     """
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     from smithcode import agent as agent_mod
-    from smithcode.agent.events import ToolEnd
+    from smithcode.event.catalog import ToolEnd
 
     captured = []
     bare = agent_mod.Agent.__new__(agent_mod.Agent)

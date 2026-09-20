@@ -12,7 +12,7 @@ import json
 import pytest
 
 from smithcode.agent import Agent
-from smithcode.agent.events import QueueChanged
+from smithcode.event.catalog import QueueChanged
 from smithcode.session import Session
 
 
@@ -84,7 +84,7 @@ def test_steering_is_delivered_after_the_current_turn(monkeypatch):
     agent = _agent(monkeypatch, llm)
     holder["agent"] = agent
     seen_events: list = []
-    agent.subscribe(seen_events.append)
+    agent.events.subscribe(seen_events.append)
 
     result = asyncio.run(agent.run("做事"))
 
@@ -94,7 +94,7 @@ def test_steering_is_delivered_after_the_current_turn(monkeypatch):
     assert "顺便看下 README" not in llm.seen[0]  # 第一轮看不到（还没插）
     assert "顺便看下 README" in llm.seen[1]  # 第二轮看得到
     assert agent.steering_queue.count == 0  # 投递即出队
-    changes = [e for e in seen_events if isinstance(e, QueueChanged)]
+    changes = [env.data for env in seen_events if isinstance(env.data, QueueChanged)]
     assert changes[-1].steering == ()  # 投递发了 QueueChanged
 
 

@@ -19,7 +19,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from .. import renderer
+from ..event import publish
+from ..event.catalog import Notice
 from ..tools import DYNAMIC, register_dynamic, unregister_dynamic
 from . import auth, catalog
 from . import config as mcp_config
@@ -122,14 +123,14 @@ class McpService:
         self.diagnostics = list(loaded.diagnostics)
         self.project_path = loaded.project_path
         for message in self.diagnostics:
-            renderer.current().warn(f"[mcp] {message}")
+            publish(Notice(f"[mcp] {message}", level="warning"))
         project_names = [cfg.name for cfg in loaded.servers if cfg.scope == "project"]
         if project_names:
             # 项目配置随仓库分发且会拉起本机进程：启动时给出一次可见提示（不做门控）
-            renderer.current().warn(
+            publish(Notice(
                 f"[mcp] 已加载项目配置（{', '.join(project_names)}）："
                 "MCP 服务器将以你的本机权限运行，请确认仓库来源可信"
-            )
+            , level="warning"))
         with self._lock:
             for cfg in loaded.servers:
                 self._entries[cfg.name] = _Entry(cfg)
@@ -144,13 +145,13 @@ class McpService:
                 entry.missing = missing
                 entry.error = f"缺少环境变量: {', '.join(missing)}"
                 self._set_state(cfg.name, MISSING_ENV, entry.error)
-                renderer.current().warn(f"[mcp] {cfg.name}: {entry.error}")
+                publish(Notice(f"[mcp] {cfg.name}: {entry.error}", level="warning"))
                 continue
             if cfg.oauth and not auth.has_tokens(cfg.name):
                 entry = self._entries[cfg.name]
                 entry.error = f"需要 OAuth 授权：运行 /mcp auth {cfg.name}"
                 self._set_state(cfg.name, NEEDS_AUTH, entry.error)
-                renderer.current().warn(f"[mcp] {cfg.name}: {entry.error}")
+                publish(Notice(f"[mcp] {cfg.name}: {entry.error}", level="warning"))
                 continue
             self._pool.submit(self._connect, cfg.name)
 
@@ -382,7 +383,7 @@ class McpService:
             entry.missing = resolved.missing
             entry.error = f"缺少环境变量: {', '.join(resolved.missing)}"
             self._set_state(name, MISSING_ENV, entry.error)
-            renderer.current().warn(f"[mcp] {name}: {entry.error}")
+            publish(Notice(f"[mcp] {name}: {entry.error}", level="warning"))
             return
         entry.missing = []
 
@@ -391,7 +392,7 @@ class McpService:
                 return
             entry.error = f"需要 OAuth 授权：运行 /mcp auth {name}"
             self._set_state(name, NEEDS_AUTH, entry.error)
-            renderer.current().warn(f"[mcp] {name}: {entry.error}")
+            publish(Notice(f"[mcp] {name}: {entry.error}", level="warning"))
             return
 
         conn = create_connection(
@@ -409,7 +410,7 @@ class McpService:
                 return
             entry.error = str(e)
             self._set_state(name, NEEDS_AUTH, entry.error)
-            renderer.current().warn(f"[mcp] {name}: {entry.error}")
+            publish(Notice(f"[mcp] {name}: {entry.error}", level="warning"))
             return
         except McpError as e:
             tail = conn.stderr_tail(5)
@@ -420,7 +421,7 @@ class McpService:
             if tail:
                 entry.error += f"（stderr: {redactor().scrub(tail)}）"
             self._set_state(name, FAILED, entry.error)
-            renderer.current().error(f"[mcp] {name} 连接失败: {entry.error}")
+            publish(Notice(f"[mcp] {name} 连接失败: {entry.error}", level="error"))
             return
         except Exception as e:  # noqa: BLE001 未预期异常也要落到 FAILED，不能停在 CONNECTING
             conn.close()
@@ -428,7 +429,7 @@ class McpService:
                 return
             entry.error = f"{type(e).__name__}: {e}"
             self._set_state(name, FAILED, entry.error)
-            renderer.current().error(f"[mcp] {name} 连接失败: {entry.error}")
+            publish(Notice(f"[mcp] {name} 连接失败: {entry.error}", level="error"))
             return
 
         with self._lock:
@@ -449,9 +450,9 @@ class McpService:
                 return
             self._sync_tools(entry, tool_defs)
             self._set_state(name, CONNECTED)
-        renderer.current().success(
+        publish(Notice(
             f"[mcp] {name} 已连接（{len(entry.tools)} 个工具）"
-        )
+        , level="success"))
 
     def _refresh_tools(self, conn) -> None:
         if not conn.alive:
@@ -467,7 +468,7 @@ class McpService:
                 return
             self._sync_tools(entry, tool_defs)
             count = len(entry.tools)
-        renderer.current().info(f"[mcp] {name} 工具列表已更新（{count} 个工具）")
+        publish(Notice(f"[mcp] {name} 工具列表已更新（{count} 个工具）"))
 
     def _on_tools_changed(self, conn) -> None:
         self._pool.submit(self._refresh_tools, conn)
@@ -484,7 +485,7 @@ class McpService:
         self._unregister(entry)
         entry.tools = []
         self._set_state(name, FAILED, "服务器连接已断开")
-        renderer.current().error(f"[mcp] {name}: 服务器连接已断开")
+        publish(Notice(f"[mcp] {name}: 服务器连接已断开", level="error"))
 
     def _disconnect(self, entry: _Entry, state: str) -> None:
         with self._lock:

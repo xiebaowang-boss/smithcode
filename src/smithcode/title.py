@@ -30,15 +30,16 @@ import re
 import signal
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from . import config
-from .agent.events import TitleChanged, TurnEnd, TurnStart
-from .agent.interactions import PromptFinished, PromptStarted
+from .event.catalog import (
+    PromptFinished,
+    PromptStarted,
+    TitleChanged,
+    TurnEnd,
+    TurnStart,
+)
 from .utils.terminal import stdout_is_tty, write_terminal_control
-
-if TYPE_CHECKING:  # 仅用于 attach 的类型注解（Relay 删除后不再继承 Renderer）
-    from .renderer import Renderer
 
 BRAND = "Smith"
 """标题里的品牌词：对齐 welcome.LOGO 与权限模式名。"""
@@ -157,13 +158,14 @@ class TerminalTitlePresenter:
             self._state.busy = max(0, self._state.busy - 1)
             self._flush()
 
-    def on_agent_event(self, event) -> None:
-        """Agent 事件订阅入口：标题 / 忙闲 / 等待态全部从这一条通道来。
+    def on_agent_event(self, env) -> None:
+        """事件订阅入口（收到的是**信封**）：标题 / 忙闲 / 等待态都从这一条通道来。
 
-        （`Relay` 删除后，原先经渲染后端转发的 `title_changed` / `turn_started` /
-        `turn_finished` 改由事件驱动；`turn_waiting_*` 是无载荷信号、本来就无法
-        配对，改由带 id 的提问事件对承担。）
+        信封带 `session_id`（多客户端各自订阅时会话标识就在手上），这里只关心
+        `env.data` 这一个载荷。`Relay` 中间层已删除——不需要装饰器转发。
+        未知事件（含连信封都不是的对象）一律空操作：新增事件类型不得让订阅者抛错。
         """
+        event = getattr(env, "data", None)
         if isinstance(event, PromptStarted):
             self.on_prompt_started(event)
         elif isinstance(event, PromptFinished):
@@ -345,18 +347,3 @@ def enable_title(sink=None, workspace: str = "") -> TerminalTitlePresenter:
         target.bind_sink(sink)
     target.enable(workspace)
     return target
-
-
-def attach(inner: Renderer, sink=None, workspace: str = "", agent=None) -> Renderer:
-    """终端宿主的组合根装配：接管窗口标题 + 订阅 Agent 事件，返回**原样**的后端。
-
-    曾经这里会包一层 `Relay` 装饰器来转发标题/等待事件；事件层补齐后不需要中间
-    层了（见模块 docstring），因此现在只做两件事：`enable_title()` 与
-    `agent.subscribe(...)`，后端保持原对象——调用方拿到的仍是自己的渲染后端。
-
-    `agent` 不传时只装配标题（命令层自建宿主、测试等场景）。
-    """
-    target = enable_title(sink, workspace)
-    if agent is not None:
-        agent.subscribe(target.on_agent_event)
-    return inner

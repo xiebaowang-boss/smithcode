@@ -2,7 +2,7 @@
 
 import asyncio
 
-from smithcode import config
+from smithcode import config, frontend
 from smithcode.agent import Agent
 from smithcode.context import (
     ContextMeter,
@@ -16,9 +16,18 @@ from smithcode.context import (
     report,
     validate_summary,
 )
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 
 # ---------- 估算启发式 ----------
+
+
+def _console_agent(**kwargs):
+    """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例用 capsys 读输出。"""
+    agent = Agent(session=Session(), **kwargs)
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
+
 
 def test_estimate_text_empty():
     assert estimate_text("") == 0
@@ -196,7 +205,9 @@ def _over_threshold_agent(monkeypatch):
     session = Session()
     # 历史：system + 一轮千 token 的工具结果，越过阈值
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
-    return Agent(session=session)
+    agent = Agent(session=session)
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
 
 
 def test_run_compacts_when_over_threshold(monkeypatch, capsys):
@@ -250,6 +261,7 @@ def test_compact_prunes_skills_lost_from_context(monkeypatch, capsys, tmp_path):
             + _turn("上次任务", 4000)
         )
         agent = Agent(session=session)
+        frontend.attach(agent.events, ConsoleFrontend())
 
         assert asyncio.run(agent.compact()) is True
 
@@ -296,6 +308,7 @@ def test_compact_aborts_when_summary_invalid_twice(monkeypatch, capsys):
     session = Session()
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
+    frontend.attach(agent.events, ConsoleFrontend())
 
     assert asyncio.run(agent.run("继续")).text == "最终回复"  # 压缩失败不中断任务
 
@@ -321,6 +334,7 @@ def test_run_recovers_from_context_overflow(monkeypatch, capsys):
     session = Session()
     session.messages = [{"role": "system", "content": "SYS"}] + _turn("上次任务", 4000)
     agent = Agent(session=session)
+    frontend.attach(agent.events, ConsoleFrontend())
 
     assert asyncio.run(agent.run("继续")).text == "重试后回复"
 
@@ -355,6 +369,7 @@ def test_compact_manual_reports_empty_when_nothing_to_compact(monkeypatch):
         {"role": "user", "content": "你好"},
     ]
     agent = Agent(session=session)
+    frontend.attach(agent.events, ConsoleFrontend())
 
     assert asyncio.run(agent.compact_manual()) == "empty"
     assert len(agent.session.messages) == 2
@@ -391,7 +406,7 @@ def test_agent_run_records_anchor(monkeypatch):
             yield ("message", {"role": "assistant", "content": "好的"})
 
     monkeypatch.setattr("smithcode.agent.LLMClient", UsageLLM)
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     asyncio.run(agent.run("你好"))
 

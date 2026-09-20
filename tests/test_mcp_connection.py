@@ -137,11 +137,12 @@ def test_progress_reporter_throttles_by_10_percent(monkeypatch):
     conn = _connection()
     events = []
 
-    class _Renderer:
-        def info(self, text):
-            events.append(text)
+    from smithcode.event import Bus, activate
+    from smithcode.event.catalog import Notice
 
-    monkeypatch.setattr("smithcode.mcp.connection.renderer.current", lambda: _Renderer())
+    bus = Bus(session_id="t")
+    bus.subscribe(lambda env: isinstance(env.data, Notice) and events.append(env.data.text))
+    _bus_token = activate(bus)
     report = conn._progress_reporter("slow")
     asyncio.run(report(1, 100, None))    # 1% → 上报
     asyncio.run(report(5, 100, None))    # 5% → 节流
@@ -308,11 +309,12 @@ def test_http_progress_callback(monkeypatch):
     server.start()
     events = []
 
-    class _Renderer:
-        def info(self, text):
-            events.append(text)
+    from smithcode.event import Bus, activate
+    from smithcode.event.catalog import Notice
 
-    monkeypatch.setattr("smithcode.renderer.current", lambda: _Renderer())
+    bus = Bus(session_id="t")
+    bus.subscribe(lambda env: isinstance(env.data, Notice) and events.append(env.data.text))
+    _bus_token = activate(bus)
     cfg = mcp_config.ServerConfig(
         name="remote", type="http", url=server.url, timeout=10.0
     )

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from .. import config, goal, instructions, renderer, sessions, skills
+from .. import config, goal, instructions, sessions, skills
 from ..context import (
     ContextMeter,
     assemble,
@@ -21,6 +21,28 @@ from ..context import (
     truncate_output,
     validate_summary,
 )
+from ..event import Bus
+from ..event.catalog import (
+    AgentEnd,
+    AgentEvent,
+    MessageEnd,
+    MessageUpdate,
+    Notice,
+    PlanUpdate,
+    QueueChanged,
+    QueuedPromptDelivered,
+    QueueItem,
+    StatusChanged,
+    StatusCleared,
+    TitleChanged,
+    ToolEnd,
+    ToolPreview,
+    ToolStart,
+    TurnEnd,
+    TurnStart,
+)
+from ..event.envelope import wrap
+from ..event.stream import EventStream, agent_event_stream
 from ..llm import LLMClient as _RealLLMClient
 from ..llm.models import (
     CachedModelSource,
@@ -33,7 +55,7 @@ from ..llm.request import TurnConfig
 from ..llm.retry import describe as describe_error
 from ..mcp import McpService
 from ..permission import Permission
-from ..plan import has_active, render_current, summary
+from ..plan import has_active, render_current, render_titles, summary
 from ..session import Session
 from ..tools import (
     DESCRIBERS,
@@ -47,27 +69,9 @@ from ..tools import (
     visible_schemas,
 )
 from ..tools.skills import sync_schema
-from . import emitter, interactions
+from . import emitter
 from .agent_session import AgentSession
-from .errors import RendererError, StreamInterrupted
-from .events import (
-    AgentEnd,
-    AgentEvent,
-    EventStream,
-    MessageEnd,
-    MessageUpdate,
-    Notice,
-    PlanUpdate,
-    QueueChanged,
-    QueuedPromptDelivered,
-    TitleChanged,
-    ToolEnd,
-    ToolPreview,
-    ToolStart,
-    TurnEnd,
-    TurnStart,
-    agent_event_stream,
-)
+from .errors import StreamInterrupted, SubscriberError
 from .hooks import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -81,11 +85,9 @@ from .loop import (
     MAX_ITERATIONS_WRAPUP,
     stream_interrupted_context,
 )
-from .queues import MessageQueue, QueueItem
-from .renderer_bridge import RendererBridge
+from .queues import MessageQueue
 from .result import RunResult
 from .signal import AbortSignal, activate_token, current_token
-from .status import StatusChanged, StatusCleared
 from .stream_fn import drain_sync_stream
 from .tools_run import (
     DENIED_RESULT,
@@ -207,17 +209,13 @@ class Agent:
         # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
         self.mcp = mcp if mcp is not None else McpService()
         self._token: AbortSignal | None = None  # 当前轮次的取消令牌（run 期间非空）
-        # 事件出口：核心只发类型化事件，呈现交给订阅者（见 _emit / subscribe）。
-        # `_loop` 是「本轮 run 所在的事件循环」——UI 线程改队列时的事件要转回
+        # 事件出口：核心只发类型化事件（见 _emit）。`events` 是本**会话**的事件总线，
+        # 前端订阅它取事件、`event.publish` 从深层调用点发事件。
+        # `_loop` 是「本轮 run 所在的事件循环」——UI 线程 / 后台线程发的事件要转回
         # 它，否则 push 会跨线程碰 EventStream 的内部状态。
-        self._listeners: list[Callable[[AgentEvent], None]] = []
-        self._stream: EventStream[AgentEvent, RunResult] | None = None
+        self.events = Bus()
+        self._stream: EventStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._bridge: RendererBridge | None = None
-        self._bridge_target = None
-        # 迁移桥：把事件翻译回既有 Renderer 方法调用，前端因此一行不用改
-        # （阶段 5 前端改订阅后移除，见 renderer_bridge.py）。
-        self.subscribe(self._emit_to_renderer)
         # 运行中排队的两条队列（见 queues.py）：变更即发 QueueChanged。
         # 属性名带 `_queue` 后缀，避免与 steer()/follow_up() 方法同名互相遮蔽。
         self.queue_config = config.load_queue_config()
@@ -227,11 +225,6 @@ class Agent:
         self.follow_up_queue = MessageQueue(
             "follow_up", self.queue_config.follow_up_mode, on_change=self._on_queue_changed
         )
-        # 交互桥：阻塞提问进出两侧成对发事件，消费者按 `open_prompts` 判定
-        # 「还在不在等」。挂到 ContextVar 上，让不持有 Agent 的深层调用点
-        # （权限引擎 / ask_user / 技能信任）也能发事件；`to_thread` 会复制上下文，
-        # 因此跑在 worker 线程里的预检同样看得到。
-        self.interactions = interactions.InteractionBridge(self.emit)
         # 四个可选决策点（见 hooks.py）：不传 = 现状行为，逐字不变
         self.hooks = hooks or AgentHooks()
         self._session_owner: AgentSession | None = None
@@ -303,62 +296,53 @@ class Agent:
 
     # ---------- 事件出口（核心 → 订阅者） ----------
 
-    def subscribe(self, listener: Callable[[AgentEvent], None]) -> Callable[[], None]:
-        """订阅 agent 事件，返回取消订阅的函数。
-
-        订阅者是**同步**回调，按注册顺序依次调用；异常不吞——订阅者自身的
-        故障应当暴露，而不是让事件静默消失。事件的线程见 `emit`。
-        """
-        self._listeners.append(listener)
-        target = listener
-
-        def unsubscribe() -> None:
-            if target in self._listeners:
-                self._listeners.remove(target)
-
-        return unsubscribe
-
     @property
-    def stream(self) -> EventStream[AgentEvent, RunResult] | None:
+    def stream(self) -> EventStream | None:
         """最近一轮 run 的事件流（run 期间创建，此后保留供宿主导出）。"""
         return self._stream
 
-    def emit(self, event: AgentEvent) -> None:
+    def emit(self, data: AgentEvent) -> None:
         """线程安全的事件入口：UI 线程改队列、后台标题线程都用它。"""
         loop = self._loop
         if loop is None or loop.is_closed():
-            self._emit(event)  # 非运行态（如后台标题线程）：直接发
+            self._emit(data)  # 非运行态（如后台标题线程）：直接发
             return
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
         if running is loop:
-            self._emit(event)
+            self._emit(data)
             return
-        loop.call_soon_threadsafe(self._emit, event)
+        loop.call_soon_threadsafe(self._emit, data)
 
-    def _emit(self, event: AgentEvent) -> None:
-        """事件出口（只在本轮事件循环线程上调用，见 `emit`）。"""
+    def _emit(self, data: AgentEvent) -> None:
+        """事件出口（只在本轮事件循环线程上调用，见 `emit`）。
+
+        装一次信封，喂本轮流 + 投递给总线订阅者：**同一条事件的两个消费者看到
+        的是同一个信封**（同一个 id / 会话标识），不存在两份真相。
+        """
+        if self.events.session_id is None:
+            self.events.session_id = self.session_id()
+        env = wrap(data, session_id=self.events.session_id)
         stream = self._stream
         if stream is not None and not stream.done:
-            stream.push(event)
-        for listener in list(self._listeners):
-            listener(event)
+            stream.push(env)
+        try:
+            self.events.deliver(env)
+        except Exception as e:
+            # 订阅者（前端 / 标题 / 将来的远程客户端）自身的故障：单独成型，
+            # 不落进 StreamInterrupted 的收尾语义——UI 坏了既不该重试，也不该
+            # 被报成「输出中断」（那会把排查方向引到网络上）。
+            raise SubscriberError(f"订阅者异常: {type(e).__name__}: {e}") from e
 
-    def _emit_to_renderer(self, event: AgentEvent) -> None:
-        """默认订阅者：事件 → 既有 Renderer 调用（迁移桥）。
+    def session_id(self) -> str | None:
+        """本会话的标识（供事件信封注入）。
 
-        渲染后端是**运行期解析**的（`renderer.current()`）：宿主可能在 Agent
-        构造之后才装上自己的后端（TUI 即如此），所以不能在建桥时把后端固定
-        下来。后端换了就重建桥，同一后端则复用——工具行的旧式 id 配对要跨
-        事件保留。
+        会话 id 目前仍由转录存储持有（见 `sessions/store.py`）；阶段 B 会把它
+        收敛到会话对象上，届时这里改为直接读会话字段。
         """
-        target = renderer.current()
-        if self._bridge is None or self._bridge_target is not target:
-            self._bridge = RendererBridge(target)
-            self._bridge_target = target
-        self._bridge.emit(event)
+        return getattr(getattr(self.session, "store", None), "id", None)
 
     # ---------- 钩子调用（未配置时返回默认值，行为与没有钩子时一致） ----------
 
@@ -570,9 +554,9 @@ class Agent:
         恢复三处），会话中途不重载以保护提示前缀缓存；读取失败只警告、不阻断启动。
         """
         self.models.bootstrap()
-        # 主线程上下文里常驻交互桥：启动期与命令层的提问（如 /skills refresh 的
-        # 项目信任确认）不在 run 里，也要能发事件。进程退出时在 close() 里复位。
-        interactions.activate(self.interactions)
+        # 事件总线与询问端口由**宿主**装配（`frontend.attach`）：本类不认识任何前端，
+        # 也不该往进程级全局里塞东西——多会话时那是两份真相。start() 之前装配好
+        # 即可覆盖启动期与命令层的提问（如 /skills refresh 的项目信任确认）。
         self.refresh_skills() 
         instructions.refresh()
         self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
@@ -802,7 +786,6 @@ class Agent:
 
     def close(self) -> None:
         """进程退出前收尾：关闭 MCP 连接 + flush + 关闭转录句柄。"""
-        interactions.activate(None)  # 交互桥随进程退出复位（测试隔离也依赖它）
         self.mcp.stop()
         if self.session.store is not None:
             self.session.store.close()
@@ -874,8 +857,8 @@ class Agent:
         owner = self._ensure_stream()  # 直接调用时本层拥有事件流；被目标续跑驱动时不是
         if owner:
             self._loop = asyncio.get_running_loop()
+            self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
         reset_token = activate_token(token)
-        interactions_token = interactions.activate(self.interactions)
         emitter_token = emitter.activate(self.emit)  # 深层模块（llm 层）也能发事件
         status = "error"
         self._emit(TurnStart())
@@ -894,7 +877,6 @@ class Agent:
         finally:
             self._token = None
             reset_token()
-            interactions.reset(interactions_token)
             emitter.reset(emitter_token)
             self._emit(TurnEnd(status))
         if owner:
@@ -924,6 +906,7 @@ class Agent:
         owner = self._ensure_stream()
         if owner:
             self._loop = asyncio.get_running_loop()
+            self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
         self._emit(TurnStart())
         return owner
 
@@ -1238,19 +1221,13 @@ class Agent:
         token = current_token()
 
         def emit(kind: str, payload) -> None:
-            """把增量交给渲染后端；后端自身的异常不得伪装成流中断。
+            """把流式增量发成事件（订阅者故障由 `_emit` 统一包成 SubscriberError）。
 
-            渲染层的 bug（如事件总线对未知回调抛 `AttributeError`）此前会被下面
+            订阅者里的 bug（如某个前端对未知事件抛 `AttributeError`）此前会被下面
             的流异常处理捕获，于是每一轮都报"输出中断"——把 UI 故障描述成网络故障，
-            排查方向直接跑偏。这里换成一个不参与流重试语义的独立异常：宿主如实
-            报出渲染后端异常，不再误标成网络中断。
+            排查方向直接跑偏。`_emit` 把这类故障包成不参与流重试语义的独立异常。
             """
-            try:
-                self._emit(MessageUpdate(message=msg, delta=payload, kind=kind))
-            except Exception as e:  # 渲染后端故障：不重试，只如实上报
-                raise RendererError(
-                    f"渲染后端异常: {type(e).__name__}: {e}"
-                ) from e
+            self._emit(MessageUpdate(message=msg, delta=payload, kind=kind))
 
         try:
             source = self.llm.chat_stream(self.session.messages, tools=schemas, **kwargs)
@@ -1263,8 +1240,8 @@ class Agent:
                     if kind == "content":
                         parts.append(payload)
                     emit(kind, payload)
-        except (StreamInterrupted, RendererError):
-            raise  # 流中断已成型；渲染后端故障不参与流重试/收尾语义
+        except (StreamInterrupted, SubscriberError):
+            raise  # 流中断已成型；订阅者故障不参与流重试/收尾语义
         except Exception as e:
             if token is not None and token.cancelled:
                 raise  # 取消引发的读错误：不是流故障，按取消语义上抛
@@ -1372,6 +1349,7 @@ class Agent:
                     return result
                 self._emit(PlanUpdate(
                     summary=summary(), rendered=render_current(color=True),
+                    titles=render_titles(color=True),
                     created=created, tool_call_id=tc.get("id"),
                 ))
                 return result

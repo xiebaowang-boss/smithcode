@@ -5,12 +5,12 @@ from contextlib import closing
 
 from openai import BadRequestError, OpenAI
 
-from .. import config, renderer
+from .. import config
 
 # 直接导入子模块：经包门面 `from ..agent import ...` 会惰性转发拉起整条重链（成环）
 from ..agent.emitter import emit as emit_event
-from ..agent.status import StatusChanged, StatusCleared
 from ..cancel import current_token
+from ..event.catalog import StatusChanged, StatusCleared
 from ..utils.proxy import normalize_proxy_env
 from . import retry as retry_mod
 from .request import ChatRequest, build_kwargs
@@ -137,7 +137,6 @@ class LLMClient:
         )
         kwargs = build_kwargs(req, default_model=self.default_model)
 
-        view = renderer.current()
         owner = self  # 重试态的归属者：前台任务与后台标题各自清理，互不误清
         policy = policy or RetryPolicy(max_attempts=config.MAX_RETRIES + 1)
 
@@ -145,17 +144,15 @@ class LLMClient:
             yield from self._stream_once(kwargs)
 
         def on_retry(state) -> None:
-            # 优先走事件通道（前端可订阅 StatusChanged）；没有通道（单测直接调
-            # 客户端、无 Agent 的调用方）则退回渲染器直调，两者可观测结果一致。
-            if not emit_event(StatusChanged(
+            # 经事件通道发 StatusChanged：没有通道 = 没有接收方（单测直接调客户端、
+            # 无 Agent 的调用方），此时静默，与 publish 的规则一致。
+            emit_event(StatusChanged(
                 kind="retry", text=state.text(), owner=owner, payload=state,
-            )):
-                view.retry_started(state, owner)
+            ))
 
         def on_settled() -> None:
             # 成功或放弃都清掉重试态（owner 保证只清自己那条）
-            if not emit_event(StatusCleared(kind="retry", owner=owner)):
-                view.retry_finished(owner)
+            emit_event(StatusCleared(kind="retry", owner=owner))
 
         yield from retry_mod.stream_with_retry(
             attempt, policy, on_retry=on_retry, on_settled=on_settled,

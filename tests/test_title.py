@@ -8,17 +8,17 @@ import signal
 
 import pytest
 
-import smithcode.renderer as renderer_module
 from smithcode import title
 from smithcode.agent import Agent
-from smithcode.agent.interactions import (
-    InteractionBridge,
-    PromptFinished,
-    PromptRequest,
-    PromptStarted,
-)
-from smithcode.renderer import Renderer
+from smithcode.event.catalog import PromptFinished, PromptStarted
 from smithcode.session import Session
+
+
+def _env(payload):
+    """把载荷装进信封：订阅者收到的是信封（会话标识由总线注入）。"""
+    from smithcode.event.envelope import wrap
+
+    return wrap(payload)
 
 
 def _prompt(prompt_id: str, kind: str = "permission", title: str = "允许执行 x?"):
@@ -37,52 +37,6 @@ class Recorder:
 
     def __call__(self, seq: str) -> None:
         self.writes.append(seq)
-
-
-class FakeRenderer(Renderer):
-    """记录收到的调用，用于断言事件经迁移桥到达后端。"""
-
-    def __init__(self):
-        super().__init__()
-        self.calls = []
-
-    def title_changed(self, title_text: str) -> None:
-        self.calls.append(("title", title_text))
-
-    def turn_started(self) -> None:
-        self.calls.append(("started",))
-
-    def turn_finished(self, status: str = "ok") -> None:
-        self.calls.append(("finished", status))
-
-    def turn_waiting_started(self) -> None:
-        self.calls.append(("waiting_started",))
-
-    def turn_waiting_finished(self) -> None:
-        self.calls.append(("waiting_finished",))
-
-    def warn(self, text: str) -> None:
-        self.calls.append(("warn", text))
-
-    def info(self, text: str, scope=None) -> None:
-        self.calls.append(("info", text))
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str, detail=None,
-                       descriptions=None, content=None, scope=None) -> str:
-        self.calls.append(("confirm", prompt))
-        return "y"
-
-    def ask_form(self, questions: list[dict], scope=None) -> list[str]:
-        self.calls.append(("ask_form",))
-        return [""] * len(questions)
-
-
-class BrokenAskRenderer(FakeRenderer):
-    """confirm_choice 抛异常的假后端（模拟面板装配失败等）。"""
-
-    def confirm_choice(self, prompt: str, valid: str, hint: str, detail=None,
-                       descriptions=None, content=None, scope=None) -> str:
-        raise RuntimeError("面板炸了")
 
 
 @pytest.fixture(autouse=True)
@@ -192,12 +146,12 @@ def test_waiting_survives_overlapping_prompts():
     p = _make_presenter(sink)
     p.enable()
     p.on_turn_started()
-    p.on_agent_event(_prompt("outer"))
-    p.on_agent_event(_prompt("inner"))
+    p.on_agent_event(_env(_prompt("outer")))
+    p.on_agent_event(_env(_prompt("inner")))
     assert sink.writes[-1] == "\x1b]0;! Smith · smithcode\x07"
-    p.on_agent_event(_finished("inner"))  # 内层先结束
+    p.on_agent_event(_env(_finished("inner")))  # 内层先结束
     assert sink.writes[-1] == "\x1b]0;! Smith · smithcode\x07"  # 外层还在等，不熄灭
-    p.on_agent_event(_finished("outer"))
+    p.on_agent_event(_env(_finished("outer")))
     assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"  # 回到运行态
     p.on_turn_finished()
     assert sink.writes[-1] == "\x1b]0;Smith · smithcode\x07"
@@ -332,76 +286,56 @@ def test_chain_handler_respects_ignored_signal(monkeypatch):
 # ---------- 装配：attach 只做「接管标题 + 订阅事件」 ----------
 
 
-def test_attach_returns_the_same_backend_and_enables_title(monkeypatch):
-    """attach 不再包一层装饰器：返回原后端对象，同时接管窗口标题。
-
-    （原来返回的是 `Relay(inner, presenter)`；等待/标题事件都有正式事件通道后，
-    中间层被删除——调用方拿到的就是自己传进去的那个渲染后端。）
-    """
-    sink = Recorder()
-    inner = FakeRenderer()
-    returned = title.attach(inner, sink=sink, workspace="proj")
-    assert returned is inner
-    assert sink.writes == ["\x1b[22;2t", "\x1b]0;Smith · proj\x07"]
-
-
-def test_attach_subscribes_presenter_to_agent_events(monkeypatch):
-    """传了 agent 就订阅：标题/忙闲/等待三类事件都能驱动标题。"""
-    from smithcode.agent.events import TitleChanged
-
-    sink = Recorder()
-    inner = FakeRenderer()
-    monkeypatch.setattr(renderer_module, "_current", None, raising=False)
-    renderer_module.set_renderer(inner)  # 迁移桥送达的是「当前后端」
-    agent = Agent(session=Session(), persist=False)
-    title.attach(inner, sink=sink, workspace="proj", agent=agent)
-
-    agent.emit(TitleChanged("新标题"))
-
-    assert sink.writes[-1] == "\x1b]0;Smith · 新标题\x07"
-    assert inner.calls == [("title", "新标题")]  # 迁移桥照常送达后端
-
-
 def test_presenter_ignores_events_it_does_not_handle():
     """不认识的事件不得抛异常（回归：新增事件曾让每轮都误报「输出中断」）。
 
-    旧实现用 `getattr(self._presenter, "on_" + name)` 转发，未实现的方法直接抛
-    `AttributeError`。现在按类型分派，未知事件天然是空操作——这条锁住该性质，
-    顺带确认已知事件仍照常处理。
+    现在按类型分派，未知事件天然是空操作——这条锁住该性质，顺带确认已知事件仍
+    照常处理。订阅者收到的是**信封**，所以这里包一层 `wrap`；连信封都不是的对象
+    也不得抛（订阅者可能被别处直接调用）。
     """
-    from smithcode.agent.status import StatusChanged
+    from smithcode.event.catalog import StatusChanged
+    from smithcode.event.envelope import wrap
 
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
 
-    p.on_agent_event(StatusChanged(kind="retry", text="重试 1/3"))  # 不关心，不报错
-    p.on_agent_event(object())  # 完全未知
+    p.on_agent_event(wrap(StatusChanged(kind="retry", text="重试 1/3")))  # 不关心，不报错
+    p.on_agent_event(object())  # 连信封都不是：getattr 兜底，不得抛
     p.on_turn_started()
 
     assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"
 
 
-# ---------- 阻塞（等待用户输入）：交互桥事件对 → 标题 ----------
+# ---------- 阻塞（等待用户输入）：询问事件对 → 标题 ----------
+
+
+def _ask_with_presenter(presenter, *, run):
+    """在一条总线上提问一次，让呈现器看到 started / finished 事件对。"""
+    from smithcode.event import Bus, activate, reset
+    from smithcode.event.asks import ask
+
+    bus = Bus(session_id="s")
+    bus.subscribe(presenter.on_agent_event)
+    token = activate(bus)
+    try:
+        return ask("permission", title="允许执行 x?", run=run)
+    finally:
+        reset(token)
 
 
 def test_prompt_events_mark_waiting_in_title():
     """提问期间标题打 `!`，作答后回到运行态——切走窗口再回来能看出卡在等人。
 
-    等待态由 `InteractionBridge` 在提问进出两侧发 `PromptStarted` /
-    `PromptFinished`（id 配对），呈现器订阅这两个事件（不再经 Relay 拦截 ask）。
+    等待态由询问事件对（`PromptStarted` / `PromptFinished`，id 配对）驱动：
+    呈现器订阅这两个事件，不再经 Relay 拦截 ask。
     """
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
-    inner = FakeRenderer()
-    bridge = InteractionBridge(p.on_agent_event)
     p.on_turn_started()
 
-    answer = bridge.request(
-        PromptRequest(kind="permission", title="允许执行 x?"),
-        lambda: inner.confirm_choice("允许执行 x?", "yn", "y / n"),
-    )
+    answer = _ask_with_presenter(p, run=lambda: "y")
 
     assert answer == "y"
     assert sink.writes == [
@@ -411,8 +345,6 @@ def test_prompt_events_mark_waiting_in_title():
         "\x1b]0;! Smith · smithcode\x07",
         "\x1b]0;◐ Smith · smithcode\x07",
     ]
-    assert bridge.open_prompts == {}  # 成对收口
-    assert inner.calls == [("confirm", "允许执行 x?")]
 
 
 def test_prompt_waiting_cleared_when_ask_raises():
@@ -420,22 +352,19 @@ def test_prompt_waiting_cleared_when_ask_raises():
     sink = Recorder()
     p = _make_presenter(sink)
     p.enable()
-    inner = BrokenAskRenderer()
-    bridge = InteractionBridge(p.on_agent_event)
-    p.on_turn_started()  # 任务在跑：等待态摘掉后应回到 `◐`
+    p.on_turn_started()  # 任务在跑：等待态摘掉后应回到 ◐
+
+    def boom() -> str:
+        raise RuntimeError("面板挂了")
 
     with pytest.raises(RuntimeError):
-        bridge.request(
-            PromptRequest(kind="permission", title="允许执行 x?"),
-            lambda: inner.confirm_choice("允许执行 x?", "yn", "y / n"),
-        )
+        _ask_with_presenter(p, run=boom)
 
     assert sink.writes[-1] == "\x1b]0;◐ Smith · smithcode\x07"
-    assert bridge.open_prompts == {}
 
 
 def test_enable_title_is_separable_and_idempotent():
-    """拆出的 `enable_title()` 独立可用（幂等：重复调用不重复压栈）。"""
+    """`enable_title()` 独立可用（幂等：重复调用不重复压栈）。"""
     sink = Recorder()
     first = title.enable_title(sink=sink, workspace="proj")
     second = title.enable_title(sink=sink, workspace="proj")
@@ -443,17 +372,42 @@ def test_enable_title_is_separable_and_idempotent():
     assert sink.writes == ["\x1b[22;2t", "\x1b]0;Smith · proj\x07"]
 
 
-def test_attach_equals_enable_title_for_side_effects():
-    """`attach` 的副作用就是 `enable_title()`：写入序列逐字节一致。"""
-    sink_a, sink_b = Recorder(), Recorder()
-    inner_a, inner_b = FakeRenderer(), FakeRenderer()
-    combined = title.attach(inner_a, sink=sink_a, workspace="proj")
-    title.reset()  # 复位单例，手工装配同一场景
-    manual = title.enable_title(sink=sink_b, workspace="proj")
-    assert combined is inner_a  # 不再包装后端
-    assert isinstance(manual, title.TerminalTitlePresenter)
-    assert sink_a.writes == sink_b.writes
-    assert inner_a.calls == inner_b.calls == []
+def test_frontend_attach_subscribes_presenter_and_activates_asker():
+    """装配入口 `frontend.attach`：订阅事件（含标题呈现器）+ 挂上询问端口。
+
+    这是宿主的**唯一**装配方式（`cli.main` / `SmithTUI.on_mount` 都走它），
+    所以这里锁住三件事：事件到达订阅者、询问落到该前端、detach 后复位。
+    """
+    from smithcode import frontend
+    from smithcode.event.catalog import TitleChanged
+
+    class FakeAsker:
+        def on_event(self, env): pass  # 订阅事件：本用例只关心装配与询问端口
+
+        def ask_text(self, question): return ""
+        def ask_choice(self, question, options, multiple=False, descriptions=None): return ""
+        def ask_form(self, questions): return ["" for _ in questions]
+        def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None,
+                           content=None): return "y"
+
+    sink = Recorder()
+    presenter = _make_presenter(sink)
+    presenter.enable()
+    agent = Agent(session=Session(), persist=False)
+    attached = frontend.attach(
+        agent.events, FakeAsker(), extra_subscribers=(presenter.on_agent_event,)
+    )
+    try:
+        agent.emit(TitleChanged("新标题"))
+        assert sink.writes[-1] == "\x1b]0;Smith · 新标题\x07"
+        assert frontend.current().confirm_choice("允许?", "yn", "y / n") == "y"
+    finally:
+        attached.detach()
+    # detach 后回到**终端兜底**（与旧 renderer.current() 一致）；fail-closed 由调用点的
+    # confirmations_available() 保证，所以这里断言的是"兜底是终端前端"而不是"一律拒绝"
+    from smithcode.frontend.console import ConsoleFrontend
+
+    assert isinstance(frontend.current(), ConsoleFrontend)
 
 
 # ---------- Agent 事件发射 ----------
@@ -466,48 +420,63 @@ class FakeLLM:
         yield ("message", {"role": "assistant", "content": "最终回复"})
 
 
-def _install_recording_backend(monkeypatch):
-    """把全局渲染后端换成记录器并启用标题呈现器；返回 (inner, sink, presenter)。
+class RecordingSubscriber:
+    """订阅者替身：记下收到的载荷类型（事件只有一个通道）。"""
 
-    呈现器与 Agent 的连接由调用方用 `_wire()` 建立——这就是 Relay 删除后的装配
-    方式：订阅事件（而不是经渲染后端转发）。
-    """
-    inner = FakeRenderer()
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def __call__(self, env) -> None:
+        from smithcode.event.catalog import TitleChanged, TurnEnd, TurnStart
+
+        data = env.data
+        if isinstance(data, TitleChanged):
+            self.calls.append(("TitleChanged", data.title))
+        elif isinstance(data, TurnStart):
+            self.calls.append(("TurnStart",))
+        elif isinstance(data, TurnEnd):
+            self.calls.append(("TurnEnd", data.status))
+
+
+def _install_presenter():
+    """启用标题呈现器（+ 一个记录订阅者），返回 (recorder, sink, presenter)。"""
+    recorder = RecordingSubscriber()
     sink = Recorder()
     presenter = _make_presenter(sink)
     presenter.enable()
-    monkeypatch.setattr(renderer_module, "_current", None, raising=False)
-    renderer_module.set_renderer(inner)
-    return inner, sink, presenter
+    return recorder, sink, presenter
 
 
-def _wire(agent, presenter) -> None:
-    agent.subscribe(presenter.on_agent_event)
+def _wire(agent, presenter, recorder=None) -> None:
+    """装配：呈现器与记录器都订阅 agent 的事件总线（唯一的通道）。"""
+    agent.events.subscribe(presenter.on_agent_event)
+    if recorder is not None:
+        agent.events.subscribe(recorder)
 
 
 def test_agent_run_emits_turn_events(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
-    inner, sink, presenter = _install_recording_backend(monkeypatch)
+    recorder, sink, presenter = _install_presenter()
     agent = Agent(session=Session(), persist=False)
-    _wire(agent, presenter)
+    _wire(agent, presenter, recorder)
     asyncio.run(agent.run("你好"))
-    assert inner.calls == [("started",), ("finished", "ok")]
+    assert recorder.calls == [("TurnStart",), ("TurnEnd", "ok")]
     # 收尾回到空闲态（回退名取自工作区目录名，故不断言具体字符串）
     assert sink.writes[-1].startswith("\x1b]0;Smith · ") and sink.writes[-1].endswith("\x07")
 
 
 def test_agent_new_session_emits_empty_title(monkeypatch):
-    inner, sink, presenter = _install_recording_backend(monkeypatch)
+    recorder, sink, presenter = _install_presenter()
     agent = Agent(session=Session(), persist=False)
-    _wire(agent, presenter)
+    _wire(agent, presenter, recorder)
     agent.rename_session("旧标题")
     agent.new_session()
-    assert ("title", "") in inner.calls
+    assert ("TitleChanged", "") in recorder.calls
     assert sink.writes[-1].startswith("\x1b]0;Smith · ")  # 回退默认标题
 
 
 def test_agent_rename_pushes_title_to_terminal(monkeypatch):
-    _inner, sink, presenter = _install_recording_backend(monkeypatch)
+    _recorder, sink, presenter = _install_presenter()
     agent = Agent(session=Session(), persist=False)
     _wire(agent, presenter)
     assert agent.rename_session("数据库迁移") is True

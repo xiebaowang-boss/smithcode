@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 
 from .. import __version__, config
+from ..event import publish
+from ..event.catalog import Notice
 from . import format, paths
 from .model import LoadedSession, SessionSummary
 
@@ -207,12 +209,10 @@ class SessionStore:
             return
         self._reported = True
         try:
-            from .. import renderer
-
-            renderer.current().warn(
+            publish(Notice(
                 f"[会话] 无法写入会话记录（{type(exc).__name__}: {exc}），"
                 "本次会话不会被自动保存。"
-            )
+            , level="warning"))
         except Exception:  # noqa: BLE001 渲染失败不影响主流程
             return
 

@@ -2,11 +2,22 @@
 
 import pytest
 
-from smithcode import config
+from smithcode import config, frontend
 from smithcode.cli import main
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.utils.terminal import prompt_choice, read_user_input
 
 # ---------- 后台任务入口：事件循环与既有线程结构的接线 ----------
+
+
+def _console_agent():
+    """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例读 stdout。"""
+    from smithcode.agent import Agent
+    from smithcode.session import Session
+
+    agent = Agent(session=Session())
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
 
 def test_run_agent_task_drives_coroutine_through_event_loop(monkeypatch, capsys):
     """REPL 的后台任务入口用 `asyncio.run` 驱动协程，正常完成并打印正文。
@@ -15,9 +26,7 @@ def test_run_agent_task_drives_coroutine_through_event_loop(monkeypatch, capsys)
     循环与既有「后台线程 + 主线程 Ctrl+C 通道」结构接起来的地方；本用例锁住
     这条接线（协程没被 await 时这里会静默什么都不做）。
     """
-    from smithcode.agent import Agent
     from smithcode.cli import _run_agent_task
-    from smithcode.session import Session
 
     class FakeLLM:
         def chat_stream(self, messages, tools=None):
@@ -25,7 +34,7 @@ def test_run_agent_task_drives_coroutine_through_event_loop(monkeypatch, capsys)
             yield ("message", {"role": "assistant", "content": ""})
 
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     _run_agent_task(agent, "打个招呼")
 

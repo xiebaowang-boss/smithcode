@@ -32,17 +32,15 @@ from .. import (
     goal,
     permission,
     plan,
-    renderer,
     skills,
     title,
     welcome,
 )
 from ..agent import format_stream_interrupted
-from ..agent.events import QueueChanged, QueuedPromptDelivered
+from ..frontend import attach as attach_frontend
 from ..mcp.errors import McpConfigError
 from ..mcp.wizard import McpWizard, apply_plan
 from . import clipboard
-from .bridge import TuiRenderer
 from .chat import (
     Assistant,
     Block,
@@ -62,6 +60,7 @@ from .chat import (
     coerce_level,
     level_from_style,
 )
+from .frontend import TuiFrontend
 from .panels import (
     McpWizardPanel,
     McpWizardScreen,
@@ -128,9 +127,10 @@ class SmithTUI(App):
         self._busy = False
         self._turn_start: float | None = None
         self._turn_reason = ""  # 本轮 stream_error 的失败原因（页脚带出，便于排障）
-        # 本界面的渲染后端（on_mount 装配后填入）：界面收尾时要靠它唤醒挂起的
-        # 弹窗等待方，见 TuiRenderer.abandon_pending
-        self._frontend: TuiRenderer | None = None
+        # 本界面的前端（on_mount 装配后填入）：界面收尾时要靠它唤醒挂起的
+        # 弹窗等待方，见 TuiFrontend.abandon_pending
+        self._frontend: TuiFrontend | None = None
+        self._attached = None  # frontend.attach 的两枚复位令牌（收尾用）
         # 选择面板的层级栈：[(父级 CommandSelect, 进入下级时选中的值)]，
         # Esc 未选中时逐级返回（锚点让光标落回原行），执行动作后清空
         self._select_stack: list = []
@@ -182,19 +182,18 @@ class SmithTUI(App):
             yield Sidebar(id="sidebar")
 
     def on_mount(self) -> None:
-        # 窗口标题：sink 换成 Textual 的写入队列（整条序列由 writer 线程落盘，
-        # 与帧输出不交错）；标题状态与压栈已在 cli.main 装配时接管
+        # 装配前端：事件只有一条路（订阅 agent 的事件总线），询问端口挂在当前
+        # 上下文。窗口标题的 sink 换成 Textual 的写入队列（整条序列由 writer
+        # 线程落盘，与帧输出不交错）；cli.main 那边装的是终端前端，TUI 起来后
+        # 由这里接管（同一进程只会有一个接受询问的前端）。
         driver = self._driver
-        self._frontend = TuiRenderer(self)
-        renderer.set_renderer(
-            title.attach(
-                self._frontend,
-                sink=driver.write if driver is not None else None,
-                agent=self.agent,
-            )
+        presenter = title.enable_title(sink=driver.write if driver is not None else None)
+        self._frontend = TuiFrontend(self)
+        self._attached = attach_frontend(
+            self.agent.events,
+            self._frontend,
+            extra_subscribers=(presenter.on_agent_event,),
         )
-        # 队列变化走事件订阅（阶段 4 起核心只发事件）：面板持久显示当前排队状态
-        self.agent.subscribe(self._on_agent_event)
         self.query_one("#queued").display = False  # 排队面板：空则隐藏
         self.query_one(ChatInput).focus()
         self.query_one("#running").display = False  # 运行动画默认隐藏
@@ -676,14 +675,6 @@ class SmithTUI(App):
             return
         self._chat().apply(User(text))  # 非运行态：回显用户消息，避免"发出去没反应"
         self.start_task(text)
-
-    def _on_agent_event(self, event) -> None:
-        """Agent 事件订阅（可能在 agent 线程上被调用）：只接排队变化，转发到主线程。"""
-        if isinstance(event, QueueChanged):
-            self.post_message(UiAction("queue", event))
-        elif isinstance(event, QueuedPromptDelivered):
-            # 排队输入被投递：现在才落到对话区（入队时只在面板里）
-            self.post_message(UiAction("queued_delivered", event.text))
 
     def edit_queued(self, item_id: str) -> None:
         """把某条排队输入取回输入框去改（面板行的 `edit` 按钮）。

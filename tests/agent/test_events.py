@@ -1,4 +1,4 @@
-"""核心事件流（agent/events.py）：有序交付、终结值、生产者异常的收尾语义。
+"""核心事件流（event/stream.py）：有序交付、终结值、生产者异常的收尾语义。
 
 项目未安装 pytest-asyncio（dev extra 只有 pytest / ruff），故用 `asyncio.run`
 在同步用例里驱动协程，避免为测试引入新依赖。所有并发场景都带超时，失败是
@@ -12,16 +12,16 @@ from typing import get_args
 
 import pytest
 
-from smithcode.agent.events import (
-    AGENT_EVENT_TYPES,
+from smithcode.cancel import RunResult
+from smithcode.event import registry
+from smithcode.event.catalog import (
     AgentEnd,
     AgentEvent,
-    EventStream,
     MessageStart,
     TurnStart,
-    agent_event_stream,
 )
-from smithcode.cancel import RunResult
+from smithcode.event.envelope import wrap
+from smithcode.event.stream import EventStream, agent_event_stream
 
 TIMEOUT = 5.0
 
@@ -146,17 +146,21 @@ def test_stream_without_terminal_event_reports_error():
 def test_agent_event_stream_terminates_on_agent_end():
     async def scenario():
         stream = agent_event_stream()
-        stream.push(TurnStart())
-        stream.push(AgentEnd(result=RunResult("ok", "正文")))
-        seen = [event async for event in stream]
+        stream.push(wrap(TurnStart()))
+        stream.push(wrap(AgentEnd(result=RunResult("ok", "正文"))))
+        seen = [env.data async for env in stream]
         return seen, await stream.result()
 
     seen, result = run(scenario)
-    assert [type(event) for event in seen] == [TurnStart, AgentEnd]
+    # 流里走的是**信封**（订阅者与流看到同一个 id / 会话标识），载荷在 env.data
+    assert [type(payload) for payload in seen] == [TurnStart, AgentEnd]
     assert result.status == "ok"
     assert result.text == "正文"
 
 
 def test_event_type_inventory_matches_union():
-    """`AGENT_EVENT_TYPES` 是完备性断言的遍历依据，漏登记会让断言失去意义。"""
-    assert set(AGENT_EVENT_TYPES) == set(get_args(AgentEvent))
+    """注册表是完备性断言的遍历依据，漏声明会让断言失去意义。"""
+    declared = set(registry.declared_classes())
+    # 联合里的每个成员都必须已声明（未声明 = 没有类型名，无法落盘/路由）
+    for cls in get_args(AgentEvent):
+        assert cls in declared, f"{cls.__name__} 未声明"

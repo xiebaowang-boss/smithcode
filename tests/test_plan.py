@@ -4,8 +4,9 @@ import json
 
 import pytest
 
-from smithcode import config, plan
+from smithcode import config, frontend, plan
 from smithcode.agent import Agent
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 from smithcode.tools.todo import todo_read, todo_write
 
@@ -233,6 +234,7 @@ def test_agent_executes_todo_write_and_renders(monkeypatch, capsys):
         ),
     )
     agent = Agent(session=Session())
+    frontend.attach(agent.events, ConsoleFrontend())
     assert asyncio.run(agent.run("多步任务")).text == "完成"
     out = capsys.readouterr().out
     assert "[计划]" in out
@@ -257,42 +259,24 @@ def _todo_write_call(call_id, todos):
     }
 
 
-class _PlanRenderer:
-    """记录工具行与 plan 事件的假渲染后端。"""
+class _PlanSubscriber:
+    """事件订阅者：记录工具行的出现与 plan 更新（前端就是这么消费的）。
+
+    工具行的可见性由 `ToolEnd.expand` + 事件本身决定：新建清单发一条
+    `PlanUpdate(created=True)`，后续更新只发 `created=False` 的那条。
+    """
 
     def __init__(self):
         self.tool_calls = []
         self.plans = []
-        self.seq = 0
 
-    def tool_call(self, line, display="inline", name=""):
-        self.seq += 1
-        self.tool_calls.append((name, display))
-        return self.seq
+    def __call__(self, env):
+        from smithcode.event.catalog import PlanUpdate, ToolStart
 
-    def tool_result(self, result, tool_id=None, expand=False):
-        pass
-
-    def plan(self, summary, rendered, *, created=False, tool_id=None):
-        self.plans.append((created, tool_id))
-
-    def stream(self, kind, chunk):
-        pass
-
-    def stream_done(self):
-        pass
-
-    def info(self, text):
-        pass
-
-    warn = info
-    error = info
-
-    def turn_started(self):
-        pass
-
-    def turn_finished(self, status="ok"):
-        pass
+        if isinstance(env.data, ToolStart):
+            self.tool_calls.append((env.data.name, env.data.display))
+        elif isinstance(env.data, PlanUpdate):
+            self.plans.append((env.data.created, env.data.tool_call_id))
 
 
 def test_agent_prints_plan_only_when_created(monkeypatch, capsys):
@@ -319,6 +303,7 @@ def test_agent_prints_plan_only_when_created(monkeypatch, capsys):
         ),
     )
     agent = Agent(session=Session())
+    frontend.attach(agent.events, ConsoleFrontend())
     assert asyncio.run(agent.run("多步任务")).text == "完成"
     out = capsys.readouterr().out
     assert out.count("[计划]") == 1
@@ -336,10 +321,10 @@ def test_agent_skips_tool_row_on_plan_update(monkeypatch):
             ]
         ),
     )
-    cap = _PlanRenderer()
-    monkeypatch.setattr("smithcode.renderer._current", cap)
-
+    cap = _PlanSubscriber()
     agent = Agent(session=Session())
+    agent.events.subscribe(cap)
+
     asyncio.run(agent.run("多步任务"))
 
     todo_rows = [display for name, display in cap.tool_calls if name == "todo_write"]

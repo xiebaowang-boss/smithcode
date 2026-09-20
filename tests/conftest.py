@@ -28,17 +28,21 @@ def _isolate_terminal_title(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_interaction_bridge():
-    """交互桥挂在 ContextVar 上（`Agent.start` 在主线程挂载）：用完复位。
+def _isolate_frontend_context():
+    """前端上下文用完复位：事件总线与询问端口都挂在 ContextVar 上。
 
     不复位会把上一个用例的 Agent 泄漏给同线程的下一个用例——那时权限确认
-    会朝一个已经结束的 Agent 发事件。
-    """
-    from smithcode.agent import interactions
+    会朝一个已经结束的 Agent 要答案，事件也会投给已经拆掉的前端。
 
-    token = interactions.activate(None)
+    询问端口复位为 `None`（= fail-closed 兜底：拒绝/取消，永不挂起）。
+    """
+    from smithcode import event, frontend
+
+    bus_token = event.activate(None)
+    asker_token = frontend.activate(None)
     yield
-    interactions.reset(token)
+    frontend.reset(asker_token)
+    event.reset(bus_token)
 
 
 # ---------- 本地假 HTTP 代理（网络工具的环境代理回归用例） ----------

@@ -11,14 +11,13 @@ from rich.color import ColorTriplet
 from textual.geometry import Region
 from textual.widgets import Static
 
-import smithcode.renderer as renderer_module
 from smithcode import __version__, config
 from smithcode.agent import Agent
+from smithcode.event.catalog import PlanUpdate, TitleChanged
 from smithcode.llm import RetryState
 from smithcode.llm.request import TurnConfig
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
-from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.panels import (
     PermissionPanel,
     QuestionPanel,
@@ -49,16 +48,6 @@ from smithcode.utils.terminal import confirmations_available
 
 
 @pytest.fixture(autouse=True)
-def restore_renderer():
-    """TuiRenderer.on_mount 会替换全局渲染后端，测试结束还原，避免污染同进程后续测试。"""
-    from smithcode import renderer
-
-    backup = renderer._current
-    yield
-    renderer_module.set_renderer(backup)
-
-
-@pytest.fixture(autouse=True)
 def _fresh_goal():
     """持久目标是全局单例，逐用例清空防止跨测试污染。"""
     from smithcode import goal
@@ -82,6 +71,21 @@ class FakeLLM:
         yield ("content", "世界")
         yield ("message", {"role": "assistant", "content": "你好，世界"})
 
+
+
+def publish_plan(app, summary: str = "共 1 步", *, created: bool = False,
+                 tool_call_id: str | None = None) -> None:
+    """把计划更新事件投给界面（替代从前直接调渲染后端）。
+
+    两种渲染形态都随载荷发出（与生产一致）：前端不读会话状态。
+    """
+    from smithcode import plan as plan_mod
+
+    app.agent.events.publish(PlanUpdate(
+        summary=summary, rendered=plan_mod.render_current(color=True),
+        titles=plan_mod.render_titles(color=True),
+        created=created, tool_call_id=tool_call_id,
+    ))
 
 def _make_agent(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
@@ -192,25 +196,22 @@ def test_tui_mount_wires_terminal_title(monkeypatch):
     monkeypatch.setattr(title_module, "stdout_is_tty", lambda: True)
 
     captured = {"writes": []}
-    real_attach = title_module.attach
+    real_enable = title_module.enable_title
 
-    def spy_attach(inner, sink=None, workspace="", agent=None):
-        captured["inner"] = inner
+    def spy_enable(sink=None, workspace=""):
         captured["sink"] = sink
-        captured["agent"] = agent  # 等待态靠订阅 Agent 事件（见 on_agent_event）
 
         def recording_sink(seq):
             captured["writes"].append(seq)
 
-        return real_attach(inner, sink=recording_sink, workspace=workspace, agent=agent)
+        return real_enable(sink=recording_sink, workspace=workspace)
 
-    monkeypatch.setattr(title_module, "attach", spy_attach)
+    monkeypatch.setattr(title_module, "enable_title", spy_enable)
 
     async def _run_case():
         monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
         app = SmithTUI(Agent(session=Session(), persist=False))
         async with app.run_test():
-            assert isinstance(captured["inner"], TuiRenderer)
             assert captured["sink"] == app._driver.write  # 走 Textual 写入队列
             app.agent.rename_session("标题接线")
             assert "\x1b]0;Smith · 标题接线\x07" in captured["writes"]
@@ -751,7 +752,7 @@ def test_tui_sidebar_shows_plan_section(monkeypatch):
             workspace = str(sidebar.query_one(".sidebar-workspace").content)
             assert workspace.startswith(f"{Path(config.WORKSPACE_ROOT).name} | ")
             assert str(config.WORKSPACE_ROOT) in workspace
-            TuiRenderer(app).plan("共 1 步", plan_mod.render_current(color=True))
+            publish_plan(app, created=True, tool_call_id="1")
             await pilot.pause()
             plan_body = str(sidebar.query_one(".plan-body").content)
             assert "读文件" in plan_body
@@ -771,19 +772,21 @@ def test_tui_plan_created_shows_expandable_detail(monkeypatch):
             plan_mod.current().replace(
                 [{"title": "读文件", "status": "in_progress", "description": "细节内容"}]
             )
-            app.ui_tool_start(1, "plan (1 步)", "block", "todo_write")
+            app.ui_tool_start("1", "plan (1 步)", "block", "todo_write")
             await pilot.pause()
             pending = app.query_one(ToolCall)
             assert pending._pending is True
             assert pending._spin_timer is None  # pending 期也不转轮
             assert pending._header_text().startswith("☰ plan (1 步)")
-            TuiRenderer(app).plan(
-                "共 1 步", plan_mod.render_current(color=True), created=True, tool_id=1
-            )
+            app.agent.events.publish(PlanUpdate(
+                summary="共 1 步", rendered=plan_mod.render_current(color=True),
+                titles=plan_mod.render_titles(color=True),
+                created=True, tool_call_id="1",
+            ))
             await pilot.pause()
 
             # plan 工具块已收尾，默认展开，正文含计划内容
-            assert 1 not in app._tool_widgets
+            assert "1" not in app._tool_widgets
             block = app.query_one(ToolCall)
             assert block._pending is False
             assert block._expanded is True
@@ -793,9 +796,11 @@ def test_tui_plan_created_shows_expandable_detail(monkeypatch):
 
             # 更新（created=False）：只刷侧边栏，不再新增对话块
             before = len(app.query(ToolCall))
-            TuiRenderer(app).plan(
-                "共 1 步", plan_mod.render_current(color=True), created=False, tool_id=None
-            )
+            app.agent.events.publish(PlanUpdate(
+                summary="共 1 步", rendered=plan_mod.render_current(color=True),
+                titles=plan_mod.render_titles(color=True),
+                created=False, tool_call_id=None,
+            ))
             await pilot.pause()
             assert len(app.query(ToolCall)) == before
 
@@ -818,7 +823,7 @@ def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
 
             # 全部完成 → 仍隐藏
             plan_mod.current().replace([{"title": "写代码", "status": "completed"}])
-            TuiRenderer(app).plan("共 1 步", plan_mod.render_current(color=True))
+            publish_plan(app, created=True, tool_call_id="1")
             await pilot.pause()
             assert section.display is False
 
@@ -826,7 +831,7 @@ def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
             plan_mod.current().replace(
                 [{"title": "写代码", "status": "completed"}, {"title": "跑测试", "status": "in_progress"}]
             )
-            TuiRenderer(app).plan("共 2 步", plan_mod.render_current(color=True))
+            publish_plan(app, summary="共 2 步")
             await pilot.pause()
             assert section.display is True
             assert "跑测试" in str(sidebar.query_one(".plan-body").content)
@@ -836,7 +841,7 @@ def test_tui_sidebar_plan_hidden_without_active_tasks(monkeypatch):
             plan_mod.current().replace(
                 [{"title": "写代码", "status": "cancelled"}, {"title": "跑测试", "status": "cancelled"}]
             )
-            TuiRenderer(app).plan("共 2 步", plan_mod.render_current(color=True))
+            publish_plan(app, summary="共 2 步")
             await pilot.pause()
             assert section.display is False
 
@@ -1106,7 +1111,7 @@ def test_tui_title_changed_action_refreshes(monkeypatch):
             assert app.query_one(".sidebar-title").display is False
 
             agent.session.set_title("后台生成的标题")
-            TuiRenderer(app).title_changed("后台生成的标题")
+            app.agent.events.publish(TitleChanged("后台生成的标题"))
             await pilot.pause()
             widget = app.query_one(".sidebar-title")
             assert widget.display is True

@@ -29,7 +29,8 @@ from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 
 from .. import config as root_config
-from .. import renderer
+from ..event import publish
+from ..event.catalog import Notice
 from .errors import McpAuthError
 from .secrets import _atomic_write, redactor
 
@@ -220,9 +221,9 @@ def _pick_port(preferred: int) -> int:
         try:
             httpd = HTTPServer(("127.0.0.1", preferred), _CallbackHandler)
         except OSError:
-            renderer.current().warn(
+            publish(Notice(
                 f"[mcp] OAuth 回调端口 {preferred} 被占用，临时改用随机端口"
-            )
+            , level="warning"))
         else:
             httpd.server_close()
             return preferred
@@ -262,10 +263,10 @@ class OAuthSession:
                 f"MCP 服务器 {self.cfg.name} 需要 OAuth 授权："
                 f"请在交互终端运行 /mcp auth {self.cfg.name}"
             )
-        renderer.current().info(f"[mcp] 请在浏览器完成授权: {authorization_url}")
+        publish(Notice(f"[mcp] 请在浏览器完成授权: {authorization_url}"))
         opened = await anyio.to_thread.run_sync(webbrowser.open, authorization_url)
         if not opened:
-            renderer.current().warn("[mcp] 无法自动打开浏览器，请手动访问上述链接")
+            publish(Notice("[mcp] 无法自动打开浏览器，请手动访问上述链接", level="warning"))
 
     async def _callback(self) -> AuthorizationCodeResult:
         if self._server is None:

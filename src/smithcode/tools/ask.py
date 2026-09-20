@@ -4,17 +4,17 @@
 的多个决策一起问完，避免来回打断。**每题必须给 1-5 个候选项 options**（强制遵守）：
 用户按键即选，另有一行「输入自定义回答」可自由输入，因此无需再留"无选项的纯文本题"。
 multiple=True 表示该题可多选（可同时勾选多个选项，并与自定义回答合并计入答案）。
-工具把入参归一化后交给 renderer 的 `ask_form`：CLI 逐题串行提问，TUI 用一个面板承载
+工具把入参归一化后交给前端的 `ask_form`：CLI 逐题串行提问，TUI 用一个面板承载
 全部问题并支持手动切题（←/→ 或 Tab 切换）。用户的回答通过工具结果回传给模型：单题
-直接返回答案，多题返回编号列表。渲染交给 renderer（CLI 编号选择，TUI 方向键/数字键
+直接返回答案，多题返回编号列表。渲染交给前端（CLI 编号选择，TUI 方向键/数字键
 选择），非交互 stdin 下 fail-closed 取消，避免在管道/CI 场景里阻塞等待输入。
 """
 from __future__ import annotations
 
-from .. import renderer
+from .. import frontend
 
 # 直接导入子模块：经包门面 `from ..agent import interactions` 会惰性拉起重链
-from ..agent.interactions import ask as ask_prompt
+from ..event.asks import ask as ask_prompt
 from ..utils.terminal import confirmations_available
 from .base import register
 
@@ -37,7 +37,7 @@ def _describe(args: dict) -> str:
 
 
 def _normalize(questions: list[dict] | None) -> list[dict]:
-    """把模型入参拍平成 renderer.ask_form 认识的统一结构。
+    """把模型入参拍平成 前端 ask_form 认识的统一结构。
 
     每项输出 {question, options: [label...], descriptions: [说明...], multiple}；
     缺题干/非 dict 的项被跳过（模型偶发脏数据时不抛异常，交由调用方判空兜底）。
@@ -140,6 +140,6 @@ def ask_user(questions: list[dict]) -> str:
         payload={"question_count": len(normalized)},
         # 整组答案全为空 = 用户取消了这次提问（每题空串表示该题取消）
         outcome_of=lambda values: "cancelled" if all(not value for value in values) else "answered",
-        run=lambda: renderer.current().ask_form(normalized),
+        run=lambda: frontend.current().ask_form(normalized),
     )
     return _format(normalized, answers)

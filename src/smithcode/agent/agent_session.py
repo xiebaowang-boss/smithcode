@@ -24,8 +24,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .. import goal, plan
+from ..event.catalog import Notice
 from ..skills import state as skills_state
-from .events import Notice
 from .queues import QueueItem
 from .result import RunResult
 
@@ -59,7 +59,8 @@ class AgentSession:
         self.session = agent.session
         self.permission = agent.permission
         self.mcp = agent.mcp
-        self.interactions = agent.interactions
+        # 事件总线：本会话唯一的发布/订阅通道（前端订阅它；会话标识由总线注入）
+        self.events = agent.events
         # 三个会话状态**实例**（目标 / 步骤清单 / 技能激活集合）：本会话的唯一真相。
         # goal.py / plan.py / skills/state.py 原先各自是模块级单例，恢复或切换会话时
         # 会串味（旧会话的目标出现在新会话里）。现在状态随会话对象存续。

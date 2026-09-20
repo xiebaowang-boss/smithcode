@@ -198,6 +198,19 @@ def test_write_failure_disables_store(_isolated, monkeypatch, capsys):
     def boom(path):
         raise OSError("磁盘只读")
 
+    from smithcode.event import Bus, activate, reset
+    from smithcode.frontend.console import ConsoleFrontend
+
+    bus = Bus(session_id="t")
+    bus.subscribe(ConsoleFrontend().on_event)  # 写失败警告走事件，装配终端前端读 stdout
+    token = activate(bus)
+    try:
+        _write_failure_case(store_mod, monkeypatch, boom, capsys)
+    finally:
+        reset(token)
+
+
+def _write_failure_case(store_mod, monkeypatch, boom, capsys):
     monkeypatch.setattr(store_mod.paths, "ensure_private_dir", boom)
     store = SessionStore.create()
     store.append_message({"role": "user", "content": "x"})  # 不得抛异常

@@ -17,7 +17,8 @@ from textual.geometry import Region
 from textual.message import Message
 from textual.widgets import Static, TextArea
 
-from .. import __version__, config, renderer
+from .. import __version__, config
+from ..frontend.render import diff_line_kind
 from .chat import (
     LEVEL_MARK,
     LEVEL_STYLE,
@@ -988,7 +989,7 @@ class ToolCall(Vertical):
 
     def _line_style(self, line: str) -> str | None:
         """diff 行着色；普通行不着色（继承 tool-body 样式）。"""
-        kind = renderer.diff_line_kind(line)
+        kind = diff_line_kind(line)
         return self.DIFF_STYLES.get(kind) if kind else None
 
     def _spin(self) -> None:

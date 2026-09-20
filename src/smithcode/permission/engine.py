@@ -20,12 +20,10 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
-from .. import config, renderer
-
-# 直接导入子模块而不是 `from ..agent import interactions`：后者会经包门面的
-# `__getattr__` 惰性转发把 `agent/agent.py` 整条重链拉进来，而本模块正是那条链上
-# 的一环（成环）。`agent/interactions.py` 只依赖标准库，单向安全。
-from ..agent.interactions import ask as ask_prompt
+from .. import config, frontend
+from ..event import publish
+from ..event.asks import ask as ask_prompt
+from ..event.catalog import Notice
 from ..tools import PATTERN_ARGS, PATTERN_FAMILIES
 from ..utils.terminal import confirmations_available
 from . import shell_policy
@@ -271,7 +269,7 @@ class Permission:
         if action == ALLOW:
             return True
         if action == DENY:
-            renderer.current().error(f"已被权限规则拒绝: {tool_name}（模式 {pattern}）")
+            publish(Notice(f"已被权限规则拒绝: {tool_name}（模式 {pattern}）", level="error"))
             return False
         return self._dispatch_ask(tool_name, asked, remember, content)
 
@@ -320,7 +318,7 @@ class Permission:
             for pat in patterns
         ]
         if any(a == DENY for a in actions):
-            renderer.current().error(f"已被权限规则拒绝: {tool_name}（目标含保护/受限路径）")
+            publish(Notice(f"已被权限规则拒绝: {tool_name}（目标含保护/受限路径）", level="error"))
             return False
         if any(a == ASK for a in actions):
             if self.approved_all:
@@ -343,9 +341,9 @@ class Permission:
         if self.approved_all:
             return "once", root
         if not confirmations_available():
-            renderer.current().error(f"非交互模式，无法确认越界访问，已拒绝: {raw_path}")
+            publish(Notice(f"非交互模式，无法确认越界访问，已拒绝: {raw_path}", level="error"))
             return "deny", None
-        r = renderer.current()
+        r = frontend.current()
         title = f"允许访问授权目录之外的路径 {raw_path}?"
         descriptions = {
             "y": _clip(f"仅本次访问 {target}"),
@@ -452,11 +450,12 @@ class Permission:
         能被后续命中。remember=False 时只提供 y/n。变更预览（diff）不在这里展示——
         它由 Agent 在确认前推送到工具调用块，与权限框解耦。"""
         if not confirmations_available():
-            renderer.current().error(
-                f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）"
-            )
+            publish(Notice(
+                f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）",
+                level="error",
+            ))
             return False
-        r = renderer.current()
+        r = frontend.current()
         proposals = self._remember_proposals(tool_name, patterns) if remember else []
         title = f"允许执行 {tool_name}?"
         descriptions = {"y": "仅本次执行", "n": "拒绝并跳过该操作"}

@@ -18,7 +18,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config, renderer
+from .. import config, frontend
+from ..event import publish
+from ..event.catalog import Notice
 from . import frontmatter
 
 SKILL_FILENAME = "SKILL.md"
@@ -262,18 +264,18 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
     if key in _session_trusted or bool(load_trust().get(key)):
         return True
     # 延迟导入：utils.terminal 导入 commands，而 commands 导入 skills，顶层导入会成环
-    from ..agent.interactions import ask as ask_prompt
+    from ..event.asks import ask as ask_prompt
     from ..utils.terminal import confirmations_available
 
     if not confirmations_available():
         diagnostics.append("非交互模式，已跳过项目技能（[skills].project=ask）")
-        renderer.current().info(
+        publish(Notice(
             f"  [技能] 发现 {len(preview)} 个项目技能，非交互模式已跳过"
             "（[skills].project=ask）"
-        )
+        ))
         return False
 
-    r = renderer.current()
+    r = frontend.current()
     detail = ["发现项目技能（随仓库分发，可能不可信）:"] + [
         f"- {skill.name}: {skill.description[:60]}" for skill in preview
     ]
@@ -292,7 +294,7 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
     if answer in ("y", "a"):
         if answer == "a":
             remember_project(key)
-            renderer.current().info(f"  已记住信任项目: {key}")
+            publish(Notice(f"  已记住信任项目: {key}"))
         _session_trusted.add(key)
         return True
     diagnostics.append("用户跳过了项目技能")

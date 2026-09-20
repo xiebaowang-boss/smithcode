@@ -5,11 +5,10 @@ import pytest
 from rich.text import Text
 from textual.geometry import Region
 
-import smithcode.renderer as renderer_module
 from smithcode.agent import Agent
+from smithcode.event.catalog import Notice as NoticeEvent
 from smithcode.session import Session
 from smithcode.tui.app import SmithTUI
-from smithcode.tui.bridge import TuiRenderer
 from smithcode.tui.chat import (
     LEVEL_MARK,
     LEVEL_STYLE,
@@ -31,11 +30,8 @@ from smithcode.tui.widgets import ChatView, ToolCall
 
 @pytest.fixture(autouse=True)
 def restore_renderer():
-    from smithcode import renderer
 
-    backup = renderer._current
     yield
-    renderer_module.set_renderer(backup)
 
 
 class FakeLLM:
@@ -159,15 +155,14 @@ def test_ui_notice_routes_through_apply(monkeypatch):
     _run(_run_case())
 
 
-def test_tui_renderer_info_warn_error_use_levels(monkeypatch):
-    """TuiRenderer.info/warn/error 投递带级别的通知，不再手写 style。"""
+def test_tui_notice_levels(monkeypatch):
+    """通知按级别投递（Notice 事件带 level），前端不再手写 style。"""
     async def _run_case():
         app = SmithTUI(_make_agent(monkeypatch))
         async with app.run_test() as pilot:
-            r = TuiRenderer(app)
-            r.info("普通")
-            r.warn("警告")
-            r.error("错误")
+            app.agent.events.publish(NoticeEvent("普通"))
+            app.agent.events.publish(NoticeEvent("警告", level="warning"))
+            app.agent.events.publish(NoticeEvent("错误", level="error"))
             await pilot.pause()
             notices = [str(w.content) for w in app.query_one(ChatView).query(".notice")]
             joined = "\n".join(notices)

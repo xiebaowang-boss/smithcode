@@ -1,38 +1,55 @@
-"""TUI 渲染后端：把 Agent 的终端交互桥接到 Textual 界面。
+"""TUI 前端：事件订阅者 + 询问端口。
 
-**线程不变量（承重，改动前先读）**：Agent 的任务本身跑在 Textual 的事件循环
-上（`app.run_worker`），但**所有会弹窗的调用都来自 Agent 下放的 worker 线程**——
-预检（权限确认 / 越界授权）与工具执行（`ask_user` / 技能信任）都经
-`asyncio.to_thread` 执行（见 `agent/tools_run.py`）。因此：
+与 `frontend/console.py` 的关系：同一个契约（订阅事件 + 实现 `Asker`）、同一批判定
+逻辑，只有「呈现」不同——本类把事件投成 `UiAction` 交给 Textual 主线程，把询问
+交给面板。
 
-- 即发即走的更新用 `post_message`：线程安全，从循环线程或 worker 线程都可以；
+**线程不变量（承重，改动前先读）**：Agent 的任务跑在 Textual 的事件循环上
+（`app.run_worker`），但**所有会弹窗的调用都来自 worker 线程**——预检
+（权限确认 / 越界授权）与工具执行（`ask_user` / 技能信任）都经 `asyncio.to_thread`
+执行（见 `agent/tools_run.py`）。因此：
+
+- 即发即走的通知用 `post_message`：线程安全，从循环线程或 worker 线程都可以；
 - 需要结果的弹窗用 `call_from_thread` + `Event`：**只能从 worker 线程调用**
   （Textual 在同一个线程上调用它会直接抛 `RuntimeError`，这也是上一条不变量的
   自动保护）。
 
-若将来把预检/工具执行搬回循环线程，这两处会立刻炸——那正是我们想要的信号：
-那时必须改成 `push_screen_wait`（异步等待），而不是让 `Event.wait()` 冻住循环。
+阶段 C 会把询问改成事件化的请求-应答（`asked → replied`），届时这里换成
+`push_screen_wait`，`call_from_thread` 与 `Event` 一起退场。
 """
+
 from __future__ import annotations
 
 import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from .. import config, plan, renderer
+from .. import config
+from ..event.catalog import (
+    MessageEnd,
+    MessageUpdate,
+    Notice,
+    PlanUpdate,
+    QueueChanged,
+    QueuedPromptDelivered,
+    StatusChanged,
+    StatusCleared,
+    TitleChanged,
+    ToolEnd,
+    ToolPreview,
+    ToolStart,
+)
+from ..event.envelope import Envelope
 from .widgets import UiAction
 
 if TYPE_CHECKING:
     from .app import SmithTUI
 
 
-class TuiRenderer(renderer.Renderer):
-    """Agent 与 SmithTUI 之间唯一的线程侧通道（renderer 基类的 TUI 实现）。
-
-    Agent 事件经 post_message 投递到宿主，由主线程消费渲染。"""
+class TuiFrontend:
+    """SmithTUI 的前端实现：唯一与 Agent 交互的一侧。"""
 
     def __init__(self, app: SmithTUI):
-        super().__init__()
         self.app = app
         self._thinking: int | None = None  # 正在思考时累计的字符数
         # 挂起中的弹窗等待：{就绪事件: 结果槽}。唤醒口见 abandon_pending
@@ -40,82 +57,68 @@ class TuiRenderer(renderer.Renderer):
         self._pending_lock = threading.Lock()
         self._closed = False  # 界面已收尾：此后的询问直接走默认值，不进等待
 
+    # ----- 通知面：事件订阅者 -----
+
+    def on_event(self, env: Envelope) -> None:
+        """事件 → UiAction（主线程消费）。未列出的事件在 TUI 无额外表现。"""
+        data = env.data
+        match data:
+            case MessageUpdate(kind="reasoning", delta=delta):
+                self._thinking_tick(delta)
+            case MessageUpdate(kind=kind, delta=delta):
+                self._thinking_done()
+                self._post("stream", kind, delta)
+            case MessageEnd():
+                self._thinking_done()
+                self._post("stream_done")
+            case ToolStart(tool_call_id=tool_call_id, line=line, display=display, name=name):
+                # id 由模型给出（agent 侧生成），前端只做查表——不再自行编号
+                self._post("tool_start", tool_call_id, line, display, name)
+            case ToolPreview(tool_call_id=tool_call_id, detail=detail):
+                self._post("tool_preview", tool_call_id, detail)
+            case ToolEnd(tool_call_id=tool_call_id, result=result, is_error=is_error,
+                         expand=expand):
+                expanded = is_error or expand or config.load_tool_display() == "detail"
+                self._post("tool_result", tool_call_id, result, expanded, is_error)
+            case PlanUpdate(tool_call_id=tool_call_id, created=created,
+                            rendered=rendered, titles=titles):
+                # 两种渲染形态都由载荷带来（前端不读会话状态）；侧边栏始终刷新，
+                # 聊天区仅新建清单时展示一次详情——复用 plan 工具块，可展开/收起、
+                # 默认展开；后续每步更新不再往对话区重复打印进度
+                self._post("plan_sidebar", titles)
+                if created:
+                    self._post("tool_result", tool_call_id, rendered, True, False)
+            case Notice(text=text, level=level):
+                self._post("notice", text, level)
+            case TitleChanged(title=title):
+                self._post("title", title)
+            case StatusChanged(kind="retry", owner=owner, payload=state):
+                self._post("retry_start", state, owner)
+            case StatusCleared(kind="retry", owner=owner):
+                self._post("retry_end", owner)
+            case QueueChanged():
+                self.app.post_message(UiAction("queue", data))
+            case QueuedPromptDelivered(text=text):
+                self.app.post_message(UiAction("queued_delivered", text))
+            case _:
+                return
+
     def _post(self, action: str, *args) -> None:
         self.app.post_message(UiAction(action, *args))
 
-    def stream(self, kind: str, chunk: str) -> None:
-        if kind == "reasoning":
-            if self._thinking is None:
-                self._thinking = 0
-                self._post("thinking_start")
-            self._thinking += len(chunk)
-            self._post("thinking_tick", chunk)
-        else:
-            if self._thinking is not None:
-                self._post("thinking_done")
-                self._thinking = None
-            self._post("stream", kind, chunk)
+    def _thinking_tick(self, chunk: str) -> None:
+        if self._thinking is None:
+            self._thinking = 0
+            self._post("thinking_start")
+        self._thinking += len(chunk)
+        self._post("thinking_tick", chunk)
 
-    def stream_done(self) -> None:
+    def _thinking_done(self) -> None:
         if self._thinking is not None:
             self._post("thinking_done")
             self._thinking = None
-        else:
-            self._post("stream_done")
 
-    def tool_call(self, line: str, display: str = "inline", name: str = "") -> int:
-        """opencode 式 pending 行：摘要先上屏转轮，结果到了原地更新。
-
-        name 供 TUI 判定是否归入「已探索」上下文汇总块（读取/搜索/列目录）。"""
-        tool_id = self._next_tool_id()
-        self._post("tool_start", tool_id, line, display, name)
-        return tool_id
-
-    def tool_preview(self, tool_id: int | None, detail: str) -> None:
-        """执行前的变更预览（diff）：推给对应的 pending 工具块，审核时已可见。"""
-        self._post("tool_preview", tool_id, detail)
-
-    def tool_result(self, result: str, tool_id: int | None = None,
-                    expand: bool = False) -> None:
-        is_error = result.startswith("错误:") or result == "用户拒绝了此操作"
-        expanded = is_error or expand or config.load_tool_display() == "detail"
-        self._post("tool_result", tool_id, result, expanded, is_error)
-
-    def plan(self, summary: str, rendered: str, *, created: bool = False,
-             tool_id: int | None = None) -> None:
-        # 侧边栏始终刷新；聊天区仅新建清单时展示一次详情——复用 plan 工具块，
-        # 可展开/收起、默认展开；后续每步更新不再往对话区重复打印进度
-        self._post("plan_sidebar", plan.render_titles(color=True))
-        if created:
-            self._post("tool_result", tool_id, plan.render_current(), True, False)
-
-    def info(self, text: str) -> None:
-        self._post("notice", text, "info")
-
-    def success(self, text: str) -> None:
-        self._post("notice", text, "success")
-
-    def warn(self, text: str) -> None:
-        self._post("notice", text, "warning")
-
-    def error(self, text: str) -> None:
-        self._post("notice", text, "error")
-
-    def title_changed(self, title: str) -> None:
-        """会话标题变化（/rename 或后台自动标题）：通知主线程刷新底栏。"""
-        self._post("title", title)
-
-    def retry_started(self, state, owner=None) -> None:
-        """模型请求失败即将重试：宿主在运行动画行显示「正在重试 N/M · Xs 后」。
-
-        不落对话区（对齐 opencode：重试进度属于状态行，不是对话内容）；已上屏的
-        那一段正文由宿主标记为中断，避免与重试后的正文看起来一模一样。
-        owner 随事件带上，宿主据此只清自己那条重试态（后台标题可能同时在重试）。"""
-        self._post("retry_start", state, owner)
-
-    def retry_finished(self, owner=None) -> None:
-        """重试过程结束（成功或放弃）：清除运行动画行的重试态。"""
-        self._post("retry_end", owner)
+    # ----- 询问面：面板 -----
 
     def ask_form(self, questions: list[dict]) -> list[str]:
         """一次提交 1-N 个问题：单个面板承载，可手动切题，答完一次性回传。"""

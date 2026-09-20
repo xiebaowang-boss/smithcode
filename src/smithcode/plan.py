@@ -156,11 +156,11 @@ _active_state = _default_state
 def bind(state: PlanState | None) -> None:
     """切换本模块函数作用的状态实例（`None` = 回到默认实例）。
 
-    与 `renderer.current()` / `signal.activate_token()` 同一套"活动实例"模式：
+    与 `event.activate()` / `signal.activate_token()` 同一套"活动实例"模式：
     调用点太多（session.py、commands/*、tui/app.py、tui/sidebar），与其逐个改成
     `session.plan_state.xxx()`，不如让既有函数指向当前实例。**局限**：同一进程
     同时跑两个会话会互相覆盖——这与改造前的单例行为一致，不会更糟；TUI/REPL
-    都是一个进程一个会话。
+    都是一个进程一个会话（阶段 D 会把它收敛到会话对象上）。
     """
     global _active_state
     _active_state = state if state is not None else _default_state

@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import smithcode.renderer as renderer_module
 from smithcode import config
 from smithcode.agent import Agent
 from smithcode.session import Session
@@ -20,11 +19,8 @@ from smithcode.tui.widgets import ChatInput, QueuePanel, QueueRow, display_width
 
 @pytest.fixture(autouse=True)
 def restore_renderer():
-    from smithcode import renderer
 
-    backup = renderer._current
     yield
-    renderer_module.set_renderer(backup)
 
 
 @pytest.fixture(autouse=True)
@@ -272,18 +268,18 @@ def test_delivered_queued_prompt_lands_in_the_chat(monkeypatch):
 
 def test_steering_delivery_marks_the_event(monkeypatch):
     """投递事件带得动"是插话还是续跑"：前端不必自己猜（具体事件，不靠类型推断）。"""
-    from smithcode.agent.events import QueuedPromptDelivered
+    from smithcode.event.catalog import QueuedPromptDelivered
 
     agent = _make_agent(monkeypatch)
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
     agent.steer("插话")
     agent.follow_up("续跑")
 
     agent.get_steering_messages()
     agent.get_follow_up_messages()
 
-    delivered = [e for e in seen if isinstance(e, QueuedPromptDelivered)]
+    delivered = [env.data for env in seen if isinstance(env.data, QueuedPromptDelivered)]
     assert [(e.text, e.steering) for e in delivered] == [("插话", True), ("续跑", False)]
 
 

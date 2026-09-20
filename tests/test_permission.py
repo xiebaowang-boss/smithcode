@@ -130,26 +130,55 @@ def test_ask_approved_once_does_not_remember(make_perm, monkeypatch):
     assert perm.session_rules == []
 
 
-class _CaptureRenderer:
-    def __init__(self):
-        self.infos = []
-        self.calls = []
+@pytest.fixture
+def capture():
+    """捕获权限提示的两个通道：询问端口收到的参数 + Notice 事件。
 
-    def info(self, text):
-        self.infos.append(text)
+    权限信息经 `frontend.current().confirm_choice(...)` 传参（标题 / 工具摘要 /
+    选项小字都在那里成形），而提示文本走事件总线——所以这里两样都收。
+    """
+    from smithcode import event as event_module
+    from smithcode import frontend
+    from smithcode.event import Bus
+    from smithcode.event.catalog import Notice
 
-    warn = info
-    error = info
+    class _Capture:
+        def __init__(self):
+            self.infos = []
+            self.calls = []
 
-    def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
-        self.calls.append((prompt, valid, detail, descriptions, content))
-        return "n"
+        def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None,
+                           content=None):
+            self.calls.append((prompt, valid, detail, descriptions, content))
+            return "n"
+
+        def ask_form(self, questions):
+            self.calls.append(("form", questions))
+            return ["" for _ in questions]
+
+        def ask_text(self, question):
+            return ""
+
+        def ask_choice(self, question, options, multiple=False, descriptions=None):
+            return ""
+
+        def on_event(self, env):
+            if isinstance(env.data, Notice):
+                self.infos.append(env.data.text)
+
+    cap = _Capture()
+    bus = Bus(session_id="t")
+    bus.subscribe(cap.on_event)
+    bus_token = event_module.activate(bus)
+    asker_token = frontend.activate(cap)
+    yield cap
+    frontend.reset(asker_token)
+    event_module.reset(bus_token)
 
 
-def test_ask_renders_options_in_confirm_not_chat(make_perm, monkeypatch):
+def test_ask_renders_options_in_confirm_not_chat(make_perm, monkeypatch, capture):
+    cap = capture
     """权限信息经 confirm_choice 传参：标题统一、工具摘要作为 content、副作用进选项小字。"""
-    cap = _CaptureRenderer()
-    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
     perm = make_perm(permissions={"write_file": "ask"})
 
     assert perm.check("write_file", {"path": "a.txt"}, content="write a.txt") is False
@@ -163,10 +192,9 @@ def test_ask_renders_options_in_confirm_not_chat(make_perm, monkeypatch):
     assert "本会话将记住" in descriptions["a"]
 
 
-def test_ask_truncates_long_content_and_option_descriptions(make_perm, monkeypatch):
+def test_ask_truncates_long_content_and_option_descriptions(make_perm, monkeypatch, capture):
+    cap = capture
     """确认框不再全量打印：工具摘要与「总是允许」小字都压平并截断到 CONFIRM_LIMIT。"""
-    cap = _CaptureRenderer()
-    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
     perm = make_perm(permissions={"run_command": "ask"})
     command = "mytool --flag " + "x" * 200  # 未登记命令 → 记忆候选退回整段（足够长）
 
@@ -181,10 +209,9 @@ def test_ask_truncates_long_content_and_option_descriptions(make_perm, monkeypat
     assert perm.session_rules == []
 
 
-def test_ask_clips_content_to_single_line(make_perm, monkeypatch):
+def test_ask_clips_content_to_single_line(make_perm, monkeypatch, capture):
+    cap = capture
     """content 内含换行时压成单行，避免撑破确认框布局。"""
-    cap = _CaptureRenderer()
-    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
     perm = make_perm(permissions={"write_file": "ask"})
 
     assert perm.check("write_file", {"path": "a.txt"},
@@ -409,14 +436,13 @@ def test_ask_outside_access_once_always_deny(tmp_path, monkeypatch):
     assert perm.ask_outside_access("x.py", outside / "x.py") == ("deny", None)
 
 
-def test_ask_outside_access_renders_detail(tmp_path, monkeypatch):
+def test_ask_outside_access_renders_detail(tmp_path, monkeypatch, capture):
+    cap = capture
     """越界路径授权信息也走 confirm_choice 传参，聊天区不重复打印。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
     outside = tmp_path.parent / (tmp_path.name + "-od")
     outside.mkdir()
-    cap = _CaptureRenderer()
-    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
 
     assert Permission().ask_outside_access("x.py", outside / "x.py") == ("deny", None)
     assert cap.infos == []
@@ -427,14 +453,13 @@ def test_ask_outside_access_renders_detail(tmp_path, monkeypatch):
     assert "信任目录" in descriptions["a"]
 
 
-def test_ask_outside_access_truncates_long_option_descriptions(tmp_path, monkeypatch):
+def test_ask_outside_access_truncates_long_option_descriptions(tmp_path, monkeypatch, capture):
+    cap = capture
     """越界授权的选项小字含长路径时同样截断，不把整条路径铺满终端。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
     outside = tmp_path.parent / (tmp_path.name + "-" + "o" * 80)
     outside.mkdir()
-    cap = _CaptureRenderer()
-    monkeypatch.setattr("smithcode.permission.engine.renderer.current", lambda: cap)
 
     assert Permission().ask_outside_access("x.py", outside / "x.py") == ("deny", None)
     _prompt, _valid, _detail, descriptions, _content = cap.calls[0]

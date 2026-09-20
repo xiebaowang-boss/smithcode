@@ -16,7 +16,7 @@ import pytest
 
 from smithcode import config
 from smithcode.agent import Agent, emitter
-from smithcode.agent.status import StatusChanged, StatusCleared
+from smithcode.event.catalog import StatusChanged, StatusCleared
 from smithcode.llm import client as client_mod
 from smithcode.llm.client import LLMClient
 from smithcode.session import Session
@@ -38,10 +38,9 @@ class _FakeView:
         self.finished += 1
 
 
-def _patch_retry(monkeypatch, view) -> None:
+def _patch_retry(monkeypatch, view=None) -> None:
     monkeypatch.setattr(client_mod.config, "MAX_RETRIES", 2)
     monkeypatch.setattr(client_mod.retry_mod, "wait", lambda state: None)  # 不真的退避
-    monkeypatch.setattr("smithcode.renderer.current", lambda: view)
 
 
 def _failing_client() -> LLMClient:
@@ -102,21 +101,11 @@ def test_retry_emits_status_events_when_channel_exists(monkeypatch):
 
     assert [type(event).__name__ for event in seen] == ["StatusChanged", "StatusCleared"]
     started, cleared = seen
+    # 这条走 emitter 通道：记录器直接拿到**载荷**（不经总线信封）
     assert started.kind == cleared.kind == "retry"
     assert started.owner is not None  # owner 带上：前台与后台标题各自的态互不误清
     assert started.payload is not None  # RetryState 原样透传（TUI 靠它渲染序号与倒计时）
     assert view.retries == [] and view.finished == 0  # 不得重复上报
-
-
-def test_retry_falls_back_to_renderer_without_channel(monkeypatch):
-    """没有通道（单测直接调客户端、无 Agent 的调用方）：退回渲染器直调。"""
-    view = _FakeView()
-    _patch_retry(monkeypatch, view)
-
-    list(_one_retry_client().chat_stream([{"role": "user", "content": "问题"}]))
-
-    assert len(view.retries) == 1
-    assert view.finished == 1
 
 
 # ---------- compaction ----------
@@ -149,32 +138,32 @@ def _over_threshold_agent(monkeypatch, summary: str) -> Agent:
 def test_compact_emits_status_pair(monkeypatch):
     agent = _over_threshold_agent(monkeypatch, SUMMARY)
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
 
     assert asyncio.run(agent.compact()) is True
 
-    kinds = [type(event).__name__ for event in seen]
+    kinds = [type(env.data).__name__ for env in seen]
     # 压缩的进度文案现在也走事件（Notice），与忙碌态（StatusChanged/Cleared）分开：
     # 前者是"说了什么"，后者是"忙不忙"，前端各自消费。顺序是「开始忙 → 不忙了 → 结果文案」。
     assert kinds == ["StatusChanged", "StatusCleared", "Notice"]
-    assert seen[0].kind == seen[1].kind == "compaction"
-    assert "压缩" in seen[0].text
-    assert "已压缩" in seen[2].text
+    assert seen[0].data.kind == seen[1].data.kind == "compaction"
+    assert "压缩" in seen[0].data.text
+    assert "已压缩" in seen[2].data.text
 
 
 def test_compact_failure_still_clears_the_status(monkeypatch):
     """摘要不合格（放弃压缩）也要摘掉忙碌态，否则前端一直显示「正在压缩」。"""
     agent = _over_threshold_agent(monkeypatch, "不合格的摘要")
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
 
     assert asyncio.run(agent.compact()) is False
 
     # 放弃压缩：忙碌态照样摘掉（否则前端一直显示"正在压缩"），并说明为什么放弃
-    assert [type(event).__name__ for event in seen] == [
+    assert [type(env.data).__name__ for env in seen] == [
         "StatusChanged", "StatusCleared", "Notice",
     ]
-    assert "放弃本次压缩" in seen[2].text
+    assert "放弃本次压缩" in seen[2].data.text
 
 
 @pytest.mark.parametrize("mode", ["empty"])
@@ -183,7 +172,7 @@ def test_compact_without_middle_emits_nothing(monkeypatch, mode):
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: _SummaryLLM(SUMMARY))
     agent = Agent(session=Session())
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
 
     assert asyncio.run(agent.compact()) is False
     assert seen == []

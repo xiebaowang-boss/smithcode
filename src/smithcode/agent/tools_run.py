@@ -12,7 +12,7 @@ import asyncio
 import inspect
 from typing import TYPE_CHECKING
 
-from .events import Notice
+from ..event.catalog import Notice
 from .signal import AbortSignal
 
 if TYPE_CHECKING:

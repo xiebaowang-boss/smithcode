@@ -7,8 +7,9 @@ import threading
 
 import pytest
 
-from smithcode import config, renderer
+from smithcode import config, frontend
 from smithcode.agent import TITLE_MAX_ATTEMPTS, TITLE_RETRY_ROUNDS, Agent
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 
 
@@ -32,15 +33,14 @@ def agent(tmp_path, monkeypatch):
         "[sessions]\nauto_title = true\ncleanup_days = 0\n", encoding="utf-8"
     )
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM())
-    backup = renderer._current
-    renderer.set_renderer(renderer.ConsoleRenderer())
     monkeypatch.setattr(
         "smithcode.permission.engine.confirmations_available", lambda: True
     )
     instance = Agent(session=Session(), persist=True)
+    # 装配终端前端（订阅事件 + 接受询问），与生产一致
+    frontend.attach(instance.events, ConsoleFrontend())
     instance.session.add("user", "帮我重构会话管理模块")
     yield instance
-    renderer.set_renderer(backup)
 
 
 def _wait_title_threads() -> None:

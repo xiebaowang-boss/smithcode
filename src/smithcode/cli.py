@@ -4,13 +4,15 @@ import sys
 import threading
 from pathlib import Path
 
-from . import __version__, commands, config, renderer, sessions, title
+from . import __version__, commands, config, sessions, title
 from .agent import (
     INTERRUPTED_NOTE,
     STREAM_INTERRUPTED_NOTE,
     Agent,
     format_stream_interrupted,
 )
+from .frontend import attach as attach_frontend
+from .frontend.console import ConsoleFrontend
 from .session import Session
 from .utils.proxy import normalize_proxy_env
 from .utils.terminal import (
@@ -320,10 +322,13 @@ def main(argv=None):
     agent.start()  # 启动模型目录：外部未配置时后台拉取 /models（不阻塞启动）
     _cleanup_old_sessions()
     interactive = not args.task and confirmations_available()
-    if interactive:
-        # 尽早接管窗口标题：`--name` / 恢复会话的标题事件发生在宿主启动之前，
-        # 由标题呈现器暂存，宿主首屏时统一写出（非 tty 自动失效）
-        renderer.set_renderer(title.attach(renderer.current(), agent=agent))
+    # 装配终端前端：**无条件**——事件必须有接收方，否则单次任务 / 管道 / CI 下
+    # 一切呈现（含工具摘要与错误）都会静默消失。交互终端随后由 TUI 接管装配。
+    # 窗口标题尽早接管：`--name` / 恢复会话的标题事件发生在宿主启动之前，由标题
+    # 呈现器暂存，宿主首屏时统一写出（非 tty 自动失效）。
+    presenter = title.enable_title() if interactive else None
+    extras = (presenter.on_agent_event,) if presenter is not None else ()
+    attach_frontend(agent.events, ConsoleFrontend(), extra_subscribers=extras)
     if restoring:
         _resume_session(agent, args.continue_session, args.resume)
     if args.name:

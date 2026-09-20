@@ -14,8 +14,9 @@ import time
 
 import pytest
 
-from smithcode import config
+from smithcode import config, frontend
 from smithcode.agent import Agent
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 from smithcode.tools import FUNCTIONS, SERIAL
 
@@ -24,6 +25,15 @@ from smithcode.tools import FUNCTIONS, SERIAL
 def enable_prompting(monkeypatch):
     """pytest 环境下 stdin 非 TTY，显式放行交互确认，否则权限确认会全部 fail-closed 拒绝。"""
     monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: True)
+
+
+
+
+def _console_agent(**kwargs):
+    """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例用 capsys 读输出。"""
+    agent = Agent(session=Session(), **kwargs)
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
 
 
 def _tc(name, args="{}", call_id="1"):
@@ -49,7 +59,7 @@ def _tool_calls_llm(batches):
 
 def _make_agent(monkeypatch, batches):
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(batches))
-    agent = Agent(session=Session())
+    agent = _console_agent()
     # 假工具不在权限规则表内，默认 ask 会弹确认；测试统一放行
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
     return agent
@@ -188,7 +198,7 @@ def test_denial_happens_before_any_execution(monkeypatch, tmp_path):
 
     monkeypatch.setitem(FUNCTIONS, "fake_tool", tool)
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     seen = []
 
@@ -236,7 +246,7 @@ def test_serial_executes_before_later_preflight(monkeypatch, tmp_path):
         _tc("cmd_tool", args='{"tag": "cmd2"}', call_id="3"),
     ]
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     def check(name, args, content=None):
         events.append(("check", args.get("tag")))
@@ -277,7 +287,7 @@ def test_wave_runs_before_serial_barrier(monkeypatch, tmp_path):
         _tc("cmd_tool", args='{"tag": "c"}', call_id="3"),
     ]
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
     monkeypatch.setattr(agent.permission, "check", lambda name, args, content=None: True)
 
     asyncio.run(agent.run("屏障"))
@@ -301,7 +311,7 @@ def test_denied_after_executed_serial_keeps_partial(monkeypatch, tmp_path):
 
     calls = [_tc("cmd_tool", call_id="1"), _tc("fake_tool", call_id="2")]
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     seen = []
     monkeypatch.setattr(
@@ -321,86 +331,49 @@ def test_denied_after_executed_serial_keeps_partial(monkeypatch, tmp_path):
 # ---------- 展示分组的隐式契约 ----------
 
 def test_tool_start_events_precede_ordered_results(monkeypatch):
-    """TUI 的「已探索」分组依赖：同批 tool_calls 的 tool_call（start）全部
-    先于结果到达，且结果按请求顺序到达（不按完成顺序）。"""
+    """TUI 的「已探索」分组依赖：同批 tool_calls 的 ToolStart 全部先于结果到达，
+    且结果按请求顺序到达（不按完成顺序）。id 由模型给出（agent 侧生成）。"""
     calls = [_tc("fake_tool", call_id=str(i)) for i in (1, 2, 3)]
     monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
     agent = _make_agent(monkeypatch, calls)
 
-    events = []
+    class CapSubscriber:
+        """记录工具事件的到达顺序（前端就是这么消费的）。"""
 
-    class CapRenderer:
         def __init__(self):
-            self.seq = 0
+            self.events = []
 
-        def tool_call(self, line, display="inline", name=""):
-            self.seq += 1
-            events.append(("start", self.seq))
-            return self.seq
+        def __call__(self, env):
+            from smithcode.event.catalog import ToolEnd, ToolStart
 
-        def tool_result(self, result, tool_id=None, expand=False):
-            events.append(("result", tool_id))
+            if isinstance(env.data, ToolStart):
+                self.events.append(("start", env.data.tool_call_id))
+            elif isinstance(env.data, ToolEnd):
+                self.events.append(("result", env.data.tool_call_id))
 
-        def stream(self, kind, chunk):
-            pass
-
-        def stream_done(self):
-            pass
-
-        def info(self, text):
-            pass
-
-        warn = info
-        error = info
-
-        def turn_started(self):
-            pass
-
-        def turn_finished(self, status="ok"):
-            pass
-
-    monkeypatch.setattr("smithcode.renderer._current", CapRenderer())
+    cap = CapSubscriber()
+    agent.events.subscribe(cap)
     asyncio.run(agent.run("契约"))
 
-    kinds = [kind for kind, _ in events]
+    kinds = [kind for kind, _ in cap.events]
     last_start = max(i for i, kind in enumerate(kinds) if kind == "start")
     first_result = min(i for i, kind in enumerate(kinds) if kind == "result")
     assert last_start < first_result  # 全部 start 先于任何 result
-    assert [arg for kind, arg in events if kind == "start"] == [1, 2, 3]
-    assert [arg for kind, arg in events if kind == "result"] == [1, 2, 3]  # 按请求顺序
+    assert [arg for kind, arg in cap.events if kind == "start"] == ["1", "2", "3"]
+    assert [arg for kind, arg in cap.events if kind == "result"] == ["1", "2", "3"]
 
 
-class _CapRenderer:
-    """记录 (tool_id, result) 的假渲染后端，验证 pending 工具块被收尾。"""
+class _CapSubscriber:
+    """记录 (tool_call_id, result) 的订阅者，验证 pending 工具块被收尾。"""
 
     def __init__(self):
-        self.seq = 0
         self.results = []
 
-    def tool_call(self, line, display="inline", name=""):
-        self.seq += 1
-        return self.seq
+    def __call__(self, env):
+        from smithcode.event.catalog import ToolEnd
 
-    def tool_result(self, result, tool_id=None, expand=False):
-        self.results.append((tool_id, result))
-
-    def stream(self, kind, chunk):
-        pass
-
-    def stream_done(self):
-        pass
-
-    def info(self, text):
-        pass
-
-    warn = info
-    error = info
-
-    def turn_started(self):
-        pass
-
-    def turn_finished(self, status="ok"):
-        pass
+        if isinstance(env.data, ToolEnd):
+            self.results.append((env.data.tool_call_id, env.data.result))
 
 
 def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
@@ -409,21 +382,21 @@ def test_skipped_plan_closes_pending_widget_on_denial(monkeypatch, tmp_path):
     calls = [_tc("fake_tool", call_id="1"), _tc("fake_tool", call_id="2")]
     monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     seen = []
     monkeypatch.setattr(
         agent.permission, "check",
         lambda name, args, content=None: seen.append(name) or len(seen) == 1,  # 第二次拒绝
     )
-    cap = _CapRenderer()
-    monkeypatch.setattr("smithcode.renderer._current", cap)
+    cap = _CapSubscriber()
+    agent.events.subscribe(cap)
 
     asyncio.run(agent.run("拒绝"))
 
-    # 计划 1（tool_id=1）被跳过 → SKIPPED；计划 2（tool_id=2）被拒 → DENIED
-    assert cap.results[0] == (1, "（未执行：权限请求被拒绝，任务已中止）")
-    assert cap.results[1][0] == 2 and cap.results[1][1] == "用户拒绝了此操作"
+    # 计划 1 被跳过 → SKIPPED；计划 2 被拒 → DENIED（id 是模型的 tool_call_id）
+    assert cap.results[0] == ("1", "（未执行：权限请求被拒绝，任务已中止）")
+    assert cap.results[1][0] == "2" and cap.results[1][1] == "用户拒绝了此操作"
 
 
 def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
@@ -435,7 +408,7 @@ def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
              _tc("fake_tool", call_id="3")]
     monkeypatch.setitem(FUNCTIONS, "fake_tool", lambda: "ok")
     monkeypatch.setattr("smithcode.agent.LLMClient", _tool_calls_llm(calls))
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     seen = []
 
@@ -446,12 +419,12 @@ def test_skipped_plan_closes_pending_widget_on_interrupt(monkeypatch):
         return True
 
     monkeypatch.setattr(agent.permission, "check", check)
-    cap = _CapRenderer()
-    monkeypatch.setattr("smithcode.renderer._current", cap)
+    cap = _CapSubscriber()
+    agent.events.subscribe(cap)
 
     asyncio.run(agent.run("中断"))
 
     # 三个计划都已预检（各建了 pending 块）、都未执行 → 一律 INTERRUPTED 收尾
-    assert [r[0] for r in cap.results] == [1, 2, 3]
+    assert [r[0] for r in cap.results] == ["1", "2", "3"]
     assert all(r[1] == "（未执行：用户中断了任务）" for r in cap.results)
     assert len(_tool_messages(agent)) == 3  # 会话完整性：每个 id 都有配对结果

@@ -5,9 +5,10 @@ import json
 
 import pytest
 
-from smithcode import goal
+from smithcode import frontend, goal
 from smithcode.agent import Agent
 from smithcode.cancel import RunResult
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 
 
@@ -56,8 +57,11 @@ def _todo_step(title="步骤一", call_id="1"):
 
 
 def _make_agent(monkeypatch, script):
+    """假模型 + 装配终端前端（呈现走事件，与生产一致）。"""
     monkeypatch.setattr("smithcode.agent.LLMClient", _llm(script))
-    return Agent(session=Session())
+    agent = Agent(session=Session())
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
 
 
 def test_run_records_tools_used(monkeypatch):

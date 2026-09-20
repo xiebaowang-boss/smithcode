@@ -141,10 +141,16 @@ class ToolEnd:
 @declare("session.plan.updated")
 @dataclass(frozen=True)
 class PlanUpdate:
-    """步骤清单更新。created=True 表示本次是新建清单（只有此时前端展示整份详情）。"""
+    """步骤清单更新。created=True 表示本次是新建清单（只有此时前端展示整份详情）。
+
+    两种渲染形态都在载荷里（**前端不得再去读会话状态**）：
+    - `rendered`：完整清单（含状态标记），新建时展示在对话区；
+    - `titles`：只列步骤标题，常驻侧边栏用（每步更新都刷新）。
+    """
 
     summary: str
     rendered: str
+    titles: str = ""
     created: bool = False
     tool_call_id: str | None = None
 

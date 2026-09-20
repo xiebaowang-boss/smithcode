@@ -17,13 +17,13 @@ import pytest
 
 from smithcode import goal
 from smithcode.agent import Agent
-from smithcode.agent.events import (
+from smithcode.event.catalog import (
     AgentEnd,
     QueueChanged,
+    TitleChanged,
     TurnEnd,
     TurnStart,
 )
-from smithcode.renderer import Renderer
 from smithcode.session import Session
 
 LIFECYCLE = (TurnStart, TurnEnd, AgentEnd)
@@ -72,166 +72,52 @@ def _make_agent(monkeypatch, script=None) -> Agent:
 
 
 def _names(events) -> list[str]:
-    return [type(event).__name__ for event in events]
+    """载荷类型名序列（订阅者拿到的是信封，载荷在 env.data）。"""
+    return [type(env.data).__name__ for env in events]
 
 
 def _lifecycle(events) -> list:
-    return [event for event in events if isinstance(event, LIFECYCLE)]
+    """只看回合/终结事件（返回信封，断言处用 .data 取载荷）。"""
+    return [env for env in events if isinstance(env.data, LIFECYCLE)]
 
 
-class RecordingRenderer(Renderer):
-    """只记录收到的 Renderer 方法名。"""
+class RecordingSubscriber:
+    """订阅者替身：记下收到的载荷类型名（事件只有一个通道，没有桥）。"""
 
     def __init__(self):
-        super().__init__()
         self.calls: list[str] = []
 
-    def turn_started(self):
-        self.calls.append("turn_started")
-
-    def turn_finished(self, status="ok"):
-        self.calls.append(f"turn_finished:{status}")
-
-    def title_changed(self, title):
-        self.calls.append(f"title_changed:{title}")
-
-
-# ---------- 订阅与事件流 ----------
+    def __call__(self, env) -> None:
+        data = env.data
+        if isinstance(data, TurnStart):
+            self.calls.append("turn_started")
+        elif isinstance(data, TurnEnd):
+            self.calls.append(f"turn_finished:{data.status}")
+        elif isinstance(data, TitleChanged):
+            self.calls.append(f"title_changed:{data.title}")
 
 
-def test_subscriber_receives_run_lifecycle_in_order(monkeypatch):
+# ---------- 事件到达订阅者（无桥） ----------
+
+
+def test_turn_events_reach_the_subscriber(monkeypatch):
     agent = _make_agent(monkeypatch)
-    seen: list = []
-    agent.subscribe(seen.append)
-
-    asyncio.run(agent.run("打个招呼"))
-
-    assert _names(_lifecycle(seen)) == ["TurnStart", "TurnEnd", "AgentEnd"]
-    assert _lifecycle(seen)[-1].result.text == "最终回复"
-
-
-def test_unsubscribe_stops_delivery(monkeypatch):
-    agent = _make_agent(monkeypatch)
-    seen: list = []
-    unsubscribe = agent.subscribe(seen.append)
-
-    unsubscribe()
-    asyncio.run(agent.run("打个招呼"))
-
-    assert seen == []
-
-
-def test_event_stream_yields_events_and_terminal_result(monkeypatch):
-    agent = _make_agent(monkeypatch)
-
-    async def scenario():
-        result = await agent.run("打个招呼")
-        stream = agent.stream
-        events = [event async for event in stream]
-        return result, events, await stream.result()
-
-    result, events, terminal = asyncio.run(scenario())
-
-    # 视觉事件也在同一条流上：这一轮的假客户端只回一条完整消息（无增量），
-    # 所以夹在 TurnStart / TurnEnd 之间的是 MessageEnd（正文块收口）
-    assert _names(events) == ["TurnStart", "MessageEnd", "TurnEnd", "AgentEnd"]
-    assert terminal is result
-
-
-def test_each_task_opens_a_new_stream(monkeypatch):
-    agent = _make_agent(monkeypatch, [_text("一"), _text("二")])
-
-    asyncio.run(agent.run("第一条"))
-    first = agent.stream
-    asyncio.run(agent.run("第二条"))
-
-    assert agent.stream is not first
-    assert first.done is True
-
-
-def test_stream_is_closed_with_error_when_loop_raises(monkeypatch):
-    """循环抛未预期异常时事件流必须收口，否则消费者的 await 永远不返回。"""
-    agent = _make_agent(monkeypatch)
-
-    async def boom(_token):
-        raise RuntimeError("循环炸了")
-
-    monkeypatch.setattr(agent, "_run_loop", boom)
-
-    async def scenario():
-        with pytest.raises(RuntimeError, match="循环炸了"):
-            await agent.run("打个招呼")
-        return await agent.stream.result()
-
-    with pytest.raises(RuntimeError, match="循环炸了"):
-        asyncio.run(scenario())
-
-
-def test_goal_driven_multi_turn_run_shares_one_stream(monkeypatch):
-    """目标续跑连跑多轮：只有一条流、一个终结事件，终结值是最终结果。
-
-    若每轮各自收口，消费者会在第一轮就拿到结果（pi 的 agent_end 是**整个 run**
-    的终结事件，不是单轮的）。
-    """
-    agent = _make_agent(
-        monkeypatch,
-        [
-            _tool("todo_write", {"todos": [{"title": "步骤一", "status": "in_progress"}]}, "1"),
-            _text("第一步完成"),
-            _tool("goal_update", {"status": "complete", "summary": "全部通过"}, "2"),
-            _text("目标完成"),
-        ],
-    )
-    goal.set("测试目标", max_turns=10)
-    seen: list = []
-    agent.subscribe(seen.append)
-
-    async def scenario():
-        return await agent.session_owner.run_with_goal("开始"), await agent.stream.result()
-
-    result, terminal = asyncio.run(scenario())
-
-    assert _names(_lifecycle(seen)).count("AgentEnd") == 1
-    assert _names(_lifecycle(seen)).count("TurnStart") == 3  # 外层包装 + 两轮
-    assert result.text == "目标完成"
-    assert terminal is result
-
-
-# ---------- 迁移桥：前端一行不改 ----------
-
-
-def test_turn_events_still_reach_the_renderer(monkeypatch):
-    agent = _make_agent(monkeypatch)
-    recording = RecordingRenderer()
-    monkeypatch.setattr("smithcode.agent.agent.renderer.current", lambda: recording)
+    recording = RecordingSubscriber()
+    agent.events.subscribe(recording)
 
     asyncio.run(agent.run("打个招呼"))
 
     assert recording.calls == ["turn_started", "turn_finished:ok"]
 
 
-def test_title_change_reaches_the_renderer(monkeypatch):
+def test_title_change_reaches_the_subscriber(monkeypatch):
     agent = _make_agent(monkeypatch)
-    recording = RecordingRenderer()
-    monkeypatch.setattr("smithcode.agent.agent.renderer.current", lambda: recording)
+    recording = RecordingSubscriber()
+    agent.events.subscribe(recording)
 
     assert agent.rename_session("新标题") is True
 
     assert recording.calls == ["title_changed:新标题"]
-
-
-def test_bridge_follows_a_renderer_swap(monkeypatch):
-    """宿主可能在 Agent 构造后才装上后端（TUI 即如此）：事件要发给当前后端。"""
-    agent = _make_agent(monkeypatch)
-    first, second = RecordingRenderer(), RecordingRenderer()
-
-    monkeypatch.setattr("smithcode.agent.agent.renderer.current", lambda: first)
-    agent.rename_session("一")
-    monkeypatch.setattr("smithcode.agent.agent.renderer.current", lambda: second)
-    agent.rename_session("二")
-
-    assert first.calls == ["title_changed:一"]
-    assert second.calls == ["title_changed:二"]
 
 
 # ---------- 排队 ----------
@@ -240,13 +126,13 @@ def test_bridge_follows_a_renderer_swap(monkeypatch):
 def test_steer_emits_queue_changed_with_item_ids(monkeypatch):
     agent = _make_agent(monkeypatch)
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
 
     item = agent.steer("先别改 config")
 
-    assert isinstance(seen[-1], QueueChanged)
-    assert [queued.id for queued in seen[-1].steering] == [item.id]
-    assert seen[-1].follow_up == ()
+    assert isinstance(seen[-1].data, QueueChanged)
+    assert [queued.id for queued in seen[-1].data.steering] == [item.id]
+    assert seen[-1].data.follow_up == ()
     assert agent.pending_message_count == 1
 
 
@@ -255,11 +141,11 @@ def test_cancel_queued_removes_the_item_and_emits(monkeypatch):
     item = agent.steer("一")
     agent.steer("二")
     seen: list = []
-    agent.subscribe(seen.append)
+    agent.events.subscribe(seen.append)
 
     assert agent.cancel_queued(item.id) is True
 
-    assert [queued.text for queued in seen[-1].steering] == ["二"]
+    assert [queued.text for queued in seen[-1].data.steering] == ["二"]
     assert agent.cancel_queued("不存在") is False
 
 
@@ -313,7 +199,7 @@ def test_enqueue_from_ui_thread_emits_on_the_loop_thread(monkeypatch):
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: fake)
     agent = Agent(session=Session())
     seen: list[tuple[object, int]] = []
-    agent.subscribe(lambda event: seen.append((event, threading.get_ident())))
+    agent.events.subscribe(lambda event: seen.append((event, threading.get_ident())))
 
     async def scenario():
         loop_ident = threading.get_ident()
@@ -326,6 +212,6 @@ def test_enqueue_from_ui_thread_emits_on_the_loop_thread(monkeypatch):
 
     item, loop_ident = asyncio.run(scenario())
 
-    changes = [entry for entry in seen if isinstance(entry[0], QueueChanged)]
-    assert [queued.id for queued in changes[-1][0].steering] == [item.id]
+    changes = [entry for entry in seen if isinstance(entry[0].data, QueueChanged)]
+    assert [queued.id for queued in changes[-1][0].data.steering] == [item.id]
     assert changes[-1][1] == loop_ident  # 在循环线程上发出

@@ -16,12 +16,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from smithcode import config
+from smithcode import config, frontend
 from smithcode.agent import Agent
+from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
 
 MODEL = "stub-model"
 
+
+
+def _console_agent():
+    """建 Agent 并装配终端前端：呈现走事件（与生产一致），用例读 stdout。"""
+    from smithcode.agent import Agent
+    from smithcode.session import Session
+
+    agent = Agent(session=Session())
+    frontend.attach(agent.events, ConsoleFrontend())
+    return agent
 
 def _chunk(delta: dict, finish: str | None = None) -> str:
     payload = {
@@ -112,7 +123,7 @@ def pointed_at_stub(monkeypatch, stub, tmp_path):
 
 def test_full_turn_over_http(pointed_at_stub, capfd):
     """一次完整回合：真实 HTTP + SSE 解析 + 循环 + 渲染 + 历史。"""
-    agent = Agent(session=Session())  # 不替换 LLMClient：走真实客户端
+    agent = _console_agent()  # 不替换 LLMClient：走真实客户端
 
     result = asyncio.run(agent.session_owner.run_with_goal("打个招呼"))
 
@@ -134,7 +145,7 @@ def test_repl_driver_runs_the_same_path(pointed_at_stub, capfd):
     """`cli._run_agent_task`（REPL 后台任务入口）同样跑得通：事件循环 + 出错上报。"""
     from smithcode.cli import _run_agent_task
 
-    agent = Agent(session=Session())
+    agent = _console_agent()
 
     _run_agent_task(agent, "打个招呼")
 

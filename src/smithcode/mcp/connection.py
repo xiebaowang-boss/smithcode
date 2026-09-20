@@ -33,8 +33,9 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.subscriptions import ListenNotSupportedError
 
-from .. import renderer
 from ..cancel import current_token
+from ..event import publish
+from ..event.catalog import Notice
 from .auth import OAuthSession
 from .errors import McpAuthError, McpError
 
@@ -286,7 +287,7 @@ class SdkConnection:
             text = f"[mcp] {self.cfg.name}.{tool} 进度 {pct}%"
             if message:
                 text += f"（{message}）"
-            renderer.current().info(text)
+            publish(Notice(text))
 
         return report
 

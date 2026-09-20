@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-import smithcode.renderer as renderer_module
 from smithcode.agent import Agent
 from smithcode.process import ProcessResult
 from smithcode.session import Session
@@ -16,11 +15,9 @@ from smithcode.tui.app import SmithTUI
 
 @pytest.fixture(autouse=True)
 def _restore():
-    backup = renderer_module._current
     clipboard.reset_cache()
     yield
     clipboard.reset_cache()
-    renderer_module.set_renderer(backup)
 
 
 class FakeLLM:

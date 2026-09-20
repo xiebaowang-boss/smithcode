@@ -192,19 +192,24 @@ def test_resources_listing_excludes_skill_md(isolated):
 
 # ---------- 项目级信任门控 ----------
 
-class _DummyRenderer:
+class _DummyAsker:
+    """假询问端口：回答固定，并记下收到的提示（技能信任确认用）。"""
+
     def __init__(self, answer="n"):
         self.answer = answer
         self.infos = []
 
-    def info(self, text):
-        self.infos.append(text)
-
-    warn = info
-    error = info
-
     def confirm_choice(self, prompt, valid, hint, detail=None, descriptions=None, content=None):
         return self.answer
+
+    def ask_form(self, questions):
+        return ["" for _ in questions]
+
+    def ask_text(self, question):
+        return ""
+
+    def ask_choice(self, question, options, multiple=False, descriptions=None):
+        return ""
 
 
 def _project_preview(isolated):
@@ -247,7 +252,7 @@ def test_trust_ask_always_persists(isolated, monkeypatch):
         "smithcode.utils.terminal.confirmations_available", lambda: True
     )
     monkeypatch.setattr(
-        "smithcode.skills.registry.renderer.current", lambda: _DummyRenderer("a")
+        "smithcode.frontend.current", lambda: _DummyAsker("a")
     )
 
     assert registry.resolve_project_trust(config.SkillsConfig(), preview, []) is True
@@ -264,7 +269,7 @@ def test_trust_ask_once_is_session_only(isolated, monkeypatch):
         "smithcode.utils.terminal.confirmations_available", lambda: True
     )
     monkeypatch.setattr(
-        "smithcode.skills.registry.renderer.current", lambda: _DummyRenderer("y")
+        "smithcode.frontend.current", lambda: _DummyAsker("y")
     )
 
     assert registry.resolve_project_trust(config.SkillsConfig(), preview, []) is True
@@ -272,7 +277,7 @@ def test_trust_ask_once_is_session_only(isolated, monkeypatch):
     assert registry.load_trust().get(key) is None  # 未落盘
     registry.reset_session_trust()
     monkeypatch.setattr(
-        "smithcode.skills.registry.renderer.current", lambda: _DummyRenderer("n")
+        "smithcode.frontend.current", lambda: _DummyAsker("n")
     )
     assert registry.resolve_project_trust(config.SkillsConfig(), preview, []) is False
 
@@ -284,7 +289,7 @@ def test_trust_denied_diagnostics(isolated, monkeypatch):
         "smithcode.utils.terminal.confirmations_available", lambda: True
     )
     monkeypatch.setattr(
-        "smithcode.skills.registry.renderer.current", lambda: _DummyRenderer("n")
+        "smithcode.frontend.current", lambda: _DummyAsker("n")
     )
 
     assert registry.resolve_project_trust(config.SkillsConfig(), preview, diagnostics) is False

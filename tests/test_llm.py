@@ -59,19 +59,25 @@ def test_list_models_skips_items_without_id():
 # ---------- 流中断线自动重试 ----------
 
 
-class _FakeView:
-    """只记录重试相关调用的渲染后端（其余事件忽略）。"""
+class _RetryRecorder:
+    """重试状态记录器：挂到 emitter 通道上收 StatusChanged / StatusCleared。
+
+    重试进度不再经渲染后端直调（那条兜底路径已删除），而是走事件通道——
+    没有通道（不经 Agent 的裸客户端）时事件被丢弃，与 ``publish`` 的规则一致。
+    """
 
     def __init__(self):
         self.retries = []
         self.finished = 0
         self.warns = []
 
-    def retry_started(self, state, owner=None):
-        self.retries.append(state)
+    def __call__(self, event) -> None:
+        from smithcode.event.catalog import StatusChanged, StatusCleared
 
-    def retry_finished(self, owner=None):
-        self.finished += 1
+        if isinstance(event, StatusChanged) and event.kind == "retry":
+            self.retries.append(event.payload)
+        elif isinstance(event, StatusCleared) and event.kind == "retry":
+            self.finished += 1
 
     def warn(self, text):
         self.warns.append(text)
@@ -87,10 +93,14 @@ def _streaming_client(stream_once):
     return llm
 
 
-def _patch_retry(monkeypatch, view: _FakeView, retries: int = 2):
+def _patch_retry(monkeypatch, view: _RetryRecorder, retries: int = 2):
     monkeypatch.setattr(client_mod.config, "MAX_RETRIES", retries)
     monkeypatch.setattr(client_mod.retry_mod, "wait", lambda state: None)  # 不真的退避
-    monkeypatch.setattr("smithcode.renderer.current", lambda: view)
+    # 挂 emitter 通道：不需要 Agent 也能收事件（与 Agent 内部用的是同一条）
+    from smithcode.agent import emitter
+
+    token = emitter.activate(view)
+    monkeypatch.setattr(client_mod, "_test_emitter_token", token, raising=False)
 
 
 def test_chat_stream_retries_incomplete_stream(monkeypatch):
@@ -105,7 +115,7 @@ def test_chat_stream_retries_incomplete_stream(monkeypatch):
         yield ("content", "答案")
         yield ("message", {"role": "assistant", "content": ""})
 
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view)
 
     events = list(_streaming_client(fake_stream).chat_stream(
@@ -138,7 +148,7 @@ def test_chat_stream_retries_after_content(monkeypatch):
         yield ("content", "半句总结：改了 commands/base.py，Enter 已屏蔽。")
         yield ("message", {"role": "assistant", "content": ""})
 
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view, retries=3)
 
     events = list(_streaming_client(fake_stream).chat_stream(
@@ -163,7 +173,7 @@ def test_chat_stream_raises_after_retries_exhausted(monkeypatch):
         yield from ()  # 保持生成器语义
         raise httpx2.RemoteProtocolError(DROP)
 
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view)
 
     with pytest.raises(httpx2.RemoteProtocolError):
@@ -188,7 +198,7 @@ def test_chat_stream_does_not_retry_non_transient(monkeypatch):
         response = httpx2.Response(400, request=httpx2.Request("POST", "http://x"))
         raise BadRequestError("bad", response=response, body=None)
 
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view, retries=3)
 
     with pytest.raises(BadRequestError):
@@ -206,7 +216,7 @@ def test_chat_stream_retry_finished_on_success_without_retry(monkeypatch):
     def fake_stream(kwargs):
         yield ("message", {"role": "assistant", "content": ""})
 
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view)
 
     events = list(_streaming_client(fake_stream).chat_stream(
@@ -288,7 +298,7 @@ def test_chat_stream_effort_param_overrides_constructed(monkeypatch):
     """effort 参数覆盖构造值：Agent 的轮级快照经此透传。"""
     seen = []
     llm = _recording_client(seen)
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view)
     list(llm.chat_stream([{"role": "user", "content": "hi"}], effort="low"))
     assert seen == [("m-default", "low")]  # model 回退构造值，effort 用透传值
@@ -298,7 +308,7 @@ def test_chat_stream_effort_falls_back_to_constructed(monkeypatch):
     """effort 为空回退构造值：轮外调用（如后台标题）行为不变。"""
     seen = []
     llm = _recording_client(seen)
-    view = _FakeView()
+    view = _RetryRecorder()
     _patch_retry(monkeypatch, view)
     list(llm.chat_stream([{"role": "user", "content": "hi"}], model="m-req"))
     assert seen == [("m-req", "high")]
