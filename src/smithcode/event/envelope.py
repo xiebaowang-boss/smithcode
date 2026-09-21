@@ -37,6 +37,8 @@ class Envelope:
     durable: bool
     data: object
     #: 持久事件落盘后的序号（每会话单调递增）；易失事件恒为 None。
+    #: **由日志在写盘时分配**（`sessions/store.py::append_event`）——订阅者拿到的是
+    #: 发布时的信封，此时 `seq` 还是 None；日志里的那一条才带 seq（游标只对日志有意义）。
     seq: int | None = None
 
     @property
