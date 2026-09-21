@@ -202,6 +202,25 @@ def test_volatile_events_never_hit_the_log(monkeypatch, tmp_path):
     assert "session.notice" not in types
 
 
+def test_every_logged_event_carries_one_session_id(monkeypatch, tmp_path):
+    """日志里只能出现**一个**会话标识（= 会话对象那份）。
+
+    会话标识由总线注入，而总线要跟着会话对象走：`/new` 与恢复都会换 id，若刷新
+    滞后，换 id 之后、下一次 agent 发事件之前的事件会带旧 id——日志里同一会话出现
+    两个 id，按会话路由与重放都会错。（这个漏是本次改动的演示脚本暴露的。）
+    """
+    agent = _agent(monkeypatch, [_text("回复")])
+    asyncio.run(agent.run("第一句"))
+    agent.new_session()  # 换 id：后续事件必须用新 id
+    asyncio.run(agent.run("第二句"))
+    path = agent.session.store.path
+    agent.session.store.close()
+
+    ids = {json.loads(line)["session_id"]
+           for line in path.read_text(encoding="utf-8").splitlines()}
+    assert ids == {agent.session.id}
+
+
 # ---------- 3. 崩溃收尾也是事件 ----------
 
 

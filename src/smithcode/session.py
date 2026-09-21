@@ -78,6 +78,8 @@ class Session:
             self.id = store.id
             config.use_session_id(store.id)  # `{$session}` 请求头占位符解析用
             self.journal.session_id = store.id
+            if self._bus is not None:
+                self._bus.session_id = store.id
             if store.materialized:
                 self.journal.mark_created()  # 恢复既有日志：出生事件已在里面
             else:
@@ -122,6 +124,11 @@ class Session:
         都成立——否则脱离 Agent 的会话会静默丢掉自己的历史。
         """
         if self._bus is not None:
+            # 会话标识的唯一来源是会话对象：`/new` 与恢复都会换 id，总线跟着刷新，
+            # 否则"换 id 之后、下一次 agent 发事件之前"的那些事件会带旧 id
+            # （日志里同一会话出现两个 session_id，按会话路由/重放就错了）
+            if self._bus.session_id != self.id:
+                self._bus.session_id = self.id
             self._bus.publish(payload)
             return
         env = publish(payload, session_id=self.id)
