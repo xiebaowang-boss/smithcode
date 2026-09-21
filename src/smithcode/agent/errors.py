@@ -1,13 +1,12 @@
 """Agent 的错误类型。
 
 自 `agent/agent.py` 搬出（纯搬运，语义一字不改）：这两个异常是**循环与宿主之间的
-契约**（`StreamInterrupted` 决定 `stream_error` 状态、`SubscriberError` 决定"UI 故障
-不当成网络中断"），放在自己的模块里，宿主与扩展引用它们时不必把整个 Agent 拉进来。
+契约**（`StreamInterrupted` 决定 `stream_error` 状态），放在自己的模块里，宿主与扩展
+引用它时不必把整个 Agent 拉进来。订阅者故障（`SubscriberError`）属于**事件层**
+（扇出在那里，见 `event/bus.py`）——本模块不再转发它。
 """
 
 from __future__ import annotations
-
-from ..event.bus import SubscriberError
 
 
 class StreamInterrupted(Exception):
@@ -24,6 +23,4 @@ class StreamInterrupted(Exception):
         self.partial = partial
 
 
-# 订阅者故障的类型在事件层定义（扇出在那里，见 `event/bus.py` 的说明）；
-# 这里再导出一次，让 `smithcode.agent.SubscriberError` 这个既有引用点不变。
-__all__ = ["StreamInterrupted", "SubscriberError"]
+__all__ = ["StreamInterrupted"]

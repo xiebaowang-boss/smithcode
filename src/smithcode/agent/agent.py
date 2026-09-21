@@ -23,6 +23,7 @@ from ..context import (
 )
 from ..event import Bus, asks
 from ..event.asks import AskPort
+from ..event.bus import SubscriberError
 from ..event.catalog import (
     AgentEnd,
     AgentEvent,
@@ -85,7 +86,7 @@ from ..tools import (
 from ..tools.skills import sync_schema
 from . import emitter
 from .agent_session import AgentSession
-from .errors import StreamInterrupted, SubscriberError
+from .errors import StreamInterrupted
 from .hooks import (
     AfterToolCallContext,
     AfterToolCallResult,

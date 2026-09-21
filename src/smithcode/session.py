@@ -27,23 +27,12 @@ from .llm.usage import UsageTracker
 
 
 class MessageLog(list):
-    """带落盘钩子的消息列表：`append` 即追加转录，`insert` 不触发（system 专用）。
+    """消息历史（OpenAI 形状的 `list[dict]`）。
 
-    钩子在调用时读取 `Session._store`，因此绑定/解绑无需重新包裹列表；
-    `Session.messages` 的 setter 也会重新包裹，任何整体赋值都不会丢钩子。
+    改造前它带一个"append 即落盘"的钩子；事件溯源之后**写入路径只有
+    `Session.add()`（发事件）**，钩子没有调用方了，因此退化成普通列表——留着钩子
+    反而会让人觉得"直接 append 也会落盘"。
     """
-
-    def __init__(self, items=(), on_append=None):
-        super().__init__(items)
-        self._on_append = on_append
-
-    def set_hook(self, on_append) -> None:
-        self._on_append = on_append
-
-    def append(self, message) -> None:
-        super().append(message)
-        if self._on_append is not None:
-            self._on_append(message)
 
 
 class Session:

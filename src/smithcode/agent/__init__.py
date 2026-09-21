@@ -24,7 +24,8 @@ from typing import Any
 # 直接 import，而它们并不都活在实现模块 agent/agent.py 里——错误类型在 errors.py、
 # 中断文案在 loop.py、占位结果在 tools_run.py。显式转出还避免"实现模块里只被 import
 # 没被使用，被 lint 当 F401 删掉后包门面转发不到"这种脆弱耦合。
-from .errors import StreamInterrupted, SubscriberError
+from ..event.bus import SubscriberError
+from .errors import StreamInterrupted
 from .loop import (
     INTERRUPTED_CONTEXT,
     INTERRUPTED_NOTE,
