@@ -734,8 +734,6 @@ class Agent:
             raise sessions.StoreError("未指定要恢复的会话。")
         path = Path(text)
         if path.is_file():
-            if path.suffix == ".json":
-                return sessions.import_json(path)  # 旧格式：导入后继续
             return sessions.summary_from_path(path)
         summary = sessions.find(text)
         if summary is None:

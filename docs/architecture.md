@@ -178,7 +178,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 模型 / 用量 / 状态检查点）。恢复 = 重放：`load()` 读日志 → 折叠 → 崩溃收尾。所以"上一次会话看到
 什么"与"重放出来什么"必然一致（验收断言见 `tests/test_event_sourcing.py`）。
 
-启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径；旧 `.json` 可导入），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
+启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
 
 恢复时：system 段按最新提示词重建（不入日志）；`HistoryCompacted` 事件重置模型可见投影（旧消息仍在文件里，
 可导出/审计）；尾部悬空 `tool_calls` 补「结果未知」占位，且**把占位结果作为事件写回日志**（崩溃修复：
@@ -321,7 +321,7 @@ event/bus.py ─→ TerminalTitlePresenter（订阅者：状态机 + 合成 + �
 | `textfile.py` | 文本文件读写的唯一出口：换行风格（LF / CRLF / CR）与 UTF-8 BOM 的探测、LF 归一化与写回还原、`TextFileError` 友好错误。文件工具（read_file / write_file / edit_file / apply_patch / grep）全部经此读写，保证**编辑不改动文件既有的换行风格与 BOM**（见「安全边界」的换行保真条目） |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自定义请求头注入、`/models` 拉取）、`retry.py` 重试策略与状态机（分类 / 预算 / 退避 / 状态文案的唯一权威，见「请求保护与重试」）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根 = **事件折叠出来的视图** + 写入路径（发事件）：`add` / `set_title` / `set_compacted` / 检查点都只发事件，`messages` / `title` / `usage` 是折叠结果；系统提示词装配与原地恢复 |
-| `sessions/` | 会话**事件日志**子系统：`format.py`（一行一个信封、版本化类型名、坏行容忍）、`store.py`（唯一写入口 `append_event`、重放加载、项目级列表/查找/删除/导入/清理）、`project.py`（纯折叠：事件 → 会话视图）、`journal.py`（总线订阅者：durable 落盘 + 折叠），标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
+| `sessions/` | 会话**事件日志**子系统：`format.py`（一行一个信封、版本化类型名、坏行容忍）、`store.py`（唯一写入口 `append_event`、重放加载、项目级列表/查找/删除/清理）、`project.py`（纯折叠：事件 → 会话视图）、`journal.py`（总线订阅者：durable 落盘 + 折叠），标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
 | `title.py` | 终端窗口标题：订阅事件（`TitleChanged` / `Execution*` / 询问事件对按 id 配对判定等待态）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |

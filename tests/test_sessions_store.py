@@ -20,7 +20,6 @@ from smithcode.sessions import (
     delete,
     find,
     find_last,
-    import_json,
     list_sessions,
     load,
     rename,
@@ -140,33 +139,6 @@ def test_find_last_excludes_oneshot(_isolated):
     last = find_last()
     assert last is not None and last.id == normal.id
     assert find(oneshot.id).id == oneshot.id  # 显式 id 仍可直达
-
-
-def test_import_legacy_json(_isolated):
-    legacy_dir = _isolated / "sessions"
-    legacy_dir.mkdir()
-    legacy = legacy_dir / "20260101_000000.json"
-    legacy.write_text(
-        json.dumps(
-            [
-                {"role": "user", "content": "旧消息"},
-                {"role": "assistant", "content": "旧回复"},
-            ],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    summary = import_json(legacy)
-    loaded = load(summary)
-    assert [m["role"] for m in loaded.messages] == ["user", "assistant"]
-    assert loaded.messages[0]["content"] == "旧消息"
-
-
-def test_import_legacy_json_rejects_invalid(_isolated):
-    bad = _isolated / "bad.json"
-    bad.write_text("{不是数组}", encoding="utf-8")
-    with pytest.raises(StoreError):
-        import_json(bad)
 
 
 def test_model_events_last_wins(_isolated):

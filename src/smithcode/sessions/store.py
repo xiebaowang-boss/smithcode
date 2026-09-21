@@ -281,29 +281,6 @@ def rename(session_id, title: str, cwd=None) -> bool:
     return True
 
 
-def import_json(path, cwd=None) -> SessionSummary:
-    """把旧 `<workspace>/sessions/*.json`（纯 messages 数组）导入为事件日志。"""
-    import json
-
-    source = Path(path)
-    try:
-        data = json.loads(source.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise StoreError(f"无法读取旧会话文件 {source}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise StoreError(f"旧会话文件不是合法 JSON：{source}（{exc}）") from exc
-    if not isinstance(data, list) or not data:
-        raise StoreError(f"旧会话文件应是非空的消息数组：{source}")
-    store = SessionStore.create(cwd=cwd)
-    try:
-        for message in data:
-            if isinstance(message, dict) and message.get("role") != "system":
-                store.append_event(wrap(MessageEnd(message=message), session_id=store.id))
-    finally:
-        store.close()
-    return summary_from_path(store.path)
-
-
 def sweep(cleanup_days) -> int:
     """保留期清理：删除全部项目中 mtime 早于截止时间的日志。返回删除数。"""
     import time
@@ -434,8 +411,7 @@ def _read_summary(path: Path) -> SessionSummary | None:
         title, source, scanned_model = _tail_facts(_iter_records(path))
         model = model or scanned_model
     if not meta and not first_prompt and not title and parsed == 0:
-        # 整段都读不出事件（空文件 / 全坏行）才算"无法解析"；只有 assistant 消息
-        # 之类的残缺日志仍给出摘要（元数据由 `_synthesize_meta` 兜底）
+        # 整段都读不出事件（空文件 / 全坏行）才算"无法解析"
         return None
     return SessionSummary(
         id=str(meta.get("session_id") or meta.get("id") or path.stem),

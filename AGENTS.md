@@ -63,7 +63,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
 | `session.py` | 会话聚合根 = **事件折叠出来的视图** + 写入路径（发事件）：`add` / `set_title` / `set_compacted` 只发事件，`messages` / `title` / `usage` 是折叠结果；系统提示词装配、原地恢复 |
-| `sessions/` | 会话**事件日志**子系统：`format.py` 一行一个信封（版本化类型名、坏行容忍）、`store.py` 唯一写入口 `append_event` + 重放加载、`project.py` 纯折叠（事件 → 会话视图）、`journal.py` 总线订阅者（durable 落盘 + 折叠进视图）、项目级列表/查找/删除/导入/清理 |
+| `sessions/` | 会话**事件日志**子系统：`format.py` 一行一个信封（版本化类型名、坏行容忍）、`store.py` 唯一写入口 `append_event` + 重放加载、`project.py` 纯折叠（事件 → 会话视图）、`journal.py` 总线订阅者（durable 落盘 + 折叠进视图）、项目级列表/查找/删除/清理 |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
 | `title.py` | 终端窗口标题：订阅事件（`TitleChanged` / `Execution*` / `PromptStarted`+`PromptFinished` 按 id 配对判定等待态）合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；入口 `enable_title(sink=…)` 返回呈现器（宿主自己留着并作为额外订阅者装配）。呈现器是**进程级单例**（一块终端标题 + 退出钩子需要它） |

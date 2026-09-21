@@ -243,8 +243,6 @@ def _locate_session(last: bool, target: str):
         return sessions.find_last()
     path = Path(target)
     if path.is_file():
-        if path.suffix == ".json":
-            return sessions.import_json(path)  # 旧格式：导入后继续
         return sessions.summary_from_path(path)
     summary = sessions.find(target)
     if summary is None:
