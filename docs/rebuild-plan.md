@@ -1,5 +1,16 @@
 # Agent 核心异步重构：进度与约定
 
+> **状态：已被取代（2026-09）**。本文描述的重构（循环异步化 + 事件层 + 迁移桥
+> `renderer_bridge.py`）已完成一半就被**事件溯源重构**接手：渲染后端协议、迁移桥、
+> `agent/events.py` / `interactions.py` 等已删除，改为「单一事件出口 + 事件日志 + 折叠」
+> 的架构（见 [architecture.md](architecture.md) 的「事件架构」节与
+> `tests/guard/test_single_event_path.py` 的守卫规则）。
+>
+> 仍有效的是本文的**判断类内容**（哪些接缝保留、为什么不做 AsyncOpenAI、压缩与恢复的
+> 语义）；「冻结的兼容面」表中与 `Renderer` / `RendererError` 有关的条目按新架构重命名
+> （`SubscriberError`，语义不变）。阅读时请以代码与 architecture.md 为准。
+
+
 本文件记录重构的落地进度、冻结的兼容面与各阶段验证基线。完整设计见
 `~/.commandcode/plans/smithcode-async-agent-core-rebuild.md`（方案 v3）。
 

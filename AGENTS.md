@@ -34,7 +34,7 @@ smith setup                   # 初始化配置（用户机器上才需要）
 **跑多大范围由改动的波及面决定**，先判断这个文件被多少地方依赖：
 
 - 判断方法：用 `grep` 工具搜模块名（如 `config`、`session`），看命中多少个 `src/` 与 `tests/` 文件；被十几处引用的按全量处理。这一步只要一两秒，远低于一次全量，拿不准就按宽处理
-- 波及面大的典型位置（示例，以实际依赖为准）：默认值与全局状态的 `config.py`、注册表与抽象基类 `tools/base.py`、跨切面的 `renderer.py` / `permission/`、状态聚合根 `session.py`、被大量测试反向依赖的 `goal.py` / `skills/` / `plan.py`
+- 波及面大的典型位置（示例，以实际依赖为准）：默认值与全局状态的 `config.py`、注册表与抽象基类 `tools/base.py`、跨切面的 `event/` / `permission/`、状态聚合根 `session.py`、被大量测试反向依赖的 `goal.py` / `skills/` / `plan.py`
 - 波及面小的叶子（示例）：单个工具实现（如 `tools/websearch.py`）、纯函数渲染（`tui/render.py`）、子系统内部文件——改了跑同名测试文件即可
 - 涉及公共接口、默认值或协议语义的改动等于同时改了一片调用方，直接跑全量
 - 测试与源码不一一对端（`test_display.py` / `test_agent_parallel.py`），找不到同名测试文件时按引用面判断，不要因为「没有对应文件」就跳过验证
@@ -53,18 +53,20 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | 模块 | 职责 |
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
-| `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线）、`app.tcss` 集中样式（经 `SmithTUI.CSS_PATH` 加载）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据）、`widgets.py` 自包含控件（消息区 `ChatView.apply` 是唯一打印入口）、`panels.py` 弹窗面板、`bridge.py` 线程桥（`TuiRenderer`）、`render.py` 纯函数工具 |
+| `event/` | **事件层（L0）**：`envelope.py` 信封（id/type/version/created/session_id/durable/seq）、`registry.py` 声明（`@declare(type, durable, version, aggregate)`）、`catalog.py` **唯一的事件定义处**（含事件词汇）、`bus.py` 唯一发布口 `publish()` + 唯一订阅口 `subscribe()` + `SubscriberError`（订阅者故障的唯一包装点）、`asks.py` 询问端口（asked → replied）、`stream.py` 事件流。本层不 import 其他 smithcode 包 |
+| `frontend/` | 前端适配层（L3）：`__init__.py` `Asker` 协议 + 上下文 + `attach()` 装配入口、`console.py` 终端前端（事件订阅者 + 读 stdin）、`render.py` 文本化纯函数 |
+| `sandbox.py` | **会话沙箱授权目录**（每会话一份）：工作区快照、启动附加目录、越界信任目录、技能只读白名单、临时放行（ContextVar，进出成对）。`config.allowed_roots()` / `read_roots()` 委托它 |
+| `tui/` | Textual 全屏聊天界面，仅交互终端加载：`app.py` 组装层（布局接线）、`app.tcss` 集中样式（经 `SmithTUI.CSS_PATH` 加载）、`chat.py` 对话区语义消息模型（`Level` + `ChatItem`，纯数据）、`widgets.py` 自包含控件（消息区 `ChatView.apply` 是唯一打印入口）、`panels.py` 弹窗面板、`frontend.py` 事件订阅者 + 面板作答、`render.py` 纯函数工具 |
 | `commands/` | 斜杠命令框架：注册表（`@register`）+ 统一 `dispatch()`，REPL/TUI 共用；新命令一个文件接入，`/help` 自动生成 |
-| `agent.py` | Agent 循环编排（`_BatchScheduler` 流式调度：边预检边执行、并行波次 + 串行屏障、结果按提交序；todo 专用路径：`todo_write` 以 serial 计划独占主线程、`display_result=False`）；`run_with_goal()` 是 `/goal` 的续跑驱动器 |
+| `agent/` | Agent 循环编排（包）：`agent.py` 主循环 + `_BatchScheduler` 流式调度（边预检边执行、并行波次 + 串行屏障、结果按提交序；todo 专用路径 `todo_write` 以 serial 计划独占主线程）；`run_with_goal()` 是 `/goal` 的续跑驱动器；`agent_session.py` 会话外观（状态实例 + 总线 + 根部）、`tools_run.py` 工具执行、`hooks.py` 四个边界钩子、`queues.py` 运行中排队、`status.py` 状态事件、`signal.py` 取消令牌、`emitter.py` 深层发事件通道 |
 | `cancel.py` | 协作式取消原语：`CancellationToken` + ContextVar 传播 + `RunResult`；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：超时、取消与跨平台进程树终止（`taskkill` / `killpg`），工具层只做文案映射 |
-| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer` + `current()` / `set_renderer()`）：Agent 全部终端交互经此收口，TUI 启动时替换后端；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`），等待事件由 `title.Relay` 在 ask 方法进出时发射 |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、重试、自定义请求头、`/models` 拉取）、`models.py` 候选模型目录 `ModelCatalog`、`usage.py` token 用量、`prompts.py` 系统提示词（Agent 行为规则，改行为先看这里）；`__init__.py` 汇总公共 API |
-| `session.py` | 会话聚合根：消息历史（追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
-| `sessions/` | 会话持久化子系统：JSONL 转录（`paths`/`format`/`store`）、崩溃修复、项目级列表/查找/删除/导入/保留期清理、标题生成纯逻辑（设计见 `docs/architecture.md` 的「会话持久化与恢复」节） |
+| `session.py` | 会话聚合根 = **事件折叠出来的视图** + 写入路径（发事件）：`add` / `set_title` / `set_compacted` 只发事件，`messages` / `title` / `usage` 是折叠结果；系统提示词装配、原地恢复 |
+| `sessions/` | 会话**事件日志**子系统：`format.py` 一行一个信封（版本化类型名、坏行容忍）、`store.py` 唯一写入口 `append_event` + 重放加载、`project.py` 纯折叠（事件 → 会话视图）、`journal.py` 总线订阅者（durable 落盘 + 折叠进视图）、项目级列表/查找/删除/导入/清理 |
 | `plan.py` | todo_write 的会话级步骤清单（状态机 + 渲染） |
 | `goal.py` | 持久目标（`/goal`）的会话级状态机与提示词：生命周期、回合预算、完成/阻碍审计、续跑注入；`/new` 时重置 |
-| `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）与 Relay 在 ask 类方法上报的等待态，合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；装配入口两个：终端宿主 `attach()`（总线 + 接管标题）、GUI 前端 `bus()`（纯总线，不碰终端标题）（设计见 `docs/architecture.md` 的「终端窗口标题」节） |
+| `title.py` | 终端窗口标题：订阅事件（`TitleChanged` / `Execution*` / `PromptStarted`+`PromptFinished` 按 id 配对判定等待态）合成 `Smith · <会话标题>`（运行中加 `◐`、等待确认/回答时加 `!` 且优先），经注入 sink 写 OSC 0，退出用窗口标题栈恢复原标题；入口 `enable_title(sink=…)` 返回呈现器（宿主自己留着并作为额外订阅者装配）。呈现器是**进程级单例**（一块终端标题 + 退出钩子需要它） |
 | `instructions.py` | 项目指令（AGENTS.md）装载：用户级 + git 根到工作区的目录链 + `[instructions].paths`、会话边界装载（启动 / `/new` / 恢复）与指纹去重、预算截断，注入系统提示词动态段 |
 | `skills/` | 技能子系统：`SKILL.md` 宽容解析（无第三方 YAML）、扫描发现与优先级、项目级信任门控、会话级加载集合与载荷投递（模型走工具结果、用户走 user 消息，正文不进系统提示词；压缩后裁剪 + 提示）、目录段渲染（设计见 `docs/architecture.md` 的「技能（Skills）」节）；扫描范围暂为项目 `.agents/skills` + 用户 `~/.smithcode/skills` + `[skills].paths` |
 | `context/` | 上下文计量（`meter`）、压缩逻辑（`compact`）、压缩提示词（`prompts`） |
@@ -79,6 +81,29 @@ smith setup                   # 初始化配置（用户机器上才需要）
 | `mcp/` | MCP 子系统：双作用域配置（用户 TOML + 项目 `.smithcode/mcp.json`）、`${VAR}` 密钥链与凭据库、工具命名/动态注册、`/mcp` 命令与添加向导；客户端基于官方 `mcp` SDK（`runtime.py` 共享 loop 线程、`connection.py` 同步门面、`factory.py` 按传输构造）（完整设计见 `docs/mcp-architecture.md`，摘要见 `docs/architecture.md`「MCP」节）；支持 stdio / Streamable HTTP / SSE 与 OAuth2.1 |
 
 ## 关键约定
+
+### 事件架构（改动前先读）
+
+模块详情见 `docs/architecture.md` 的「事件架构」节。五条硬规则（各有守卫测试，
+`tests/guard/test_single_event_path.py` + `tests/agent/test_core_emits_events.py`）：
+
+1. **事件类只在 `event/catalog.py` 定义**（用 `@declare` 声明类型名/持久性/聚合根/
+   版本）。别处 `@declare` 会被守卫拦住。
+2. **发布只有一个口**：`event.publish(payload)`（或会话的 `bus.publish`）。扇出只在
+   `event/bus.py`，`deliver()` 也只允许总线与 `Agent._emit` 调。
+3. **订阅只有一个口**：`bus.subscribe(...)`。前端（`frontend/`、`tui/frontend.py`）
+   **不得 import `agent` / `plan` / `goal` / `skills`**——呈现所需的一切由载荷带来。
+4. **消息只有一个写入口**：`session.add(...)`（发事件）。直接 `session.messages.append`
+   会绕过日志，重放时丢失。
+5. **询问只有一个口**：`event/asks` 的端口（`await port.ask(AskRequest)`；同步上下文用
+   `ask_sync`）。别处不得直接调前端提问。
+
+新增事件的流程：在 `catalog.py` 用 `@declare` 声明（会话事件带
+`aggregate="session_id"`；边界类事实 `durable=True`，流式增量/进度/忙碌态留易失）
+→ 想清楚**前端怎么呈现**（两个前端的 `on_event` 都要显式列出，守卫会提醒）
+→ 若它改变会话视图，在 `sessions/project.py` 的 `apply` 里加折叠规则（不改视图
+就什么都不用做）→ 补测试。`durable=True` 的事件会被 `sessions/journal.py` 落盘并按
+`type.version` 写入日志。
 
 ### 安全边界（不要破坏）
 

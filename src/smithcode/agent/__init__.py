@@ -66,7 +66,7 @@ def __getattr__(name: str) -> Any:
     """把属性解析转发到实现模块 `agent/agent.py`（首次访问时才导入它）。
 
     包化把一个模块拆成了「包 + 子模块」两个命名空间，而旧代码与测试会把
-    `smithcode.agent` 当模块用（如 `agent_mod.renderer`、`agent_mod.config`、
+    `smithcode.agent` 当模块用（如 `agent_mod.emitter`、`agent_mod.config`、
     内部私有类）。惰性转发既保持旧模块的完整属性面，又不会在包初始化阶段
     把整条重链拉进来（见模块 docstring 的导入环说明）。
 

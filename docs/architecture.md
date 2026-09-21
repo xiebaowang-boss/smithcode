@@ -155,7 +155,7 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 - `session.reset()`：消息历史清空（系统提示词随历史懒加载）、会话 id 轮换、会话用量清零（"应用启动以来"口径跨 `/new` 存活）
 - `permission.new_session()`：清空会话内"总是允许"积累的规则（权限模式档位是用户手动选择，跨会话保留）
-- `config.SESSION_EXTRA_ROOTS.clear()`：清空越界确认积累的信任目录
+- `agent.roots.new_session()`：清空越界确认积累的信任目录（会话沙箱，见 `sandbox.py`）
 - `context.new_session()`：压缩计数清零、上一会话的真实 token 锚点作废（旧锚点对新会话的估算对比无意义）
 - `reset_read_tracking()`：清空工具侧「已读文件」记录（新会话中未读过的文件重新受 write/edit 前置校验约束）
 - `plan.reset()`：清空步骤清单
@@ -164,15 +164,27 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 
 ### 会话持久化与恢复
 
-每条非 system 消息实时追加到用户目录的 append-only JSONL 转录（`~/.smithcode/projects/<项目 slug>/sessions/<会话 id>.jsonl`；懒物化，没有消息不建文件；`[sessions].enabled=false` 或 `--no-session-persistence` 可关闭且失败只降级为纯内存会话）。`/new` 只闭合旧转录、开新会话——旧会话留在磁盘、仍可恢复。
+**日志就是事件流**：`~/.smithcode/projects/<项目 slug>/sessions/<会话 id>.jsonl`，一行一个信封
+（`{seq, id, type: 类型.版本, version, created, session_id, durable, data}`）。懒物化（首条事件才建
+文件）；`[sessions].enabled=false` 或 `--no-session-persistence` 可关闭，写失败只降级为纯内存会话
+（记一条警告事件，不阻断 Agent）。`/new` 只闭合旧日志、开新会话——旧会话留在磁盘、仍可恢复。
 
-写入分两层：每条记录 `write` + `flush`（进程内可见即可），**`sync()`（`fsync`）只在两个语义点调用**——工具执行前（副作用屏障：本批 `tool_calls` 先落盘，工具才会真正执行）与每轮结束（本轮消息与 `t=state` 一并挺过断电）。不在每次追加都 fsync：成本留给「错了就没法挽回」的时刻；写失败仍按 fail-open 降级为纯内存会话。
+**写入路径唯一**：`sessions/store.py::append_event(env)`（分配 seq → 序列化 → 追加 → flush）。
+谁决定要不要写：`sessions/journal.py`（总线订阅者，只写 `durable=True` 的事件），所以"持久化"
+不需要在业务代码里埋调用，新增事件也不会漏记。`sync()`（flush + fsync）只在两个语义点调用——
+工具执行前（副作用屏障：本批 `tool_calls` 先落盘，工具才会真正执行）与每轮结束。
 
-转录另外记两类「谁生成的 / 当前是什么」事实，都取最后一条生效：`t=model`（每轮实际使用的模型与思考强度，与上一条相同则不写；`meta` 只记创建时的模型，`/model` 中途切换靠它留痕，恢复时据此提示「该会话上次使用模型 X」但不悄悄改全局模型）、`t=state`（下面的投影缓存）。
+**状态由折叠得出**：`sessions/project.py` 的 `fold()` 把事件折成会话视图（消息 / 压缩基线 / 标题 /
+模型 / 用量 / 状态检查点）。恢复 = 重放：`load()` 读日志 → 折叠 → 崩溃收尾。所以"上一次会话看到
+什么"与"重放出来什么"必然一致（验收断言见 `tests/test_event_sourcing.py`）。
 
 启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径；旧 `.json` 可导入），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
 
-恢复时：system 段按最新提示词重建（不入转录）；`compact` 检查点重置模型可见投影（旧消息保留供导出/审计）；尾部悬空 `tool_calls` 补「结果未知」占位（崩溃修复：不回写「未执行」——崩溃只证明结果没落盘，工具可能已生效，占位文案改为声明结果未知并给出核实建议，避免诱使模型直接重试写操作；中段损坏则截断）；goal/plan/技能激活集从 `t=state` 投影缓存恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在每轮正常结束后由后台模型自动生成（`[sessions].title_model`，用户标题优先），只取首个真实用户轮（中断回写 / 流中断回写 / 压缩提示 / 技能回找引导 / 迭代上限收尾五类记账消息跳过，不污染 payload、不错位轮次边界），单次请求失败不永久放弃——下一轮结束后补试，上限 `TITLE_MAX_ATTEMPTS`（3）次，失败经 renderer 提示并说明是否还会补试；到顶后进入 `TITLE_RETRY_ROUNDS`（5）轮冷却再自动探一次，`/model` 切换模型立即重置计数（到顶提示一并告知这两条出路，另提示 `/rename` 手动命名）；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏；同内容跳过重写，Shift+Tab 只刷底栏模式段、不碰标题）。完整设计见本文件「会话持久化与恢复」节。
+恢复时：system 段按最新提示词重建（不入日志）；`HistoryCompacted` 事件重置模型可见投影（旧消息仍在文件里，
+可导出/审计）；尾部悬空 `tool_calls` 补「结果未知」占位，且**把占位结果作为事件写回日志**（崩溃修复：
+不回写「未执行」——崩溃只证明结果没落盘，工具可能已生效；中段损坏则截断）；goal/plan/技能激活集从
+`SessionCheckpoint` 事件恢复（goal 回合计数与 token 基线重置）；权限会话规则、越界信任目录、已读记录
+**一律不恢复**（安全优先）。会话 id 沿用，`{$session}` 请求头跨进程稳定。标题在每轮正常结束后由后台模型自动生成（`[sessions].title_model`，用户标题优先），只取首个真实用户轮（中断回写 / 流中断回写 / 压缩提示 / 技能回找引导 / 迭代上限收尾五类记账消息跳过，不污染 payload、不错位轮次边界），单次请求失败不永久放弃——下一轮结束后补试，上限 `TITLE_MAX_ATTEMPTS`（3）次，失败发一条警告事件并说明是否还会补试；到顶后进入 `TITLE_RETRY_ROUNDS`（5）轮冷却再自动探一次，`/model` 切换模型立即重置计数（到顶提示一并告知这两条出路，另提示 `/rename` 手动命名）；TUI 侧边栏顶部常显当前会话标题（未生成时回退首轮 prompt 截断，无历史时隐藏；同内容跳过重写，Shift+Tab 只刷底栏模式段、不碰标题）。完整设计见本文件「会话持久化与恢复」节。
 
 TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底清空聊天区**（含欢迎横幅，不追加任何提示文本——清空本身即反馈；REPL 仍打印「已开启新会话。」）、清空计划侧栏与残留的工具块映射、刷新状态栏。
 
@@ -184,35 +196,82 @@ TUI 端的宿主动作由 `CommandResult.session_reset` 标记触发：**彻底�
 
 - **配置双作用域**：用户级 `config.toml` 的 `[mcp.servers.<名称>]`（tomlkit 写入保注释，`env` / `headers` 用内联表使同一条目的属性聚合在同一段）；项目级 `<工作区>/.smithcode/mcp.json`（`mcpServers` 结构，兼容 Claude/Cursor/VS Code 片段写法）。传输类型 `type` 支持 `stdio`（别名 `local`）/ `http`（别名 `remote` / `streamable-http`）/ `sse`；stdio 用 `command` + `env` + `cwd`，远程用 `url` + `headers`（值可含 `${VAR}`）。同名服务器**项目条目整体覆盖**用户条目（字段不合并）；`enabled` 是服务器条目的普通字段，写在定义它的文件里（默认启用时省略），不做跨文件覆盖表。
 - **密钥链**：配置只写 `${VAR}` / `${VAR:-default}` 引用（command / args / env / headers / cwd 均展开）；解析顺序为进程环境 > `credentials.json` 的 `mcp.<服务器>.<变量>`（原子写、POSIX 0600）> 向导交互补录；缺失即标记 `missing_env`、不带着空值拉起 server（非交互 fail-closed）。所有展开值登记全局 Redactor，工具结果 / stderr / 日志 / 预览统一过筛。
-- **SDK 客户端**（`mcp/runtime.py` + `mcp/connection.py`）：连接基于官方 `mcp` SDK。`AsyncRuntime` 把唯一的 asyncio 事件循环关在专用线程里，`SdkConnection` 对服务层暴露同步门面（握手 / `list_tools` / `call_tool` / `close`），每次调用经 `run_coroutine_threadsafe` 投递并轮询当前线程取消令牌（Esc 取消、超时中断）。SDK v2 不推送「连接断开」事件，故用一层代读泵包装传输，原读流 EOF 即回调 `on_closed`（等价旧读线程的崩溃检测）；stdio 子进程 stderr 落临时文件供 `/mcp logs`；`notifications/tools/list_changed` 在旧协议经 SDK `message_handler` 触发工具刷新、现代协议（2026-07-28+）经 `Client.listen` 订阅流触发（不可用时静默跳过）；工具调用接入 `progress_callback`，按 10% 里程碑经 renderer 展示（`total` 未知不外显）；结果用 `model_dump(by_alias=True)` 归一为旧客户端同形 dict，`catalog` 零改动。传输由 `factory.py` 按 `cfg.type` 构造：stdio 走 SDK `stdio_client`；`http` 走 `streamable_http_client`（自持 `httpx2.AsyncClient`，headers 承载静态 token）；`sse` 走 SDK `sse_client`（legacy）；`oauth=True` 的远程服务器在同一 `httpx2.AsyncClient` 上挂 SDK `OAuthClientProvider`（见下条）。
+- **SDK 客户端**（`mcp/runtime.py` + `mcp/connection.py`）：连接基于官方 `mcp` SDK。`AsyncRuntime` 把唯一的 asyncio 事件循环关在专用线程里，`SdkConnection` 对服务层暴露同步门面（握手 / `list_tools` / `call_tool` / `close`），每次调用经 `run_coroutine_threadsafe` 投递并轮询当前线程取消令牌（Esc 取消、超时中断）。SDK v2 不推送「连接断开」事件，故用一层代读泵包装传输，原读流 EOF 即回调 `on_closed`（等价旧读线程的崩溃检测）；stdio 子进程 stderr 落临时文件供 `/mcp logs`；`notifications/tools/list_changed` 在旧协议经 SDK `message_handler` 触发工具刷新、现代协议（2026-07-28+）经 `Client.listen` 订阅流触发（不可用时静默跳过）；工具调用接入 `progress_callback`，按 10% 里程碑发 `Notice` 事件（`total` 未知不外显）；结果用 `model_dump(by_alias=True)` 归一为旧客户端同形 dict，`catalog` 零改动。传输由 `factory.py` 按 `cfg.type` 构造：stdio 走 SDK `stdio_client`；`http` 走 `streamable_http_client`（自持 `httpx2.AsyncClient`，headers 承载静态 token）；`sse` 走 SDK `sse_client`（legacy）；`oauth=True` 的远程服务器在同一 `httpx2.AsyncClient` 上挂 SDK `OAuthClientProvider`（见下条）。
 - **OAuth2.1**（`mcp/auth.py`）：SDK 的 `OAuthClientProvider` 负责发现 / DCR / PKCE / 换 token / 刷新，本子系统补齐 token 持久化与浏览器回调。`FileTokenStorage` 把 token / client_info 存 `~/.smithcode/mcp_auth.json`（独立于 config，原子写、POSIX 0600，读写时值登记 Redactor）；交互授权的回调走固定本地端口（`127.0.0.1:3334`，被占用时退随机端口）的临时 HTTP 服务。**后台连接绝不弹浏览器**：无 token 时启动预检直接置 `needs_auth`，只有用户显式 `/mcp auth <名称>` 才以交互模式（`webbrowser.open` + 等回调）完成授权；非交互下 `redirect_handler` 一律抛 `McpAuthError` fail-closed；服务端返回的授权失败也归入 `needs_auth` 并给出可操作提示。
 - **工具接入**：连接成功后经 `tools/base.register_dynamic()` 进入同一注册表，与静态工具共用权限 / serial / describe / 展示机制；暴露名 `mcp__<服务器>__<工具>`（非 `[A-Za-z0-9_-]` 替换 `_`、64 截断、冲突补后缀），默认 `ask` + `serial=True`（外部服务器状态未知）；断开或工具列表变化时原子替换注册项。
 - **入口**：`/mcp`（状态与操作菜单，选择面板）、`/mcp auth <名称>`（OAuth 浏览器授权）、`/mcp add`（TUI 居中向导面板 / REPL 行式流程，命令层只返回 `CommandResult.wizard` 意图；向导支持模板 / 手动命令 / 远程 URL 三分支）、直通添加 `/mcp add <名称> -- <命令...>`（stdio）或 `--url <地址> [--type http|sse] [--header K=V] [--oauth]`（远程）；`mcp/templates.py` 提供常用模板（filesystem / github / playwright / memory / everything / Linear / Sentry）。
 - **服务生命周期**：`Agent.start()` 后台并发连接（失败隔离、不阻塞启动）、`Agent.close()` 统一关闭；连接/刷新在专用线程池，注册表增删走 `tools/base` 的锁。
 
+## 事件架构（event/ + frontend/ + sessions/）
+
+**任何状态变化都是一条事件**：核心只 `publish`，前端 / 会话日志 / 终端标题都是它的
+订阅者。会话状态不是被"改"出来的，而是**折叠事件**折出来的（事件溯源）。
+
+```
+LLM 流 / 工具 / 权限 / 会话写入（发布方，只 publish）
+  │  event.publish(载荷)  ← Agent._emit 装信封（id/type/version/created/session_id/durable）
+  ▼
+event/bus.py（每会话一条总线：唯一扇出点）
+  ├─→ 前端订阅者：frontend/console.py（终端）、tui/frontend.py（界面）
+  ├─→ title.TerminalTitlePresenter（终端标题状态机）
+  └─→ sessions/journal.py：durable 事件落盘（一行一个信封，带 seq）
+                          + 折叠进会话视图（sessions/project.py）
+```
+
+- **信封与声明**：事件类只在 `event/catalog.py` 定义，用 `@declare(type, durable, version,
+  aggregate)` 声明类型名（稳定契约，写进日志）、是否持久、聚合根字段、版本。信封由
+  `event/envelope.py` 负责，`id` / `created` / `session_id` 由发布侧注入，调用方不手写。
+- **持久 / 易失二分**：边界类事实（消息入历史、执行与步骤起止、工具起止、询问结果、
+  标题、模型、用量、压缩基线、检查点）是 `durable=True`，进日志可回放；流式增量、
+  通知、进度、忙碌态是易失的，前端丢一帧无所谓（重放骨架就能重建视图）。
+- **唯一写入口**：`event.publish()`（发布）、`bus.subscribe()`（订阅）、`session.add()`
+  （消息）、`session.record()`（会话状态）、`event.asks` 端口（询问）各只有一个；守卫
+  测试静态扫描，散出去会红（见 `tests/guard/test_single_event_path.py`）。
+- **询问端口（asked → replied）**：`event/asks.py` 发布 `PromptStarted` → await 当前前端
+  作答 → 发布 `PromptFinished`。前端只实现一个 `async ask(AskRequest) -> AskAnswer`
+  （终端读 stdin、TUI 挂面板 + await Future）；同步上下文（命令层）用 `ask_sync()` 借
+  运行中的循环投回协程。收尾时 `AskPort.cancel_in_flight()` 统一取消挂起询问并按
+  fail-closed 放行等待方——**没有阻塞在非 daemon 线程里的等待**，退出卡死那类故障从
+  根上消失。
+- **会话日志 = 事件日志**（`sessions/`）：一行一个信封（类型名带版本，读回按"不超过该
+  版本的最新一个"取类），写失败降级为纯内存会话；`load()` 重放全部事件并折叠，崩溃
+  收尾（尾部悬空 `tool_calls` 补占位）**作为事件写回日志**，于是那次恢复本身也可回放。
+- **验真方式**：重放日志折叠出的视图必须与在线视图逐字段相等，且总线上发过的 durable
+  事件一条不漏（`tests/test_event_sourcing.py`）。
+
 ## 终端窗口标题（title.py）
 
-标题**由 agent 事件驱动，前端只提供写入通道**——为后续接 desktop 等新前端留出解耦：
+标题**由事件驱动，前端只提供写入通道**：
 
 ```
-Agent / 权限引擎（事件源，经 renderer.current()）
-  │  title_changed(title) / turn_started() / turn_finished(status)
-  │  turn_waiting_started() / turn_waiting_finished()（由 Relay 在 ask 方法进出时发射）
+Agent / 权限引擎 / 询问端口（事件源，只 publish）
+  │  TitleChanged（标题变化）/ Execution*（忙闲）/ PromptStarted+PromptFinished（等待，按 id 配对）
   ▼
-title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其余原样透传）
-  ├─→ 内层后端（TuiRenderer / ConsoleRenderer / 未来 DesktopRenderer）：总线消费方
-  └─→ TerminalTitlePresenter（可选订阅者：状态机 + 合成 + 生命周期）
-            │  sink(seq): TUI = driver.write（Textual 写入队列，线程安全）
-            ▼            REPL = 真实 stdout 控制序列
+event/bus.py ─→ TerminalTitlePresenter（订阅者：状态机 + 合成 + 生命周期）
+                      │  sink(seq): TUI = driver.write（Textual 写入队列，线程安全）
+                      ▼            REPL = 真实 stdout 控制序列
 ```
 
-- **装配入口（两个）**：终端宿主用 `attach()`——等价于 `bus()` + `enable_title()`，建总线并接管终端标题（REPL 与 TUI 现用此入口，参数与语义未变）；只想要事件、不要终端标题的 GUI 前端（desktop / web）用 `bus()`——不创建标题呈现器、不装退出钩子、不写任何控制序列。`Relay` 的订阅者可省略（`target=None`），此时它就是一条纯总线。注意**等待事件只由 `Relay` 发射**（ask 方法边界）：前端若绕过 `Relay` 直接 `set_renderer(...)`，`turn_waiting_*` 会收不到；忙闲与标题事件由 Agent 主动调用，不受此限。
-- **事件发射点**：`Agent.run()`（内层一对忙闲）、`Agent.run_with_goal()`（外层一对，多回合期间忙闲计数不归零、标题不闪烁）、`Agent.new_session()`（发 `title_changed("")`，标题回退到工作区目录名）、`Agent.resume()`（发恢复后的标题）、`_title_worker` / `rename_session`（原有）。
-- **等待用户输入（`Renderer` 总线事件）**：`turn_waiting_started` / `turn_waiting_finished` 是**基类协议的一部分**（默认空实现），发射点在 `Relay`：它在 ask 类方法（`ask_text` / `ask_choice` / `ask_form` / `confirm_choice`）进出时广播，覆盖权限确认、越界授权、技能信任确认与 `ask_user` 提问——调用点零改动。发射点只能是**最外层装饰器**而非基类实现：ask 方法在 4 个实现里都是整体覆盖、不调 `super()`，且 `Relay` 必须覆盖公开名才能转发，写在基类里会被装饰器绕过或重复发射。事件同时喂给呈现器与内层后端，因此任何前端覆盖这两个方法即可当消费方（当前只有终端标题消费，TUI 尚未接）。等待与忙闲分开计数（确认可能嵌套），标题前缀 `!` 优先于 `◐`。
-- **合成规则**：`Smith` / `Smith · <会话标题>` / 运行中 `◐ Smith · …` / 等待中 `! Smith · …`（优先于运行中）；空标题回退工作区目录名；写入前去控制字符（标题可能来自模型生成，须防"数据 → 转义序列"注入）并截断。
-- **写入与恢复**：`OSC 0`（`ESC ] 0 ; … BEL`）设窗口标题 + 图标名；退出用 xterm 窗口标题栈（`CSI 22;2t` 压栈 / `CSI 23;2t` 出栈）恢复用户原标题——**不写空标题**（那会把原标题抹掉），也不读回原标题（读回要抢 stdin 解析终端应答，而 stdin 归 prompt_toolkit / Textual 独占）。运行期改标题只写 OSC，不碰栈。
-- **退出钩子**：`atexit`（覆盖 `/exit` / EOF / 第二次 Ctrl+C 的 `SystemExit(130)` / 未捕获异常）+ `SIGTERM` / `SIGHUP`（链回原处理器，保持退出码语义）；**刻意不注册 SIGINT**——`cli._wait_for_task` 用它做「第一次取消任务、第二次退出」，抢占会破坏中断语义。钩子在主线程装载（`signal.signal` 限制）。
-- **开关与降级**：`SMITHCODE_TERMINAL_TITLE` > `config.toml` 的 `terminal_title` > 默认开；非 tty（管道 / CI）或开关关闭时整体空操作，一个字节都不写。tmux 等会拦截该栈序列的复用器下，退出后窗口名由下一个 shell 提示符覆盖。
+- **装配入口**：`title.enable_title(sink=…)` 返回呈现器（幂等），宿主自己留着并作为**额外
+  订阅者**装配：`frontend.attach(bus, 前端, extra_subscribers=(presenter.on_agent_event,))`。
+  只想要事件、不要终端标题的 GUI 前端（desktop / web）不调它即可。
+- **订阅入口**：呈现器收的是**信封**（`on_agent_event(env)`），只看 `env.data`；未知事件
+  与连信封都不是的对象一律空操作（新增事件类型不得让订阅者抛错）。
+- **忙闲与等待**：忙闲由 `ExecutionStarted` / `ExecutionSucceeded|Failed|Interrupted`
+  计数（多回合期间不归零）；等待由 `PromptStarted` / `PromptFinished` **按 id 配对**判定
+  （`open_prompts` 非空即在等），因此并发的两次提问先结束的那个不会把另一个的 `!` 抹掉。
+  等待优先于运行中（前缀 `!` 胜过 `◐`）。
+- **合成规则**：`Smith` / `Smith · <会话标题>` / 运行中 `◐ Smith · …` / 等待中 `! Smith · …`；
+  空标题回退工作区目录名；写入前去控制字符（标题可能来自模型生成，须防"数据 → 转义序列"
+  注入）并截断。
+- **写入与恢复**：`OSC 0`（`ESC ] 0 ; … BEL`）设窗口标题 + 图标名；退出用 xterm 窗口标题栈
+  （`CSI 22;2t` 压栈 / `CSI 23;2t` 出栈）恢复用户原标题——**不写空标题**（那会把原标题抹掉），
+  也不读回原标题（读回要抢 stdin 解析终端应答，而 stdin 归 prompt_toolkit / Textual 独占）。
+- **退出钩子**：`atexit`（覆盖 `/exit` / EOF / 第二次 Ctrl+C 的 `SystemExit(130)` / 未捕获异常）
+  + `SIGTERM` / `SIGHUP`（链回原处理器，保持退出码语义）；**刻意不注册 SIGINT**——
+  `cli._wait_for_task` 用它做「第一次取消任务、第二次退出」，抢占会破坏中断语义。
+- **开关与降级**：`SMITHCODE_TERMINAL_TITLE` > `config.toml` 的 `terminal_title` > 默认开；
+  非 tty（管道 / CI）或开关关闭时整体空操作，一个字节都不写。
 
 ## 模块职责
 
@@ -220,17 +279,19 @@ title.Relay（渲染后端装饰器：拦截标题事件与 ask 类方法，其�
 | ---- | ---- |
 | `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
 | `commands/` | 斜杠命令框架：注册表（`@register` 装饰器）+ 统一 `dispatch()`，REPL 与 TUI 共用；命令元数据（`accepts_args` / `immediate` / `aliases`）驱动两端行为；`/help` 文案由注册表自动生成，新命令一个文件零改动接入 |
-| `agent.py` | Agent 循环编排；`run_with_goal()` 是 `/goal` 唯一的续跑驱动器（无目标等价 `run()`）；`new_session()` 集中承担 `/new` 的全部会话级重置（消息历史、会话用量、权限会话规则、信任目录、上下文快照、已读记录、步骤清单、持久目标） |
+| `event/` | **事件层（L0）**：信封与声明（`envelope.py` / `registry.py` / `catalog.py`）、唯一发布口与订阅口（`bus.py`）、询问端口（`asks.py`）、事件流（`stream.py`）。本层不 import 其他 smithcode 包 |
+| `frontend/` | 前端适配层（L3）：`Asker` 协议与上下文、`attach()` 装配入口（订阅事件 + 挂询问端口）、终端前端（`console.py`）与文本化纯函数（`render.py`） |
+| `sandbox.py` | 会话沙箱授权目录：工作区快照 / 启动附加目录 / 越界信任目录 / 技能只读白名单 / 临时放行（ContextVar） |
+| `agent/` | Agent 循环编排（包）：主循环与流式调度（`agent.py`）、会话外观（`agent_session.py`）、工具执行（`tools_run.py`）、边界钩子（`hooks.py`）、运行中排队（`queues.py`）、取消令牌（`signal.py`）、深层发事件通道（`emitter.py`）；`run_with_goal()` 是 `/goal` 唯一的续跑驱动器（无目标等价 `run()`）；`new_session()` 集中承担 `/new` 的全部会话级重置 |
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
 | `textfile.py` | 文本文件读写的唯一出口：换行风格（LF / CRLF / CR）与 UTF-8 BOM 的探测、LF 归一化与写回还原、`TextFileError` 友好错误。文件工具（read_file / write_file / edit_file / apply_patch / grep）全部经此读写，保证**编辑不改动文件既有的换行风格与 BOM**（见「安全边界」的换行保真条目） |
 | `llm/` | 模型交互子系统：`client.py` OpenAI 兼容接口封装（流式、自定义请求头注入、`/models` 拉取）、`retry.py` 重试策略与状态机（分类 / 预算 / 退避 / 状态文案的唯一权威，见「请求保护与重试」）、`models.py` 候选模型目录 `ModelCatalog`（`ModelSource` 三级组合，线程安全；启动同步装载、未配置后台刷新回写缓存）、`usage.py` token 用量、`prompts.py` 系统提示词（行为规则）；`__init__.py` 汇总公共 API |
-| `session.py` | 会话聚合根：消息历史（`MessageLog` 追加即落盘）、系统提示词装配、原地恢复 / 压缩检查点 / 标题 |
-| `sessions/` | 会话持久化子系统：JSONL 转录（`paths` / `format` / `store`）、崩溃修复、项目级列表 / 查找 / 删除 / 导入 / 保留期清理、标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
+| `session.py` | 会话聚合根 = **事件折叠出来的视图** + 写入路径（发事件）：`add` / `set_title` / `set_compacted` / 检查点都只发事件，`messages` / `title` / `usage` 是折叠结果；系统提示词装配与原地恢复 |
+| `sessions/` | 会话**事件日志**子系统：`format.py`（一行一个信封、版本化类型名、坏行容忍）、`store.py`（唯一写入口 `append_event`、重放加载、项目级列表/查找/删除/导入/清理）、`project.py`（纯折叠：事件 → 会话视图）、`journal.py`（总线订阅者：durable 落盘 + 折叠），标题生成纯逻辑（见本文件「会话持久化与恢复」节） |
 | `plan.py` | 任务拆分与分步骤执行：`todo_write` / `todo_read` 维护的会话级步骤清单（id 分配、标题不可变、状态机 + 全量/仅标题两种渲染 + `/plan` 查看） |
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
-| `renderer.py` | 渲染后端抽象（`Renderer` 基类 + `ConsoleRenderer`）与全局实例（`current()` / `set_renderer()`）：Agent 全部终端交互经此收口；基类事件即前端可订阅的总线（`turn_started` / `turn_finished` / `turn_waiting_started` / `turn_waiting_finished` / `title_changed`） |
-| `title.py` | 终端窗口标题：消费 agent 事件（`title_changed` / `turn_started` / `turn_finished`）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |
+| `title.py` | 终端窗口标题：订阅事件（`TitleChanged` / `Execution*` / 询问事件对按 id 配对判定等待态）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |
 | `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级加载集合与载荷投递（含压缩后裁剪）、`render.py` 目录段与载荷渲染（字符预算降级）；`/new` 时重置加载集合 |
 | `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |

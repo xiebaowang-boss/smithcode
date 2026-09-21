@@ -1314,7 +1314,7 @@ class Agent:
 
         `use_tools=False` 时不暴露任何工具（迭代上限收尾轮强制纯文本）。
         返回 (消息, 用量, 是否被中断)。用量由 llm 层从流中提取，服务商
-        不提供时为 None。渲染交给 renderer（CLI 逐字打印 / TUI 进组件）。
+        不提供时为 None。呈现走事件：增量发 `MessageUpdate`，前端各自渲染。
 
         **正文按尝试累积**（对齐 opencode 在一条 assistant 消息里累积多个 text
         part）：llm 层每次尝试的正文都实时上屏，这里把它们按到达顺序拼进同一条
