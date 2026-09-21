@@ -1,26 +1,31 @@
-"""会话转录的读写：append-only JSONL + 项目级列举 / 查找 / 加载。
+"""会话日志的写路径与加载：**一个写入方法**（`append_event`）+ 重放加载。
 
-写路径（`SessionStore`）：懒物化（首条非 system 消息才建文件）、每条记录
-一次 `write` + `flush`、任何 `OSError` 降级为禁用持久化（绝不阻断 Agent）。
-`sync()` 是持久化屏障（flush + fsync），只在语义点调用：工具执行前与每轮结束
-——单条 `flush` 只把数据交给内核页缓存，扛不住断电。
-读路径（模块函数）：列举只读文件头/尾，加载单遍流式并做崩溃修复。
+写路径：懒物化（首条事件才建文件）、每条事件一次 `write` + `flush`、任何
+`OSError` 降级为禁用持久化（绝不阻断 Agent）。`sync()` 是持久化屏障
+（flush + fsync），只在语义点调用：工具执行前与每轮结束——单条 `flush` 只把数据
+交给内核页缓存，扛不住断电。
+
+读路径：列举只读文件头/尾（列表页不解析整个日志），加载重放全部事件并折叠出
+视图；崩溃收尾把占位结果**作为事件**写回日志（见 `format.repair_dangling_tool_calls`）。
+
+历史沿革：这里原来有 7 个 `append_*`（msg/compact/state/title/model/usage）和一
+套"记录种类"协议（`t=msg/…`）；现在只有事件——会话状态由折叠得出
+（见 `sessions/project.py`），所以写入路径只有一个入口。
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
-import time
+from dataclasses import replace
 from pathlib import Path
 
 from .. import __version__, config
-from ..event import publish
-from ..event.catalog import Notice
+from ..event.catalog import MessageEnd
+from ..event.envelope import Envelope, wrap
 from . import format, paths
 from .model import LoadedSession, SessionSummary
 
-# 列举时的头/尾读取窗口：meta 与首轮 prompt 在头部，标题记录在尾部
+# 列举时的头/尾读取窗口：created 与首轮 prompt 在头部，标题事件在尾部
 HEAD_BYTES = 8192
 TAIL_BYTES = 16384
 
@@ -39,27 +44,25 @@ class SessionStore:
                  effort: str = "", oneshot: bool = False):
         self.id = str(session_id)
         self._path = paths.session_path(self.id, cwd=cwd)
-        self._header = format.meta_record(
-            self.id,
-            cwd=str(Path(cwd or config.WORKSPACE_ROOT).resolve()),
-            model=model or config.MODEL,
-            effort=effort or config.REASONING_EFFORT,
-            app=__version__,
-            oneshot=oneshot,
-        )
+        # 供 `session.created` 事件取用的元数据（原先写在文件头 meta 里）
+        self.cwd = str(Path(cwd or config.WORKSPACE_ROOT).resolve())
+        self.model = model or config.MODEL
+        self.effort = effort or config.REASONING_EFFORT
+        self.oneshot = bool(oneshot)
+        self.app = __version__
         self._fh = None
         self._lock = threading.Lock()  # 标题线程与主线程并发追加时串行化写
         self._disabled = False
         self._reported = False
         self._materialized = False
-        self._last_model: tuple[str, str] | None = None  # 已写入的 (模型, 强度)：去重
+        self._next_seq = 1  # 每会话单调递增；恢复时由 load 续上（见 adopt_seq）
 
     # ---------- 构造 ----------
 
     @classmethod
     def create(cls, cwd=None, model: str = "", effort: str = "",
                oneshot: bool = False) -> SessionStore:
-        """新建会话：轮换会话 id，文件懒物化（首条消息时才落盘）。"""
+        """新建会话：轮换会话 id，文件懒物化（首条事件时才落盘）。"""
         return cls(
             config.new_session_id(), cwd=cwd, model=model, effort=effort,
             oneshot=oneshot,
@@ -67,7 +70,7 @@ class SessionStore:
 
     @classmethod
     def open(cls, path, session_id: str, cwd=None) -> SessionStore:
-        """恢复既有会话：沿用原文件（后续消息追加到同一转录）。"""
+        """恢复既有会话：沿用原文件（后续事件追加到同一日志）。"""
         store = cls(session_id, cwd=cwd)
         store._path = Path(path)
         store._materialized = store._path.exists()
@@ -87,39 +90,27 @@ class SessionStore:
     def materialized(self) -> bool:
         return self._materialized
 
-    # ---------- 追加 ----------
+    @property
+    def next_seq(self) -> int:
+        return self._next_seq
 
-    def append_message(self, message: dict) -> None:
-        if not isinstance(message, dict) or message.get("role") == "system":
-            return  # system 每次由 sync_system 重建，不入转录
-        self._append(format.msg_record(message))
+    def adopt_seq(self, next_seq: int) -> None:
+        """恢复会话后续上 seq（日志里已有 1..N，下一条从 N+1 开始）。"""
+        self._next_seq = max(1, int(next_seq))
 
-    def append_compaction(self, summary: dict, tail: list,
-                          before: int = 0, after: int = 0) -> None:
-        self._append(format.compact_record(summary, tail, before, after))
+    # ---------- 追加（唯一写入口） ----------
 
-    def append_state(self, payload: dict) -> None:
-        if isinstance(payload, dict):
-            self._append(format.state_record(payload))
+    def append_event(self, env: Envelope) -> Envelope:
+        """把一条事件写进日志：分配 seq 后追加，返回带 seq 的信封。
 
-    def append_title(self, title: str, source: str = format.TITLE_SOURCE_USER) -> None:
-        self._append(format.title_record(title, source))
-
-    def append_usage(self, usage) -> None:
-        if isinstance(usage, dict) and usage:
-            self._append(format.usage_record(usage))
-
-    def append_model(self, model: str, effort: str = "") -> None:
-        """记录本次调用实际使用的模型 / 思考强度（与上一条相同则不写）。
-
-        首次调用必写一条（`_last_model` 为空），此后仅在变化时追加——`meta`
-        只记创建时的模型，`/model` 中途切换后需要靠这条记录回答「谁生成的」。
+        「只写 durable」的判断在调用方（`sessions/journal.py`）：这里只负责写，
+        于是"写日志"只有一条路径，新增事件不会漏记（是否持久在声明里，见
+        `event/registry.py`）。
         """
-        key = (str(model or ""), str(effort or ""))
-        if not key[0] or key == self._last_model:
-            return
-        self._last_model = key
-        self._append(format.model_record(*key))
+        numbered = replace(env, seq=self._next_seq)
+        self._next_seq += 1
+        self._append(format.to_record(numbered))
+        return numbered
 
     def _append(self, record: dict) -> None:
         if self._disabled:
@@ -133,10 +124,8 @@ class SessionStore:
                     # 会话期持有句柄（每条 flush），close() 统一释放；故不用 with
                     self._fh = open(self._path, "a", encoding="utf-8")  # noqa: SIM115
                     paths.restrict_file(self._path)
-                if not self._materialized:  # 懒物化：meta 首行与首条消息同批写入
-                    self._fh.write(format.dump_record(self._header))
                     self._materialized = True
-                self._fh.write(line)
+                self._fh.write(line + "\n")
                 self._fh.flush()
             except OSError as exc:
                 error = exc
@@ -150,80 +139,65 @@ class SessionStore:
         if error is not None:
             self._report(error)
 
-    def flush(self) -> None:
-        with self._lock:
-            if self._fh is None:
-                return
-            try:
-                self._fh.flush()
-            except OSError as exc:
-                self._disabled = True
-                error = exc
-            else:
-                return
-        self._report(error)
-
-    def sync(self) -> None:
-        """持久化屏障：flush + `os.fsync`，确保已追加记录挺过断电 / 内核崩溃。
-
-        与 `flush()` 的区别只在落盘层级：`flush()` 把数据交给内核页缓存（进程被
-        kill 通常能保住），`fsync()` 才真正写进设备。成本是每次一次系统调用，
-        所以只在语义点调用（工具执行前 / 每轮结束），不追求每条记录都 fsync。
-        写失败仍按既有策略降级为纯内存会话（fail-open）。
-        """
-        if self._disabled:
-            return
-        error = None
-        with self._lock:
-            fh = self._fh
-            if fh is None:
-                return
-            try:
-                fh.flush()
-                os.fsync(fh.fileno())
-            except ValueError:
-                return  # 句柄已被 close() 关闭（并发竞争），不是写失败，不降级
-            except OSError as exc:
-                self._disabled = True
-                error = exc
-        if error is not None:
-            self._report(error)
-
-    def close(self) -> None:
-        with self._lock:
-            fh, self._fh = self._fh, None
-        if fh is None:
-            return
-        try:
-            fh.flush()
-        except OSError:
-            pass
-        try:
-            fh.close()
-        except OSError:
-            pass
-
     def _report(self, exc: OSError) -> None:
         """写失败只警告一次并降级为纯内存会话（与权限的 fail-closed 相反）。"""
         if self._reported:
             return
         self._reported = True
         try:
+            from ..event import publish
+            from ..event.catalog import Notice
+
             publish(Notice(
                 f"[会话] 无法写入会话记录（{type(exc).__name__}: {exc}），"
-                "本次会话不会被自动保存。"
-            , level="warning"))
-        except Exception:  # noqa: BLE001 渲染失败不影响主流程
+                "本次会话不会被自动保存。",
+                level="warning",
+            ))
+        except Exception:  # noqa: BLE001 事件通道故障不影响主流程
             return
 
+    # ---------- 收尾 ----------
 
-# ---------- 项目级查询 ----------
+    def flush(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                except OSError:
+                    pass
+
+    def sync(self) -> None:
+        """持久化屏障：flush + fsync（手动保存与每轮结束的语义点用）。"""
+        with self._lock:
+            if self._fh is None:
+                return
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+
+# --------------------------------------------------------------------------
+# 列举与查找
+# --------------------------------------------------------------------------
+
 
 def list_sessions(cwd=None, limit: int = 20,
                   include_oneshot: bool = False) -> list:
     """列出当前项目的会话摘要，按最近更新倒序。
 
-    只读每个文件的头部（meta + 首轮 prompt）与尾部（最近的 title 记录）；
+    只读每个文件的头部（created + 首轮 prompt）与尾部（最近的标题事件）；
     尾部未命中标题时回退全文扫描（标题可能被长会话推到文件深处）。
     """
     root = paths.sessions_dir(cwd)
@@ -270,7 +244,7 @@ def find(session_id_or_prefix, cwd=None) -> SessionSummary | None:
 
 
 def summary_from_path(path) -> SessionSummary:
-    """从任意路径的转录文件构造摘要（`--resume <路径>` 用）。"""
+    """从任意路径的日志构造摘要（`--resume <路径>` 用）。"""
     target = Path(path)
     if not target.is_file():
         raise StoreError(f"会话文件不存在: {target}")
@@ -278,16 +252,6 @@ def summary_from_path(path) -> SessionSummary:
     if summary is None:
         raise StoreError(f"会话文件为空或无法解析: {target}")
     return summary
-
-
-def load(summary) -> LoadedSession:
-    """加载转录：单遍解析 + 投影重置（compact）+ 崩溃修复，返回 LoadedSession。"""
-    path = Path(summary.path if isinstance(summary, SessionSummary) else summary)
-    try:
-        records, bad_lines = format.read_transcript(path)
-    except OSError as exc:
-        raise StoreError(f"无法读取会话记录 {path}: {exc}") from exc
-    return _assemble(path, records, bad_lines)
 
 
 def delete(session_id, cwd=None) -> bool:
@@ -303,16 +267,24 @@ def delete(session_id, cwd=None) -> bool:
 
 
 def rename(session_id, title: str, cwd=None) -> bool:
-    """给指定会话追加用户标题记录（最后一条生效，不重写文件）。"""
+    """给指定会话追加一条标题事件（最后一条生效，不重写文件）。"""
     summary = find(session_id, cwd=cwd)
     if summary is None:
         return False
-    _append_raw(summary.path, format.title_record(title, format.TITLE_SOURCE_USER))
+    from ..event.catalog import TitleChanged
+
+    store = SessionStore.open(summary.path, session_id=summary.id)
+    try:
+        store.append_event(wrap(TitleChanged(title, source="user"), session_id=summary.id))
+    finally:
+        store.close()
     return True
 
 
 def import_json(path, cwd=None) -> SessionSummary:
-    """把旧 `<workspace>/sessions/*.json`（纯 messages 数组）导入为 v1 转录。"""
+    """把旧 `<workspace>/sessions/*.json`（纯 messages 数组）导入为事件日志。"""
+    import json
+
     source = Path(path)
     try:
         data = json.loads(source.read_text(encoding="utf-8"))
@@ -323,15 +295,19 @@ def import_json(path, cwd=None) -> SessionSummary:
     if not isinstance(data, list) or not data:
         raise StoreError(f"旧会话文件应是非空的消息数组：{source}")
     store = SessionStore.create(cwd=cwd)
-    for message in data:
-        if isinstance(message, dict):
-            store.append_message(message)
-    store.close()
+    try:
+        for message in data:
+            if isinstance(message, dict) and message.get("role") != "system":
+                store.append_event(wrap(MessageEnd(message=message), session_id=store.id))
+    finally:
+        store.close()
     return summary_from_path(store.path)
 
 
 def sweep(cleanup_days) -> int:
-    """保留期清理：删除全部项目中 mtime 早于截止时间的转录。返回删除数。"""
+    """保留期清理：删除全部项目中 mtime 早于截止时间的日志。返回删除数。"""
+    import time
+
     try:
         days = float(cleanup_days)
     except (TypeError, ValueError):
@@ -353,58 +329,72 @@ def sweep(cleanup_days) -> int:
     return removed
 
 
-# ---------- 内部 ----------
+# --------------------------------------------------------------------------
+# 加载（重放折叠）
+# --------------------------------------------------------------------------
 
-def _assemble(path: Path, records: list, bad_lines: int = 0) -> LoadedSession:
-    """把记录流装配为加载结果：compact 重置投影，最后一条 state/title/model 生效。"""
-    meta = {}
-    messages: list = []
-    state = None
-    title = ""
-    title_source = ""
-    model = ""
-    effort = ""
-    compact_count = 0
-    for record in records:
-        kind = record.get("t")
-        if kind == format.T_META:
-            meta = record
-        elif kind == format.T_MSG:
-            message = record.get("m")
-            if isinstance(message, dict) and message.get("role") != "system":
-                messages.append(message)
-        elif kind == format.T_COMPACT:
-            summary = record.get("summary")
-            tail = record.get("tail") or []
-            messages = ([summary] if isinstance(summary, dict) else []) + [
-                item for item in tail if isinstance(item, dict)
-            ]
-            compact_count += 1
-        elif kind == format.T_STATE:
-            state = record.get("state") if isinstance(record.get("state"), dict) else None
-        elif kind == format.T_TITLE:
-            title = str(record.get("title") or "")
-            title_source = str(record.get("source") or "")
-        elif kind == format.T_MODEL:
-            # 只采纳带模型的记录：残缺记录退回上一条，而不是清空已还原的值
-            candidate = str(record.get("model") or "")
-            if candidate:
-                model, effort = candidate, str(record.get("effort") or "")
-    if not meta:
-        meta = _synthesize_meta(path)
-    if not model:  # 旧转录（或首次调用尚未登记）回退 meta 的创建时模型
-        model = str(meta.get("model") or "")
-        effort = effort or str(meta.get("effort") or "")
-    repair, repaired = format.repair_dangling_tool_calls(messages)
+
+def load(summary) -> LoadedSession:
+    """加载日志：重放全部事件并折叠出视图；崩溃收尾补占位结果。
+
+    与 `format.read_log` 的分工：这里负责"折叠 + 收尾 + 装配 LoadedSession"，
+    读文件与坏行容忍在 format 层。
+    """
+    from . import project
+
+    path = Path(summary.path if isinstance(summary, SessionSummary) else summary)
+    try:
+        events, bad_lines = format.read_log(path)
+    except OSError as exc:
+        raise StoreError(f"无法读取会话记录 {path}: {exc}") from exc
+
+    view = project.fold(events)
+    meta = dict(view.meta) or _synthesize_meta(path)
+    session_id = str(meta.get("session_id") or path.stem)
+    repair, appended = format.repair_dangling_tool_calls(view.messages)
+    if appended:
+        # 崩溃收尾的产物也是事件：写回日志，下次恢复就是合法历史（不再读时打补丁）
+        store = SessionStore.open(path, session_id=session_id)
+        try:
+            store.adopt_seq(max([env.seq or 0 for env in events] or [0]) + 1)
+            for message in appended:
+                store.append_event(wrap(MessageEnd(message=message), session_id=session_id))
+        finally:
+            store.close()
+    meta.setdefault("id", session_id)
     return LoadedSession(
-        path=path, meta=meta, messages=messages, state=state,
-        title=title, title_source=title_source, compact_count=compact_count,
-        model=model, effort=effort,
-        bad_lines=bad_lines, repair=repair, repaired=repaired,
+        path=path, meta=meta, messages=view.messages, state=view.state or None,
+        title=view.title, title_source=view.title_source,
+        compact_count=view.compactions,
+        model=view.model or str(meta.get("model") or ""),
+        effort=view.effort or str(meta.get("effort") or ""),
+        bad_lines=bad_lines, repair=repair, repaired=bool(appended),
     )
 
 
+def _synthesize_meta(path: Path) -> dict:
+    """没有 `session.created` 事件时，从文件名与 mtime 合成最小元数据。"""
+    import time
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = time.time()
+    return {
+        "id": path.stem,
+        "session_id": path.stem,
+        "cwd": "",
+        "created": mtime,
+        "model": "",
+        "effort": "",
+        "app": "",
+        "oneshot": False,
+        "synthesized": True,
+    }
+
+
 def _read_summary(path: Path) -> SessionSummary | None:
+    """读会话摘要：只看头尾两段。"""
     try:
         stat = path.stat()
     except OSError:
@@ -424,58 +414,50 @@ def _read_summary(path: Path) -> SessionSummary | None:
 
     meta: dict = {}
     first_prompt = ""
+    parsed = 0
     for record in _parse_chunk(head):
-        kind = record.get("t")
-        if kind == format.T_META and not meta:
-            meta = record
-        elif kind == format.T_MSG and not first_prompt:
-            message = record.get("m") or {}
+        base, data = _event_parts(record)
+        if base == "session.created" and not meta:
+            meta = dict(data)
+            meta.setdefault("session_id", record.get("session_id"))
+        elif base == "session.message.ended" and not first_prompt:
+            message = data.get("message") or {}
             if message.get("role") == "user":
                 first_prompt = _clip(_text_of(message.get("content")), PROMPT_CLIP)
-        if meta and first_prompt:
-            break
-
-    title, title_source, model = _last_tail_facts(_parse_chunk(tail or head))
+    parsed += bool(meta or first_prompt)
+    title, source, model = _tail_facts(_parse_chunk(tail or head))
     if not title and size > len(head) + len(tail):
-        # 标题可能被长会话推到文件深处：回退全文扫描（仅此一种情况读全文）
-        title, title_source, scanned_model = _last_tail_facts(_iter_records(path))
+        # 标题可能被长日志推到深处：回退全文扫描（仅此一种情况读全文）
+        title, source, scanned_model = _tail_facts(_iter_records(path))
         model = model or scanned_model
-    if not meta and not first_prompt and not title:
+    if not meta and not first_prompt and not title and parsed == 0:
+        # 整段都读不出事件（空文件 / 全坏行）才算"无法解析"；只有 assistant 消息
+        # 之类的残缺日志仍给出摘要（元数据由 `_synthesize_meta` 兜底）
         return None
     return SessionSummary(
-        id=str(meta.get("id") or path.stem),
+        id=str(meta.get("session_id") or meta.get("id") or path.stem),
         path=path,
         cwd=str(meta.get("cwd") or ""),
         created=float(meta.get("created") or stat.st_mtime),
         updated=stat.st_mtime,
-        # 首轮 prompt 与标题来自头尾窗口；模型取最后一条 model 记录（回退创建时模型）
+        # 首轮 prompt 与标题来自头尾窗口；模型取最后一条 model 事件（回退创建时模型）
         model=model or str(meta.get("model") or ""),
         title=title,
-        title_source=title_source,
+        title_source=source,
         first_prompt=first_prompt,
         oneshot=bool(meta.get("oneshot")),
         size=size,
     )
 
 
-def _synthesize_meta(path: Path) -> dict:
-    """首行 meta 缺失/损坏时，从文件名与 mtime 合成最小元数据。"""
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        mtime = time.time()
-    return {
-        "v": format.FORMAT_VERSION,
-        "t": format.T_META,
-        "id": path.stem,
-        "cwd": "",
-        "created": mtime,
-        "model": "",
-        "effort": "",
-        "app": "",
-        "oneshot": False,
-        "synthesized": True,
-    }
+def _event_parts(record: dict) -> tuple[str, dict]:
+    """记录 → (去掉版本号的类型名, data)。"""
+    type_name = str(record.get("type") or "")
+    base, _, version_text = type_name.rpartition(".")
+    if base and version_text.isdigit():
+        type_name = base
+    data = record.get("data")
+    return type_name, data if isinstance(data, dict) else {}
 
 
 def _parse_chunk(data: bytes) -> list:
@@ -495,16 +477,16 @@ def _iter_records(path: Path):
                 yield record
 
 
-def _last_tail_facts(records) -> tuple[str, str, str]:
-    """一段记录里最后生效的 (标题, 标题来源, 模型)：列举只读头尾窗口时用。"""
+def _tail_facts(records) -> tuple[str, str, str]:
+    """一段记录里最后生效的 (标题, 标题来源, 模型)。"""
     title, source, model = "", "", ""
     for record in records:
-        kind = record.get("t")
-        if kind == format.T_TITLE:
-            title = str(record.get("title") or "")
-            source = str(record.get("source") or "")
-        elif kind == format.T_MODEL:
-            model = str(record.get("model") or "") or model
+        base, data = _event_parts(record)
+        if base == "session.title.changed":
+            title = str(data.get("title") or "")
+            source = str(data.get("source") or "")
+        elif base == "session.model.selected":
+            model = str(data.get("model") or "") or model
     return title, source, model
 
 
@@ -527,11 +509,3 @@ def _clip(text: str, limit: int) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 1] + "…"
-
-
-def _append_raw(path: Path, record: dict) -> None:
-    paths.ensure_private_dir(path.parent)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(format.dump_record(record))
-        fh.flush()
-    paths.restrict_file(path)

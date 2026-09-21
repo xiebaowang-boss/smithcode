@@ -1,9 +1,12 @@
-"""会话持久化子系统：JSONL 转录的写路径与项目级查询。
+"""会话持久化子系统：**事件日志**的写路径、投影与项目级查询。
 
-对外只暴露本模块的公共 API；其余实现模块（paths / format / model / store）
-不直接被外部导入。设计文档见 docs/session-architecture.md。
+对外只暴露本模块的公共 API；其余实现模块（paths / format / model / store /
+project / journal）不直接被外部导入。
+
+日志只有事件（见 `format.py` 的模块说明），会话状态由折叠得出（`project.py`），
+落盘与折叠的装配在 `journal.py`。
 """
-from .format import CRASH_PLACEHOLDER, FORMAT_VERSION
+from .format import CRASH_PLACEHOLDER, LOG_VERSION
 from .model import LoadedSession, SessionSummary
 from .store import (
     SessionStore,
@@ -22,7 +25,7 @@ from .title import build_title_request, clean_title, should_generate
 
 __all__ = [
     "CRASH_PLACEHOLDER",
-    "FORMAT_VERSION",
+    "LOG_VERSION",
     "LoadedSession",
     "SessionStore",
     "SessionSummary",

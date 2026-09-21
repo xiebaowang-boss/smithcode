@@ -73,7 +73,8 @@ def test_events_are_only_declared_in_the_catalog():
         if path.name in ("catalog.py", "registry.py") or path.parent.name == "event":
             continue
         text = path.read_text(encoding="utf-8")
-        if "@declare(" in text or "@event(" in text:
+        # 只认装饰器用法（行首）：文档里提到 `@declare` 不算声明
+        if re.search(r"^\s*@?(declare|registry\.declare)\(", text, re.MULTILINE):
             offenders.append(str(path.relative_to(SRC)))
     assert not offenders, f"事件声明只能写在 event/catalog.py：{offenders}"
 

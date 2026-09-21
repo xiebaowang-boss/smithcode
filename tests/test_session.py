@@ -151,8 +151,8 @@ def test_message_log_persists_appends(_isolated_home):
     session = Session(store=store)
     assert config.SESSION_ID == store.id  # 绑定时采用转录 id
     session.add("user", "你好")
-    session.sync_system()  # system 不入转录
-    session.messages.append({"role": "assistant", "content": "在"})
+    session.sync_system()  # system 不入日志（恢复时按最新提示词重建）
+    session.add("assistant", "在")  # 消息的写入路径只有 add（发事件）
     store.close()
 
     loaded = load(summary_from_path(store.path))

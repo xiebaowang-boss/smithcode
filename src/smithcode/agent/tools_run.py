@@ -130,9 +130,7 @@ class BatchScheduler:
         plan = ToolPlan(tool_call, tool_call.get("function", {}).get("name", ""),
                         lambda: reason or HOOK_BLOCKED_RESULT, rendered=False)
         result = plan.run()
-        self._agent.session.messages.append(
-            {"role": "tool", "content": result, "tool_call_id": tool_call.get("id")}
-        )
+        self._agent.session.add("tool", result, tool_call_id=tool_call.get("id"))
         self.collected.append(result)
 
     async def _finish_plan(self, plan: ToolPlan) -> None:

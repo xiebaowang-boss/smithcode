@@ -28,18 +28,24 @@ from ..event.catalog import (
     ExecutionInterrupted,
     ExecutionStarted,
     ExecutionSucceeded,
+    HistoryCompacted,
     Idle,
     InboxCancelled,
     InboxCleared,
     InboxDelivered,
     InboxEnqueued,
     MessageEnd,
+    MessageStart,
     MessageUpdate,
+    ModelSelected,
     Notice,
     PlanUpdate,
+    SessionCheckpoint,
+    SessionCreated,
     StatusChanged,
     StepEnded,
     StepStarted,
+    StreamEnded,
     ToolEnd,
     ToolPreview,
     ToolStart,
@@ -68,7 +74,7 @@ class ConsoleFrontend:
         match data:
             case MessageUpdate(kind=kind, delta=delta):
                 self._stream(kind, delta)
-            case MessageEnd():
+            case StreamEnded():
                 self._stream_done()
             case ToolStart(line=line):
                 self._tool_call(line)
@@ -89,6 +95,8 @@ class ConsoleFrontend:
                 | UsageChanged() | CompactionStarted() | CompactionEnded()
                 | CompactionFailed() | InboxEnqueued() | InboxDelivered()
                 | InboxCancelled() | InboxCleared()
+                | MessageEnd() | MessageStart() | SessionCreated()
+                | ModelSelected() | SessionCheckpoint() | HistoryCompacted()
             ):
                 # 执行 / 步骤边界、压缩态、排队变更：终端按"内容与工具块"呈现，
                 # 排队是 TUI 的面板概念（终端里入队即排队等待，无需额外呈现）。

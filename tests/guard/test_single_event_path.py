@@ -46,7 +46,9 @@ def test_events_are_declared_only_in_the_catalog():
         if path.parent.name == "event":
             continue
         text = path.read_text(encoding="utf-8")
-        if "@declare(" in text or "registry.declare(" in text:
+        # 只认**装饰器用法**（行首 `@declare(` / `registry.declare(`）：文档与注释里
+        # 提到这两个名字不算声明（否则讲规则的文档会把守卫自己触发了）
+        if re.search(r"^\s*@?(declare|registry\.declare)\(", text, re.MULTILINE):
             offenders.append(str(path.relative_to(SRC)))
     assert not offenders, f"事件声明只能写在 event/catalog.py：{offenders}"
 
@@ -81,11 +83,16 @@ def test_durable_events_are_serializable():
     from smithcode.event import catalog, registry
     from smithcode.event.envelope import payload_to_dict
 
+    # 检查点事件例外：它的载荷**就是**投影快照（goal/plan/skills 的字典），
+    # 天然是"任意 JSON 形状"——它不是领域事实，不吃这条约束。
+    EXEMPT = {"session.checkpointed"}
     offenders = []
     for cls in registry.declared_classes():
-        if cls.__module__ != "smithcode.event.catalog" or not registry.meta(cls).durable:
+        info = registry.meta(cls)
+        if cls.__module__ != "smithcode.event.catalog" or not info.durable:
             continue
-        # 用一个"空实例"试序列化：字段级类型检查比构造实例更省事
+        if info.type in EXEMPT:
+            continue
         for field in fields(cls):
             hint = str(field.type)
             if "Mapping" in hint or "Any" in hint or "object" in hint:

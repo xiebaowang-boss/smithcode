@@ -143,11 +143,11 @@ def test_compact_emits_status_pair(monkeypatch):
     assert asyncio.run(agent.compact()) is True
 
     kinds = [type(env.data).__name__ for env in seen]
-    # 压缩有专属的起止事件（对齐 opencode 的 `session.compaction.*`），
-    # 「说了什么」仍走 Notice：结构事件与文案分开，前端各自消费。
-    assert kinds == ["CompactionStarted", "CompactionEnded", "Notice"]
-    assert seen[0].data.before_tokens > seen[1].data.after_tokens  # 确实压小了
-    assert "已压缩" in seen[2].data.text
+    # 压缩期间的三种事实：进度（`Compaction*`）、**历史被替换**（`HistoryCompacted`，
+    # 可回放的骨架）、结果文案（Notice）。三者分开，前端各自消费。
+    assert kinds == ["CompactionStarted", "HistoryCompacted", "CompactionEnded", "Notice"]
+    assert seen[1].data.before_tokens > seen[1].data.after_tokens  # 确实压小了
+    assert "已压缩" in seen[3].data.text
 
 
 def test_compact_failure_still_clears_the_status(monkeypatch):

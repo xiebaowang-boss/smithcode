@@ -30,6 +30,15 @@ from . import envelope as _envelope
 from .envelope import Envelope
 
 
+class SubscriberError(Exception):
+    """**订阅者**（前端 / 终端标题 / 日志 / 将来的远程客户端）自身的异常。
+
+    为什么在事件层定义：扇出发生在这里，所以"哪个订阅者炸了"也只有这里知道。
+    与"模型响应流中断"是两回事——订阅者坏了既不该重试，也不该被报成「输出中断」
+    （那会把排查方向引到网络上）。
+    """
+
+
 class Bus:
     """一条会话的事件总线。"""
 
@@ -89,14 +98,21 @@ class Bus:
         loop.call_soon_threadsafe(self.deliver, env)
 
     def deliver(self, env: Envelope) -> None:
-        """在事件循环线程上按注册顺序投递；订阅者异常不吞。
+        """在事件循环线程上按注册顺序投递。
 
-        调用方已确保处于循环线程时可直接用它（如 `Agent._emit` 同时要喂本轮流）。
+        订阅者异常**包成 `SubscriberError` 抛出**（不吞、也不放任它伪装成别的
+        故障）：这是"谁炸了"的唯一判断点，所以包装必须在这里做一次，而不是散在
+        各个发布方（漏掉一处就等于没有契约）。
         """
         with self._lock:
             targets = list(self._listeners) + list(self._by_type.get(env.type, ()))
         for listener in targets:
-            listener(env)
+            try:
+                listener(env)
+            except SubscriberError:
+                raise  # 已经是这个类型：别包第二层
+            except Exception as e:
+                raise SubscriberError(f"订阅者异常: {type(e).__name__}: {e}") from e
 
 
 # --------------------------------------------------------------------------

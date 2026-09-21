@@ -16,7 +16,12 @@ from smithcode import frontend as _frontend_mod
 from smithcode.agent import Agent
 from smithcode.event import asks as ask_port
 from smithcode.event.asks import AskRequest
-from smithcode.event.catalog import PlanUpdate, TitleChanged
+from smithcode.event.catalog import (
+    MessageEnd,
+    PlanUpdate,
+    TitleChanged,
+)
+from smithcode.event.envelope import wrap
 from smithcode.llm import RetryState
 from smithcode.llm.request import TurnConfig
 from smithcode.session import Session
@@ -2493,8 +2498,8 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
     from smithcode.sessions import SessionStore
 
     store = SessionStore.create(cwd=str(workspace))
-    store.append_message({"role": "user", "content": "旧会话的问题"})
-    store.append_message({"role": "assistant", "content": "旧会话的回答"})
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": "旧会话的问题"})))
+    store.append_event(wrap(MessageEnd(message={"role": "assistant", "content": "旧会话的回答"})))
     store.close()
 
     async def _run_case():

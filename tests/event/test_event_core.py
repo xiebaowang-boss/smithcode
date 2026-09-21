@@ -179,14 +179,20 @@ def test_publish_without_bus_is_silent():
 
 
 def test_subscriber_exception_is_not_swallowed(bus):
-    """订阅者自己的故障必须暴露，不能被当成模型流中断静默掉。"""
+    """订阅者自己的故障必须暴露（包成 `SubscriberError`），不能被静默掉。
+
+    包装点在总线：扇出发生在这里，"谁炸了"也只有这里知道；散到各个发布方去包，
+    漏掉一处就等于没有契约。
+    """
+    from smithcode.event.bus import SubscriberError
 
     def broken(_env):
         raise RuntimeError("前端炸了")
 
     bus.subscribe(broken)
-    with pytest.raises(RuntimeError, match="前端炸了"):
+    with pytest.raises(SubscriberError, match="前端炸了") as err:
         publish(catalog.Notice("x"))
+    assert isinstance(err.value.__cause__, RuntimeError)  # 原始异常保留在 __cause__
 
 
 def test_to_thread_publish_keeps_context_and_hops_to_loop():

@@ -135,6 +135,22 @@ class UsageTracker:
         """/new 时只清会话口径，应用启动以来的累计保留。"""
         self.current_session = UsageAccumulator()
 
+    def adopt_session(self, totals: dict) -> None:
+        """用折叠出来的累计口径替换会话账本（重放/恢复时用）。
+
+        与 `add()` 的区别：`add()` 是"再记一笔"，这里是"账本就是这些"——
+        事件溯源下会话用量是折叠结果，不能靠累加去凑（重放会重复计数）。
+        """
+        if not isinstance(totals, dict):
+            return
+        accumulator = UsageAccumulator()
+        accumulator.calls = int(totals.get("calls") or 0)
+        for field in NUMERIC_FIELDS:
+            value = totals.get(field)  # 扁平字段名（与 UsageChanged 的口径一致）
+            if isinstance(value, (int, float)):
+                accumulator.totals[field] = int(value)
+        self.current_session = accumulator
+
     def summary(self) -> str:
         """/usage 命令的展示文本：两个口径各一段 + 非零细节。"""
 

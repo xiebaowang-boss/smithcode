@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from ..event.bus import SubscriberError
+
 
 class StreamInterrupted(Exception):
     """模型响应流中途断开（读完超时 / 对端掐断连接）。
@@ -22,13 +24,6 @@ class StreamInterrupted(Exception):
         self.partial = partial
 
 
-class SubscriberError(Exception):
-    """**订阅者**（前端）自身的异常，与"模型响应流中断"是两回事。
-
-    单独成型是为了不落进 `StreamInterrupted` 的收尾语义：前端坏了既不该重试、
-    也不该报成「输出中断」（那会把排查方向引到网络上）。宿主照常按未处理异常
-    展示，失败点一眼可见。
-
-    事件只有一个通道（`event/bus.py`），所以这里包住的是**任何订阅者**的异常：
-    前端实现、终端标题呈现器，或将来接入的远程客户端。
-    """
+# 订阅者故障的类型在事件层定义（扇出在那里，见 `event/bus.py` 的说明）；
+# 这里再导出一次，让 `smithcode.agent.SubscriberError` 这个既有引用点不变。
+__all__ = ["StreamInterrupted", "SubscriberError"]

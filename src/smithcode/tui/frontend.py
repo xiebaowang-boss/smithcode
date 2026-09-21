@@ -24,19 +24,25 @@ from ..event.catalog import (
     ExecutionInterrupted,
     ExecutionStarted,
     ExecutionSucceeded,
+    HistoryCompacted,
     Idle,
     InboxCancelled,
     InboxCleared,
     InboxDelivered,
     InboxEnqueued,
     MessageEnd,
+    MessageStart,
     MessageUpdate,
+    ModelSelected,
     Notice,
     PlanUpdate,
+    SessionCheckpoint,
+    SessionCreated,
     StatusChanged,
     StatusCleared,
     StepEnded,
     StepStarted,
+    StreamEnded,
     TitleChanged,
     ToolEnd,
     ToolPreview,
@@ -69,7 +75,7 @@ class TuiFrontend:
             case MessageUpdate(kind=kind, delta=delta):
                 self._thinking_done()
                 self._post("stream", kind, delta)
-            case MessageEnd():
+            case StreamEnded():
                 self._thinking_done()
                 self._post("stream_done")
             case ToolStart(tool_call_id=tool_call_id, line=line, display=display, name=name):
@@ -101,6 +107,8 @@ class TuiFrontend:
                 ExecutionStarted() | ExecutionSucceeded() | ExecutionFailed()
                 | ExecutionInterrupted() | StepStarted() | StepEnded() | Idle()
                 | CompactionStarted() | CompactionEnded() | CompactionFailed()
+                | MessageEnd() | MessageStart() | SessionCreated()
+                | ModelSelected() | SessionCheckpoint() | HistoryCompacted()
             ):
                 # 执行 / 步骤边界与压缩态：界面按内容、工具块与忙闲行呈现，
                 # 这些事件本身不额外呈现。显式列出以便新增事件时被提醒。

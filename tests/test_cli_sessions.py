@@ -4,6 +4,10 @@ import pytest
 
 from smithcode import config
 from smithcode.cli import _locate_session, _resume_session, build_parser
+from smithcode.event.catalog import (
+    MessageEnd,
+)
+from smithcode.event.envelope import wrap
 from smithcode.sessions import SessionStore, StoreError
 
 
@@ -57,7 +61,7 @@ class _FakeAgent:
 
 def test_locate_returns_latest_and_explicit():
     store = SessionStore.create()
-    store.append_message({"role": "user", "content": "hi"})
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": "hi"})))
     store.close()
 
     assert _locate_session(True, "").id == store.id
@@ -68,7 +72,7 @@ def test_locate_returns_latest_and_explicit():
 
 def test_resume_session_uses_latest(capsys):
     store = SessionStore.create()
-    store.append_message({"role": "user", "content": "hi"})
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": "hi"})))
     store.close()
 
     agent = _FakeAgent()
@@ -80,7 +84,7 @@ def test_resume_session_uses_latest(capsys):
 def test_resume_session_reports_recorded_model(capsys, monkeypatch):
     """转录里的模型与当前不同：恢复提示点出，方便用户决定是否 /model 切回。"""
     store = SessionStore.create()
-    store.append_message({"role": "user", "content": "hi"})
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": "hi"})))
     store.close()
 
     monkeypatch.setattr(config, "MODEL", "current-model")

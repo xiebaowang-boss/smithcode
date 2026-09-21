@@ -7,6 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from smithcode import commands, config, goal, plan
+from smithcode.event.catalog import (
+    MessageEnd,
+    TitleChanged,
+)
+from smithcode.event.envelope import wrap
 from smithcode.sessions import SessionStore
 
 
@@ -27,9 +32,9 @@ def _isolated(tmp_path, monkeypatch):
 
 def _store_with(prompt="测试会话", title="", session_id=None):
     store = SessionStore(session_id) if session_id else SessionStore.create()
-    store.append_message({"role": "user", "content": prompt})
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": prompt})))
     if title:
-        store.append_title(title)
+        store.append_event(wrap(TitleChanged(title)))
     store.close()
     return store
 

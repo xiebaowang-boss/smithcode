@@ -9,6 +9,10 @@ import pytest
 
 from smithcode import config, goal, instructions, plan, sandbox, skills
 from smithcode.agent import Agent
+from smithcode.event.catalog import (
+    MessageEnd,
+)
+from smithcode.event.envelope import wrap
 from smithcode.session import Session
 from smithcode.sessions import SessionStore, list_sessions, load, summary_from_path
 from smithcode.tools import FUNCTIONS
@@ -64,7 +68,7 @@ def test_run_persists_and_resume_roundtrip(monkeypatch):
     store = agent.session.store
     assert store.path.is_file()
     first_line = store.path.read_text(encoding="utf-8").splitlines()[0]
-    assert json.loads(first_line)["t"] == "meta"
+    assert json.loads(first_line)["type"].startswith("session.created")  # 首条是出生事件
 
     # 新 Agent（同一工作区）按 id 恢复：历史一致、会话 id 沿用
     resumed = _make_agent(monkeypatch)
@@ -146,7 +150,11 @@ def test_run_records_model_and_resume_reports_it(monkeypatch):
     records = [
         json.loads(line) for line in store.path.read_text(encoding="utf-8").splitlines()
     ]
-    assert [r["model"] for r in records if r["t"] == "model"] == ["model-a", "model-b"]
+    # 模型事件去重后只记变化（与既有行为一致：同值不重复写）
+    assert [
+        r["data"]["model"] for r in records
+        if r["type"].startswith("session.model.selected")
+    ] == ["model-a", "model-b"]
 
     resumed = _make_agent(monkeypatch)
     report = resumed.resume(store.id)
@@ -156,8 +164,8 @@ def test_run_records_model_and_resume_reports_it(monkeypatch):
 
 def test_resume_repairs_dangling_tool_calls_and_persists(monkeypatch):
     store = SessionStore.create()
-    store.append_message({"role": "user", "content": "做任务"})
-    store.append_message({
+    store.append_event(wrap(MessageEnd(message={"role": "user", "content": "做任务"})))
+    store.append_event(wrap(MessageEnd(message={
         "role": "assistant",
         "content": "",
         "tool_calls": [{
@@ -165,7 +173,7 @@ def test_resume_repairs_dangling_tool_calls_and_persists(monkeypatch):
             "type": "function",
             "function": {"name": "list_dir", "arguments": "{}"},
         }],
-    })
+    })))
     store.close()
 
     agent = _make_agent(monkeypatch)

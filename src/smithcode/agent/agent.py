@@ -38,15 +38,17 @@ from ..event.catalog import (
     InboxCleared,
     InboxDelivered,
     InboxEnqueued,
-    MessageEnd,
     MessageUpdate,
+    ModelSelected,
     Notice,
     PlanUpdate,
     QueueItem,
+    SessionCheckpoint,
     StepEnded,
     StepFinish,
     StepStarted,
     StepUsage,
+    StreamEnded,
     TitleChanged,
     ToolEnd,
     ToolPreview,
@@ -227,6 +229,10 @@ class Agent:
         # 它，否则 push 会跨线程碰 EventStream 的内部状态。
         # 事件总线按**会话**实例化：会话标识随会话对象来（见 _emit 的刷新）
         self.events = Bus(session_id=self.session.id)
+        # 会话日志是总线的订阅者：durable 事件由它落盘（每会话一个日志文件）；
+        # 会话自己也知道这条总线（它发的状态事件要走同一条路，见 Session.record）
+        self.session.bind_bus(self.events)
+        self.events.subscribe(self.session.journal)
         # 询问端口（每会话一个）：提问经它发 asked 事件 + 等前端作答
         self.asks = AskPort(session_id=self.session.id)
         # 会话沙箱授权目录（本会话的真相：工作区快照 + 会话内信任目录 + 技能白名单）。
@@ -248,6 +254,7 @@ class Agent:
         self.hooks = hooks or AgentHooks()
         self._session_owner: AgentSession | None = None
         self._last_batch_results: list[str] = []  # 本批工具结果文本，供 TurnContext
+        self._last_model_event: tuple[str, str] | None = None  # 已发过的模型事件（去重）
         self._model = model  # 非空时覆盖 config.MODEL
         self._turn: TurnConfig | None = None  # 本轮请求快照：run() 开头 pin，轮内冻结
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
@@ -352,13 +359,8 @@ class Agent:
         stream = self._stream
         if stream is not None and not stream.done:
             stream.push(env)
-        try:
-            self.events.deliver(env)
-        except Exception as e:
-            # 订阅者（前端 / 标题 / 将来的远程客户端）自身的故障：单独成型，
-            # 不落进 StreamInterrupted 的收尾语义——UI 坏了既不该重试，也不该
-            # 被报成「输出中断」（那会把排查方向引到网络上）。
-            raise SubscriberError(f"订阅者异常: {type(e).__name__}: {e}") from e
+        # 订阅者故障由总线统一包成 SubscriberError（扇出在那里，见 bus.py）
+        self.events.deliver(env)
 
     def _usage_event(self, step: StepUsage | None = None) -> UsageChanged:
         """构造一条用量事件（会话累计口径 + 可选的本步增量）。"""
@@ -673,9 +675,6 @@ class Agent:
             loaded.messages, loaded.meta,
             title=loaded.title, title_source=loaded.title_source,
         )
-        # 崩溃修复补的占位结果落盘：否则下次恢复会被误判成中段损坏
-        for message in loaded.repaired:
-            store.append_message(message)
 
         # 安全例外：跨进程不继承（对齐 Claude Code 的 fork 语义）
         self.permission.new_session()
@@ -756,7 +755,7 @@ class Agent:
         if payload == self._last_state:
             return
         self._last_state = payload
-        self.session.store.append_state(payload)
+        self.session.record(SessionCheckpoint(state=payload))  # 检查点也是事件
 
     # ---------- 自动标题（后台，失败有限次补试） ----------
 
@@ -810,8 +809,9 @@ class Agent:
         if not title:
             self._note_title_failure("模型未返回可用标题", attempt)
             return
+        # 标题事件由 `Session.set_title` 发（本条也进日志，重放才能还原标题）；
+        # 后台线程上发事件走的是总线的线程安全投递
         self.session.set_title(title, source="auto")
-        self.emit(TitleChanged(title))  # 后台线程：走线程安全入口
 
     def _note_title_failure(self, reason: str, attempt: int) -> None:
         """标题生成失败提示：说明是否还会补试，避免"静默失败"让人以为功能没生效。
@@ -832,8 +832,7 @@ class Agent:
         text = str(title or "").strip()
         if not text:
             return False
-        self.session.set_title(text, source="user")
-        self.emit(TitleChanged(text))  # 可能来自 UI 线程：走线程安全入口
+        self.session.set_title(text, source="user")  # 事件由 Session 发（含日志）
         return True
 
     def close(self) -> None:
@@ -1104,17 +1103,17 @@ class Agent:
         """登记一次模型调用：会话用量 + 真实 token 锚点 + 转录用量 + 消息入库。"""
         self.session.usage.add(usage)
         self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
-        store = self.session.store
-        if store is not None:
-            # 记「谁生成的」：用本轮 pin 住的快照，而不是可能已被 /model 改掉的全局值
-            turn = self._turn or TurnConfig.capture(self._model)
-            store.append_model(turn.model, turn.effort)
-            if usage:
-                store.append_usage(usage)
+        # 记「谁生成的」：用本轮 pin 住的快照，而不是可能已被 /model 改掉的全局值。
+        # 只在与上一条不同时发（事件驱动之后，"去重"归调用方——日志不该被同一
+        # 模型的连续调用刷屏）。
+        turn = self._turn or TurnConfig.capture(self._model)
+        if (turn.model, turn.effort) != self._last_model_event:
+            self._last_model_event = (turn.model, turn.effort)
+            self.session.record(ModelSelected(model=turn.model, effort=turn.effort))
         if msg:
             # 空消息（首块之前就中断）不入库：正文本就没收到，占位说明由
             # `_note_stream_interrupted` 单独写——留一个 {} 会让消费者读 role 时崩
-            self.session.messages.append(msg)
+            self.session.add(**msg)
 
     def _checkpoint(self) -> None:
         """崩溃持久化屏障：把已追加的记录 fsync 到磁盘（无持久化时无操作）。
@@ -1198,7 +1197,7 @@ class Agent:
         模型知道断在哪类故障上。
         """
         if partial.strip():
-            self.session.messages.append({"role": "assistant", "content": partial})
+            self.session.add("assistant", partial)
         self.session.add("user", stream_interrupted_context(reason))
 
     async def _compact_if_needed(self) -> None:
@@ -1375,7 +1374,8 @@ class Agent:
             raise StreamInterrupted(e, "".join(parts)) from e
         finally:
             # 幂等；异常路径也必须收口，否则下一轮流会黏进本块
-            self._emit(MessageEnd(message=msg))
+            # （收口指的是"屏幕上的这一段写完了"，与消息入历史是两件事）
+            self._emit(StreamEnded(message=msg))
         if token is not None and token.cancelled and not msg:
             msg = {"role": "assistant", "content": "".join(parts)}
             return msg, usage, True
@@ -1574,9 +1574,7 @@ class Agent:
         `rendered` 表示该调用是否已经开出界面上的工具块（预检时发过 ToolStart）：
         开过的要补一条结果收尾，否则 TUI 停在 pending 态；没开过的不该凭空多出
         一个结果块。"""
-        self.session.messages.append(
-            {"role": "tool", "content": content, "tool_call_id": tool_call_id}
-        )
+        self.session.add("tool", content, tool_call_id=tool_call_id)
         if rendered:
             self._emit(ToolEnd(tool_call_id=tool_call_id, result=content))
 
@@ -1588,9 +1586,7 @@ class Agent:
         """
         if plan.display_result:
             result = self._finish(result, plan.tc.get("id"), plan.name)
-        self.session.messages.append(
-            {"role": "tool", "content": result, "tool_call_id": plan.tc.get("id")}
-        )
+        self.session.add("tool", result, tool_call_id=plan.tc.get("id"))
         return result
 
     def _finish(self, result: str, tool_call_id: str | None = None,

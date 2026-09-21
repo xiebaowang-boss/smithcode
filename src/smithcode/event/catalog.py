@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
 from .registry import declare
@@ -107,6 +107,67 @@ class QueueItem:
 
 
 # --------------------------------------------------------------------------
+# 会话生命周期与日志骨架
+# --------------------------------------------------------------------------
+
+
+@declare("session.created", durable=True, aggregate="session_id")
+@dataclass(frozen=True)
+class SessionCreated:
+    """会话建立（日志的首条事件）：转录文件的一切元数据都在这里。
+
+    对齐 opencode 的 `session.created`：会话的"出生"是一条事件，而不是文件头里
+    的一段元数据——这样日志从头到尾只有"事件"一种东西，重放规则也就只剩一条。
+    """
+
+    cwd: str = ""
+    model: str = ""
+    effort: str = ""
+    app: str = ""
+    oneshot: bool = False
+
+
+@declare("session.model.selected", durable=True, aggregate="session_id")
+@dataclass(frozen=True)
+class ModelSelected:
+    """本轮使用的模型与思考强度（`/model` 切换、恢复会话都会发）。
+
+    `store` 侧按 (model, effort) 去重：连续相同不重复落盘（与既有行为一致）。
+    """
+
+    model: str
+    effort: str = ""
+
+
+@declare("session.checkpointed", durable=True, aggregate="session_id")
+@dataclass(frozen=True)
+class SessionCheckpoint:
+    """会话状态**检查点**：goal / plan / skills 等会话状态的快照。
+
+    与"事件"的区别要认清：它描述的是**状态**而不是"发生了什么"，所以它只为
+    重放省时间（折叠到最后一个检查点，再往后叠事件）。之所以也走事件通道，
+    是为了让"写日志"只有一条路径（`EventLog.append`）。
+    """
+
+    state: Mapping[str, Any] = field(default_factory=dict)
+
+
+@declare("session.history.compacted", durable=True, aggregate="session_id")
+@dataclass(frozen=True)
+class HistoryCompacted:
+    """历史被压缩：`summary` + `tail` 成为此后重放的**新基线**。
+
+    有它之前，压缩是转录里的一种特殊记录（`t=compact`），重放时要特判；现在它
+    就是一条事件：折叠到它时把消息换成 `summary + tail`，规则与其它事件一样。
+    """
+
+    summary: AgentMessage = field(default_factory=dict)
+    tail: tuple[AgentMessage, ...] = ()
+    before_tokens: int = 0
+    after_tokens: int = 0
+
+
+# --------------------------------------------------------------------------
 # 消息生命周期
 # --------------------------------------------------------------------------
 
@@ -132,9 +193,24 @@ class MessageUpdate:
 @declare("session.message.ended", durable=True, aggregate="session_id")
 @dataclass(frozen=True)
 class MessageEnd:
-    """一条消息完成。"""
+    """一条消息**进入历史**（会话日志里的消息事实就是它）。
+
+    注意与 `StreamEnded` 的区别：本事件是"消息成为历史的一部分"（持久、可回放，
+    折叠进会话视图）；流式输出的收口是另一件事（易失、只是呈现）。
+    """
 
     message: AgentMessage
+
+
+@declare("session.stream.ended", aggregate="session_id")
+@dataclass(frozen=True)
+class StreamEnded:
+    """本轮流式输出收口：前端据此结束当前正文/思考块。
+
+    易失：它是"屏幕上的这一段写完了"，不是历史事实——历史由 `MessageEnd` 承担。
+    """
+
+    message: AgentMessage = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -259,6 +335,9 @@ class TitleChanged:
     """会话标题变化（自动生成 / `/rename` / 新会话清空）。空串表示回退默认标题。"""
 
     title: str
+    #: 来源（`user` = 显式命名、`auto` = 后台自动命名）；空串表示未声明，
+    #: 重放时保留上一个来源（见 `sessions/project.py` 的折叠规则）。
+    source: str = ""
 
 
 @declare("session.execution.started", durable=True, aggregate="session_id")
@@ -394,7 +473,7 @@ class UsageChanged:
     step: StepUsage = StepUsage()
 
 
-@declare("session.compaction.started", durable=True, aggregate="session_id")
+@declare("session.compaction.started", aggregate="session_id")
 @dataclass(frozen=True)
 class CompactionStarted:
     """上下文压缩开始（要发一次摘要请求，数秒到数十秒）。"""
@@ -402,7 +481,7 @@ class CompactionStarted:
     before_tokens: int = 0
 
 
-@declare("session.compaction.ended", durable=True, aggregate="session_id")
+@declare("session.compaction.ended", aggregate="session_id")
 @dataclass(frozen=True)
 class CompactionEnded:
     """压缩完成：`before` → `after` 的 token 数。"""
@@ -411,7 +490,7 @@ class CompactionEnded:
     after_tokens: int = 0
 
 
-@declare("session.compaction.failed", durable=True, aggregate="session_id")
+@declare("session.compaction.failed", aggregate="session_id")
 @dataclass(frozen=True)
 class CompactionFailed:
     """压缩放弃（摘要未按模板生成 / 中断）：原上下文原样继续。"""
@@ -458,9 +537,14 @@ class PromptFinished:
 # --------------------------------------------------------------------------
 
 AgentEvent: TypeAlias = (
-    MessageStart
+    SessionCreated
+    | ModelSelected
+    | SessionCheckpoint
+    | HistoryCompacted
+    | MessageStart
     | MessageUpdate
     | MessageEnd
+    | StreamEnded
     | ToolStart
     | ToolPreview
     | ToolEnd
