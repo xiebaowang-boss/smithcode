@@ -239,6 +239,39 @@ event/bus.py（每会话一条总线：唯一扇出点）
 - **验真方式**：重放日志折叠出的视图必须与在线视图逐字段相等，且总线上发过的 durable
   事件一条不漏（`tests/test_event_sourcing.py`）。
 
+### 每轮页脚：哪些必须存、哪些算出来
+
+聊天区每条回复下面那行 `▣ 模型 · 思考强度 · 用时`（中断时带 `· 已停止`，流断开带
+`· 输出中断`）**不是一条事件**——它是投影。事件溯源的通用原则在这里体现得最清楚：
+**能算出来的不存，存了就会有两份真相**。
+
+| 页脚字段 | 口径 | 存在哪 |
+|---|---|---|
+| `model` / `effort` | **本轮 `run()` 开头 pin 住的请求快照**（`TurnConfig.capture`），不是渲染时的全局配置——轮内 `/model` 切换不影响本轮，页脚不会误报 | `session.model.selected`（`ModelSelected`）；**只在 (model, effort) 与上一条不同时发**（调用方去重，避免同一模型连续调用刷屏） |
+| `elapsed` | `终结事件.created − ExecutionStarted.created`，两者都是**信封里的墙钟时间戳**（跨进程可比、不受挂起影响） | 不存——从 `Execution*` 事件的 `created` 算 |
+| 状态后缀 | `footer_suffix(status, hint)`（`tui/render.py`）：`interrupted` → 「已停止」；`stream_error` → 「输出中断」+ `format_stream_interrupted(reason)` 的可操作提示；其余状态无后缀 | `ExecutionInterrupted` / `ExecutionFailed(status, reason)` |
+
+几个容易踩的口径细节：
+
+- **用时含等待**：起点在 `run()` 进循环之前、终点在 `finally` 发终结事件时，所以
+  「在权限框 / 提问面板前等你的时间」也算在这一轮里——它表达的是**墙钟**，不是模型耗时。
+- **重算值 ≠ 实时值**：实时用 `time.monotonic() − _turn_start`（`_turn_start` 在宿主**提交任务时**
+  打点、`ui_turn_end` 在 UI 侧执行，两头都略宽），所以实时值通常**略大**；量级一致，
+  但别指望逐位相同。
+- **崩在中间的轮次没有页脚**：没有终结事件就没有终点，重放时那一轮表现为"没结束"
+  （崩溃收尾负责把消息历史补合法，但补不出那轮的用时）。
+- **口径只有一处**：后缀映射写在 `footer_suffix` 里，实时（`ui_turn_end`）与重放
+  （`_replay_events`）都调它——两处各写一份必然漂（曾经重放把 `denied` 标成「失败」、
+  还丢了流断开的原因）。
+
+**不在页脚里的**：token 用量在 `session.usage.updated` 与 `StepEnded.usage`；步数 / 工具数
+是统计出来的派生量，页脚不显示。
+
+**为什么恢复会话要按事件回放**（而不是遍历 `session.messages`）：消息只是事件的一种投影，
+工具调用行（`ToolStart` / `ToolEnd` / `PlanUpdate`）与每轮页脚都只有事件才带得全——只走消息
+就会出现"日志里存了、界面不显示"。TUI 的 `_replay_history` 因此按事件重建（`Agent.replayable_events()`
+给出日志里的原始事件；将来远程客户端用同一批事件渲染）。
+
 ## 终端窗口标题（title.py）
 
 标题**由事件驱动，前端只提供写入通道**：
