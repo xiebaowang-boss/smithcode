@@ -234,6 +234,54 @@ def test_preflight_is_not_pushed_to_a_thread():
     assert "await self._agent._preflight_safe(" in tools_run
 
 
+# ---------- 8. 会话级可变状态不得留在模块全局 ----------
+
+
+def test_config_holds_no_session_state():
+    """`config` 只留**启动期只读默认值**：会话级可变状态必须归会话（或沙箱）。
+
+    留在 config 的不是"难看"，是并发下会算错：信任目录会被另一个会话看见、
+    临时放行会被交错删掉。已迁移的三项不得复活。
+    """
+    text = (SRC / "config.py").read_text(encoding="utf-8")
+    legacy = ("SESSION_EXTRA_ROOTS", "_WIDENED_ROOTS", "SKILL_READ_ROOTS")
+    offenders = [name for name in legacy if name in text]
+    assert not offenders, f"会话级状态不得回到 config：{offenders}（见 sandbox.py）"
+
+
+def test_state_modules_use_contextvars_not_process_pointers():
+    """goal / plan / skills 的"活动实例"必须是 ContextVar，不是进程级指针。
+
+    进程级指针会让同进程的两个会话互相覆盖（谁后 bind 谁生效），而这类错**不会**
+    报错：只会把 A 的目标显示给 B。探针见 `test_multi_session_isolation.py`。
+    """
+    targets = {
+        "goal.py": "smithcode_goal_state",
+        "plan.py": "smithcode_plan_state",
+        "skills/state.py": "smithcode_skills_state",
+    }
+    offenders = []
+    for rel, var in targets.items():
+        text = (SRC / rel).read_text(encoding="utf-8")
+        if f'"{var}"' not in text:
+            offenders.append(f"{rel}: 没有 ContextVar {var}")
+        if re.search(r"^_active_state\s*=", text, re.MULTILINE):
+            offenders.append(f"{rel}: 仍存在进程级 _active_state 指针")
+    assert not offenders, f"活动状态必须按上下文解析：{offenders}"
+
+
+def test_session_scoped_roots_are_only_touched_through_the_sandbox():
+    """会话沙箱的字段只能经 `sandbox.current()` 访问，且只有沙箱模块定义它们。"""
+    offenders = []
+    for path in _python_files():
+        if path.name == "sandbox.py" or path.parent.name == "event":
+            continue
+        for number, line in _lines(path):
+            if re.search(r"config\.(SESSION_EXTRA_ROOTS|SKILL_READ_ROOTS|_WIDENED_ROOTS)", line):
+                offenders.append(f"{path.relative_to(SRC)}:{number}")
+    assert not offenders, f"会话沙箱目录只能经 sandbox.current() 访问：{offenders}"
+
+
 # ---------- 6. 删除即删除（无兼容层、无转发壳）----------
 
 

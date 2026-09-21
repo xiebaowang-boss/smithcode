@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from smithcode import config, frontend
+from smithcode import config, frontend, sandbox
 from smithcode.agent import MAX_SUMMARY_LEN, Agent
 from smithcode.frontend.console import ConsoleFrontend
 from smithcode.session import Session
@@ -146,7 +146,7 @@ def _run_tool(monkeypatch, tmp_path, name, args_dict, display=None) -> Agent:
     }
     monkeypatch.setattr("smithcode.agent.LLMClient", lambda: FakeLLM(tool_call))
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     if display:
         monkeypatch.setattr(config, "load_tool_display", lambda: display)
     agent = Agent(session=Session())

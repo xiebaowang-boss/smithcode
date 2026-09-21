@@ -12,7 +12,9 @@ reset()）；AgentSession.run_with_goal() 在每轮任务结束后检查状态�
 """
 from __future__ import annotations
 
+import copy
 import time
+from contextvars import ContextVar
 
 from . import config
 
@@ -371,8 +373,12 @@ class GoalState:
         为什么需要：`/goal set` 之类的调用可能发生在会话对象建立之前（命令层直接
         调 `goal.set`，那时绑定的是默认实例）。新会话若从这里从空开始，用户刚设的
         目标就凭空消失了。接过来是"会话建立前设的状态属于随后建立的这个会话"。
+
+        **复制**而不是别名：`self.current = other.current` 会让两个会话共用同一个
+        目标对象——一个会话 `/goal clear` 会把另一个的目标也清掉（同进程多会话时
+        的静默串味，探针 `tests/guard/test_multi_session_isolation.py` 抓的就是它）。
         """
-        self.current = other.current
+        self.current = copy.deepcopy(other.current)
 
 
     def reset(self) -> None:
@@ -418,7 +424,10 @@ class GoalState:
 
 # 进程级默认实例：没有会话绑定时的落点（直接调本模块的测试、无 Agent 的路径）
 _default_state = GoalState()
-_active_state = _default_state
+# 活动状态：**按上下文**解析（不是进程级指针）。
+# 同进程并发两个会话时，各自的 goal/plan/skills 互不覆盖——这正是把
+# "活动实例"从模块全局换成 ContextVar 要解决的问题（事件总线/取消信号同款做法）。
+_active_state_var: ContextVar[GoalState] = ContextVar("smithcode_goal_state", default=_default_state)
 
 
 def bind(state: GoalState | None) -> None:
@@ -428,103 +437,102 @@ def bind(state: GoalState | None) -> None:
     `session.goal_state.xxx()` 不如让既有函数指向"当前实例"。**局限**：同一进程
     同时跑两个会话会互相覆盖——与改造前的单例行为一致；TUI/REPL 是一个进程一个会话。
     """
-    global _active_state
-    _active_state = state if state is not None else _default_state
+    _active_state_var.set(state if state is not None else _default_state)
 
 
 def current() -> Goal | None:
-    return _active_state.current
+    return _active_state_var.get().current
 
 
 def is_set() -> bool:
-    return _active_state.current is not None
+    return _active_state_var.get().current is not None
 
 
 def is_active() -> bool:
-    return _active_state.current is not None and _active_state.current.status == ACTIVE
+    return _active_state_var.get().current is not None and _active_state_var.get().current.status == ACTIVE
 
 
 def set(objective: str, max_turns: int | None = None, tokens_at_start: int = 0) -> Goal:
     """设定（或替换）当前目标；max_turns 缺省取配置 GOAL_MAX_TURNS（默认 -1 不限）。"""
-    _active_state.current = Goal(
+    _active_state_var.get().current = Goal(
         objective=str(objective).strip(),
         max_turns=config.GOAL_MAX_TURNS if max_turns is None else int(max_turns),
         tokens_at_start=int(tokens_at_start or 0),
     )
-    return _active_state.current
+    return _active_state_var.get().current
 
 
 def pause(note: str = "") -> bool:
-    if _active_state.current is None or _active_state.current.status != ACTIVE:
+    if _active_state_var.get().current is None or _active_state_var.get().current.status != ACTIVE:
         return False
-    _active_state.current.pause(note)
+    _active_state_var.get().current.pause(note)
     return True
 
 
 def resume() -> bool:
-    return _active_state.current.resume() if _active_state.current is not None else False
+    return _active_state_var.get().current.resume() if _active_state_var.get().current is not None else False
 
 
 def clear() -> bool:
-    if _active_state.current is None:
+    if _active_state_var.get().current is None:
         return False
-    _active_state.current = None
+    _active_state_var.get().current = None
     return True
 
 
 def complete(evidence: str = "") -> bool:
-    if _active_state.current is None:
+    if _active_state_var.get().current is None:
         return False
-    _active_state.current.complete(evidence)
+    _active_state_var.get().current.complete(evidence)
     return True
 
 
 def budget_limited() -> bool:
-    if _active_state.current is None or _active_state.current.status != ACTIVE:
+    if _active_state_var.get().current is None or _active_state_var.get().current.status != ACTIVE:
         return False
-    _active_state.current.budget_limited()
+    _active_state_var.get().current.budget_limited()
     return True
 
 
 def try_block(reason: str) -> tuple[bool, str]:
-    if _active_state.current is None:
+    if _active_state_var.get().current is None:
         return False, "错误: 当前没有持久目标，不要调用 goal_update。"
-    return _active_state.current.try_block(reason)
+    return _active_state_var.get().current.try_block(reason)
 
 
 def begin_turn() -> int:
-    if _active_state.current is None:
+    if _active_state_var.get().current is None:
         return 0
-    return _active_state.current.begin_turn()
+    return _active_state_var.get().current.begin_turn()
 
 
 def note_run(tools_used=(), total_tokens: int | None = None) -> None:
-    if _active_state.current is not None:
-        _active_state.current.note_run(tools_used, total_tokens)
+    if _active_state_var.get().current is not None:
+        _active_state_var.get().current.note_run(tools_used, total_tokens)
 
 
 def set_budget(max_turns: int) -> bool:
-    if _active_state.current is None:
+    if _active_state_var.get().current is None:
         return False
-    _active_state.current.max_turns = int(max_turns)
+    _active_state_var.get().current.max_turns = int(max_turns)
     return True
 
 
 def render_status() -> str:
-    return _active_state.current.render_status() if _active_state.current is not None else "当前没有持久目标。"
+    return _active_state_var.get().current.render_status() if _active_state_var.get().current is not None else "当前没有持久目标。"
 
 
 def render_section() -> str:
-    return _active_state.current.render_section() if _active_state.current is not None else ""
+    return _active_state_var.get().current.render_section() if _active_state_var.get().current is not None else ""
 
 
 def marker() -> str:
-    return _active_state.current.marker() if _active_state.current is not None else ""
+    return _active_state_var.get().current.marker() if _active_state_var.get().current is not None else ""
 
 
 def sidebar() -> tuple | None:
     """侧边栏目标卡片内容；无目标返回 None（宿主隐藏该卡片）。"""
-    return _active_state.current.sidebar() if _active_state.current is not None else None
+    return _active_state_var.get().current.sidebar() if _active_state_var.get().current is not None else None
 
 
 
@@ -533,19 +541,19 @@ def sidebar() -> tuple | None:
 def reset(*args, **kwargs):
     """对**当前绑定的实例**做 reset（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.reset(*args, **kwargs)
+    return _active_state_var.get().reset(*args, **kwargs)
 
 
 def snapshot(*args, **kwargs):
     """对**当前绑定的实例**做 snapshot（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.snapshot(*args, **kwargs)
+    return _active_state_var.get().snapshot(*args, **kwargs)
 
 
 def restore(*args, **kwargs):
     """对**当前绑定的实例**做 restore（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.restore(*args, **kwargs)
+    return _active_state_var.get().restore(*args, **kwargs)
 
 
 def default_state() -> GoalState:
@@ -554,5 +562,8 @@ def default_state() -> GoalState:
 
 
 def active_state() -> GoalState:
-    """当前绑定生效的实例（会话建立时从它接管状态，见 AgentSession）。"""
-    return _active_state
+    """当前生效的实例（会话建立时从它接管状态，见 AgentSession）。
+
+    按**上下文**解析：并发会话各拿各的（同进程多会话不会互相覆盖）。
+    """
+    return _active_state_var.get()

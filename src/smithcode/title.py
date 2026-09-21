@@ -329,7 +329,12 @@ _presenter: TerminalTitlePresenter | None = None
 
 
 def presenter() -> TerminalTitlePresenter:
-    """当前标题呈现器（进程内一块终端标题，故为单例）。"""
+    """当前标题呈现器。
+
+    **刻意保持进程级单例**：一个进程只有一块终端标题，退出钩子（`release`）
+    也必须拿得到它。这与"会话级状态"是两回事——goal/plan/skills 与沙箱目录都
+    已按上下文隔离，标题不需要（GUI 前端不接终端标题，走 `bus()` 那套）。
+    """
     global _presenter
     if _presenter is None:
         _presenter = TerminalTitlePresenter()

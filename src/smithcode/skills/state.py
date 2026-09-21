@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from .. import config
 from . import registry, render
 
@@ -64,32 +66,34 @@ class SkillsState:
 
 # 进程级默认实例：没有会话绑定时的落点（见 `bind` 的说明）
 _default_state = SkillsState()
-_active_state = _default_state
+# 活动状态：**按上下文**解析（不是进程级指针）。
+# 同进程并发两个会话时，各自的 goal/plan/skills 互不覆盖——这正是把
+# "活动实例"从模块全局换成 ContextVar 要解决的问题（事件总线/取消信号同款做法）。
+_active_state_var: ContextVar[SkillsState] = ContextVar("smithcode_skills_state", default=_default_state)
 
 
 def bind(state: SkillsState | None) -> None:
     """切换本模块函数作用的状态实例（`None` = 回到默认实例）。"""
-    global _active_state
-    _active_state = state if state is not None else _default_state
+    _active_state_var.set(state if state is not None else _default_state)
 
 
 def refresh() -> list:
     """重新发现全部技能（含信任门控），同步只读白名单，返回诊断列表。"""
-    _active_state.settings = config.load_skills_config()
-    result = registry.discover(_active_state.settings)
+    _active_state_var.get().settings = config.load_skills_config()
+    result = registry.discover(_active_state_var.get().settings)
     if result.enabled:
         preview = [s for s in result.skills if s.scope == "project"]
         if preview and not registry.resolve_project_trust(
-            _active_state.settings, preview, result.diagnostics
+            _active_state_var.get().settings, preview, result.diagnostics
         ):
             result.skills = [s for s in result.skills if s.scope != "project"]
-    _active_state.skills = result.skills
-    _active_state.index = {s.name: s for s in _active_state.skills}
-    _active_state.diagnostics = result.diagnostics
-    _active_state.loaded = True
-    _active_state.active[:] = [n for n in _active_state.active if n in _active_state.index and not _active_state.index[n].disabled]
+    _active_state_var.get().skills = result.skills
+    _active_state_var.get().index = {s.name: s for s in _active_state_var.get().skills}
+    _active_state_var.get().diagnostics = result.diagnostics
+    _active_state_var.get().loaded = True
+    _active_state_var.get().active[:] = [n for n in _active_state_var.get().active if n in _active_state_var.get().index and not _active_state_var.get().index[n].disabled]
     _sync_read_roots()
-    return list(_active_state.diagnostics)
+    return list(_active_state_var.get().diagnostics)
 
 
 
@@ -97,57 +101,57 @@ def refresh() -> list:
 
 def clear() -> None:
     """彻底清空全部状态与只读白名单（测试、进程内完全重载用）。"""
-    _active_state.skills = []
-    _active_state.index = {}
-    _active_state.active.clear()
-    _active_state.diagnostics = []
-    _active_state.settings = None
-    _active_state.loaded = False
+    _active_state_var.get().skills = []
+    _active_state_var.get().index = {}
+    _active_state_var.get().active.clear()
+    _active_state_var.get().diagnostics = []
+    _active_state_var.get().settings = None
+    _active_state_var.get().loaded = False
     config.set_skill_roots([])
     registry.reset_session_trust()
 
 
 def ensure() -> None:
     """按需发现（命令、激活等显式入口用；系统提示词装配不走这里）。"""
-    if not _active_state.loaded:
+    if not _active_state_var.get().loaded:
         refresh()
 
 
 def is_loaded() -> bool:
-    return _active_state.loaded
+    return _active_state_var.get().loaded
 
 
 def current_settings():
     """已装载的 [skills] 配置；从未刷新过时为 None。"""
-    return _active_state.settings
+    return _active_state_var.get().settings
 
 
 def all_skills() -> list:
     ensure()
-    return list(_active_state.skills)
+    return list(_active_state_var.get().skills)
 
 
 def model_skills() -> list:
     """可进入系统提示词目录与 use_skill 枚举的技能。"""
     ensure()
-    return [s for s in _active_state.skills if s.model_invocable and not s.disabled]
+    return [s for s in _active_state_var.get().skills if s.model_invocable and not s.disabled]
 
 
 def get(name: str):
     ensure()
-    return _active_state.index.get(name)
+    return _active_state_var.get().index.get(name)
 
 
 def is_active(name: str) -> bool:
-    return name in _active_state.active
+    return name in _active_state_var.get().active
 
 
 def active_names() -> list:
-    return list(_active_state.active)
+    return list(_active_state_var.get().active)
 
 
 def diagnostics() -> list:
-    return list(_active_state.diagnostics)
+    return list(_active_state_var.get().diagnostics)
 
 
 def activate(name: str, by: str = "model") -> str:
@@ -161,7 +165,7 @@ def activate(name: str, by: str = "model") -> str:
     不向用户打印）；失败返回 `错误: ...`。
     """
     ensure()
-    skill = _active_state.index.get(name)
+    skill = _active_state_var.get().index.get(name)
     if skill is None:
         available = "、".join(s.name for s in model_skills()) or "（无）"
         return f"错误: 未找到技能 {name}。可用技能: {available}"
@@ -169,7 +173,7 @@ def activate(name: str, by: str = "model") -> str:
         return f"错误: 技能 {name} 已被配置禁用（规则 {skill.disabled_by}）"
     if not skill.model_invocable and by == "model":
         return f"错误: 技能 {name} 仅允许用户手动加载（输入 /{name} 加载）"
-    if name in _active_state.active:
+    if name in _active_state_var.get().active:
         if by == "user":
             # 命令层专用：调用方据 `is_payload` 为假判定重复；正recall_notice文见 render.recall_notice。
             return f"__already_loaded__:{name}"
@@ -179,7 +183,7 @@ def activate(name: str, by: str = "model") -> str:
             f"请先在历史中找到它并按其中步骤执行；历史中找不到完整载荷时，"
             f"用 read_file 读取 {skill.location}（技能目录: {skill.base}）。"
         )
-    _active_state.active.append(name)
+    _active_state_var.get().active.append(name)
     return _fit_payload(render.payload(skill), skill)
 
 
@@ -216,11 +220,11 @@ def prune_active(messages) -> list:
         if isinstance(message.get("content"), str)
     )
     dropped: list = []
-    for name in list(_active_state.active):
-        skill = _active_state.index.get(name)
+    for name in list(_active_state_var.get().active):
+        skill = _active_state_var.get().index.get(name)
         if skill is not None and render.payload(skill) in text:
             continue
-        _active_state.active.remove(name)
+        _active_state_var.get().active.remove(name)
         dropped.append(name)
     return dropped
 
@@ -228,7 +232,7 @@ def prune_active(messages) -> list:
 def _sync_read_roots() -> None:
     """把技能根目录登记为只读白名单（读工具放行、写工具不认）。"""
     roots: list = []
-    for skill in _active_state.skills:
+    for skill in _active_state_var.get().skills:
         if skill.root not in roots:
             roots.append(skill.root)
     config.set_skill_roots(roots)
@@ -237,19 +241,19 @@ def _sync_read_roots() -> None:
 def reset(*args, **kwargs):
     """对**当前绑定的实例**做 reset（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.reset(*args, **kwargs)
+    return _active_state_var.get().reset(*args, **kwargs)
 
 
 def snapshot(*args, **kwargs):
     """对**当前绑定的实例**做 snapshot（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.snapshot(*args, **kwargs)
+    return _active_state_var.get().snapshot(*args, **kwargs)
 
 
 def restore(*args, **kwargs):
     """对**当前绑定的实例**做 restore（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.restore(*args, **kwargs)
+    return _active_state_var.get().restore(*args, **kwargs)
 
 
 def default_state() -> SkillsState:
@@ -258,5 +262,8 @@ def default_state() -> SkillsState:
 
 
 def active_state() -> SkillsState:
-    """当前绑定生效的实例（会话建立时从它接管状态，见 AgentSession）。"""
-    return _active_state
+    """当前生效的实例（会话建立时从它接管状态，见 AgentSession）。
+
+    按**上下文**解析：并发会话各拿各的（同进程多会话不会互相覆盖）。
+    """
+    return _active_state_var.get()

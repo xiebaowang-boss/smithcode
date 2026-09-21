@@ -20,7 +20,7 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
-from .. import config
+from .. import config, sandbox
 from ..event import asks as ask_port
 from ..event import publish
 from ..event.asks import AskRequest
@@ -30,6 +30,11 @@ from ..utils.terminal import confirmations_available
 from . import shell_policy
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
+
+
+def _roots():
+    """当前会话的沙箱目录（无会话时为进程默认那份，见 sandbox.py）。"""
+    return sandbox.current()
 
 # 会话级权限模式：控制 ask 的去向（deny 任何模式下都拒绝）。
 # smith=逐个确认（默认）；accept_edits=编辑族自动放行；auto=全部自动放行（原 -y）。
@@ -338,7 +343,7 @@ class Permission:
 
         -y（approved_all）：静默放行本次访问，视为"仅本次"授权，不弹确认、不写入会话级信任。
         非交互 stdin：无法询问用户，fail-closed 拒绝（不会因 EOFError 崩溃）。
-        其余：返回 ("once", 信任根) / ("always", 信任根)（根已写入 SESSION_EXTRA_ROOTS）
+        其余：返回 ("once", 信任根) / ("always", 信任根)（根已写入本会话的沙箱信任目录，见 sandbox.py）
         或 ("deny", None)。
         """
         root = infer_trust_root(target)
@@ -368,7 +373,7 @@ class Permission:
         if answer == "y":
             return "once", root
         if answer == "a":
-            config.SESSION_EXTRA_ROOTS.append(str(root))
+            _roots().session_extra.append(Path(root))  # 写进**本会话**的沙箱
             return "always", root
         return "deny", None
 

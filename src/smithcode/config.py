@@ -11,7 +11,6 @@ import math
 import os
 import platform
 import sys
-import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -263,13 +262,9 @@ OS_TYPE = platform.system().lower()  # 'windows', 'linux', 'darwin'
 
 # 附加授权目录：cli 的 --add 可重复传入，供一个会话内跨项目访问
 EXTRA_ROOTS: list[str] = []
-# 会话内通过"越界确认"积累的信任目录（/new 时清空）
-SESSION_EXTRA_ROOTS: list[str] = []
-# 仅单次工具调用期间临时放行的目录（由 widen_roots 维护，正常情况下为空）
-_WIDENED_ROOTS: list[str] = []
-# _WIDENED_ROOTS 的增删锁：工具并发执行时多个线程同时进出 widen_roots，
-# 列表 extend/del 不是原子操作，无锁会竞态导致放行目录被误删
-_WIDENED_ROOTS_LOCK = threading.Lock()
+# `WORKSPACE_ROOT`（定义在上方）是**只读默认值**：本会话的工作区在会话建立时
+# 快照进 `sandbox.Roots.workspace`（见 sandbox.py）；这里只是启动期的默认值与
+# 测试的注入点，不再是"当前工作区"的真相。
 
 
 def add_workspace(path):
@@ -278,43 +273,35 @@ def add_workspace(path):
 
 
 def allowed_roots() -> list[Path]:
-    """全部授权目录（主工作区在前）：工具沙箱与权限模式归一化的共同依据。"""
-    return (
-        [Path(WORKSPACE_ROOT).resolve()]
-        + [Path(p) for p in EXTRA_ROOTS]
-        + [Path(p) for p in SESSION_EXTRA_ROOTS]
-        + [Path(p) for p in _WIDENED_ROOTS]
-    )
+    """全部授权目录（主工作区在前）：工具沙箱与权限模式归一化的共同依据。
+
+    解析当前**会话**的沙箱目录（无会话时是进程默认那份），见 sandbox.py。
+    """
+    from . import sandbox  # 局部导入：sandbox 依赖 config，避免初始化期成环
+
+    return sandbox.current().allowed()
 
 
 @contextmanager
 def widen_roots(roots):
     """把目录临时加入授权列表，仅覆盖 with 块内的那次工具调用（"仅本次"语义）。"""
-    added = [str(Path(r).resolve()) for r in roots]
-    if not added:
-        yield
-        return
-    with _WIDENED_ROOTS_LOCK:
-        _WIDENED_ROOTS.extend(added)
-    try:
-        yield
-    finally:
-        with _WIDENED_ROOTS_LOCK:
-            del _WIDENED_ROOTS[-len(added):]
+    from . import sandbox
 
-
-# 技能目录只读白名单：由 skills 子系统发现后写入。读工具放行（免越界确认），
-# 写工具（files._resolve(write=True)）不认——技能文件不可被静默改写。
-SKILL_READ_ROOTS: list = []
+    with sandbox.current().widen(roots):
+        yield
 
 
 def set_skill_roots(paths) -> None:
     """替换技能只读白名单（skills.refresh 时全量重建）。"""
-    SKILL_READ_ROOTS[:] = [str(Path(p).resolve()) for p in paths]
+    from . import sandbox
+
+    sandbox.current().set_skill_roots(paths)
 
 
 def skill_roots() -> list[Path]:
-    return [Path(p) for p in SKILL_READ_ROOTS]
+    from . import sandbox
+
+    return list(sandbox.current().skill)
 
 
 def read_roots() -> list[Path]:

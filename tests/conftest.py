@@ -36,11 +36,13 @@ def _isolate_frontend_context():
 
     询问端口复位为 `None`（= fail-closed 兜底：拒绝/取消，永不挂起）。
     """
-    from smithcode import event, frontend
+    from smithcode import event, frontend, sandbox
 
     bus_token = event.activate(None)
     asker_token = frontend.activate(None)
+    roots_token = sandbox.activate(None)
     yield
+    sandbox.reset(roots_token)
     frontend.reset(asker_token)
     event.reset(bus_token)
 

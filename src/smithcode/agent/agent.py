@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
-from .. import config, goal, instructions, sessions, skills
+from .. import config, goal, instructions, sandbox, sessions, skills
 from ..context import (
     ContextMeter,
     assemble,
@@ -229,6 +229,10 @@ class Agent:
         self.events = Bus(session_id=self.session.id)
         # 询问端口（每会话一个）：提问经它发 asked 事件 + 等前端作答
         self.asks = AskPort(session_id=self.session.id)
+        # 会话沙箱授权目录（本会话的真相：工作区快照 + 会话内信任目录 + 技能白名单）。
+        # **不在构造时挂载**：挂载发生在哪个上下文就属于哪个上下文，构造期挂载会让
+        # 后建的会话覆盖先建的那个（并发会话互相串目录）。挂载点见 run() 与 start()。
+        self.roots = sandbox.fresh()
         self._stream: EventStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # 运行中排队的两条队列（见 queues.py）：变更即发 QueueChanged。
@@ -599,6 +603,9 @@ class Agent:
         # 事件总线与询问端口由**宿主**装配（`frontend.attach`）：本类不认识任何前端，
         # 也不该往进程级全局里塞东西——多会话时那是两份真相。start() 之前装配好
         # 即可覆盖启动期与命令层的提问（如 /skills refresh 的项目信任确认）。
+        # 会话边界：本会话的沙箱在此接管宿主上下文（命令层与启动期的提问、
+        # 技能白名单重建都按本会话的目录判定）。run() 里会再按各自上下文挂一次。
+        sandbox.activate(self.roots)
         self.refresh_skills() 
         instructions.refresh()
         self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
@@ -624,7 +631,7 @@ class Agent:
         self.cancel_pending_asks()  # 换会话：旧会话的挂起提问一并作废
         self.session.reset()
         self.permission.new_session()
-        config.SESSION_EXTRA_ROOTS.clear()
+        self.roots.new_session()  # 清空会话内积累的信任目录
         self.context.new_session()
         reset_read_tracking()
         for part in self._state_registry():
@@ -672,7 +679,7 @@ class Agent:
 
         # 安全例外：跨进程不继承（对齐 Claude Code 的 fork 语义）
         self.permission.new_session()
-        config.SESSION_EXTRA_ROOTS.clear()
+        self.roots.new_session()  # 清空会话内积累的信任目录
         reset_read_tracking()
 
         # 计量重算：真实 token 锚点作废，压缩次数按转录里的检查点数恢复
@@ -832,6 +839,7 @@ class Agent:
     def close(self) -> None:
         """进程退出前收尾：关闭 MCP 连接 + flush + 关闭转录句柄。"""
         self.cancel_pending_asks()  # 退出前放行所有挂起提问（否则等待方永远不醒）
+        sandbox.activate(None)  # 会话沙箱随会话收尾（回到进程默认）
         self.mcp.stop()
         if self.session.store is not None:
             self.session.store.close()
@@ -908,7 +916,9 @@ class Agent:
         reset_token = activate_token(token)
         emitter_token = emitter.activate(self.emit)  # 深层模块（llm 层）也能发事件
         asks_token = asks.activate(self.asks)  # 深层模块（权限预检 / ask_user）也能提问
+        roots_token = sandbox.activate(self.roots)  # 本轮的授权目录 = 本会话的那一份
         status = "error"
+        result: RunResult | None = None  # 未预期异常时 finally 也要能安全收尾
         self._emit(ExecutionStarted())
         try:
             result = await self._run_loop(token)
@@ -927,6 +937,7 @@ class Agent:
             reset_token()
             emitter.reset(emitter_token)
             asks.reset(asks_token)
+            sandbox.reset(roots_token)
             self._emit_execution_end(status, result, token)
         if owner:
             self._close_stream(None, result)

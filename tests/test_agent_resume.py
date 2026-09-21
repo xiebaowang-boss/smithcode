@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from smithcode import config, goal, instructions, plan, skills
+from smithcode import config, goal, instructions, plan, sandbox, skills
 from smithcode.agent import Agent
 from smithcode.session import Session
 from smithcode.sessions import SessionStore, list_sessions, load, summary_from_path
@@ -42,14 +42,14 @@ def _isolated(tmp_path, monkeypatch):
     plan.reset()
     skills.clear()
     instructions.reset()
-    config.SESSION_EXTRA_ROOTS.clear()
+    sandbox.current().session_extra.clear()
     files_mod.READ_FILES.clear()
     yield
     goal.reset()
     plan.reset()
     skills.clear()
     instructions.reset()
-    config.SESSION_EXTRA_ROOTS.clear()
+    sandbox.current().session_extra.clear()
     files_mod.READ_FILES.clear()
 
 
@@ -188,7 +188,7 @@ def test_resume_restores_state_but_resets_authorizations(monkeypatch, tmp_path):
     # 模拟上一进程的会话级授权：恢复时必须全部丢弃
     resumed = _make_agent(monkeypatch)
     resumed.permission.session_rules.append(("write_file", "*", "allow"))
-    config.SESSION_EXTRA_ROOTS.append(str(tmp_path))
+    resumed.roots.session_extra.append(tmp_path)  # 会话沙箱里的信任目录
     files_mod.READ_FILES.add(str(tmp_path / "b.py"))
     report = resumed.resume(session_id)
 
@@ -198,7 +198,7 @@ def test_resume_restores_state_but_resets_authorizations(monkeypatch, tmp_path):
     assert goal.current().turns == 0  # 回合计数有意重置
     assert [item["title"] for item in plan.current().items] == ["第一步"]
     assert resumed.permission.session_rules == []
-    assert config.SESSION_EXTRA_ROOTS == []
+    assert resumed.roots.session_extra == []
     assert not files_mod.READ_FILES
 
 

@@ -11,7 +11,7 @@ from rich.color import ColorTriplet
 from textual.geometry import Region
 from textual.widgets import Static
 
-from smithcode import __version__, config
+from smithcode import __version__, config, sandbox
 from smithcode import frontend as _frontend_mod
 from smithcode.agent import Agent
 from smithcode.event import asks as ask_port
@@ -561,7 +561,7 @@ def test_tui_tool_call_collapsible(monkeypatch, tmp_path):
     no_prompting(monkeypatch)
     (tmp_path / "hi.txt").write_text("文件内容", encoding="utf-8")
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     import smithcode.agent as agent_mod
 
     tool_call = {

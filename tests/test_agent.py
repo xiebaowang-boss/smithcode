@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import httpx2
 import pytest
 
-from smithcode import config, frontend
+from smithcode import config, frontend, sandbox
 from smithcode.agent import Agent
 from smithcode.context import truncate_output
 from smithcode.frontend.console import ConsoleFrontend
@@ -211,7 +211,7 @@ def test_wrap_up_strips_unexpected_tool_calls(monkeypatch):
 def test_run_stops_when_permission_denied(monkeypatch, tmp_path):
     """权限被拒：任务立即终止，同批剩余 tool_calls 补占位结果（防悬空 tool_call_id）。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
 
     class TwoToolCallsLLM(FakeLLM):
         def chat_stream(self, messages, tools=None):
@@ -345,7 +345,7 @@ def test_new_session_resets_all_session_scope_state(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch)
     agent.session.usage.add({"prompt_tokens": 10, "completion_tokens": 5})
     agent.permission.session_rules.append(("run_command", "*", "allow"))
-    config.SESSION_EXTRA_ROOTS.append(str(tmp_path))
+    agent.roots.session_extra.append(tmp_path)
     agent.context.compact_count = 3
     agent.context.last_actual = 1234
     files_mod.READ_FILES.add(str(tmp_path / "旧文件.py"))
@@ -358,7 +358,7 @@ def test_new_session_resets_all_session_scope_state(monkeypatch, tmp_path):
     assert agent.session.usage.current_session.calls == 0
     assert agent.session.usage.since_start.get("prompt_tokens") == 10  # 启动口径跨 /new 存活
     assert agent.permission.session_rules == []
-    assert config.SESSION_EXTRA_ROOTS == []
+    assert agent.roots.session_extra == []
     assert agent.context.compact_count == 0
     assert agent.context.last_actual is None  # 旧会话锚点对新会话无意义，作废
     assert not files_mod.READ_FILES
@@ -413,7 +413,7 @@ def _outside_file(tmp_path):
 
 def _outside_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     return _console_agent()
 
@@ -448,7 +448,7 @@ def test_execute_outside_path_denied(monkeypatch, tmp_path):
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
     assert _run_call(agent, call) == "用户拒绝了此操作"
-    assert config.SESSION_EXTRA_ROOTS == []
+    assert agent.roots.session_extra == []
 
 
 def test_execute_outside_path_once_approval(monkeypatch, tmp_path):
@@ -459,7 +459,7 @@ def test_execute_outside_path_once_approval(monkeypatch, tmp_path):
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
     assert "s" in _run_call(agent, call)
-    assert config.SESSION_EXTRA_ROOTS == []
+    assert agent.roots.session_extra == []
 
 
 def test_execute_outside_path_always_approval(monkeypatch, tmp_path):
@@ -474,7 +474,7 @@ def test_execute_outside_path_always_approval(monkeypatch, tmp_path):
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
     assert "s" in _run_call(agent, call)
-    assert config.SESSION_EXTRA_ROOTS == [str(outside)]
+    assert sandbox.current().session_extra == [outside]
 
     assert "s" in _run_call(agent, call)
 
@@ -488,7 +488,7 @@ def test_execute_outside_path_auto_approved_with_yes(monkeypatch, tmp_path):
 
     call = _fake_tool_call("read_file", json.dumps({"path": arg}))
     assert "s" in _run_call(agent, call)
-    assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义
+    assert agent.roots.session_extra == []  # "仅本次"语义
 
 
 def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
@@ -506,7 +506,7 @@ def test_execute_outside_path_denied_non_interactive(monkeypatch, tmp_path):
 
 def _patch_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
     return _console_agent()
 

@@ -1,7 +1,7 @@
 """命令策略测试：安全只读矩阵、重定向与替换边界、跨平台安全集、前缀推导。"""
 import pytest
 
-from smithcode import config
+from smithcode import config, sandbox
 from smithcode.permission import shell_policy
 from smithcode.permission.shell_policy import (
     command_key,
@@ -15,8 +15,7 @@ def isolated_workspace(tmp_path, monkeypatch):
     """把工作区指向临时目录，并清空附加/会话/临时授权目录，保证 cd 判定确定。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(config, "EXTRA_ROOTS", [])
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
-    monkeypatch.setattr(config, "_WIDENED_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     return tmp_path
 
 

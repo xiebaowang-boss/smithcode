@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from smithcode import config
+from smithcode import config, sandbox
 from smithcode import frontend as frontend_mod
 from smithcode.event import Bus
 from smithcode.event import activate as activate_bus
@@ -438,19 +438,19 @@ def test_infer_trust_root_falls_back_to_parent(tmp_path):
 def test_ask_outside_access_once_always_deny(tmp_path, monkeypatch):
     """[y] 仅本次不入库；[a] 信任根写入会话列表；[n] 拒绝。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-out")
     outside.mkdir()
     perm = Permission()
 
     monkeypatch.setattr("builtins.input", lambda _: "y")
     assert asyncio.run(perm.ask_outside_access("x.py", outside / "x.py")) == ("once", outside)
-    assert config.SESSION_EXTRA_ROOTS == []
+    assert sandbox.current().session_extra == []
 
     monkeypatch.setattr("builtins.input", lambda _: "a")
     action, root = asyncio.run(perm.ask_outside_access("x.py", outside / "x.py"))
     assert (action, root) == ("always", outside)
-    assert config.SESSION_EXTRA_ROOTS == [str(outside)]
+    assert sandbox.current().session_extra == [outside]
 
     monkeypatch.setattr("builtins.input", lambda _: "n")
     assert asyncio.run(perm.ask_outside_access("x.py", outside / "x.py")) == ("deny", None)
@@ -460,7 +460,7 @@ def test_ask_outside_access_renders_detail(tmp_path, monkeypatch, capture):
     cap = capture
     """越界路径授权信息也走 confirm_choice 传参，聊天区不重复打印。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-od")
     outside.mkdir()
 
@@ -477,7 +477,7 @@ def test_ask_outside_access_truncates_long_option_descriptions(tmp_path, monkeyp
     cap = capture
     """越界授权的选项小字含长路径时同样截断，不把整条路径铺满终端。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-" + "o" * 80)
     outside.mkdir()
 
@@ -493,8 +493,7 @@ def test_widen_roots_is_temporary(tmp_path, monkeypatch):
     extra = tmp_path / "widen-me"
     extra.mkdir()
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
-    monkeypatch.setattr(config, "_WIDENED_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
 
     base = config.allowed_roots()
     with config.widen_roots([extra]):
@@ -531,7 +530,7 @@ def test_ask_still_accepts_valid_answers(make_perm, monkeypatch):
 def test_ask_outside_access_reprompts_on_invalid_answer(tmp_path, monkeypatch):
     """越界路径确认同样对非法输入重问。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-out2")
     outside.mkdir()
     perm = Permission()
@@ -556,7 +555,7 @@ def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
     """非交互 stdin 下越界访问直接拒绝，不尝试询问。"""
     monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-out")
     outside.mkdir()
     perm = Permission()
@@ -567,7 +566,7 @@ def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
 def test_approved_all_auto_approves_outside_access(tmp_path, monkeypatch):
     """/-y（approved_all）覆盖越界访问确认：静默放行本次访问，不弹确认、不留会话级信任。"""
     monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
-    monkeypatch.setattr(config, "SESSION_EXTRA_ROOTS", [])
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
     outside = tmp_path.parent / (tmp_path.name + "-out")
     outside.mkdir()
     perm = Permission()
@@ -575,7 +574,7 @@ def test_approved_all_auto_approves_outside_access(tmp_path, monkeypatch):
 
     action, root = asyncio.run(perm.ask_outside_access("x.py", outside / "x.py"))
     assert (action, root) == ("once", outside)
-    assert config.SESSION_EXTRA_ROOTS == []  # "仅本次"语义，不写入会话级信任
+    assert sandbox.current().session_extra == []  # "仅本次"语义，不写入会话级信任
 
 
 # ---------- family 机制与多资源聚合 ----------

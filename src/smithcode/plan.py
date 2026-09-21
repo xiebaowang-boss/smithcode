@@ -9,6 +9,7 @@ reason 可变。清单存于本模块进程内状态（会话口径，/new 时 r
 from __future__ import annotations
 
 import uuid
+from contextvars import ContextVar
 
 STATUSES = ("pending", "in_progress", "completed", "cancelled")
 MAX_ITEMS = 50  # 单份清单上限，防止模型一次提交超大清单撑爆上下文
@@ -131,8 +132,13 @@ class PlanState:
         self.current = TodoList()
 
     def inherit(self, other: PlanState) -> None:
-        """接管另一个实例的当前清单（会话建立时从默认实例接过来，见 GoalState.inherit）。"""
-        self.current = other.current
+        """接管另一个实例的当前清单（会话建立时从默认实例接过来，见 GoalState.inherit）。
+
+        **复制**而不是别名：`self.current = other.current` 会让两个会话共用同一个
+        TodoList——一个会话改清单会改到另一个的（探针
+        `tests/guard/test_multi_session_isolation.py` 抓的就是它）。
+        """
+        self.current = TodoList([dict(item) for item in other.current.items])
 
 
     def reset(self) -> None:
@@ -150,7 +156,10 @@ class PlanState:
 
 # 进程级默认实例：没有会话绑定时的落点（直接调本模块的测试、无 Agent 的路径）
 _default_state = PlanState()
-_active_state = _default_state
+# 活动状态：**按上下文**解析（不是进程级指针）。
+# 同进程并发两个会话时，各自的 goal/plan/skills 互不覆盖——这正是把
+# "活动实例"从模块全局换成 ContextVar 要解决的问题（事件总线/取消信号同款做法）。
+_active_state_var: ContextVar[PlanState] = ContextVar("smithcode_plan_state", default=_default_state)
 
 
 def bind(state: PlanState | None) -> None:
@@ -162,13 +171,12 @@ def bind(state: PlanState | None) -> None:
     同时跑两个会话会互相覆盖——这与改造前的单例行为一致，不会更糟；TUI/REPL
     都是一个进程一个会话（阶段 D 会把它收敛到会话对象上）。
     """
-    global _active_state
-    _active_state = state if state is not None else _default_state
+    _active_state_var.set(state if state is not None else _default_state)
 
 
 
 def current() -> TodoList:
-    return _active_state.current
+    return _active_state_var.get().current
 
 
 
@@ -179,19 +187,19 @@ def has_active() -> bool:
 
     opencode 式：无任务或全部完成 / 取消时不展示任务区，有进行中或待办步骤才展示。
     """
-    return any(i["status"] in ("pending", "in_progress") for i in _active_state.current.items)
+    return any(i["status"] in ("pending", "in_progress") for i in _active_state_var.get().current.items)
 
 
 def summary() -> str:
     """一行状态速览，如「共 3 步 · 已完成 1 · 进行中 1」。"""
-    items = _active_state.current.items
+    items = _active_state_var.get().current.items
     if not items:
         return "暂无任务计划"
     parts = [f"共 {len(items)} 步"]
-    done = _active_state.current.count("completed")
+    done = _active_state_var.get().current.count("completed")
     if done:
         parts.append(f"已完成 {done}")
-    prog = _active_state.current.count("in_progress")
+    prog = _active_state_var.get().current.count("in_progress")
     if prog:
         parts.append(f"进行中 {prog}")
     return " · ".join(parts)
@@ -199,36 +207,36 @@ def summary() -> str:
 
 def render_current(color: bool = False, status: str | None = None) -> str:
     """当前清单的完整渲染（标题 + 描述 + reason）；status 非空时只返回该状态。"""
-    if not _active_state.current.items:
+    if not _active_state_var.get().current.items:
         return _PLACEHOLDER
     if status is None:
-        return _active_state.current.render(color=color)
-    return _active_state.current.render_status(status, color=color) or f"（无 {status} 状态的步骤）"
+        return _active_state_var.get().current.render(color=color)
+    return _active_state_var.get().current.render_status(status, color=color) or f"（无 {status} 状态的步骤）"
 
 
 def render_titles(color: bool = False) -> str:
     """仅标题的紧凑渲染（TUI 侧边栏用），不含描述与 reason。"""
-    if not _active_state.current.items:
+    if not _active_state_var.get().current.items:
         return "（暂无任务计划）"
-    return _active_state.current.render(color=color, titles_only=True)
+    return _active_state_var.get().current.render(color=color, titles_only=True)
 
 
 def reset(*args, **kwargs):
     """对**当前绑定的实例**做 reset（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.reset(*args, **kwargs)
+    return _active_state_var.get().reset(*args, **kwargs)
 
 
 def snapshot(*args, **kwargs):
     """对**当前绑定的实例**做 snapshot（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.snapshot(*args, **kwargs)
+    return _active_state_var.get().snapshot(*args, **kwargs)
 
 
 def restore(*args, **kwargs):
     """对**当前绑定的实例**做 restore（见 `bind`）；会话内的等价调用用
     `AgentSession` 持有的实例，避免依赖绑定状态。"""
-    return _active_state.restore(*args, **kwargs)
+    return _active_state_var.get().restore(*args, **kwargs)
 
 
 def default_state() -> PlanState:
@@ -237,5 +245,8 @@ def default_state() -> PlanState:
 
 
 def active_state() -> PlanState:
-    """当前绑定生效的实例（会话建立时从它接管状态，见 AgentSession）。"""
-    return _active_state
+    """当前生效的实例（会话建立时从它接管状态，见 AgentSession）。
+
+    按**上下文**解析：并发会话各拿各的（同进程多会话不会互相覆盖）。
+    """
+    return _active_state_var.get()
