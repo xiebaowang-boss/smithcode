@@ -30,3 +30,21 @@ def test_render_markdown_honors_width_under_dumb_terminal(monkeypatch):
 def test_render_markdown_survives_very_narrow_width(monkeypatch):
     monkeypatch.setenv("TERM", "dumb")
     assert render_markdown("hello world", 5).plain.strip()
+
+
+# ---------- 每轮页脚的行尾后缀：实时与重放共用同一口径 ----------
+
+
+def test_footer_suffix_only_marks_interrupt_and_stream_error():
+    """只有中断与流断开带后缀；其余状态（ok / denied / max_iterations）不带。
+
+    这条锁的是"两处不能各写一份"：重放曾把 `denied` 也标成「失败」，
+    而实时路径没有——同一段历史在两种渲染下对不上。
+    """
+    from smithcode.tui.render import footer_suffix
+
+    assert footer_suffix("interrupted") == "已停止"
+    assert footer_suffix("stream_error", "（读取超时：…）") == "输出中断（读取超时：…）"
+    assert footer_suffix("ok") is None
+    assert footer_suffix("denied") is None
+    assert footer_suffix("max_iterations") is None

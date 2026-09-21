@@ -69,7 +69,7 @@ from .panels import (
     SelectionPanel,
     SelectionScreen,
 )
-from .render import format_duration, git_branch, human_tokens
+from .render import footer_suffix, format_duration, git_branch, human_tokens
 from .widgets import (
     ChatInput,
     ChatView,
@@ -312,11 +312,10 @@ class SmithTUI(App):
                                    ev.ExecutionInterrupted)):
                 if turn_start is None:
                     continue
-                suffix = None
-                if isinstance(data, ev.ExecutionInterrupted):
-                    suffix = "已停止"
-                elif isinstance(data, ev.ExecutionFailed):
-                    suffix = {"stream_error": "输出中断"}.get(data.status, "失败")
+                # 与实时路径同一个口径（含流断开的失败原因）
+                status = "interrupted" if isinstance(data, ev.ExecutionInterrupted) else data.status
+                reason = "" if isinstance(data, ev.ExecutionInterrupted) else getattr(data, "reason", "")
+                suffix = footer_suffix(status, format_stream_interrupted(reason))
                 chat.apply(Footer(
                     model or config.MODEL,
                     effort or (config.REASONING_EFFORT or config.DEFAULT_EFFORT),
@@ -991,9 +990,8 @@ class SmithTUI(App):
             return
         elapsed = time.monotonic() - self._turn_start
         self._turn_start = None
-        suffix = {"interrupted": "已停止", "stream_error": "输出中断"}.get(status)
-        if status == "stream_error":
-            suffix += format_stream_interrupted(self._turn_reason)  # 带上失败原因
+        # 后缀口径与重放共用（见 render.footer_suffix）：中断 / 流断开才有后缀
+        suffix = footer_suffix(status, format_stream_interrupted(self._turn_reason))
         turn = self.agent.last_turn
         model = turn.model if turn is not None else config.MODEL
         effort = turn.effort if turn is not None else (

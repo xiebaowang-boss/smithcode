@@ -329,3 +329,21 @@ def side_by_side_diff(unified: str, width: int, max_rows: int | None = None) -> 
     text.append("\n")
     text.append_text(_blank_row(width))  # 下 padding
     return text
+
+
+def footer_suffix(status: str, hint: str = "") -> str | None:
+    """每轮页脚的行尾后缀（**实时与重放共用这一个口径**）。
+
+    - `interrupted` → 「已停止」
+    - `stream_error` → 「输出中断」+ `hint`（调用方用 `format_stream_interrupted`
+      生成的可操作提示：失败原因决定了该去查超时还是限流）
+    - 其余状态（`ok` / `denied` / `max_iterations`）→ 无后缀
+
+    为什么必须共用：两处各写一份必然漂——重放曾把 `denied` 也标成「失败」、
+    且丢掉流断开的失败原因，于是"重放看到的历史"与"当时屏幕上那条"对不上。
+    """
+    if status == "interrupted":
+        return "已停止"
+    if status == "stream_error":
+        return "输出中断" + hint
+    return None
