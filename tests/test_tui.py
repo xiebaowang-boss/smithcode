@@ -3975,3 +3975,78 @@ def test_ask_after_unmount_returns_default_without_blocking(monkeypatch):
 
     _run(_run_case())
 
+
+
+# ---------- 恢复会话：按事件回放历史（工具行 / 每轮页脚） ----------
+
+
+def test_resumed_session_replays_tool_rows_and_footers(monkeypatch, tmp_path):
+    """恢复旧会话时：工具调用行与每轮页脚（模型 / 用时）都要回显。
+
+    这两处原先只走「消息」渲染，于是：工具行没有（它由 `ToolStart/ToolEnd` 事件
+    驱动），每轮页脚也没有（它是实时路径的产物，靠单调时钟与 `last_turn` 快照）。
+    事件溯源之后历史按**事件**回放，两处自然齐了；页脚用时直接取事件时间戳之差。
+    """
+    from smithcode import config
+    from smithcode.session import Session
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("SMITHCODE_HOME", str(home))
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(workspace))
+    (workspace / "a.txt").write_text("hello", encoding="utf-8")
+    (home / "config.toml").write_text(
+        "[sessions]\nauto_title = false\ncleanup_days = 0\n", encoding="utf-8"
+    )
+
+    class ScriptedLLM:
+        def __init__(self): self.calls = 0
+        def chat_stream(self, messages, tools=None, model=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield ("message", {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}}]})
+                return
+            yield ("message", {"role": "assistant", "content": "读完了"})
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", ScriptedLLM)
+    original = Agent(session=Session(), persist=True)
+    asyncio.run(original.run("看看 a.txt"))  # 一轮：工具调用 + 最终回复
+    session_id = original.session.store.id
+    original.session.store.close()
+
+    resumed = Agent(session=Session(), persist=True)
+    resumed.resume(session_id)
+
+    async def _run_case():
+        app = SmithTUI(resumed)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            rendered = _chat_text(app)
+            # ① 工具行回显（含工具名与目标）
+            assert "read a.txt" in rendered, rendered
+            # ② 每轮页脚回显（模型 / 思考强度 / 用时）
+            footers = [w for w in app.query_one(ChatView).children
+                       if "turn-footer" in getattr(w, "classes", set())]
+            assert footers, "恢复后应当有每轮页脚"
+            footer_text = " ".join(str(getattr(w, "content", "") or w.render())
+                                   for w in footers)
+            assert "▣" in footer_text, footer_text              # 页脚形态
+            assert "read" not in footer_text                    # 页脚只放元数据
+            import json as _json
+
+            log_models = [
+                _json.loads(line)["data"]["model"]
+                for line in resumed.session.store.path.read_text(encoding="utf-8").splitlines()
+                if _json.loads(line)["type"].startswith("session.model.selected")
+            ]
+            assert log_models, "日志里应当有模型事件"
+            assert log_models[-1] in footer_text, footer_text   # 模型来自事件，不是回退值
+            assert "s" in footer_text, footer_text              # 用时（来自事件时间戳）
+            # ③ 文本回放
+            assert "读完了" in rendered
+
+    _run(_run_case())

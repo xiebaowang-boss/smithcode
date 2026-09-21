@@ -256,6 +256,7 @@ class Agent:
         self._session_owner: AgentSession | None = None
         self._last_batch_results: list[str] = []  # 本批工具结果文本，供 TurnContext
         self._last_model_event: tuple[str, str] | None = None  # 已发过的模型事件（去重）
+        self._replay_events: list = []  # 恢复时装载的事件（宿主按事件回放历史）
         self._model = model  # 非空时覆盖 config.MODEL
         self._turn: TurnConfig | None = None  # 本轮请求快照：run() 开头 pin，轮内冻结
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
@@ -374,6 +375,15 @@ class Agent:
             cached_tokens=totals.cache_hit(),
             step=step or StepUsage(),
         )
+
+    def replayable_events(self) -> list:
+        """恢复会话时装载的事件（按 seq 顺序），供宿主**按事件回放历史**。
+
+        界面是事件的投影：只回放消息会丢掉工具行、每轮页脚（模型 / 思考强度 /
+        用时）这些事件才有的信息。这里给的就是日志里那批原始事件，宿主自己决定
+        渲染成什么（TUI 画聊天区，将来的远程客户端序列化后发给浏览器）。
+        """
+        return list(self._replay_events)
 
     def cancel_pending_asks(self) -> int:
         """取消本会话所有挂起提问（界面收尾 / `/new` / 进程退出），返回条数。
@@ -664,6 +674,7 @@ class Agent:
         """
         summary = self._resolve_target(target)
         loaded = sessions.load(summary)
+        self._replay_events = list(loaded.events)  # 供宿主按事件回放历史
 
         if self.session.store is not None:
             self.session.store.close()

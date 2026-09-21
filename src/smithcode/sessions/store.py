@@ -358,7 +358,9 @@ def load(summary) -> LoadedSession:
         try:
             store.adopt_seq(max([env.seq or 0 for env in events] or [0]) + 1)
             for message in appended:
-                store.append_event(wrap(MessageEnd(message=message), session_id=session_id))
+                events.append(store.append_event(
+                    wrap(MessageEnd(message=message), session_id=session_id)
+                ))
         finally:
             store.close()
     meta.setdefault("id", session_id)
@@ -369,6 +371,7 @@ def load(summary) -> LoadedSession:
         model=view.model or str(meta.get("model") or ""),
         effort=view.effort or str(meta.get("effort") or ""),
         bad_lines=bad_lines, repair=repair, repaired=bool(appended),
+        events=events,
     )
 
 

@@ -248,26 +248,99 @@ class SmithTUI(App):
             self.agent.cancel_pending_asks()
 
     def _replay_history(self) -> None:
-        """恢复会话后回放历史：user / assistant 文本走既有渲染路径静态上屏。
+        """恢复会话后回放历史：**按事件重建界面**（文本 / 工具行 / 每轮页脚）。
 
-        工具调用与结果不逐条回放（历史长且没有 pending 状态语义），技能载荷消息
-        （技能正文）折叠为一行提示，避免整段正文铺满聊天区；用 batch_update 一次性
-        绘制，避免逐条 append 闪屏。
+        为什么不从 `session.messages` 渲染：消息只是事件的一种投影，工具调用行
+        （`ToolStart` / `ToolEnd` / `PlanUpdate`）与每轮页脚（模型 / 思考强度 /
+        用时）只有事件才有——只走消息就会把这些信息丢掉（"日志里存了、界面不显示"
+        正是这个原因）。事件里没有的（易失的流式增量）本就不需要：历史只要结果。
+
+        没有事件可放（临时会话 / 测试直接塞的消息）时退回按消息渲染，保证那块
+        路径不至于空白。
         """
-        messages = getattr(self.agent.session, "messages", None) or []
+        events = self.agent.replayable_events() if self.agent is not None else []
         chat = self.query_one(ChatView)
         with self.batch_update():
-            for message in messages:
+            if events:
+                self._replay_events(chat, events)
+            else:
+                self._replay_messages(chat)
+
+    def _replay_events(self, chat: ChatView, events: list) -> None:
+        """按事件重放：一次自成一体的投影（每轮的时间戳由事件带来）。"""
+        # 事件用**模块别名**引用：事件与聊天项同名（`ToolStart` / `ToolEnd`），
+        # 直接 import 会把模块级的聊天项遮蔽掉——那正是"工具行画不出来"的坑
+        from ..event import catalog as ev
+
+        model, effort = "", ""  # 页脚用：跟随最近一条 ModelSelected
+        turn_start: float | None = None  # 页脚用时：Execution 起止的时间戳之差
+        texts_seen: set[str] = set()  # 去重（同一条消息可能有多个 MessageEnd）
+        for env in events:
+            data = env.data
+            if isinstance(data, ev.MessageEnd):
+                message = data.message
                 role = message.get("role")
+                # system 不进日志；tool 结果由工具行承载，不再单列一条消息
+                if role not in ("user", "assistant"):
+                    continue
                 text = _message_text(message.get("content"))
-                if role == "user" and text:
+                if role == "user":
                     skill_name = skills.render.payload_skill_name(text)
                     if skill_name:
                         chat.apply(Notice(f"已加载技能 {skill_name}"))
-                    else:
+                    elif text:
                         chat.apply(User(text))
-                elif role == "assistant" and text.strip():
+                elif text.strip() and text not in texts_seen:
+                    texts_seen.add(text)
                     chat.apply(Assistant(text))
+            elif isinstance(data, ev.ToolStart):
+                # 静态行（历史没有 pending / 转轮语义）
+                icon = _PLAN_ICON if data.name == "todo_write" else ""
+                chat.apply(ToolStart(data.tool_call_id, data.line, data.display,
+                                     data.name, icon, ""))
+            elif isinstance(data, ev.ToolEnd):
+                chat.apply(ToolResult(data.tool_call_id, data.result, data.expand,
+                                      data.is_error))
+            elif isinstance(data, ev.PlanUpdate) and data.created:
+                # 新建清单时按既有形态展示一次详情（后续更新只刷侧边栏）
+                chat.apply(ToolResult(data.tool_call_id, data.rendered, True, False))
+            elif isinstance(data, ev.ModelSelected):
+                model, effort = data.model, data.effort
+            elif isinstance(data, ev.ExecutionStarted):
+                turn_start = env.created
+            elif isinstance(data, (ev.ExecutionSucceeded, ev.ExecutionFailed,
+                                   ev.ExecutionInterrupted)):
+                if turn_start is None:
+                    continue
+                suffix = None
+                if isinstance(data, ev.ExecutionInterrupted):
+                    suffix = "已停止"
+                elif isinstance(data, ev.ExecutionFailed):
+                    suffix = {"stream_error": "输出中断"}.get(data.status, "失败")
+                chat.apply(Footer(
+                    model or config.MODEL,
+                    effort or (config.REASONING_EFFORT or config.DEFAULT_EFFORT),
+                    format_duration(max(0.0, env.created - turn_start)),
+                    suffix,
+                ))
+                turn_start = None
+
+    def _replay_messages(self, chat: ChatView) -> None:
+        """没有日志事件时的退化路径：按消息渲染 user / assistant 文本。
+
+        技能载荷消息（技能正文）折叠为一行提示，避免整段正文铺满聊天区。
+        """
+        for message in getattr(self.agent.session, "messages", None) or []:
+            role = message.get("role")
+            text = _message_text(message.get("content"))
+            if role == "user" and text:
+                skill_name = skills.render.payload_skill_name(text)
+                if skill_name:
+                    chat.apply(Notice(f"已加载技能 {skill_name}"))
+                else:
+                    chat.apply(User(text))
+            elif role == "assistant" and text.strip():
+                chat.apply(Assistant(text))
 
     def _show_welcome(self) -> None:
         """在聊天区渲染欢迎横幅（启动与 /new 后复用）。
