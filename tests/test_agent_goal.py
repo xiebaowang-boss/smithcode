@@ -102,6 +102,40 @@ def test_run_with_goal_auto_continues_until_complete(monkeypatch, capsys):
     assert any("测试目标" in str(m.get("content", "")) for m in agent.session.messages)
 
 
+def test_goal_run_emits_one_execution_pair_per_turn(monkeypatch, capsys):
+    """`/goal` 续跑多轮：execution 边界**一轮一对**，忙碌态是易失的（不进日志）。
+
+    外层包装（`outer_turn_begin/end`）原先也发一对 execution，于是同一任务在日志里
+    出现两对边界——重放每轮页脚只能靠"跳过没有起点的终结事件"兜住（既不忠实也不好读）。
+    现在切清：`execution` 的粒度是"一次用户任务"（一轮 `run()`），外层包装只发
+    `StatusChanged(working)`（跨多轮的忙碌区间，易失、不落盘），标题的忙闲计数认两族。
+    """
+    agent = _make_agent(monkeypatch, [
+        _todo_step(call_id="1"),
+        _text("第一步完成"),
+        _tool("goal_update", {"status": "complete", "summary": "完成"}, "2"),
+        _text("目标完成"),
+    ])
+    goal.set("测试目标", max_turns=10)
+    seen: list = []
+    agent.events.subscribe(seen.append)
+
+    asyncio.run(agent.session_owner.run_with_goal("开始"))
+
+    types = [env.type for env in seen]
+    assert types.count("session.execution.started") == 2  # 首轮 + 一次续跑
+    assert types.count("session.execution.succeeded") == 2
+    # 一轮一对、严格交替（没有"两个 started 夹一个 succeeded"）
+    assert [t for t in types if t.startswith("session.execution.")] == [
+        "session.execution.started", "session.execution.succeeded",
+        "session.execution.started", "session.execution.succeeded",
+    ]
+    # 忙碌区间是**易失**事件：总线上有，但不进日志（会话日志只留骨架事实）
+    working = [env for env in seen if env.type == "session.status.changed"]
+    assert working, "跨轮的忙碌区间应当发 StatusChanged"
+    assert all(not env.durable for env in working)
+
+
 def test_run_with_goal_pauses_on_toolless_turn(monkeypatch, capsys):
     agent = _make_agent(monkeypatch, [_text("好的")])
     goal.set("测试目标")

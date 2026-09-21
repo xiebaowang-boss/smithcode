@@ -39,6 +39,8 @@ from .event.catalog import (
     ExecutionSucceeded,
     PromptFinished,
     PromptStarted,
+    StatusChanged,
+    StatusCleared,
     TitleChanged,
 )
 from .utils.terminal import stdout_is_tty, write_terminal_control
@@ -178,10 +180,17 @@ class TerminalTitlePresenter:
             self.on_prompt_finished(event)
         elif isinstance(event, TitleChanged):
             self.on_title_changed(event.title)
-        elif isinstance(event, ExecutionStarted):
+        elif isinstance(event, ExecutionStarted) or (
+            isinstance(event, StatusChanged) and event.kind == "working"
+        ):
+            # 忙碌计数认两族：`Execution*`（一次用户任务）+ `StatusChanged(working)`
+            # （跨多轮的忙碌区间，如 /goal 续跑）——嵌套计数，轮间不闪回空闲
             self.on_turn_started()
-        elif isinstance(event, (ExecutionSucceeded, ExecutionFailed, ExecutionInterrupted)):
-            # 三种终止结局都收掉忙闲计数（成对：ExecutionStarted 一个，终止一个）
+        elif isinstance(event, (ExecutionSucceeded, ExecutionFailed,
+                                ExecutionInterrupted)) or (
+            isinstance(event, StatusCleared) and event.kind == "working"
+        ):
+            # 三种终止结局（各成对）与忙碌区间结束都收掉计数
             self.on_turn_finished()
 
     def on_prompt_started(self, event: PromptStarted) -> None:

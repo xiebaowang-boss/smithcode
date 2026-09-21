@@ -45,6 +45,8 @@ from ..event.catalog import (
     PlanUpdate,
     QueueItem,
     SessionCheckpoint,
+    StatusChanged,
+    StatusCleared,
     StepEnded,
     StepFinish,
     StepStarted,
@@ -997,21 +999,24 @@ class Agent:
         多轮只应有一条事件流（否则每轮 `run()` 都终结一次，消费者会在第一轮就
         拿到结果），所以由**最外层**创建并收口。这里同时钉住本轮的事件循环，
         供跨线程事件（UI 线程改队列、后台标题）转回。
+
+        **不发 execution 事件**：`execution` 的粒度是"一次用户任务"（一轮 `run()`），
+        由 `run()` 自己发。这一层要表达的是"跨多轮的忙碌区间"（`/goal` 续跑期间
+        标题不该闪回空闲），那是**易失的忙碌态**——所以发 `StatusChanged(working)`，
+        它不进日志，也不会让一次任务在日志里出现两对 execution 边界。
         """
         owner = self._ensure_stream()
         if owner:
             self._loop = asyncio.get_running_loop()
             self.events.bind_loop(self._loop)  # 跨线程发事件时跳回本循环
             self.asks.bind_loop(self._loop)
-        self._emit(ExecutionStarted())
+        self._emit(StatusChanged(kind="working", text=""))
         return owner
 
     def outer_turn_end(self, owner: bool, result: RunResult | None,
                        exc: BaseException | None = None) -> None:
-        """外层回合收尾：发执行的结束事件；异常路径也要收口事件流。"""
-        self._emit_execution_end(
-            result.status if result is not None else "error", result, current_token()
-        )
+        """外层回合收尾：结束忙碌区间（易失）；异常路径也要收口事件流。"""
+        self._emit(StatusCleared(kind="working"))
         if exc is not None:
             if owner:
                 self._close_stream(exc)
