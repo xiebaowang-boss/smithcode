@@ -348,7 +348,7 @@ def load(summary) -> LoadedSession:
         model=view.model or str(meta.get("model") or ""),
         effort=view.effort or str(meta.get("effort") or ""),
         bad_lines=bad_lines, repair=repair, repaired=bool(appended),
-        events=events,
+        events=events, usage=dict(view.usage), context_tokens=view.last_input_tokens,
     )
 
 

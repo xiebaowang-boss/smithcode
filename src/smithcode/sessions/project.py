@@ -13,6 +13,7 @@
 | `TitleChanged` | 标题与来源 |
 | `ModelSelected` | 本轮模型与思考强度 |
 | `UsageChanged` | 会话用量账本（累计口径） |
+| `StepEnded` | 记下该步的 `usage.input_tokens`（= 那次请求的**真实 prompt_tokens**，恢复时的上下文锚点） |
 | `SessionCheckpoint` | 会话状态快照（goal / plan / skills 等，见 `SessionCheckpoint` 的说明） |
 | `SessionCreated` | 创建时间等元数据 |
 
@@ -31,6 +32,7 @@ from ..event.catalog import (
     ModelSelected,
     SessionCheckpoint,
     SessionCreated,
+    StepEnded,
     TitleChanged,
     UsageChanged,
 )
@@ -55,6 +57,8 @@ class SessionView:
     applied: int = 0
     #: 压缩次数（`/context` 与恢复报告要它）
     compactions: int = 0
+    #: 最后一次模型请求的真实 prompt_tokens（上下文估算的锚点；0 = 日志里没有）
+    last_input_tokens: int = 0
 
 
 def apply(view: SessionView, env: Envelope) -> SessionView:
@@ -87,6 +91,10 @@ def apply(view: SessionView, env: Envelope) -> SessionView:
             "total_tokens": data.total_tokens,
             "cached_tokens": data.cached_tokens,
         }
+    elif isinstance(data, StepEnded):
+        # 只认带真实用量的步：0 表示这次调用没回报用量（别把锚点冲成 0）
+        if data.usage.input_tokens:
+            view.last_input_tokens = data.usage.input_tokens
     elif isinstance(data, SessionCheckpoint):
         if data.state:
             view.state = dict(data.state)

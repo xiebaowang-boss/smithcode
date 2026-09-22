@@ -159,9 +159,10 @@ class Session:
                       title: str = "", title_source: str = "") -> None:
         """恢复会话：原地装载消息与元数据，不替换 Session 对象。
 
-        会话 id 由调用方（Agent）经 `config.use_session_id` 采用；usage 只
-        清会话口径——历史会话的累计用量可由转录的 usage 记录派生，不并入
-        当前账本。system 不在此恢复，交由 `sync_system()` 按最新提示词重建。
+        会话 id 由调用方（Agent）经 `config.use_session_id` 采用；本方法只清会话
+        用量账本，**历史累计由调用方从日志折叠值并入**（`Agent.resume` →
+        `UsageTracker.adopt_session`，同处还回填上下文锚点）。system 不在此恢复，
+        交由 `sync_system()` 按最新提示词重建。
         """
         self._messages = MessageLog(messages)
         self.created_at = float(meta.get("created") or time.time())

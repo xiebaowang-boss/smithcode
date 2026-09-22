@@ -290,3 +290,50 @@ def test_resume_reloads_instructions(monkeypatch):
     resumed.resume(store_id)
     assert "恢复后约定" in resumed.session.messages[0]["content"]
     assert "恢复前约定" not in resumed.session.messages[0]["content"]
+
+
+class _UsageLLM:
+    """每轮回报一次用量（恢复后在日志里留下真实的 prompt_tokens）。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def chat_stream(self, messages, tools=None, model=None):
+        self.calls += 1
+        yield ("message", {"role": "assistant", "content": f"回复{self.calls}"})
+        yield ("usage", {"prompt_tokens": 800 + self.calls, "completion_tokens": 40,
+                         "total_tokens": 840 + self.calls})
+
+
+def test_resume_adopts_usage_and_context_anchor(monkeypatch):
+    """恢复会话：**用量与上下文锚点都从会话历史（事件日志）取得**。
+
+    原先恢复只清账本、作废锚点——侧边栏显示 0 次调用，上下文占用退化为纯估算；
+    而这两块信息都躺在日志里：`session.usage.updated` 的累计口径，以及
+    `session.step.ended.usage.input_tokens`（= 那次请求的真实 prompt_tokens）。
+    """
+    monkeypatch.setattr("smithcode.agent.LLMClient", _UsageLLM)
+    agent = Agent(session=Session(), persist=True)
+    asyncio.run(agent.run("第一句"))
+    asyncio.run(agent.run("第二句"))
+    before = (agent.session.usage.current_session.calls,
+              agent.session.usage.current_session.get("prompt_tokens"),
+              agent.context.last_actual)
+    session_id = agent.session.store.id
+    agent.session.store.close()
+
+    resumed = Agent(session=Session(), persist=True)
+    seen: list = []
+    resumed.events.subscribe(seen.append)
+    revised = resumed.resume(session_id)
+
+    after = (resumed.session.usage.current_session.calls,
+             resumed.session.usage.current_session.get("prompt_tokens"),
+             resumed.context.last_actual)
+    assert after == before, f"用量/锚点应从日志恢复：{before} != {after}"
+    # 两次调用：prompt_tokens = 801 + 802 = 1603；锚点 = **最后一次**请求的 input（802），
+    # 不是累计值（1603）——两者混淆是这类"从日志取数"最容易犯的错
+    assert after[0] == 2 and after[1] == 1603 and after[2] == 802
+    assert revised.message_count >= 4
+    # 恢复只发两条事件（标题 + 用量）；日志回放不走总线（由宿主读 replayable_events）
+    assert [env.type for env in seen] == ["session.title.changed", "session.usage.updated"]

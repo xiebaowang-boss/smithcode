@@ -175,8 +175,19 @@ Session.sync_system() ──► messages[0]「可用技能」目录（name + 描
 工具执行前（副作用屏障：本批 `tool_calls` 先落盘，工具才会真正执行）与每轮结束。
 
 **状态由折叠得出**：`sessions/project.py` 的 `fold()` 把事件折成会话视图（消息 / 压缩基线 / 标题 /
-模型 / 用量 / 状态检查点）。恢复 = 重放：`load()` 读日志 → 折叠 → 崩溃收尾。所以"上一次会话看到
-什么"与"重放出来什么"必然一致（验收断言见 `tests/test_event_sourcing.py`）。
+模型 / 用量 / **上下文锚点** / 状态检查点）。恢复 = 重放：`load()` 读日志 → 折叠 → 崩溃收尾。所以
+"上一次会话看到什么"与"重放出来什么"必然一致（验收断言见 `tests/test_event_sourcing.py`）。
+
+**恢复时从日志取什么**（`Agent.resume`）：
+
+| 信息 | 取自 | 说明 |
+|---|---|---|
+| 会话累计用量 | `session.usage.updated` 的累计口径 → `UsageTracker.adopt_session` | 恢复后 `/usage` 与侧边栏显示该会话历史用了多少；此后新调用在其上累加 |
+| 上下文真实锚点 | 最后一条 `session.step.ended` 的 `data.usage.input_tokens` | = 那次请求的真实 `prompt_tokens`，恢复后立刻有真实占用可校准（不再是纯字符估算） |
+| 压缩次数 | `session.history.compacted` 的条数 | `/context` 展示用 |
+| 消息 / 标题 / 模型 / 状态 | `MessageEnd` / `TitleChanged` / `ModelSelected` / `SessionCheckpoint` | 见上文折叠规则 |
+
+**安全例外**：权限会话规则、越界信任目录、"已读文件"记录**一律不恢复**（安全优先，跨进程不继承）。
 
 启动入口：`smith -c`（当前目录最近会话）、`--resume [id]`（指定 id/唯一前缀/`.jsonl` 路径），会话内用 `/sessions` 查看与切换（无参弹选择框、选中即切换；`list` 文本列表、`delete` 删除、`<id|序号>` 直接切换），另有 `/rename` 命名、`--name` 启动命名。
 

@@ -47,6 +47,10 @@ class LoadedSession:
     bad_lines: int = 0
     repair: str = "none"  # none / appended / truncated（崩溃修复结果）
     repaired: list = field(default_factory=list)  # appended 时补的占位消息
+    #: 折叠出的会话用量（`UsageChanged` 的累计口径）：恢复时并入会话账本
+    usage: dict = field(default_factory=dict)
+    #: 最后一次模型请求的真实 prompt_tokens（上下文估算锚点；0 = 无）
+    context_tokens: int = 0
     #: 日志里的**原始事件**（按 seq 顺序）：宿主据此回放历史——界面是事件的投影，
     #: 消息只是其中一种投影（工具行、每轮页脚、模型与用时都要事件才齐全）
     events: list = field(default_factory=list)

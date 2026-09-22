@@ -695,9 +695,15 @@ class Agent:
         self.roots.new_session()  # 清空会话内积累的信任目录
         reset_read_tracking()
 
-        # 计量重算：真实 token 锚点作废，压缩次数按转录里的检查点数恢复
+        # 计量与用量**从会话历史取得**（方案 1）：
+        # - 用量：把日志折叠出的累计口径装回会话账本（`adopt_session`），此后新调用在其上累加；
+        # - 上下文锚点：取日志里最后一次请求的真实 prompt_tokens，恢复后立刻有真实占用
+        #   （不再只靠字符估算）；
+        # - 压缩次数：按 `HistoryCompacted` 的条数恢复。
         self.context.new_session()
         self.context.compact_count = loaded.compact_count
+        self.context.last_actual = loaded.context_tokens or None
+        self.session.usage.adopt_session(loaded.usage)
 
         # 投影缓存恢复：先全部重置，再按记录恢复（缺失时保持默认值）
         for part in self._state_registry():
