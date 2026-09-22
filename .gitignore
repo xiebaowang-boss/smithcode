@@ -13,6 +13,15 @@ __pycache__/
 .eggs/
 build/
 dist/
+packages/core/dist/
+packages/core/build/
+
+# JS / Tauri 构建产物
+packages/*/node_modules/
+packages/*/dist/
+packages/desktop/src-tauri/target/
+packages/desktop/src-tauri/binaries/
+*.node
 
 # 虚拟环境
 .venv/

@@ -120,6 +120,7 @@
 要求 Python >= 3.10。
 
 ```bash
+cd packages/core
 pip install -e .
 ```
 
@@ -301,12 +302,13 @@ smith -c -y 跑一遍测试并总结失败原因
 ## 开发
 
 ```bash
+cd packages/core
 pip install -e ".[dev]"   # 安装测试与 lint 工具
 pytest                    # 运行测试（不依赖真实 API）
 ruff check src tests      # 代码检查
 ```
 
-项目用 [uv](https://docs.astral.sh/uv/) 管理（有 `uv.lock`），也可用 `uv run pytest` / `uv run ruff check src tests`。
+项目用 [uv](https://docs.astral.sh/uv/) 管理（根 `pyproject.toml` 是 workspace，实际包与 `uv.lock` 在 `packages/core`），也可用 `uv run pytest` / `uv run ruff check src tests`（均在 `packages/core/` 下执行）。
 
 ## 文档
 

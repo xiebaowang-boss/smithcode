@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smithcode"
+version = "0.9.3"
+description = "终端 AI 编程助手"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "httpx2[socks]>=2.12",
+    "prompt_toolkit>=3.0",
+    "textual>=0.80",
+    "tomli>=2.0; python_version < '3.11'",
+    "tomlkit>=0.13",
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+smith = "smithcode.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["smithcode*"]
+
+# 非 .py 资源：TUI 样式表（Textual CSS_PATH 加载），不声明则 wheel 里会缺失
+[tool.setuptools.package-data]
+smithcode = ["tui/*.tcss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

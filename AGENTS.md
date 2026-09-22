@@ -7,20 +7,21 @@
 SmithCode 是一个终端 AI 编程助手（mini coding agent）：用户用自然语言描述任务，Agent 自主规划步骤、调用工具、根据结果继续推理，直到任务完成。核心是 **Agentic Loop**——模型要么返回纯文本（任务完成），要么返回工具调用，经权限确认后执行、结果回传，循环直至结束。
 
 - 语言：纯 Python，**>= 3.10**（MCP 子系统依赖官方 `mcp` SDK，其余仍以标准库为主；注解与运行期均可用 `X | Y` 联合写法）
-- 布局：src 布局，包在 `src/smithcode/`，测试在 `tests/`，大体对应（如 `test_agent.py` 测 `agent.py`；集成类测试如 `test_display.py` / `test_agent_parallel.py` 不一一对端）
+- 布局：monorepo，Python 包在 `packages/core/`（src 布局：`src/smithcode/`，测试在 `tests/`，大体对应，如 `test_agent.py` 测 `agent.py`；集成类测试如 `test_display.py` / `test_agent_parallel.py` 不一一对端）；桌面端在 `packages/desktop/`、协议类型在 `packages/protocol/`
 - 接口：任何 OpenAI 兼容接口均可接入；LLM 请求带流式输出与自动重试
 - 跨平台：Windows / Linux / macOS 都要正常工作
 
 ## 常用命令
 
 ```bash
+cd packages/core
 uv run pytest                # 运行全部测试（不依赖真实 API，可放心跑）
 uv run pytest tests/test_agent.py  # 只跑一个测试文件
 uv run ruff check src tests  # 代码检查
 smith setup                   # 初始化配置（用户机器上才需要）
 ```
 
-本项目用 uv 管理（有 `uv.lock`），**优先用 `uv run`**；没有 uv 的环境退回 `pip install -e ".[dev]"`，之后用裸命令 `pytest` / `ruff check src tests`。
+本项目用 uv workspace 管理（根 `pyproject.toml` 声明成员，实际包在 `packages/core`），Python 相关命令一律在 `packages/core/` 下执行，**优先用 `uv run`**；没有 uv 的环境退回 `pip install -e ".[dev]"`（同样在 `packages/core/` 下），之后用裸命令 `pytest` / `ruff check src tests`。
 
 注意：`uv run` 每次会先同步虚拟环境。在 SmithCode 内开发本仓库时，正在运行的 `smith.exe` 会锁住待替换的入口脚本，同步失败（`os error 32`）——此时改用环境里已有的 `python -m pytest` / `python -m ruff check src tests` 即可。
 
@@ -28,12 +29,12 @@ smith setup                   # 初始化配置（用户机器上才需要）
 
 测试分两个节奏，别把全量测试插进每次编辑的内循环：
 
-- **内循环（改一处看一眼）**：只跑相关测试文件，可加 `-k` 缩小到具体用例，如 `uv run pytest tests/test_agent.py -k interrupt`
+- **内循环（改一处看一眼）**：只跑相关测试文件，可加 `-k` 缩小到具体用例，如 `uv run pytest tests/test_agent.py -k interrupt`（在 `packages/core/` 下）
 - **交付前**：跑一次全量 `uv run pytest`，确认无回归
 
 **跑多大范围由改动的波及面决定**，先判断这个文件被多少地方依赖：
 
-- 判断方法：用 `grep` 工具搜模块名（如 `config`、`session`），看命中多少个 `src/` 与 `tests/` 文件；被十几处引用的按全量处理。这一步只要一两秒，远低于一次全量，拿不准就按宽处理
+- 判断方法：用 `grep` 工具搜模块名（如 `config`、`session`），看命中多少个 `src/` 与 `tests/` 文件（均在 `packages/core/` 下）；被十几处引用的按全量处理。这一步只要一两秒，远低于一次全量，拿不准就按宽处理
 - 波及面大的典型位置（示例，以实际依赖为准）：默认值与全局状态的 `config.py`、注册表与抽象基类 `tools/base.py`、跨切面的 `event/` / `permission/`、状态聚合根 `session.py`、被大量测试反向依赖的 `goal.py` / `skills/` / `plan.py`
 - 波及面小的叶子（示例）：单个工具实现（如 `tools/websearch.py`）、纯函数渲染（`tui/render.py`）、子系统内部文件——改了跑同名测试文件即可
 - 涉及公共接口、默认值或协议语义的改动等于同时改了一片调用方，直接跑全量

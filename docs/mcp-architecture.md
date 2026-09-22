@@ -1,6 +1,6 @@
 # MCP 子系统架构与实现
 
-本文是 `src/smithcode/mcp/` 的完整设计说明：分层与职责、数据模型、配置与密钥、OAuth、
+本文是 `packages/core/src/smithcode/mcp/` 的完整设计说明：分层与职责、数据模型、配置与密钥、OAuth、
 客户端运行时、生命周期与竞态处理、工具注册、与 Agent 的交互、命令与向导、线程模型、
 诊断与测试。`docs/architecture.md` 的「MCP」节是摘要版，本文是展开版。
 

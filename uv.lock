@@ -8,6 +8,12 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
+[manifest]
+members = [
+    "smithcode",
+    "smithcode-workspace",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.8.0"
@@ -1115,7 +1121,7 @@ wheels = [
 [[package]]
 name = "smithcode"
 version = "0.9.3"
-source = { editable = "." }
+source = { editable = "packages/core" }
 dependencies = [
     { name = "httpx2", extra = ["socks"] },
     { name = "mcp" },
@@ -1145,6 +1151,11 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.13" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "smithcode-workspace"
+version = "0.9.3"
+source = { virtual = "." }
 
 [[package]]
 name = "sniffio"
