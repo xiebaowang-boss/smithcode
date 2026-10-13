@@ -91,7 +91,9 @@ def discover(cfg=None) -> Discovery:
 def _scan_plan(cfg) -> list:
     """返回按优先级排列的 (scope, 技能根目录) 列表。"""
     scans = []
-    workspace = Path(config.WORKSPACE_ROOT).resolve()
+    from .. import sandbox
+
+    workspace = sandbox.current().workspace.resolve()
     for raw in cfg.paths:
         path = Path(raw).expanduser()
         if not path.is_absolute():
@@ -260,7 +262,9 @@ def resolve_project_trust(cfg, preview: list, diagnostics: list) -> bool:
     if cfg.project == "on":
         return True
 
-    key = project_key(Path(config.WORKSPACE_ROOT))
+    from .. import sandbox
+
+    key = project_key(sandbox.current().workspace)
     if key in _session_trusted or bool(load_trust().get(key)):
         return True
     # 延迟导入：utils.terminal 导入 commands，而 commands 导入 skills，顶层导入会成环

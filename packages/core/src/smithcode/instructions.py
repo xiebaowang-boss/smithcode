@@ -47,17 +47,35 @@ class InstructionFile:
 
 
 _lock = threading.Lock()
-_current: list | None = None  # list[InstructionFile]，按优先级升序
-_fingerprint: tuple | None = None
+# 按 workspace 缓存装载结果：多会话不同目录互不覆盖（单 workspace 退化为旧语义）。
+# `{workspace_str: {"files": [...], "fingerprint": (...)}}`；`_warned` 仍进程级
+# （去重打印，无正确性影响）。
+_cache: dict = {}
 _warned: set = set()
 
 
-def reset() -> None:
-    """清空装载缓存（测试与手动重载用）；`/new` 不需要——指令与会话无关。"""
-    global _current, _fingerprint
+def _workspace_key(workspace=None) -> str:
+    if workspace is None:
+        try:
+            from . import sandbox
+
+            return str(sandbox.current().workspace)
+        except Exception:  # noqa: BLE001 无沙箱上下文时回退旧锚点
+            return str(Path(config.WORKSPACE_ROOT).resolve())
+    return str(Path(workspace).resolve())
+
+
+def reset(workspace=None) -> None:
+    """清空装载缓存（测试与手动重载用）；`/new` 不需要——指令与会话无关。
+
+    `workspace=None` 清空全部（旧语义）；指定目录只清那一份。
+    """
+    global _cache
     with _lock:
-        _current = None
-        _fingerprint = None
+        if workspace is None:
+            _cache = {}
+        else:
+            _cache.pop(_workspace_key(workspace), None)
         _warned.clear()
 
 
@@ -83,18 +101,21 @@ def _project_chain(workspace: Path) -> list:
     return [workspace]
 
 
-def _candidates() -> list:
+def _candidates(workspace=None) -> list:
     """按优先级升序返回 (scope, path) 候选，重复路径只保留先出现者。
 
     项目级按目录链逐级探测（git 根在前、工作区在后）；路径必须惰性解析：
     `cli.set_workspace()` 与 `SMITHCODE_HOME` 在模块导入之后才生效，不能
     缓存到模块常量里（与 `llm/prompts._env_info` 同因）。
+    `workspace=None` 时取当前会话沙箱的工作区（多会话各拿各的）。
     """
     cfg = config.load_instructions_config()
     if not cfg.enabled:
         return []
     home = config.smithcode_home()
-    workspace = Path(config.WORKSPACE_ROOT)
+    if workspace is None:
+        workspace = _workspace_key()
+    workspace = Path(workspace)
     items: list = []
     seen: set = set()
 
@@ -148,19 +169,21 @@ def _warn_once(message: str) -> None:
     print(message)
 
 
-def refresh(force: bool = False) -> bool:
+def refresh(force: bool = False, workspace=None) -> bool:
     """在会话边界按当前配置与磁盘状态重新装载；指纹未变时零读取返回 False。
 
     由 Agent 在启动 / `/new` / 恢复三处调用；会话中途不再例行检测——文件
     变更不影响当前会话，避免提示前缀缓存失效。指纹的未变化判定覆盖「内容
     不变」与「文件不存在」两种稳定态；新增/删除文件同样改变指纹。
-    force=True 强制重读（手动刷新用）。
+    force=True 强制重读（手动刷新用）。`workspace=None` 时按当前会话沙箱
+    的工作区装载（多会话各拿各的缓存）。
     """
-    global _current, _fingerprint
-    candidates = _candidates()
+    key = _workspace_key(workspace)
+    candidates = _candidates(key)
     fingerprint, existing, unusable = _scan(candidates)
     with _lock:
-        if not force and fingerprint == _fingerprint:
+        cached = _cache.get(key)
+        if not force and cached is not None and fingerprint == cached["fingerprint"]:
             return False
         # 默认探测位置缺失是常态（静默）；显式配置的 paths 不可用应告知用户
         for scope, path, why in unusable:
@@ -180,8 +203,7 @@ def refresh(force: bool = False) -> bool:
             if not text:
                 continue
             files.append(InstructionFile(path=path, scope=scope, text=text))
-        _current = files
-        _fingerprint = fingerprint
+        _cache[key] = {"files": files, "fingerprint": fingerprint}
     return True
 
 
@@ -229,12 +251,20 @@ def _apply_budget(files: list, max_chars: int) -> tuple:
     return ordered, omitted
 
 
-def render_section() -> str:
-    """渲染注入 `messages[0]` 的指令段；无内容返回空串（调用方整段省略）。"""
-    if _current is None:
-        refresh()
+def render_section(workspace=None) -> str:
+    """渲染注入 `messages[0]` 的指令段；无内容返回空串（调用方整段省略）。
+
+    `workspace=None` 时按当前会话沙箱的工作区取缓存（多会话各拿各的）。
+    """
+    key = _workspace_key(workspace)
     with _lock:
-        files = list(_current or [])
+        cached = _cache.get(key)
+    if cached is None:
+        refresh(workspace=key)
+        with _lock:
+            cached = _cache.get(key)
+    with _lock:
+        files = list((cached or {}).get("files") or [])
     if not files:
         return ""
     budget = config.load_instructions_config().max_chars

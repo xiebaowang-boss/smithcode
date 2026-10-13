@@ -2536,12 +2536,13 @@ def test_command_menu_sessions_immediate_and_switch(monkeypatch, tmp_path):
 
 
 def test_command_menu_effort_immediate_and_switch(monkeypatch):
-    """/effort immediate：菜单选中直接弹选择框，选定后切换思考强度。"""
+    """/effort immediate：菜单选中直接弹选择框，选定后切换本会话思考强度。"""
     no_prompting(monkeypatch)
     monkeypatch.setattr(config, "REASONING_EFFORT", "low")
 
     async def _run_case():
-        app = SmithTUI(_make_agent(monkeypatch))
+        agent = _make_agent(monkeypatch)
+        app = SmithTUI(agent)
         async with app.run_test() as pilot:
             inp = app.query_one(ChatInput)
             inp.focus()
@@ -2561,7 +2562,8 @@ def test_command_menu_effort_immediate_and_switch(monkeypatch):
             await pilot.press("enter")
             await pilot.pause()
             assert not isinstance(app.screen, SelectionScreen)
-            assert config.REASONING_EFFORT != "low"
+            assert agent.effective_effort() != "low"  # 会话级：只改本会话
+            assert config.REASONING_EFFORT == "low"  # 全局不动
             assert panel._items[start].value == "low"
 
     _run(_run_case())
@@ -2964,7 +2966,7 @@ def test_selection_panel_escape_cancels(monkeypatch):
 
 
 def test_model_command_picker_switches_model(monkeypatch):
-    """真实 /model 无参：弹窗选择后切换 config.MODEL 并刷新底栏。"""
+    """真实 /model 无参：弹窗选择后切换本会话模型并刷新底栏。"""
     no_prompting(monkeypatch)
     from types import SimpleNamespace
 
@@ -2985,7 +2987,8 @@ def test_model_command_picker_switches_model(monkeypatch):
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            assert config.MODEL == "b"
+            assert agent.effective_model() == "b"  # 会话级：只改本会话
+            assert config.MODEL == "a"  # 全局不动
             assert not isinstance(app.screen, SelectionScreen)
 
     _run(_run_case())
@@ -3886,6 +3889,36 @@ def test_retry_end_from_other_owner_keeps_state(monkeypatch):
             app.ui_retry_end(owner="B")
             await pilot.pause()
             assert "正在重试" in str(running.render())
+
+    _run(_run_case())
+
+
+def test_retry_end_with_equal_token_string_clears(monkeypatch):
+    """owner 是字符串令牌：按值比较，不能靠对象身份（令牌每次都是新对象）。
+
+    `llm` 侧给每客户端发一枚 `llm:<序号>` 字符串（契约是 str|None，对象过不了
+    SSE）。令牌不驻留，`is` 比较会让自己的重试永远清不掉、Working 行一直挂着。
+    """
+    no_prompting(monkeypatch)
+
+    async def _run_case():
+        app = SmithTUI(_make_agent(monkeypatch))
+        async with app.run_test() as pilot:
+            running = app.query_one(RunningIndicator)
+            running.display = True
+            running.start()
+            state = RetryState(attempt=2, total=3, reason="读取超时", wait=8.0,
+                               next_at=time.monotonic() + 8.0)
+            token_a = "llm:" + str(1)
+            token_b = "llm:" + str(1)
+            assert token_a == token_b and token_a is not token_b  # 前提自证
+
+            app.ui_retry_start(state, owner=token_a)
+            await pilot.pause()
+            assert "正在重试" in str(running.render())
+            app.ui_retry_end(owner=token_b)  # 值同、身份不同：仍要清掉
+            await pilot.pause()
+            assert "正在重试" not in str(running.render())
 
     _run(_run_case())
 

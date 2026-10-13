@@ -150,6 +150,29 @@ def test_cd_outside_or_ambiguous_rejected(posix, command):
     assert is_safe_command(command) is False
 
 
+def test_cd_target_checked_against_session_sandbox(posix, tmp_path, monkeypatch):
+    """`cd` 目标按**当前会话**的工作区判定，不是进程默认目录。
+
+    基准与 `tools/shell.py` 真正跑命令的 cwd 同源：多会话下拿进程默认目录
+    当基准，`cd sub` 会被算到别人的目录上（要么误放行、要么误拦）。
+    """
+    default = tmp_path / "default"
+    default.mkdir()
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(default))
+    monkeypatch.setattr(sandbox, "_default", sandbox.Roots())
+
+    token = sandbox.activate(sandbox.Roots(workspace=str(proj)))
+    try:
+        assert is_safe_command("cd sub") is True      # 会话工作区内 → 放行
+        assert is_safe_command("cd ../default") is False  # 越出会话沙箱 → 拒
+        assert shell_policy.is_dir_change("cd .") is False
+        assert shell_policy.is_dir_change("cd sub") is True
+    finally:
+        sandbox.reset(token)
+
+
 # ---------- Windows 安全集 ----------
 
 @pytest.mark.parametrize("command", ["dir", "dir /w", "type a.txt", "where python",

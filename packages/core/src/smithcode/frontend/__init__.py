@@ -79,6 +79,9 @@ def current() -> Asker:
     测试）提问落在终端上。**fail-closed 由调用点保证**——权限引擎与 ask_user 在
     提问前先看 `confirmations_available()`，非交互 stdin 一律拒绝，所以这里不会
     把管道 / CI 挂住。
+
+    serve 模式（无 stdin）不得依赖此兜底：启动即 `activate(_UNAVAILABLE)`，
+    任何未装配的提问一律 fail-closed，而不是卡在终端读输入。
     """
     asker = _current.get()
     if asker is not None:
@@ -89,6 +92,11 @@ def current() -> Asker:
 
         _default = ConsoleFrontend()
     return _default
+
+
+def unavailable() -> Asker:
+    """显式「不要提问」的端口（serve / 非交互宿主用）：一律拒绝/取消，绝不读终端。"""
+    return _UNAVAILABLE
 
 
 @dataclass

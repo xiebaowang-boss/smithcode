@@ -1,0 +1,2126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SmithCode session events",
+  "$defs": {
+    "StepUsage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "total_tokens": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ]
+    },
+    "QueueItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "steer",
+            "follow_up"
+          ]
+        },
+        "images": {
+          "type": "array"
+        },
+        "created_at": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "text",
+        "kind",
+        "images",
+        "created_at"
+      ]
+    },
+    "PromptKind": {
+      "enum": [
+        "permission",
+        "outside_access",
+        "skill_trust",
+        "ask_user",
+        "confirm"
+      ]
+    },
+    "PromptOutcome": {
+      "enum": [
+        "answered",
+        "cancelled",
+        "denied",
+        "error"
+      ]
+    },
+    "StatusKind": {
+      "enum": [
+        "working",
+        "retry",
+        "compaction",
+        "branch_summary",
+        "stopping"
+      ]
+    },
+    "NoticeLevel": {
+      "enum": [
+        "info",
+        "success",
+        "warning",
+        "error"
+      ]
+    },
+    "StreamKind": {
+      "enum": [
+        "content",
+        "reasoning"
+      ]
+    },
+    "QueueItemKind": {
+      "enum": [
+        "steer",
+        "follow_up"
+      ]
+    },
+    "InterruptReason": {
+      "enum": [
+        "user",
+        "shutdown",
+        "superseded",
+        "inactivity"
+      ]
+    },
+    "StepFinish": {
+      "enum": [
+        "stop",
+        "tool_calls",
+        "interrupted",
+        "error"
+      ]
+    },
+    "SessionCheckpoint": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.checkpointed"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "CompactionEnded": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.compaction.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "before_tokens": {
+              "type": "integer"
+            },
+            "after_tokens": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "before_tokens",
+            "after_tokens"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "CompactionFailed": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.compaction.failed"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "CompactionStarted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.compaction.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "before_tokens": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "before_tokens"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "SessionCreated": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.created"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "effort": {
+              "type": "string"
+            },
+            "app": {
+              "type": "string"
+            },
+            "oneshot": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "cwd",
+            "model",
+            "effort",
+            "app",
+            "oneshot"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ExecutionFailed": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.execution.failed"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ExecutionInterrupted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.execution.interrupted"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "enum": [
+                "user",
+                "shutdown",
+                "superseded",
+                "inactivity"
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "reason",
+            "partial"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ExecutionStarted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.execution.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ExecutionSucceeded": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.execution.succeeded"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "text"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "HistoryCompacted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.history.compacted"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "object"
+            },
+            "tail": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "before_tokens": {
+              "type": "integer"
+            },
+            "after_tokens": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "summary",
+            "tail",
+            "before_tokens",
+            "after_tokens"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "Idle": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.idle"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "InboxCancelled": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.inbox.cancelled"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "item_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "item_id"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "InboxCleared": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.inbox.cleared"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "InboxDelivered": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.inbox.delivered"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/QueueItem"
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "InboxEnqueued": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.inbox.enqueued"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "item": {
+              "$ref": "#/$defs/QueueItem"
+            }
+          },
+          "required": [
+            "item"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "MessageUpdate": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.message.delta"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "object"
+            },
+            "delta": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "content",
+                "reasoning"
+              ]
+            }
+          },
+          "required": [
+            "message",
+            "delta",
+            "kind"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "MessageEnd": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.message.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "MessageStart": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.message.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ModelSelected": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.model.selected"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "effort": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "model",
+            "effort"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "Notice": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.notice"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "level": {
+              "enum": [
+                "info",
+                "success",
+                "warning",
+                "error"
+              ]
+            }
+          },
+          "required": [
+            "text",
+            "level"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "PlanUpdate": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.plan.updated"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "rendered": {
+              "type": "string"
+            },
+            "titles": {
+              "type": "string"
+            },
+            "created": {
+              "type": "boolean"
+            },
+            "tool_call_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary",
+            "rendered",
+            "titles",
+            "created",
+            "tool_call_id"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "PromptFinished": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.prompt.finished"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "permission",
+                "outside_access",
+                "skill_trust",
+                "ask_user",
+                "confirm"
+              ]
+            },
+            "outcome": {
+              "enum": [
+                "answered",
+                "cancelled",
+                "denied",
+                "error"
+              ]
+            },
+            "value": {
+              "type": "string"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "error": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "outcome",
+            "value",
+            "values",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "PromptStarted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.prompt.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "permission",
+                "outside_access",
+                "skill_trust",
+                "ask_user",
+                "confirm"
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "blocking": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "payload": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "title",
+            "blocking",
+            "detail",
+            "options",
+            "payload"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "AgentEnd": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.run.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "result": {}
+          },
+          "required": [
+            "result"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "StatusChanged": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.status.changed"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "working",
+                "retry",
+                "compaction",
+                "branch_summary",
+                "stopping"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "owner": {
+              "type": "string"
+            },
+            "payload": {}
+          },
+          "required": [
+            "kind",
+            "text",
+            "owner",
+            "payload"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "StatusCleared": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.status.cleared"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "enum": [
+                "working",
+                "retry",
+                "compaction",
+                "branch_summary",
+                "stopping"
+              ]
+            },
+            "owner": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "owner"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "StepEnded": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.step.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "step_id": {
+              "type": "string"
+            },
+            "index": {
+              "type": "integer"
+            },
+            "finish": {
+              "enum": [
+                "stop",
+                "tool_calls",
+                "interrupted",
+                "error"
+              ]
+            },
+            "usage": {
+              "$ref": "#/$defs/StepUsage"
+            }
+          },
+          "required": [
+            "step_id",
+            "index",
+            "finish",
+            "usage"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "StepStarted": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.step.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "step_id": {
+              "type": "string"
+            },
+            "index": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "step_id",
+            "index"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "StreamEnded": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.stream.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "TitleChanged": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.title.changed"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "source"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ToolEnd": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.tool.ended"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "tool_call_id": {
+              "type": "string"
+            },
+            "result": {
+              "type": "string"
+            },
+            "is_error": {
+              "type": "boolean"
+            },
+            "expand": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "tool_call_id",
+            "result",
+            "is_error",
+            "expand"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ToolPreview": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.tool.preview"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": false
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "tool_call_id": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_call_id",
+            "detail"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "ToolStart": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.tool.started"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "tool_call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "line": {
+              "type": "string"
+            },
+            "display": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tool_call_id",
+            "name",
+            "line",
+            "display"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    },
+    "UsageChanged": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "session.usage.updated"
+        },
+        "version": {
+          "const": 1
+        },
+        "created": {
+          "type": "number"
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "durable": {
+          "const": true
+        },
+        "seq": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "calls": {
+              "type": "integer"
+            },
+            "total_input": {
+              "type": "integer"
+            },
+            "total_output": {
+              "type": "integer"
+            },
+            "total_tokens": {
+              "type": "integer"
+            },
+            "cached_tokens": {
+              "type": "integer"
+            },
+            "step": {
+              "$ref": "#/$defs/StepUsage"
+            }
+          },
+          "required": [
+            "calls",
+            "total_input",
+            "total_output",
+            "total_tokens",
+            "cached_tokens",
+            "step"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "version",
+        "created",
+        "session_id",
+        "durable",
+        "data"
+      ]
+    }
+  }
+}

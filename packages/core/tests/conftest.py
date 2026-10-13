@@ -16,6 +16,65 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture
+def served(monkeypatch, tmp_path):
+    """起一个真 HTTP serve（随机端口、FakeLLM、隔离 HOME），返回 (base, token, state)。
+
+    `config` 模块常量是进程级快照：`WORKSPACE_ROOT` 的 monkeypatch 由 pytest
+    自动复位；`Agent()` 构造读 `config.KEY`，本 fixture 不碰它（FakeLLM 绕过
+    `ensure_api_key`，见 `_default_llm` 替换）。
+    """
+    import smithcode.serve as serve_mod
+    from smithcode import config
+
+    monkeypatch.setenv("SMITHCODE_HOME", str(tmp_path / "home"))
+
+    class FakeLLM:
+        accepts_turn_params = False
+
+        def chat_stream(self, messages, tools=None, **kwargs):
+            yield ("message", {"role": "assistant", "content": "假回复"})
+
+    monkeypatch.setattr("smithcode.agent.LLMClient", FakeLLM)
+    monkeypatch.setattr(config, "WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr("smithcode.sessions.paths.config.WORKSPACE_ROOT", str(tmp_path))
+
+    state = serve_mod.ServeState(auth_token="test-token")
+    state.start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), serve_mod._Handler)
+    server.state = state
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    yield base, "test-token", state
+    server.shutdown()
+    state.close()
+
+
+@pytest.fixture
+def serve_call():
+    """便捷 HTTP 调用：`call(base, token, method, path, body)` → `(status, json)`。"""
+    import json
+    import urllib.error
+    import urllib.request
+
+    def call(base, token, method, path, body=None):
+        data = json.dumps(body or {}).encode() if body is not None else None
+        req = urllib.request.Request(
+            base + path, data=data, method=method,
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode())
+
+    return call
+
+
 @pytest.fixture(autouse=True)
 def _isolate_terminal_title(monkeypatch):
     from smithcode import title

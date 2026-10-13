@@ -46,6 +46,8 @@ class SessionStore:
         self._path = paths.session_path(self.id, cwd=cwd)
         # 供 `session.created` 事件取用的元数据（原先写在文件头 meta 里）
         self.cwd = str(Path(cwd or config.WORKSPACE_ROOT).resolve())
+        # 登记 slug→cwd（项目注册表）：slug 不可逆，跨项目查历史/浏览文件靠它反查
+        paths.touch_project(self.cwd)
         self.model = model or config.MODEL
         self.effort = effort or config.REASONING_EFFORT
         self.oneshot = bool(oneshot)
@@ -193,6 +195,39 @@ class SessionStore:
 # --------------------------------------------------------------------------
 
 
+def find_global(session_id_or_prefix: str) -> SessionSummary | None:
+    """跨所有项目按 id/前缀查找（唯一前缀匹配；歧义时抛错）。"""
+    needle = str(session_id_or_prefix or "").strip()
+    if not needle:
+        return None
+    candidates: list[SessionSummary] = []
+    root = paths.projects_dir()
+    if not root.is_dir():
+        return None
+    for slug_dir in root.iterdir():
+        sess_dir = slug_dir / "sessions"
+        if not sess_dir.is_dir():
+            continue
+        for path in sess_dir.glob("*.jsonl"):
+            summary = _read_summary(path)
+            if summary is None:
+                continue
+            if summary.id == needle:
+                return summary
+            if summary.id.startswith(needle):
+                candidates.append(summary)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        names = "、".join(
+            f"{item.short_id}（{item.display_name}）" for item in candidates[:5]
+        )
+        raise StoreError(
+            f"会话 id 前缀「{needle}」不唯一，候选：{names}。请补全更多字符。"
+        )
+    return None
+
+
 def list_sessions(cwd=None, limit: int = 20,
                   include_oneshot: bool = False) -> list:
     """列出当前项目的会话摘要，按最近更新倒序。
@@ -217,6 +252,62 @@ def list_sessions(cwd=None, limit: int = 20,
     return summaries
 
 
+def list_all_sessions(limit: int = 50,
+                      include_oneshot: bool = False) -> list:
+    """跨**全部项目**列会话摘要，按最近更新倒序（侧栏「全部」与全局搜索用）。"""
+    root = paths.projects_dir()
+    if not root.is_dir():
+        return []
+    summaries = []
+    for slug_dir in root.iterdir():
+        sess_dir = slug_dir / "sessions"
+        if not sess_dir.is_dir():
+            continue
+        for path in sess_dir.glob("*.jsonl"):
+            summary = _read_summary(path)
+            if summary is None:
+                continue
+            if summary.oneshot and not include_oneshot:
+                continue
+            summaries.append(summary)
+    summaries.sort(key=lambda item: item.updated, reverse=True)
+    if limit and limit > 0:
+        return summaries[:limit]
+    return summaries
+
+
+def resolve_project(slug) -> str:
+    """项目 slug → 目录。注册表未命中时回填自愈：读该项目任一会话的 cwd。
+
+    回填只在「日志里的 cwd 算出来的 slug 确实是它」时才写注册表——目录被改名
+    或手工搬动时宁可返回空串，也不能登记一条会让后续 `list_sessions(cwd=…)`
+    指到别处的假映射。
+    """
+    slug = str(slug or "").strip()
+    if not slug:
+        return ""
+    cwd = paths.read_project(slug)
+    if cwd:
+        return cwd
+    # 默认工作区打底：`list_projects` 无条件把它列出来（哪怕没登记、零会话），
+    # 这条 slug → 目录必须答得上来，否则按它查历史会吃 404「未知项目」。
+    default_cwd = str(Path(config.WORKSPACE_ROOT).resolve())
+    if paths.project_slug(default_cwd) == slug:
+        return default_cwd
+    sess_dir = paths.projects_dir() / slug / "sessions"
+    if not sess_dir.is_dir():
+        return ""
+    for path in sess_dir.glob("*.jsonl"):
+        summary = _read_summary(path)
+        if summary is None or not summary.cwd:
+            continue
+        if paths.project_slug(summary.cwd) != slug:
+            continue
+        paths.touch_project(summary.cwd)  # 回填注册表（同 slug 才写，见 docstring）
+        return summary.cwd
+    return ""
+
+
 def find_last(cwd=None) -> SessionSummary | None:
     """`-c/--continue`：当前项目最近一次交互会话（一次性任务默认排除）。"""
     sessions = list_sessions(cwd=cwd, limit=1)
@@ -224,7 +315,10 @@ def find_last(cwd=None) -> SessionSummary | None:
 
 
 def find(session_id_or_prefix, cwd=None) -> SessionSummary | None:
-    """按 id 或唯一前缀查找（含一次性任务）；前缀不唯一时抛 StoreError。"""
+    """按 id 或唯一前缀查找（含一次性任务）；先当前项目，后跨项目全局。
+
+    前缀不唯一时抛 StoreError。
+    """
     needle = str(session_id_or_prefix or "").strip()
     if not needle:
         return None
@@ -240,7 +334,8 @@ def find(session_id_or_prefix, cwd=None) -> SessionSummary | None:
         raise StoreError(
             f"会话 id 前缀「{needle}」不唯一，候选：{names}。请补全更多字符。"
         )
-    return None
+    # 跨项目兜底（旧日志恢复/侧栏从其它项目拖入）
+    return find_global(needle)
 
 
 def summary_from_path(path) -> SessionSummary:
@@ -251,6 +346,26 @@ def summary_from_path(path) -> SessionSummary:
     summary = _read_summary(target)
     if summary is None:
         raise StoreError(f"会话文件为空或无法解析: {target}")
+    return summary
+
+
+def resolve_target(target) -> SessionSummary:
+    """定位恢复目标：摘要对象 / 文件路径 / id / 唯一前缀。
+
+    恢复前要先知道目标会话属于哪个项目目录（跨项目恢复时沙箱跟会话走），
+    所以这条定位逻辑不能只活在 `Agent` 里。
+    """
+    if isinstance(target, SessionSummary):
+        return target
+    text = str(target or "").strip()
+    if not text:
+        raise StoreError("未指定要恢复的会话。")
+    path = Path(text)
+    if path.is_file():
+        return summary_from_path(path)
+    summary = find(text)
+    if summary is None:
+        raise StoreError(f"未找到会话：{text}")
     return summary
 
 
@@ -430,13 +545,33 @@ def _read_summary(path: Path) -> SessionSummary | None:
 
 
 def _event_parts(record: dict) -> tuple[str, dict]:
-    """记录 → (去掉版本号的类型名, data)。"""
+    """记录 → (去掉版本号的类型名, data)。
+
+    新版信封读 type/data；旧版日志（`{v,t}` + 顶层字段、没有 type）按 t 映射成
+    等价的 (类型, data)——只服务摘要扫描（cwd / 标题 / 首问回填），事件回放
+    （`read_log` → `from_record`）不认旧格式，旧会话仍按「无事件」处理。
+    """
     type_name = str(record.get("type") or "")
     base, _, version_text = type_name.rpartition(".")
     if base and version_text.isdigit():
         type_name = base
     data = record.get("data")
-    return type_name, data if isinstance(data, dict) else {}
+    if type_name:
+        return type_name, data if isinstance(data, dict) else {}
+    t = record.get("t")
+    if t == "meta":
+        meta = {k: record[k] for k in ("cwd", "created", "model", "effort", "oneshot")
+                if k in record}
+        meta["session_id"] = record.get("id")
+        return "session.created", meta
+    if t == "msg":
+        return "session.message.ended", {"message": record.get("m")}
+    if t == "title":
+        return "session.title.changed", {"title": record.get("title"),
+                                         "source": record.get("source")}
+    if t == "model":
+        return "session.model.selected", {"model": record.get("model")}
+    return "", {}
 
 
 def _parse_chunk(data: bytes) -> list:

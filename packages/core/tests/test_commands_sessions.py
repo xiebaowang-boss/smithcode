@@ -128,8 +128,8 @@ def test_sessions_by_prefix_switches():
     assert outcome.refresh_status is True
 
 
-def test_sessions_switch_reports_recorded_model(monkeypatch):
-    """转录里的模型与当前不同：切换提示点出，且不悄悄改全局模型。"""
+def test_sessions_switch_inherits_recorded_model(monkeypatch):
+    """会话级模型：resume() 沿用日志里的模型，不再提示"如需沿用请 /model"。"""
     store = _store_with()
     monkeypatch.setattr(config, "MODEL", "current-model")
 
@@ -140,9 +140,9 @@ def test_sessions_switch_reports_recorded_model(monkeypatch):
             return report
 
     _, outcome = _run(f"/sessions {store.id[:8]}", agent=_ModelStub())
-    assert "other-model" in outcome.text
-    assert "current-model" in outcome.text
-    assert config.MODEL == "current-model"
+    assert "other-model" not in outcome.text  # 不再提示切回
+    assert "如需沿用" not in outcome.text
+    assert config.MODEL == "current-model"  # 全局不受影响
 
 
 def test_sessions_ambiguous_prefix_reports():

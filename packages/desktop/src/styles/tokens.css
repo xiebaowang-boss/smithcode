@@ -1,0 +1,117 @@
+/* 设计变量：浅色默认，html[data-theme="dark"] 覆盖；代码高亮配色也在此定义 */
+:root {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --bg-sidebar: #f9f9f9;
+  --hover: #f0f0f0;
+  --active: #ececec;
+  --border: #e5e5e5;
+  --border-strong: #d9d9d9;
+  --fg: #0d0d0d;
+  --muted: #5d5d5d;
+  --faint: #a3a3a3;
+  --bubble: #f4f4f4;
+  --primary: #0d0d0d;
+  --primary-fg: #ffffff;
+  --disabled: #e5e5e5;
+  --disabled-fg: #ffffff;
+  --accent: #0b57d0;
+  --success: #0f7b4f;
+  --warn: #b45309;
+  --error: #d93025;
+  --add: #1a7f37;
+  --del: #cf222e;
+  --hunk: #9a6700;
+  --code-bg: #f7f7f7;
+  --code-inline-bg: #f0f0f0;
+  --overlay-bg: rgba(0, 0, 0, 0.4);
+
+  --code-keyword: #cf222e;
+  --code-string: #0a3069;
+  --code-comment: #6e7781;
+  --code-number: #0550ae;
+  --code-title: #8250df;
+  --code-attr: #0550ae;
+  --code-type: #953800;
+  --code-meta: #6e7781;
+  --code-deleted: #82071e;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-composer: 0 2px 12px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.18);
+
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-full: 999px;
+
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --sidebar-w: 260px;
+  --rail-collapsed-w: 56px;
+  --rail-w: 260px;
+  --pane-w: 420px;
+  --column-w: 768px;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #212121;
+  --bg-sidebar: #171717;
+  --hover: #2a2a2a;
+  --active: #2f2f2f;
+  --border: #3c3c3c;
+  --border-strong: #4a4a4a;
+  --fg: #ececec;
+  --muted: #b4b4b4;
+  --faint: #8e8e8e;
+  --bubble: #303030;
+  --primary: #ffffff;
+  --primary-fg: #0d0d0d;
+  --disabled: #3c3c3c;
+  --disabled-fg: #8e8e8e;
+  --accent: #8ab4f8;
+  --success: #34d399;
+  --warn: #fbbf24;
+  --error: #f28b82;
+  --add: #3fb950;
+  --del: #f85149;
+  --hunk: #d29922;
+  --code-bg: #2f2f2f;
+  --code-inline-bg: #2f2f2f;
+  --overlay-bg: rgba(0, 0, 0, 0.6);
+
+  --code-keyword: #ff7b72;
+  --code-string: #a5d6ff;
+  --code-comment: #8b949e;
+  --code-number: #79c0ff;
+  --code-title: #d2a8ff;
+  --code-attr: #79c0ff;
+  --code-type: #ffa657;
+  --code-meta: #8b949e;
+  --code-deleted: #ffa198;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-composer: 0 2px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+
+.hljs {
+  background: none !important;
+  color: inherit;
+}
+.hljs-comment, .hljs-quote { color: var(--code-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag, .hljs-tag .hljs-name { color: var(--code-keyword); }
+.hljs-string, .hljs-regexp, .hljs-symbol, .hljs-bullet, .hljs-addition { color: var(--code-string); }
+.hljs-number { color: var(--code-number); }
+.hljs-title, .hljs-section, .hljs-selector-id, .hljs-selector-class { color: var(--code-title); }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-built_in, .hljs-params { color: var(--code-attr); }
+.hljs-type, .hljs-class .hljs-title, .hljs-attribute { color: var(--code-type); }
+.hljs-meta, .hljs-link { color: var(--code-meta); }
+.hljs-deletion { color: var(--code-deleted); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }

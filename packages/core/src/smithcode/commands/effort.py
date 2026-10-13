@@ -10,15 +10,28 @@ from ..llm.models import DEFAULT_EFFORTS
 from .base import CommandChoice, CommandResult, CommandSelect, register
 
 
+def _current_effort(agent) -> str:
+    """本会话有效的思考强度：Agent 有会话覆盖时读它，否则回退全局。"""
+    effective = getattr(agent, "effective_effort", None)
+    if callable(effective):
+        return effective()
+    return config.REASONING_EFFORT or config.DEFAULT_EFFORT
+
+
 @register("effort", "调整思考强度", usage="/effort [档位]", accepts_args=True, immediate=True)
 def _effort(ctx):
     if ctx.args:
         value = ctx.args[0]
-        config.REASONING_EFFORT = value
+        setter = getattr(ctx.agent, "set_session_effort", None)
+        if callable(setter):
+            # 会话级切换：只改本会话的覆盖（事件由 Agent 发，含日志）
+            setter(value)
+        else:
+            config.set_effort(value)
         # 静默切换：反馈由底栏「思考强度」刷新承担，不再打印提示行
         return CommandResult(refresh_status=True)
 
-    current = config.REASONING_EFFORT or config.DEFAULT_EFFORT
+    current = _current_effort(ctx.agent)
     choices = [
         CommandChoice(label=level, value=level, current=(level == current))
         for level in DEFAULT_EFFORTS

@@ -83,12 +83,7 @@ def _switch(ctx, items, token: str) -> CommandResult:
         text += "；检测到历史损坏，已截断修复"
     if report.bad_lines:
         text += f"；跳过了 {report.bad_lines} 行损坏记录"
-    if report.model and report.model != config.MODEL:
-        # 转录用 t=model 记录每轮实际使用的模型；恢复会话不悄悄改全局模型
-        text += (
-            f"；该会话上次使用模型 {report.model}"
-            f"（当前 {config.MODEL}，如需沿用请 /model {report.model}）"
-        )
+    # 会话级模型：resume() 已直接沿用日志里的值，无需再提示 /model 切回
     return CommandResult(
         text=text, style="green", session_resume=True, refresh_status=True
     )

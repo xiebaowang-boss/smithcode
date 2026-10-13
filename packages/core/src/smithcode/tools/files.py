@@ -60,8 +60,11 @@ def _resolve(path: str, write: bool = False) -> Path:
 
     读工具用读根（授权目录 + 技能目录只读白名单）；写工具必须显式
     write=True，只认授权目录——技能目录不可被静默改写。
+    相对路径锚定**当前会话**的工作区（多会话各拿各的目录）。
     """
-    p = (Path(config.WORKSPACE_ROOT) / path).resolve()
+    from .. import sandbox
+
+    p = (sandbox.current().workspace / path).resolve()
     roots = config.allowed_roots() if write else config.read_roots()
     for root in roots:
         if p.is_relative_to(root):

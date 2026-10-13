@@ -53,7 +53,9 @@ def run_command(command: str, timeout: int | None = None,
     _ = description
     seconds = min(max(1, int(timeout) if timeout else config.COMMAND_TIMEOUT),
                   config.COMMAND_TIMEOUT_MAX)
-    result = run_process(command, timeout=seconds, cwd=config.WORKSPACE_ROOT)
+    from .. import sandbox
+
+    result = run_process(command, timeout=seconds, cwd=str(sandbox.current().workspace))
     if result.status == "interrupted":
         return "错误: 命令被用户中断，已终止进程"
     if result.status == "timeout":

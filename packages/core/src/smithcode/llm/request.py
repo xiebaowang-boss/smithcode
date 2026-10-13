@@ -26,12 +26,13 @@ class TurnConfig:
     effort: str
 
     @classmethod
-    def capture(cls, model_override: str | None = None) -> TurnConfig:
+    def capture(cls, model_override: str | None = None,
+                effort_override: str | None = None) -> TurnConfig:
         from .. import config
 
         return cls(
             model=model_override or config.MODEL,
-            effort=config.REASONING_EFFORT or config.DEFAULT_EFFORT,
+            effort=effort_override or config.REASONING_EFFORT or config.DEFAULT_EFFORT,
         )
 
 

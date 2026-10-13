@@ -7,11 +7,8 @@
 from __future__ import annotations
 
 import getpass
-import json
 import math
 import os
-
-import tomlkit
 
 from . import config
 
@@ -101,37 +98,16 @@ def _ask_int(prompt: str, current: int) -> int:
 
 def _write_credentials(path, key: str):
     """把 key 写入 credentials.json（空值不动）；已有其他字段原样保留。"""
-    if not key:
-        return
-    data = {}
-    if path.is_file():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                data = existing
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    data["key"] = key
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)  # 仅本机可读；Windows 上尽力而为
-    except OSError:
-        pass
+    from .settings import _write_credentials as _save
+
+    _save(path, key)
 
 
 def _write_config(path, *, url: str, model: str, budget: int):
     """更新 config.toml 的 [provider] 与 [context] 段；tomlkit 保留注释与既有其他段落。"""
-    if path.is_file():
-        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
-        provider = doc.setdefault("provider", tomlkit.table())
-        provider["url"] = url
-        provider["model"] = model
-        context = doc.setdefault("context", tomlkit.table())
-        context["budget"] = budget
-        path.write_text(tomlkit.dumps(doc), encoding="utf-8")
-    else:
-        fresh = _CONFIG_TEMPLATE.format(url=url, model=model, budget=budget)
-        path.write_text(fresh, encoding="utf-8")
+    from .settings import _write_provider_context as _save
+
+    _save(path, url=url, model=model, budget=budget)
 
 
 def run_setup() -> int:

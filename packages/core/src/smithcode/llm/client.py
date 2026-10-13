@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from itertools import count
 
 from openai import BadRequestError, OpenAI
 
@@ -20,6 +21,9 @@ from .stream import parse_stream, usage_to_dict
 # OpenAI SDK 的分页约定：`SyncPage.has_next_page/get_next_page`；旧版本或
 # 兼容网关可能直接返回 list，`getattr` 为空即视为单页，退化为现状行为。
 _MAX_MODEL_PAGES = 10
+
+# 重试态归属标记的流水号：每个客户端一枚稳定字符串（见 `chat_stream` 的 owner）
+_RETRY_OWNER_SEQ = count(1)
 
 
 class LLMClient:
@@ -49,6 +53,10 @@ class LLMClient:
         self.reasoning_effort = reasoning_effort
         self._custom_headers = dict(custom_headers or {})
         self._session_id = session_id
+        # 重试事件的归属标记（`StatusChanged.owner`，契约是 str | None）：跨 SSE
+        # 与日志走 JSON，传实例对象会让序列化抛 TypeError、整条事件流断掉。
+        # 每客户端一枚稳定字符串，语义与"认发起方实例"一致：互不误清。
+        self.retry_owner = f"llm:{next(_RETRY_OWNER_SEQ)}"
 
     @classmethod
     def from_config(cls, client_factory=OpenAI) -> LLMClient:
@@ -137,7 +145,8 @@ class LLMClient:
         )
         kwargs = build_kwargs(req, default_model=self.default_model)
 
-        owner = self  # 重试态的归属者：前台任务与后台标题各自清理，互不误清
+        # 重试态的归属者：前台任务与后台标题各自清理，互不误清
+        owner = self.retry_owner
         policy = policy or RetryPolicy(max_attempts=config.MAX_RETRIES + 1)
 
         def attempt():

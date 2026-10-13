@@ -138,11 +138,11 @@ def test_fsync_checkpoints_bracket_tool_execution(monkeypatch):
 
 
 def test_run_records_model_and_resume_reports_it(monkeypatch):
-    """每轮把实际模型写进 t=model；恢复把「上次使用模型」交回宿主且不改全局模型。"""
+    """每轮把实际模型写进 session.model.selected；恢复沿用日志里的模型。"""
     monkeypatch.setattr(config, "MODEL", "model-a")
     agent = _make_agent(monkeypatch)
     asyncio.run(agent.run("你好"))
-    monkeypatch.setattr(config, "MODEL", "model-b")  # 中途 /model 切换
+    agent.set_session_model("model-b")  # 会话级 /model 切换：只改本会话
     asyncio.run(agent.run("再问"))
     store = agent.session.store
     store.close()
@@ -159,7 +159,8 @@ def test_run_records_model_and_resume_reports_it(monkeypatch):
     resumed = _make_agent(monkeypatch)
     report = resumed.resume(store.id)
     assert report.model == "model-b"  # 上次使用的模型交回宿主
-    assert config.MODEL == "model-b"  # 恢复不悄悄改全局模型
+    assert resumed.effective_model() == "model-b"  # 会话级沿用日志里的值
+    assert config.MODEL == "model-a"  # 全局不受影响（切换只写了原会话）
 
 
 def test_resume_repairs_dangling_tool_calls_and_persists(monkeypatch):

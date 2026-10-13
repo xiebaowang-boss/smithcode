@@ -128,7 +128,9 @@ async def ask_user(questions: list[dict]) -> str:
     提问走询问端口（`ask`），所以本函数是**协程**——工具执行层已支持 awaitable
     返回值（见 `agent/tools_run.py` 的 `_run_plan`），调用点无需感知。
     """
-    if not confirmations_available():
+    if not (ask_port.has_remote() or confirmations_available()):
+        # 无人可问 = 取消：与 permission.engine.answerable 同一判定（跨进程作答者
+        # 优先，stdin 非终端在管道 / CI 下照旧 fail-closed）
         return _CANCELLED
     normalized = _normalize(questions)
     if not normalized:

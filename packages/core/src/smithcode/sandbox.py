@@ -128,7 +128,17 @@ def reset(token: Token) -> None:
     _current.reset(token)
 
 
-def fresh(workspace=None, extra=()) -> Roots:
-    """建一份新的会话沙箱（Agent 在会话边界的唯一构造入口）。"""
+def fresh(workspace=None, extra=None) -> Roots:
+    """建一份新的会话沙箱（Agent 在会话边界的唯一构造入口）。
+
+    `workspace/extra` 缺省时**此刻**快照 `config` 的值（而不是读时跟随）——
+    会话建立后改 `config.set_workspace/add_workspace` 不再影响已建会话
+    （多会话各拿各的目录）。启动期/测试的进程默认沙箱（`_default`）仍跟随，
+    以便直接改 `config.WORKSPACE_ROOT` 生效。
+    """
     with _init_lock:
+        if workspace is None:
+            workspace = _resolve(config.WORKSPACE_ROOT)
+        if extra is None:
+            extra = [_resolve(p) for p in config.EXTRA_ROOTS]
         return Roots(workspace=workspace, extra=extra)

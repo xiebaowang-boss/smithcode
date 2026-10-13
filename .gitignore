@@ -20,7 +20,8 @@ packages/core/build/
 packages/*/node_modules/
 packages/*/dist/
 packages/desktop/src-tauri/target/
-packages/desktop/src-tauri/binaries/
+packages/desktop/src-tauri/binaries/*
+!packages/desktop/src-tauri/binaries/README.md
 *.node
 
 # 虚拟环境
@@ -55,3 +56,7 @@ Thumbs.db
 # Looptroop 工具数据与工作区（db.sqlite*、worktrees/）及其工单运行时
 .looptroop/
 .ticket/
+
+# 浏览器自动化工具产物（Playwright MCP 控制台日志、页面快照）
+.playwright-mcp/
+resume-snap.yml

@@ -238,12 +238,16 @@ event/bus.py（每会话一条总线：唯一扇出点）
 - **唯一写入口**：`event.publish()`（发布）、`bus.subscribe()`（订阅）、`session.add()`
   （消息）、`session.record()`（会话状态）、`event.asks` 端口（询问）各只有一个；守卫
   测试静态扫描，散出去会红（见 `tests/guard/test_single_event_path.py`）。
-- **询问端口（asked → replied）**：`event/asks.py` 发布 `PromptStarted` → await 当前前端
-  作答 → 发布 `PromptFinished`。前端只实现一个 `async ask(AskRequest) -> AskAnswer`
-  （终端读 stdin、TUI 挂面板 + await Future）；同步上下文（命令层）用 `ask_sync()` 借
-  运行中的循环投回协程。收尾时 `AskPort.cancel_in_flight()` 统一取消挂起询问并按
-  fail-closed 放行等待方——**没有阻塞在非 daemon 线程里的等待**，退出卡死那类故障从
-  根上消失。
+- **询问端口（asked → replied）**：`event/asks.py` 发布 `PromptStarted` → 等作答 →
+  发布 `PromptFinished`。两种作答路径：进程内（REPL/TUI）await 当前前端
+  （`async ask(AskRequest) -> AskAnswer`；同步上下文用 `ask_sync()` 借运行中的循环
+  投回协程）；跨进程（`smith serve` + 桌面端）挂 `set_remote_asker()` 后登记
+  `event/pending.py` 的 `PendingRegistry` 等 `reply(prompt_id, answer)` 唤醒——
+  `PromptStarted(id)` 经 SSE 下行，桌面端作答后 `POST reply` 上行。两种路径的事件
+  配对与 fail-closed 语义一致；`reply()` 幂等（迟到/重复作答忽略），跨线程经
+  `loop.call_soon_threadsafe` 唤醒。收尾时 `AskPort.cancel_in_flight()` 统一取消挂起
+  询问并按 fail-closed 放行等待方——**没有阻塞在非 daemon 线程里的等待**，退出卡死
+  那类故障从根上消失。`PromptFinished` 补了 `values` 字段（`ask_user` 多题答案跨进程不丢）。
 - **会话日志 = 事件日志**（`sessions/`）：一行一个信封（类型名带版本，读回按"不超过该
   版本的最新一个"取类），写失败降级为纯内存会话；`load()` 重放全部事件并折叠，崩溃
   收尾（尾部悬空 `tool_calls` 补占位）**作为事件写回日志**，于是那次恢复本身也可回放。
@@ -321,11 +325,13 @@ event/bus.py ─→ TerminalTitlePresenter（订阅者：状态机 + 合成 + �
 
 | 模块 | 职责 |
 | ---- | ---- |
-| `cli.py` | 参数解析、交互式 REPL、单次任务模式 |
+| `cli.py` | 参数解析、交互式 REPL、单次任务模式、`--serve`（本机 serve 守护进程，Tauri sidecar 用；非回环 `--host` 须显式 `--allow-remote`） |
+| `serve.py` | `smith serve`：本机守护进程（标准库 `ThreadingHTTPServer`，无新增依赖）。`{session_id: Agent}` 会话表 + 后台事件循环；下行 SSE（鉴权走**一次性票据** `POST /events/ticket` → `?ticket=`——原生 `EventSource` 设不了 header、长效 token 不进 URL；按会话游标 `cursors` 从日志重放 + 重放上限 `limit` + `replay.truncated` 续跑帧；直播直出、有界队列满则丢最旧 volatile；**直播不做去重**——订阅者拿到的信封 `seq` 恒为 None（落盘时才分配，见 `event/envelope.py`），服务端区分不出"是否已重放"，按 seq 猜会把 volatile 一起吞掉；重复由前端按事件 id 去重）、上行 `POST /sessions {workspace|extra|resume}`（建会话：workspace 只校验不写全局 config；resume 未显式给 workspace 时按会话日志的 cwd 推导，跨项目恢复沙箱跟会话走）、prompt/prompt_async（202 直接回、不抱 HTTP 线程；prompt 同步等回执、600s 上限）/interrupt/dispatch/reply/`queue/{take,cancel}`（`inject_history` 与 `start_task` 由 serve 侧消费：技能载荷先落库再续跑，运行中跳过并回 `skipped_busy`）、挂起快照 pending、设置 reload/provider；管理面 `GET|POST /workspace`（GET 默认工作区；POST 运行期切项目——只改新建落点与历史默认项目，已建会话在 `sandbox.fresh()` 时就快照了各自目录，不受影响）、`GET|POST /projects`（项目列表 = 注册表 + 扫盘合并，当前默认工作区打底；POST 登记目录）、`POST /auth/rotate`（轮换 token）、`/commands`、`/fs/list|/fs/read` 与 `/sessions/{id}/fs/list|read`（工作区内只读浏览，路径过 `files._resolve` 沙箱校验；会话级路由先 `sandbox.activate(entry.agent.roots)` 再解析，多项目下不串目录）、`/sessions/history`（默认当前项目，`?project=<slug>` 指定项目、`?all=1` 跨项目查全）、`/sessions/{id}/purge|rename|workspace`、`/sessions/{id}/skills`（读会话持有的技能缓存，不在 HTTP 线程扫盘）、`/mcp/servers*`（面板：列表 / 日志 / 工具 / 启停 / 重连 / 授权 / 删除 / 添加）。回环默认 + token 鉴权（`SMITH_AUTH_TOKEN`）+ **Host 白名单**（挡 DNS-rebind）+ Origin 白名单 + workspace jail + 严格请求体（坏 JSON/超限 413/400，不吞成 `{}`）+ SSE 脱敏（递归过 `redactor().scrub`） |
+| `settings.py` | 无 UI 设置服务（终端向导与桌面设置页共用）：`snapshot()`（不回显 key）、`apply_provider()`（tomlkit 保注释写盘 + 0600 凭据 + `config.reload()`）；`wizard.py` 只留交互采集 |
 | `commands/` | 斜杠命令框架：注册表（`@register` 装饰器）+ 统一 `dispatch()`，REPL 与 TUI 共用；命令元数据（`accepts_args` / `immediate` / `aliases`）驱动两端行为；`/help` 文案由注册表自动生成，新命令一个文件零改动接入 |
-| `event/` | **事件层（L0）**：信封与声明（`envelope.py` / `registry.py` / `catalog.py`）、唯一发布口与订阅口（`bus.py`）、询问端口（`asks.py`）、事件流（`stream.py`）。本层不 import 其他 smithcode 包 |
-| `frontend/` | 前端适配层（L3）：`Asker` 协议与上下文、`attach()` 装配入口（订阅事件 + 挂询问端口）、终端前端（`console.py`）与文本化纯函数（`render.py`） |
-| `sandbox.py` | 会话沙箱授权目录：工作区快照 / 启动附加目录 / 越界信任目录 / 技能只读白名单 / 临时放行（ContextVar） |
+| `event/` | **事件层（L0）**：信封与声明（`envelope.py` / `registry.py` / `catalog.py`）、唯一发布口与订阅口（`bus.py`）、询问端口（`asks.py`，进程内直调 + 跨进程 `pending.py` 登记表两种作答路径）、事件流（`stream.py`）。本层不 import 其他 smithcode 包 |
+| `frontend/` | 前端适配层（L3）：`Asker` 协议与上下文、`attach()` 装配入口（订阅事件 + 挂询问端口）、终端前端（`console.py`）与文本化纯函数（`render.py`）；`unavailable()` 是 serve/非交互宿主的 fail-closed 端口 |
+| `sandbox.py` | 会话沙箱授权目录：工作区快照（`fresh()` 建时快照全局，建后改全局不影响已建会话）/ 启动附加目录 / 越界信任目录 / 技能只读白名单 / 临时放行（ContextVar）；工具路径锚定**当前会话**工作区 |
 | `agent/` | Agent 循环编排（包）：主循环与流式调度（`agent.py`）、会话外观（`agent_session.py`）、工具执行（`tools_run.py`）、边界钩子（`hooks.py`）、运行中排队（`queues.py`）、取消令牌（`signal.py`）、深层发事件通道（`emitter.py`）；`run_with_goal()` 是 `/goal` 唯一的续跑驱动器（无目标等价 `run()`）；`new_session()` 集中承担 `/new` 的全部会话级重置 |
 | `cancel.py` | 协作式取消原语：`CancellationToken`（幂等 cancel / 线程安全查询）、当前令牌的 ContextVar 传播、`RunResult` 结构化结束状态；Esc / Ctrl+C 中断的唯一通道 |
 | `process.py` | 外部命令执行的唯一出口：`Popen` 创建、轮询超时、取消判定与跨平台进程树终止（Windows `taskkill /T`、POSIX `killpg` 信号升级）、`ProcessResult` 结构化结果，取消令牌取自当前线程；工具层只负责组装命令与文案映射 |
@@ -337,10 +343,11 @@ event/bus.py ─→ TerminalTitlePresenter（订阅者：状态机 + 合成 + �
 | `goal.py` | 持久目标（`/goal`）：跨回合使命的状态机（生命周期、回合预算、token 差值、阻碍审计连击）与续跑/收尾/开始提示词；会话级单例，`/new` 时重置 |
 | `title.py` | 终端窗口标题：订阅事件（`TitleChanged` / `Execution*` / 询问事件对按 id 配对判定等待态）合成 `Smith · <会话标题>`（运行中加 `◐`、等待用户输入时加 `!` 且优先），经注入 sink 写 OSC 0，退出时用窗口标题栈恢复原标题（见「终端窗口标题」节） |
 | `skills/` | 技能子系统（「技能（Skills）」节的设计落地）：`frontmatter.py` 宽容解析（无第三方 YAML）、`registry.py` 扫描/优先级/信任门控、`state.py` 会话级加载集合与载荷投递（含压缩后裁剪）、`render.py` 目录段与载荷渲染（字符预算降级）；`/new` 时重置加载集合 |
-| `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段 |
+| `instructions.py` | 项目指令（AGENTS.md）装载与注入：用户级 + 项目级 + `[instructions].paths`、`(path, scope, mtime_ns, size)` 指纹变更检测、字符预算截断，渲染系统提示词动态段；按 workspace 缓存（多会话各拿各的，`refresh(workspace)`） |
+| `sandbox.py` | 会话沙箱授权目录：工作区快照（`fresh()` 建时快照全局，建后改全局不影响已建会话）/ 启动附加目录 / 越界信任目录 / 技能只读白名单 / 临时放行（ContextVar）；工具路径锚定**当前会话**工作区 |
 | `context/` | 上下文计量与运行时压缩包：`meter` 计量（token 估算、`/context` 报告）、`compact` 压缩纯逻辑、`prompts` 压缩提示词 |
-| `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`）；`__init__.py` 汇总公共 API |
-| `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析 |
+| `permission/` | 权限子系统：`engine.py` 规则引擎与确认流程（原 `permission.py`）、`shell_policy.py` Shell 命令静态分析（只读判定 + 前缀推导，命令规范表 `COMMANDS`；相对路径按当前会话工作区锚定）；`__init__.py` 汇总公共 API |
+| `config.py` | 配置中心：`~/.smithcode/config.toml`（行为配置，含 `[provider.headers]` 自定义请求头与 `[provider].models` 候选模型列表）+ `credentials.json`（凭据），默认 < TOML < 环境变量（仅 `SMITHCODE_KEY/MODEL/URL`）三级解析；模块常量是启动期快照，`reload()` 重读并返回变更集（下一轮生效、轮内冻结），`set_model()/set_effort()` 是运行时切换的统一入口 |
 | `tools/base.py` | 工具注册表（`@register` 装饰器，支持 `pattern_arg` / `family` / `paths_from` / `describe` / `preview` / `serial`） |
 | `tools/files.py` | 文件读写，含路径越界检查 |
 | `tools/_shared_local.py` | 本地检索共享基座（glob / grep 共用：SKIP_DIRS、沙箱根判定、有序遍历、行截断；下划线前缀=非工具，不注册） |
@@ -392,7 +399,8 @@ webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂
 - **变更预览**：`write_file` / `edit_file` 在**执行前**（路径预检与权限确认之前）把 unified diff 推送到**工具调用块**——pending 态就地展开，审核时改动内容已可见，权限申请框只展示工具摘要（`describe`）与带说明的选项、不重复 diff；执行后 diff 保留在调用详情里回看（超 40 行截断，失败/被拒不重复展示），写/编辑工具的调用详情**默认展开**。TUI 中该 diff 以**左右对照**渲染——旧/新两栏、各带真实行号，改动行带 `-`/`+` 前缀并红/绿配色，整块统一底色、上下各 1 行 padding、块内不展示文件名（`tui/render.py` 的 `side_by_side_diff`，宽度不足时回退逐行统一 diff），REPL 仍按 `+/-` 行着色打印。`.env` 等敏感文件不生成预览避免密钥回显。其他工具可在注册时声明 `preview` 函数接入同一机制。
 - **换行保真**：文件工具读写一律经 `textfile.py`——读时探测换行风格（LF / CRLF / CR）与 UTF-8 BOM 并**归一化为 LF** 交给模型，写时**按原文风格还原**（新建文件默认 LF，不随 `os.linesep` 漂移）。模型因此永远只看 LF 内容，既不会往 CRLF 文件里插 LF 行，也不会出现「只改一行却整个文件换行被重写」的全文件 diff——等价 Claude Code Edit 工具的 encoding/line-ending 策略。混合换行的文件统一为占多数的风格；`.editorconfig` / `.gitattributes` 尚未接入。
 - **越界确认**：路径落在授权根之外时先交互确认（`[y]` 仅本次 / `[a]` 本会话总是 / `[n]` 拒绝）。`-y`（approved_all）按"仅本次"静默放行越界访问，不弹确认、不留会话级信任；`deny` 依然生效。
-- **非交互 fail-closed**：标准输入非终端（管道 / CI）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃。
+- **非交互 fail-closed**：标准输入非终端（管道 / CI）**且没挂跨进程作答者**（`event.asks.has_remote()`——serve + 桌面端靠它，sidecar 的 stdin 是 `/dev/null`）时无法询问，所有 `ask` 一律拒绝并回传模型，不因 `EOFError` 崩溃；权限引擎门禁（`permission.answerable()`）与 `ask_user` 用同一口径。系统提示词的「运行模式」同源判定，serve 会话对模型呈交互模式。
+- **本机 serve 边界**：`smith serve` 只绑回环，且两道门都要过——① `Authorization: Bearer`（SSE 走 `?token=`）与 `SMITH_AUTH_TOKEN` 恒定时间比对；② **Origin 白名单**（`tauri://localhost`、`http(s)://tauri.localhost`、`http://localhost:1420`，用 `SMITH_ALLOWED_ORIGINS` 追加），非白名单来源一律 403 且不回 ACAO（预检同样核）。绑回环**不构成**边界：浏览器会向 `127.0.0.1` 发跨站请求，跨站 simple request 连预检都不发——这正是 Claude Code IDE 扩展 CVE-2025-52882 的成因（goose 的 `--allowed-origin` 是同款默认）。token 由桌面壳经环境变量注入、不落盘不进 argv（`ps` 里看不到），未配置时 serve 随机生成并打印一次；壳重启沿用内存里那份。`/health` 免鉴权（只回 `{"ok": true}`）。管理面端点同样只读/受限：`/fs/list|/fs/read`（进程默认沙箱兜底）与 `/sessions/{id}/fs/list|read`（按该会话的沙箱：先 `sandbox.activate(entry.agent.roots)` 再解析，多项目下才不串目录）只读且路径必经 `files._resolve`（解析后须落在该会话工作区/附加目录内，越界 403，二进制拒读、超限截断），`/sessions/{id}/skills` 只读会话内存缓存（不扫盘），`/mcp/servers*` 的启停/重连/授权/增删是显式用户动作、返回的命令/地址/报错/日志一律过 `redactor().scrub`。
 - **超时保护**：shell 命令默认 60 秒超时；超时或被中断时终止整个进程树（`process.py`）。
 - **请求保护与重试**：LLM 请求的 `[limits].llm_timeout`（默认 120s）是**空闲超时**——两次收到数据之间静默超过它就断开，不是整个请求的总时长上限（推理型模型首字延迟长时尤其要按这个口径理解）。重试策略收敛在 `llm/retry.py`（分类 / 预算 / 退避 / 状态文案的唯一权威）：限流、断网、服务端 5xx 与流中途的传输层错误（对端掐断连接 `RemoteProtocolError`、读流超时等）按指数退避重试，2s 起步 ×2、25% 抖动、本地退避上限 30s，服务端 `Retry-After` 优先且只受宽上限（300s）约束——限流窗口常有 60s 量级，砍到 30s 提前重试只会再撞一次；默认 3 次（`[limits].max_retries`）。可重试判定顺序：取消 → 否；5xx → 是；已知永久错误（参数 / 鉴权 / 无权限 / 404）→ 否；已知传输层类型 → 是；最后按**错误文本**兜底（对齐 opencode 的 `RETRYABLE_MESSAGE_PATTERNS`：服务商把瞬时故障包成普通异常时只能看文案，且放在永久错误之后，4xx 响应体里含 `timeout` 不会被误判）。上下文溢出单独排除，由压缩恢复处理。**正文已输出过也照常重试**——整轮报废的代价大于重复显示，上游（opencode / Codex / Claude Code）同为整请求重发；重复的正文由 Agent 侧按「每次尝试的正文都记进同一条 assistant 消息」处理（对齐 opencode 的 text part 累积，见「Agentic Loop」第 5 步）。重试进行态（尝试序号 / 原因 / 恢复时刻）经 `Renderer.retry_started` 上报：TUI 显示在输入框上方的运行动画行（`Working… · 正在重试 2/3 · 8s 后`，倒计时由组件自刷），其他后端降级为一行提示；`retry_finished` 与之一一配对并带 owner，前台任务与后台标题的重试互不误清。退避等待可被取消打断（分段 sleep 查令牌），Esc 不必等满退避时长。
 - **输出截断**：单次工具返回超过 `MAX_TOOL_OUTPUT`（默认 2 万字符）时保留头尾、省略中间，防止超长输出撑爆上下文窗口。
@@ -407,7 +415,7 @@ webfetch / websearch 两个网络工具共用 `utils/http.py` 的客户端工厂
 5. **多资源聚合**：多路径工具（apply_patch）逐路径求值后聚合——任一 `deny` → 整体拒绝，任一 `ask` → 询问一次（逐条列出待确认路径），全部放行才执行；会话内"总是允许"按每个待确认路径的精确模式逐条记忆，同路径后续调用直接放行、新路径仍走确认。
 6. **审核前展示变更**：工具的变更预览（如 `write_file` / `edit_file` 的 unified diff）在权限确认与执行**之前**推送到工具调用块（pending 态就地展开）——审核时改动内容已可见；权限申请框则统一展示工具摘要（`describe`，如 `command git status` / `fetch <url>` / `write <path>`）与带说明的 y/n/a 选项；`run_command` 的 `description` 参数会排在命令摘要前，摘要与选项小字均截断到 80 字符，避免长命令 / 长路径撑满弹窗。
 7. **复合命令拆分求值**：`run_command` 的命令串按顶层操作符（`&&` / `||` / `;` / `|` / `&` / 换行）切分为子命令逐段匹配规则（引号内不切），聚合语义与多路径一致——任一段 `deny` → 拒绝，任一段 `ask` → 询问，全部放行才放行；含 `$()` 或反引号命令替换（双引号内仍算，单引号内不算）无法静态求值，强制 `ask`。防止"放行 A 后借 `&&` 偷渡 B"绕过规则。
-8. **安全只读命令免确认**：内置一批只读命令（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套安全集），在内置默认 `ask` 下自动放行以减少确认疲劳。安全层位于「内置默认规则」与「用户规则」之间——**任何用户/会话规则命中都优先**（无论 `ask` 还是 `deny`），因此可用精确 `ask`（如 `git push *`）在保留安全集的同时收紧个别命令，也可用宽泛 `ask` 整体关闭。判定是独立纯函数 `permission/shell_policy.is_safe_command`（按顶层段逐段求值，复用命令拆分），拿不准即回退 `ask`：解析失败、inline 环境变量前缀（`CI=true git commit`）、路径限定的 argv[0]（`./sed`、`/usr/bin/ls`）、写文件/读文件重定向（仅放行 `/dev/null`、`NUL`、`2>&1`）、命令替换、危险标志（`find -delete` / `sort -o` / `git -c` 等）、对有写/exec 能力命令的未加引号 glob、网络与 `env`/`awk`/`docker`/`sed` 等命令一律不纳入。开发工具链仅放行**版本查询 / 只读枚举 / 静态检查**（`python --version`、`pip list` / `show` / `freeze`、`npm ls`、`uv pip list`、`poetry show`、`ruff check` 等）；**真正运行代码的用法一律不放行**（`pytest`、`python x.py`、`node -e`、`npm run`、`uv run`、`cargo test` 等）——没有 OS 沙箱时默认放行任意执行等于放弃安全边界。`cd` 目标须落在授权目录内，同一复合命令里 `cd` 改变目录 + `git` 组合整体降级为询问（git 会执行新目录 hooks）。
+8. **安全只读命令免确认**：内置一批只读命令（`ls` / `cat` / `git status` 等，POSIX 与 cmd.exe 各一套安全集），在内置默认 `ask` 下自动放行以减少确认疲劳。安全层位于「内置默认规则」与「用户规则」之间——**任何用户/会话规则命中都优先**（无论 `ask` 还是 `deny`），因此可用精确 `ask`（如 `git push *`）在保留安全集的同时收紧个别命令，也可用宽泛 `ask` 整体关闭。判定是独立纯函数 `permission/shell_policy.is_safe_command`（按顶层段逐段求值，复用命令拆分），拿不准即回退 `ask`：解析失败、inline 环境变量前缀（`CI=true git commit`）、路径限定的 argv[0]（`./sed`、`/usr/bin/ls`）、写文件/读文件重定向（仅放行 `/dev/null`、`NUL`、`2>&1`）、命令替换、危险标志（`find -delete` / `sort -o` / `git -c` 等）、对有写/exec 能力命令的未加引号 glob、网络与 `env`/`awk`/`docker`/`sed` 等命令一律不纳入。开发工具链仅放行**版本查询 / 只读枚举 / 静态检查**（`python --version`、`pip list` / `show` / `freeze`、`npm ls`、`uv pip list`、`poetry show`、`ruff check` 等）；**真正运行代码的用法一律不放行**（`pytest`、`python x.py`、`node -e`、`npm run`、`uv run`、`cargo test` 等）——没有 OS 沙箱时默认放行任意执行等于放弃安全边界。`cd` 目标须落在授权目录内——相对目标锚定**当前会话**的工作区（与 `tools/shell.py` 真正跑命令的 cwd 同源；拿进程默认目录当基准，多会话下会算到别人的目录上），同一复合命令里 `cd` 改变目录 + `git` 组合整体降级为询问（git 会执行新目录 hooks）。
 9. **"总是允许"命令前缀记忆**：`run_command` 选"总是允许"时不再记整条命令字符串，而是记 **argv 前缀**：`permission/shell_policy.derive_prefix` 把命令归一化成稳定 key（剥 inline 环境变量前缀与 `env`/`command` 包装器；解释器保留 `-m 模块` / 脚本名；其余取从头连续的非标志 token），再按命令规范表的 `arity` / `sub_arity` 切出前缀（`python -m pytest tests/a.py` → `("python","-m","pytest")`、`git commit -m x` → `("git","commit")`、`npm run test` → `("npm","run","test")`）。匹配时对段重新计算 `command_key` 做 token 前缀比较，因此文件/参数变化（`tests/b.py`、`-k foo`、`CI=1` 前缀）都能命中。**拿不准即精确**：未登记命令、标志截断 arity（`git --no-pager log`）、inline 解释器（`python -c`）、shell（`bash -c`）、含危险标志（`ruff check --fix`）一律退回整段精确记忆；`BANNED_PREFIXES`（`uv run` / `python` / `npm run` 裸前缀等）作为最后安全网。复合命令逐段各自记忆；`cd` 改变目录 + `git` 守卫场景不提供"总是允许"。配置文件的字符串规则仍按通配匹配，行为不变。
 
 ## 如何新增一个工具

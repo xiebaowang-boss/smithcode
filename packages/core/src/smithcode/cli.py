@@ -72,6 +72,23 @@ def build_parser():
         help="单次任务最大迭代轮数；-1 为不限（默认），正整数达上限后会请求模型总结收尾",
     )
     parser.add_argument(
+        "--serve", action="store_true",
+        help="启动本机 serve 守护进程（Tauri 桌面端 sidecar 用；仅绑回环；"
+             "鉴权 token 走 SMITH_AUTH_TOKEN，未设则随机生成并打印一次）",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", metavar="HOST",
+        help="serve 监听地址（默认 127.0.0.1；非回环地址须同时加 --allow-remote）",
+    )
+    parser.add_argument(
+        "--allow-remote", action="store_true",
+        help="允许 serve 监听非回环地址（你必须自己保证防火墙 + token 安全）",
+    )
+    parser.add_argument(
+        "--port", type=int, default=18789, metavar="PORT",
+        help="serve 监听端口（默认 18789）",
+    )
+    parser.add_argument(
         "-V", "--version", action="version",
         version=f"%(prog)s {__version__}",
     )
@@ -274,12 +291,7 @@ def _resume_session(agent: Agent, last: bool, target: str) -> None:
         note += "；检测到历史损坏，已截断修复"
     if report.bad_lines:
         note += f"；跳过 {report.bad_lines} 行损坏记录"
-    if report.model and report.model != config.MODEL:
-        # 转录用 t=model 记录每轮实际使用的模型；恢复了会话但不悄悄改全局模型
-        note += (
-            f"；该会话上次使用模型 {report.model}"
-            f"（当前 {config.MODEL}，如需沿用请 /model {report.model}）"
-        )
+    # 会话级模型：resume() 已直接沿用日志里的值，无需再提示 /model 切回
     print(note)
 
 
@@ -293,6 +305,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.task == ["setup"]:  # 仅当唯一位置参数恰好是 setup，避免 subparsers 破坏自由文本任务
         sys.exit(run_setup())
+    if args.serve:
+        if args.task:
+            parser.error("--serve 不能与一次性任务同用")
+        if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allow_remote:
+            parser.error("--host 用了非回环地址：须同时加 --allow-remote（你必须自己保证防火墙 + token 安全）")
+        if args.host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"[警告] serve 监听在非回环地址 {args.host}，任何能连上它的人都能操作你的文件")
+        if args.workspace:
+            config.set_workspace(args.workspace)
+        for extra in args.add or []:
+            config.add_workspace(extra)
+        from .serve import run as run_serve
+
+        sys.exit(run_serve(host=args.host, port=args.port, workspace=args.workspace))
     restoring = args.continue_session or args.resume is not None
     if args.name and restoring:
         parser.error("--name 只能用于新会话，不能与 -c/--resume 同用")
@@ -302,8 +328,6 @@ def main(argv=None):
         config.set_workspace(args.workspace)
     for extra in args.add or []:
         config.add_workspace(extra)
-    if args.model:
-        config.MODEL = args.model
 
     try:
         agent = Agent(
@@ -311,6 +335,8 @@ def main(argv=None):
             max_iterations=args.max_iterations,
             persist=not args.no_session_persistence,
             oneshot=bool(args.task),
+            # 会话级覆盖：--model 只定本会话的初值，不改 config 全局
+            model=args.model,
         )
     except config.ConfigError as e:
         print(e)  # 指引文案由 ConfigError 自带，打印后安静退出，不甩 traceback

@@ -22,6 +22,8 @@ from ..context import (
     validate_summary,
 )
 from ..event import Bus, asks
+from ..event import activate as activate_bus
+from ..event import reset as reset_bus
 from ..event.asks import AskPort
 from ..event.bus import SubscriberError
 from ..event.catalog import (
@@ -207,13 +209,16 @@ class Agent:
     def __init__(self, session: Session | None = None, max_iterations: int | None = None,
                  store=None, persist: bool = False, oneshot: bool = False,
                  llm=None, permission=None, mcp=None, models=None,
-                 model: str | None = None, reset_globals: bool = True,
+                 model: str | None = None, effort: str | None = None,
+                 workspace: str | None = None, extra: list[str] | None = None,
+                 reset_globals: bool = True,
                  hooks: AgentHooks | None = None):
         """构造 Agent。
 
         进程级服务（llm / permission / mcp / models）可注入：复用已有实例
-        （共享权限模式与会话规则、连接与客户端），而不是各自新建。model 覆盖
-        模型；reset_globals=False 跳过「已读文件」等进程级状态的初始化
+        （共享权限模式与会话规则、连接与客户端），而不是各自新建。model / effort
+        为会话级覆盖（None = 跟随 config 全局）：serve 一进程多会话时区分各会话，
+        单会话 CLI/TUI 不传即沿用既有全局语义。reset_globals=False 跳过「已读文件」等进程级状态的初始化
         （复用实例不得清空既有记录）。hooks 是四个可选决策点（见 hooks.py），
         不传时行为与没有钩子时逐字相同。
         """
@@ -226,6 +231,10 @@ class Agent:
         # MCP 会话级服务：配置加载 / 后台连接 / 动态工具注册（start/close 挂钩）
         self.mcp = mcp if mcp is not None else McpService()
         self._token: AbortSignal | None = None  # 当前轮次的取消令牌（run 期间非空）
+        # 预热窗口的中断接力：`prompt()` 已受理但轮次令牌还没建起来（首条消息的
+        # 装配要读盘）时，interrupt() 只能先记账；令牌一建起来就照账立刻中止。
+        self._prompting = False  # prompt() 在跑（含 goal 续跑间隙，令牌会短暂为 None）
+        self._interrupt_pending = False
         # 事件出口：核心只发类型化事件（见 _emit）。`events` 是本**会话**的事件总线，
         # 前端订阅它取事件、`event.publish` 从深层调用点发事件。
         # `_loop` 是「本轮 run 所在的事件循环」——UI 线程 / 后台线程发的事件要转回
@@ -241,7 +250,7 @@ class Agent:
         # 会话沙箱授权目录（本会话的真相：工作区快照 + 会话内信任目录 + 技能白名单）。
         # **不在构造时挂载**：挂载发生在哪个上下文就属于哪个上下文，构造期挂载会让
         # 后建的会话覆盖先建的那个（并发会话互相串目录）。挂载点见 run() 与 start()。
-        self.roots = sandbox.fresh()
+        self.roots = sandbox.fresh(workspace, extra)
         self._stream: EventStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # 运行中排队的两条队列（见 queues.py）：变更即发 QueueChanged。
@@ -259,7 +268,9 @@ class Agent:
         self._last_batch_results: list[str] = []  # 本批工具结果文本，供 TurnContext
         self._last_model_event: tuple[str, str] | None = None  # 已发过的模型事件（去重）
         self._replay_events: list = []  # 恢复时装载的事件（宿主按事件回放历史）
-        self._model = model  # 非空时覆盖 config.MODEL
+        self._model = model  # 会话级覆盖（None = 跟随 config.MODEL）
+        self._effort = effort  # 会话级覆盖（None = 跟随 config.REASONING_EFFORT）
+        self._workspace = workspace  # 会话级工作区覆盖（None = 跟随 config）
         self._turn: TurnConfig | None = None  # 本轮请求快照：run() 开头 pin，轮内冻结
         # 迭代上限：None 取配置；<0（默认 -1）表示不限制，正整数表示上限轮数
         self.max_iterations = (
@@ -282,8 +293,39 @@ class Agent:
             configured=ConfiguredModelSource(),
             cached=CachedModelSource(cache),
             remote=RemoteModelSource(getattr(self.llm, "list_models", None), cache),
-            current_model=lambda: config.MODEL,
+            current_model=lambda: self.effective_model(),
         )
+
+    def effective_model(self) -> str:
+        """本会话有效的模型：会话覆盖优先，未覆盖时跟随 config 全局。"""
+        return self._model or config.MODEL
+
+    def effective_effort(self) -> str:
+        """本会话有效的思考强度：会话覆盖优先，未覆盖时跟随 config 全局。"""
+        return self._effort or config.REASONING_EFFORT or config.DEFAULT_EFFORT
+
+    def effective_workspace(self) -> str:
+        """本会话有效的工作区：会话覆盖优先，未覆盖时跟随 config 全局。"""
+        return self._workspace or config.WORKSPACE_ROOT
+
+    def set_session_model(self, name: str) -> tuple[str, str]:
+        """会话级切换模型：只改本会话的覆盖，不碰 config 全局。
+
+        返回切换后的 (model, effort) 有效值，供命令层发 `ModelSelected` 事件。
+        """
+        self._model = str(name)
+        pair = (self.effective_model(), self.effective_effort())
+        self._last_model_event = pair
+        self.session.record(ModelSelected(model=pair[0], effort=pair[1]))
+        return pair
+
+    def set_session_effort(self, value: str) -> tuple[str, str]:
+        """会话级切换思考强度：只改本会话的覆盖，不碰 config 全局。"""
+        self._effort = str(value)
+        pair = (self.effective_model(), self.effective_effort())
+        self._last_model_event = pair
+        self.session.record(ModelSelected(model=pair[0], effort=pair[1]))
+        return pair
 
     @property
     def session_owner(self) -> AgentSession:
@@ -314,14 +356,15 @@ class Agent:
         只有置了 `accepts_turn_params` 的真客户端才透传。
         """
         if getattr(self.llm, "accepts_turn_params", False):
-            turn = self._turn or TurnConfig.capture(self._model)
+            turn = self._turn or TurnConfig.capture(self._model, self._effort)
             return {"model": turn.model, "effort": turn.effort}
         return {"model": self._model} if self._model else {}
 
     def _new_store(self, oneshot: bool = False):
-        """新建一个会话转录（轮换 id，文件懒物化）。"""
+        """新建一个会话转录（轮换 id，文件懒物化）：出生事件带本会话有效值。"""
         return sessions.SessionStore.create(
-            model=config.MODEL, effort=config.REASONING_EFFORT, oneshot=oneshot,
+            cwd=self.roots.workspace, model=self.effective_model(),
+            effort=self.effective_effort(), oneshot=oneshot,
         )
 
     # ---------- 事件出口（核心 → 订阅者） ----------
@@ -505,7 +548,11 @@ class Agent:
         `QueueChanged` 事件，宿主据此刷新队列面板）。
         """
         if self._token is None:
-            return await self.session_owner.run_with_goal(text)
+            self._prompting = True  # 让 interrupt() 认得「预热窗口」里的停止请求
+            try:
+                return await self.session_owner.run_with_goal(text)
+            finally:
+                self._prompting = False
         self.enqueue(text, images, delivery)
         return None
 
@@ -621,8 +668,8 @@ class Agent:
         # 会话边界：本会话的沙箱在此接管宿主上下文（命令层与启动期的提问、
         # 技能白名单重建都按本会话的目录判定）。run() 里会再按各自上下文挂一次。
         sandbox.activate(self.roots)
-        self.refresh_skills() 
-        instructions.refresh()
+        self.refresh_skills()
+        instructions.refresh(workspace=self.roots.workspace)
         self.mcp.start()  # 后台连接已配置的 MCP 服务器；失败隔离、不阻塞启动
 
     def refresh_skills(self) -> list:
@@ -637,7 +684,8 @@ class Agent:
         覆盖：消息历史与会话 id、会话用量、权限会话规则、越界信任目录、
         上下文快照（压缩计数与真实 token 锚点）、工具侧「已读文件」记录、
         步骤清单、持久目标、技能激活集合，以及转录文件的轮换（旧会话保留
-        在磁盘、仍可恢复）。新增会话级状态时注册进 `_state_registry`，
+        在磁盘、仍可恢复）。模型与思考强度的会话覆盖也清掉：新会话回到
+        config 全局默认值。新增会话级状态时注册进 `_state_registry`，
         命令层（commands）不感知重置细节。项目指令不属会话状态，但在
         `/new` 这一会话边界重新装载一次（读盘或去重，见 instructions.refresh）。
         """
@@ -645,6 +693,10 @@ class Agent:
             self.session.store.close()  # 旧转录闭合；从未物化则不产生文件
         self.cancel_pending_asks()  # 换会话：旧会话的挂起提问一并作废
         self.session.reset()
+        self._model = None  # 会话覆盖清掉：新会话回到 config 全局默认值
+        self._effort = None
+        self._workspace = None
+        self._last_model_event = None
         self.permission.new_session()
         self.roots.new_session()  # 清空会话内积累的信任目录
         self.context.new_session()
@@ -656,7 +708,7 @@ class Agent:
         self._title_attempts = 0
         self._title_cooldown = 0
         self.clear_queue()  # 新会话不继承上一条会话的排队输入
-        instructions.refresh()  # 会话边界：重新装载项目约定（中途修改在此生效）
+        instructions.refresh(workspace=self.roots.workspace)  # 会话边界：重新装载项目约定（中途修改在此生效）
         if self._persist:
             self.session.bind_store(self._new_store())
         else:
@@ -671,12 +723,20 @@ class Agent:
 
         target 支持 SessionSummary / 会话 id / 唯一前缀 / `.jsonl` 路径 /
         旧 `.json` 路径。装载是原地的——`self.session` 对象身份不变，宿主
-        对它的引用与渲染绑定始终有效。安全语义（§3.9）：权限会话规则、
-        越界信任目录、已读记录一律重置不恢复。
+        对它的引用与渲染绑定始终有效。模型与思考强度直接沿用日志里的值
+        （会话级覆盖），不再提示"如需沿用请 /model"。安全语义（§3.9）：
+        权限会话规则、越界信任目录、已读记录一律重置不恢复。
         """
-        summary = self._resolve_target(target)
+        summary = sessions.resolve_target(target)
         loaded = sessions.load(summary)
         self._replay_events = list(loaded.events)  # 供宿主按事件回放历史
+        # 会话级模型/思考强度：沿用日志里的值（构造传入的显式覆盖优先）。
+        # 日志里没有时（旧日志）保持构造值/全局跟随，不悄悄改。
+        if loaded.model:
+            self._model = self._model or loaded.model
+        if loaded.effort:
+            self._effort = self._effort or loaded.effort
+        self._last_model_event = None
 
         if self.session.store is not None:
             self.session.store.close()
@@ -715,7 +775,7 @@ class Agent:
         self._last_state = None
         self._title_attempts = 0
         self._title_cooldown = 0
-        instructions.refresh()  # 会话边界：恢复即按磁盘最新内容重建项目约定段
+        instructions.refresh(workspace=self.roots.workspace)  # 会话边界：恢复即按磁盘最新内容重建项目约定段
         self.session.sync_system()  # system 段按当前提示词立即重建
         self.emit(TitleChanged(self.session.title))  # 标题随恢复的会话同步
         self.emit(self._usage_event())  # 恢复的用量也同步（前端纯靠事件渲染）
@@ -729,22 +789,6 @@ class Agent:
             bad_lines=loaded.bad_lines,
             model=loaded.model,
         )
-
-    @staticmethod
-    def _resolve_target(target):
-        """定位恢复目标：摘要对象 / 文件路径 / id / 唯一前缀。"""
-        if isinstance(target, sessions.SessionSummary):
-            return target
-        text = str(target or "").strip()
-        if not text:
-            raise sessions.StoreError("未指定要恢复的会话。")
-        path = Path(text)
-        if path.is_file():
-            return sessions.summary_from_path(path)
-        summary = sessions.find(text)
-        if summary is None:
-            raise sessions.StoreError(f"未找到会话：{text}")
-        return summary
 
     def _state_registry(self) -> tuple:
         """会话级状态注册表：new_session / resume / 快照共用同一张表。
@@ -869,6 +913,13 @@ class Agent:
         """
         if self._token is not None:
             self._token.cancel()
+            return
+        # 预热窗口：prompt 已受理、轮次令牌还没建起来——直接吞掉的话，用户在
+        # 首条消息的装配期（可能几百毫秒到数秒）按停止会毫无反应。记下来，
+        # _run_turn 建好令牌立刻中止；没在 prompt 期间（界面 busy 残留）不记，
+        # 免得污染下一轮。
+        if self._prompting:
+            self._interrupt_pending = True
 
     async def run(self, user_input: str) -> RunResult:
         """执行一次任务直至模型给出最终回复（或中断 / 拒绝 / 迭代上限 / 流中断）。
@@ -919,12 +970,25 @@ class Agent:
         # 状态上。会话尚未建立时不建（`session_owner` 惰性创建有它自己的时机）。
         if self._session_owner is not None:
             self._session_owner.bind_state()
-        self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
+        # 系统提示词的环境块要如实回答"有没有人可以问"（`_env_info` 读 asks 端口上的
+        # 跨进程作答者），装配期深层模块（技能信任提示等）经 `event.publish` 发的事件
+        # 也要进总线——正式装配（下面 try/finally 的整轮挂载）之前先短挂 asks / 总线，
+        # 装配完立刻复位，不改异常路径的收尾语义。
+        pre_asks = asks.activate(self.asks)
+        pre_bus = activate_bus(self.events)
+        try:
+            self.session.sync_system()  # 发请求前同步系统提示词（含当前持久目标段）
+        finally:
+            asks.reset(pre_asks)
+            reset_bus(pre_bus)
         if user_input is not None:
             self.session.add("user", user_input)
-        self._turn = TurnConfig.capture(self._model)
+        self._turn = TurnConfig.capture(self._model, self._effort)
         token = AbortSignal()
         self._token = token
+        if self._interrupt_pending:  # 预热窗口里按过停止：令牌刚建好，立刻兑现
+            self._interrupt_pending = False
+            token.abort("用户请求中断")
         owner = self._ensure_stream()  # 直接调用时本层拥有事件流；被目标续跑驱动时不是
         if owner:
             self._loop = asyncio.get_running_loop()
@@ -934,6 +998,11 @@ class Agent:
         emitter_token = emitter.activate(self.emit)  # 深层模块（llm 层）也能发事件
         asks_token = asks.activate(self.asks)  # 深层模块（权限预检 / ask_user）也能提问
         roots_token = sandbox.activate(self.roots)  # 本轮的授权目录 = 本会话的那一份
+        # 深层模块用 `event.publish`（ContextVar 总线）发的事件也必须进本会话总线：
+        # 询问端口的 PromptStarted、权限引擎的拒绝原因 Notice 都走它——宿主没
+        # `attach`（serve / TUI 的后台循环线程）时 ContextVar 是空的，事件会被
+        # bus.py 静默丢弃，前端就永远等不到弹窗信号。
+        bus_token = activate_bus(self.events)
         status = "error"
         result: RunResult | None = None  # 未预期异常时 finally 也要能安全收尾
         self._emit(ExecutionStarted())
@@ -955,6 +1024,7 @@ class Agent:
             emitter.reset(emitter_token)
             asks.reset(asks_token)
             sandbox.reset(roots_token)
+            reset_bus(bus_token)
             self._emit_execution_end(status, result, token)
         if owner:
             self._close_stream(None, result)
@@ -1124,10 +1194,10 @@ class Agent:
         """登记一次模型调用：会话用量 + 真实 token 锚点 + 转录用量 + 消息入库。"""
         self.session.usage.add(usage)
         self.context.record(usage)  # 记下真实 prompt_tokens 作估算锚点
-        # 记「谁生成的」：用本轮 pin 住的快照，而不是可能已被 /model 改掉的全局值。
+        # 记「谁生成的」：用本轮 pin 住的快照，而不是可能已被会话切换改掉的值。
         # 只在与上一条不同时发（事件驱动之后，"去重"归调用方——日志不该被同一
         # 模型的连续调用刷屏）。
-        turn = self._turn or TurnConfig.capture(self._model)
+        turn = self._turn or TurnConfig.capture(self._model, self._effort)
         if (turn.model, turn.effort) != self._last_model_event:
             self._last_model_event = (turn.model, turn.effort)
             self.session.record(ModelSelected(model=turn.model, effort=turn.effort))
@@ -1319,7 +1389,7 @@ class Agent:
         if model:
             kwargs = {"model": model}
         elif getattr(self.llm, "accepts_turn_params", False):
-            turn = self._turn or TurnConfig.capture(self._model)
+            turn = self._turn or TurnConfig.capture(self._model, self._effort)
             kwargs = {"model": turn.model, "effort": turn.effort}
         else:
             kwargs = {"model": self._model} if self._model else {}
@@ -1644,7 +1714,7 @@ class Agent:
         避免读技能引用文件反复弹越界确认；写路径不受影响。
         与工具内部的越界检查互为备份：预检管交互体验，工具侧管强制执行。
         """
-        target = (Path(config.WORKSPACE_ROOT) / str(raw)).resolve()
+        target = (sandbox.current().workspace / str(raw)).resolve()
         if any(target.is_relative_to(r) for r in config.allowed_roots()):
             return None
         if read_only and any(target.is_relative_to(r) for r in config.skill_roots()):

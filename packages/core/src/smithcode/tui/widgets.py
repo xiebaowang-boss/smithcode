@@ -561,10 +561,12 @@ class RunningIndicator(Static):
     def clear_retry(self, owner=None) -> None:
         """退出重试态（重试成功或放弃）：恢复普通 Working… 文案。
 
-        owner 与当前记录不符时忽略——另一个请求的重试可能正在进行。"""
+        owner 与当前记录不符时忽略——另一个请求的重试可能正在进行。按**值**
+        比较而非身份：owner 是跨事件传的字符串令牌（`llm:<序号>`），同一枚
+        每次都可能是新对象，`is` 会让自己的重试永远清不掉。"""
         if self._retry is None:
             return
-        if owner is not None and self._retry_owner is not None and owner is not self._retry_owner:
+        if owner is not None and self._retry_owner is not None and owner != self._retry_owner:
             return
         self._retry = None
         self._retry_owner = None

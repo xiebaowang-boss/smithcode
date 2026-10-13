@@ -131,13 +131,34 @@ def _resolve_number(section: str, key: str, default):
 
 # or 链从高到低即优先级：环境变量（临时覆盖）> 文件（长期归宿）> 内置默认；
 # 空串视为"没配"，自动落到下一级
-KEY = os.getenv("SMITHCODE_KEY") or _credentials_key()
-MODEL = os.getenv("SMITHCODE_MODEL") or _file_str("provider", "model") or "deepseek-v4-flash"
-URL = os.getenv("SMITHCODE_URL") or _file_str("provider", "url")
+#
+# 下面的模块常量是**启动期快照**：`reload()` 会原地重赋它们（serve 改设置后
+# 下一轮生效，轮内冻结——`TurnConfig.capture()` 在轮开头 pin，见 `llm/request.py`）。
+# 直接改这些常量的旧写法（`/model` 命令、`cli --model`）已收敛到 `set_model()` /
+# `set_effort()`，以便未来加"变更通知"时只有一个入口。
+def _resolve_key() -> str:
+    return os.getenv("SMITHCODE_KEY") or _credentials_key()
+
+
+def _resolve_model() -> str:
+    return os.getenv("SMITHCODE_MODEL") or _file_str("provider", "model") or "deepseek-v4-flash"
+
+
+def _resolve_url():
+    return os.getenv("SMITHCODE_URL") or _file_str("provider", "url")
+
+
+def _resolve_effort() -> str:
+    return _file_str("provider", "reasoning_effort") or "high"
+
+
+KEY = _resolve_key()
+MODEL = _resolve_model()
+URL = _resolve_url()
 # 模型思考强度（reasoning_effort）：内置默认 high，config.toml 的
 # [provider].reasoning_effort 可覆盖；候选档位见 models.DEFAULT_EFFORTS
 DEFAULT_EFFORT = "high"
-REASONING_EFFORT = _file_str("provider", "reasoning_effort") or DEFAULT_EFFORT
+REASONING_EFFORT = _resolve_effort()
 
 # 当前对话会话 id：一次对话（单次任务或 /new 之后）内保持稳定，新会话轮换。
 # 供自定义请求头 [provider.headers] 中的 {$session} 占位符使用（如 OpenCode Go
@@ -724,3 +745,67 @@ def load_sessions_config() -> SessionsConfig:
         title_model=_file_str("sessions", "title_model") or "",
         title_max_chars=title_max_chars,
     )
+
+
+# ---------- 重载（serve 改设置后下一轮生效） ----------
+
+#: `reload()` 覆盖的模块常量：快照语义（见「三项核心配置」注释）。
+#: `SESSION_ID` 不在其中——它是 `{$session}` 占位符的解析点，真相在 `session.id`。
+_RELOADABLE_NUMBERS = (
+    ("limits", "max_iterations", "MAX_ITERATIONS"),
+    ("limits", "command_timeout", "COMMAND_TIMEOUT"),
+    ("limits", "command_timeout_max", "COMMAND_TIMEOUT_MAX"),
+    ("limits", "max_tool_output", "MAX_TOOL_OUTPUT"),
+    ("context", "budget", "CONTEXT_TOKEN_BUDGET"),
+    ("context", "compact_trigger", "COMPACT_TRIGGER"),
+    ("context", "compact_keep_tokens", "COMPACT_KEEP_TOKENS"),
+    ("limits", "max_retries", "MAX_RETRIES"),
+    ("limits", "llm_timeout", "LLM_TIMEOUT"),
+    ("limits", "goal_max_turns", "GOAL_MAX_TURNS"),
+    ("limits", "max_tool_concurrency", "MAX_TOOL_CONCURRENCY"),
+)
+
+
+def reload() -> dict:
+    """重读配置文件，原地重赋模块常量，返回变更集 `{名字: (旧值, 新值)}`。
+
+    生效语义：调用后**下一轮**生效，轮内冻结——`TurnConfig.capture()` 在轮开头
+    pin（`llm/request.py`），`MAX_RETRIES` 等在每次请求现读。serve 改设置后调它，
+    再发 `Notice` 通知前端即可；`LLMClient` 构造固化的值（key/url/timeout/headers）
+    与 `Permission.user_rules` 快照需重建注入（`Agent(llm=..., permission=...)`
+    已支持传参），不在这里动。
+    """
+    global KEY, MODEL, URL, REASONING_EFFORT  # noqa: PLW0602 经 _set() 内 globals() 赋值
+    changed: dict = {}
+
+    def _set(name: str, value) -> None:
+        old = globals()[name]
+        if old != value:
+            globals()[name] = value
+            changed[name] = (old, value)
+
+    _set("KEY", _resolve_key())
+    _set("MODEL", _resolve_model())
+    _set("URL", _resolve_url())
+    _set("REASONING_EFFORT", _resolve_effort())
+    for section, key, name in _RELOADABLE_NUMBERS:
+        default = globals()[name]
+        if name == "MAX_TOOL_CONCURRENCY":
+            _set(name, max(1, _resolve_number(section, key, default)))
+        else:
+            _set(name, _resolve_number(section, key, default))
+    return changed
+
+
+def set_model(name: str) -> str:
+    """运行时切换模型（`/model` 命令 / CLI `--model` / serve 设置页的统一入口）。"""
+    global MODEL
+    MODEL = str(name)
+    return MODEL
+
+
+def set_effort(value: str) -> str:
+    """运行时切换思考强度（`/effort` 命令 / serve 设置页的统一入口）。"""
+    global REASONING_EFFORT
+    REASONING_EFFORT = str(value)
+    return REASONING_EFFORT

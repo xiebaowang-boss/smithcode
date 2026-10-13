@@ -70,6 +70,32 @@ def test_ask_user_fail_closed_non_interactive(monkeypatch, capsys):
     assert "无法向用户提问" in ask_user([{"question": "问题"}])
 
 
+def test_ask_user_answers_over_remote_when_stdin_not_interactive(monkeypatch):
+    """挂了跨进程作答者（serve/桌面端）：stdin 非终端也照问，答案由 reply 回来。
+
+    sidecar 的 stdin 是 /dev/null——只按 `isatty()` 判会把桌面端的提问全部误杀，
+    与权限确认走的是同一个"有没有人可以问"判定。
+    """
+    from smithcode.event import asks as ask_port
+
+    monkeypatch.setattr("smithcode.tools.ask.confirmations_available", lambda: False)
+
+    async def scenario():
+        port = ask_port.current()
+        port.set_remote_asker(object())
+        try:
+            task = asyncio.ensure_future(ask_mod.ask_user([{"question": "问题"}]))
+            await asyncio.sleep(0)  # 让它登记进 pending
+            assert len(port.pending) == 1
+            port.reply(port.pending.pending_ids()[0],
+                       AskAnswer(outcome="answered", values=("是的",)))
+            return await task
+        finally:
+            port.set_remote_asker(None)
+
+    assert asyncio.run(scenario()) == "是的"
+
+
 def test_ask_user_routes_through_console_frontend():
     """ask_user 与 REPL 共用同一个询问端口（未装配时兜底为终端前端）。"""
     from smithcode import frontend

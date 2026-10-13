@@ -81,8 +81,8 @@ def test_resume_session_uses_latest(capsys):
     assert "已恢复" in capsys.readouterr().out
 
 
-def test_resume_session_reports_recorded_model(capsys, monkeypatch):
-    """转录里的模型与当前不同：恢复提示点出，方便用户决定是否 /model 切回。"""
+def test_resume_session_inherits_recorded_model(capsys, monkeypatch):
+    """会话级模型：resume() 沿用日志里的模型，不再提示"如需沿用请 /model"。"""
     store = SessionStore.create()
     store.append_event(wrap(MessageEnd(message={"role": "user", "content": "hi"})))
     store.close()
@@ -92,9 +92,9 @@ def test_resume_session_reports_recorded_model(capsys, monkeypatch):
     agent.report_model = "other-model"
     _resume_session(agent, True, "")
     out = capsys.readouterr().out
-    assert "other-model" in out
-    assert "current-model" in out
-    assert config.MODEL == "current-model"  # 恢复不悄悄改全局模型
+    assert "已恢复" in out
+    assert "如需沿用" not in out
+    assert config.MODEL == "current-model"  # 全局不受影响
 
 
 def test_resume_session_missing_notice(capsys):

@@ -68,6 +68,7 @@ class _RetryRecorder:
 
     def __init__(self):
         self.retries = []
+        self.owners = []
         self.finished = 0
         self.warns = []
 
@@ -76,8 +77,10 @@ class _RetryRecorder:
 
         if isinstance(event, StatusChanged) and event.kind == "retry":
             self.retries.append(event.payload)
+            self.owners.append(event.owner)
         elif isinstance(event, StatusCleared) and event.kind == "retry":
             self.finished += 1
+            self.owners.append(event.owner)
 
     def warn(self, text):
         self.warns.append(text)
@@ -130,6 +133,35 @@ def test_chat_stream_retries_incomplete_stream(monkeypatch):
     assert state.reason == "连接中断"
     assert "正在重试 2/3" in state.text()
     assert view.finished == 1  # 过程结束一定收口
+
+
+def test_retry_status_owner_is_jsonable_string(monkeypatch):
+    """重试事件的 owner 必须是字符串（契约 `str | None`）。
+
+    它跟着事件过 SSE 的 `json.dumps`：塞实例对象会在写流时抛 TypeError，
+    整条事件流断掉（桌面端表现：重连、重试状态丢失）。同客户端两事件同值，
+    不同客户端各一枚——"前台任务与后台标题互不误清"靠的是值相等。
+    """
+    calls = []
+
+    def fake_stream(kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx2.RemoteProtocolError(DROP)
+        yield ("content", "答案")
+        yield ("message", {"role": "assistant", "content": ""})
+
+    view = _RetryRecorder()
+    _patch_retry(monkeypatch, view)
+    llm = _streaming_client(fake_stream)
+    list(llm.chat_stream([{"role": "user", "content": "问题"}]))
+
+    assert len(view.owners) == 2  # StatusChanged + 配对的 StatusCleared
+    assert all(isinstance(owner, str) for owner in view.owners)
+    assert view.owners[0] == view.owners[1]  # 同一枚令牌收口自己的重试
+    assert llm.retry_owner == view.owners[0]
+    # 另一个客户端各一枚：区分发起方的语义没被字符串化削弱
+    assert _streaming_client(fake_stream).retry_owner != llm.retry_owner
 
 
 def test_chat_stream_retries_after_content(monkeypatch):

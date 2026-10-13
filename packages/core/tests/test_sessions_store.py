@@ -243,3 +243,44 @@ def test_sweep_removes_expired(_isolated):
     assert not old.path.exists()
     assert fresh.path.exists()
     assert sweep(0) == 0  # 0 = 不清理
+
+
+def test_legacy_log_summary_and_resolve(_isolated):
+    """旧版日志（`{v,t}` + 顶层字段）摘要可读：侧栏按项目展开不再 404。
+
+    事件架构之前的会话没有信封，`_read_summary` 读不出 cwd，`resolve_project`
+    的日志回填就会落空——项目列表列得出、按它查历史却吃「未知项目」红字。
+    摘要扫描认旧格式即可自愈；事件回放不认（旧会话内容仍不可恢复）。
+    """
+    from smithcode.sessions import paths, resolve_project
+
+    cwd = _isolated / "old-proj"
+    cwd.mkdir()
+    slug = paths.project_slug(str(cwd))
+    sess_dir = paths.projects_dir() / slug / "sessions"
+    sess_dir.mkdir(parents=True)
+    legacy = [
+        {"v": 1, "t": "meta", "id": "oldsess0001", "cwd": str(cwd),
+         "created": 1789801945.5, "model": "m-old", "effort": "high",
+         "oneshot": False},
+        {"v": 1, "t": "model", "model": "m-old-2", "effort": "high", "ts": 2.0},
+        {"v": 1, "t": "title", "title": "旧会话标题", "source": "generated",
+         "ts": 3.0},
+        {"v": 1, "t": "msg", "m": {"role": "user", "content": "你好"}},
+        {"v": 1, "t": "msg", "m": {"role": "assistant", "content": "在"}},
+    ]
+    path = sess_dir / "oldsess0001.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in legacy) + "\n",
+                    encoding="utf-8")
+
+    summary = summary_from_path(path)
+    assert summary is not None
+    assert summary.id == "oldsess0001"
+    assert summary.cwd == str(cwd)
+    assert summary.title == "旧会话标题"
+    assert summary.first_prompt == "你好"
+    assert summary.model == "m-old-2"  # 尾部 model 事件最后生效
+
+    assert paths.read_project(slug) == ""  # 注册表没登记过
+    assert resolve_project(slug) == str(cwd)  # 旧日志回填 cwd 成功
+    assert paths.read_project(slug) == str(cwd)  # 回填后注册表也有了

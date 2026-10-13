@@ -1,0 +1,59 @@
+.filebrowser { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.filebrowser-crumb {
+  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;
+  font-size: 12.5px; color: var(--muted);
+}
+.filebrowser-crumb button {
+  background: none; border: none; color: var(--muted); padding: 2px 5px; border-radius: 6px;
+  font-size: 12.5px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.filebrowser-crumb button:hover { background: var(--hover); color: var(--fg); }
+.filebrowser-crumb .sep { color: var(--faint); }
+.filebrowser-list { display: flex; flex-direction: column; }
+.filebrowser-row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border: none; background: transparent; border-radius: var(--r-sm);
+  color: var(--fg); font-size: 13px; cursor: pointer; text-align: left;
+}
+.filebrowser-row:hover { background: var(--hover); }
+.filebrowser-row .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filebrowser-row .size { font-size: 11.5px; color: var(--faint); }
+.filebrowser-preview {
+  font-family: var(--font-mono); font-size: 12px;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 10px 12px; overflow: auto; white-space: pre; line-height: 1.55;
+}
+.filebrowser-line { display: block; }
+.filebrowser-no {
+  display: inline-block; width: 40px; color: var(--faint);
+  user-select: none; text-align: right; margin-right: 12px;
+}
+.filebrowser-hint { font-size: 11.5px; color: var(--faint); }
+
+.placeholder-panel { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.placeholder-panel .tag {
+  font-size: 11.5px; color: var(--warn); background: var(--bg-sidebar);
+  border: 1px solid var(--border); border-radius: var(--r-full); padding: 2px 8px;
+}
+
+.diffpane { font-size: 13px; }
+.diffpane details { margin-bottom: 10px; }
+.diffpane summary {
+  display: flex; gap: 6px; align-items: center; cursor: pointer;
+  font-size: 13px; padding: 4px 6px; border-radius: var(--r-sm); list-style: none;
+}
+.diffpane summary::-webkit-details-marker { display: none; }
+.diffpane summary:hover { background: var(--hover); }
+.diffpane summary button { background: none; border: none; color: var(--faint); padding: 0 2px; cursor: pointer; margin-left: auto; }
+.diffpane summary button:hover { color: var(--fg); }
+.diff-hunk {
+  font-family: var(--font-mono); font-size: 11.5px; max-height: 280px; overflow: auto;
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--r-md);
+  padding: 8px 10px; margin: 6px 0 0; line-height: 1.5;
+}
+.diff-add { color: var(--add); }
+.diff-del { color: var(--del); }
+.diff-hunk-line { color: var(--hunk); }
+.diff-comment { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; font-size: 13px; }
+.diff-comment textarea { width: 100%; margin-top: 6px; }
+

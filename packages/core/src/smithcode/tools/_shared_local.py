@@ -34,7 +34,9 @@ def roots(path: str) -> tuple:
     内即放行。单个命中的文件经符号链接指向他根时，展示路径按目标实际所在的根
     计算（见 containing_root），此处返回的根只做越界判定。
     """
-    base = (Path(config.WORKSPACE_ROOT) / path).resolve()
+    from .. import sandbox
+
+    base = (sandbox.current().workspace / path).resolve()
     for root in config.read_roots():
         if base.is_relative_to(root):
             return root, base

@@ -317,8 +317,8 @@ class SmithTUI(App):
                 reason = "" if isinstance(data, ev.ExecutionInterrupted) else getattr(data, "reason", "")
                 suffix = footer_suffix(status, format_stream_interrupted(reason))
                 chat.apply(Footer(
-                    model or config.MODEL,
-                    effort or (config.REASONING_EFFORT or config.DEFAULT_EFFORT),
+                    model or self.agent.effective_model(),
+                    effort or self.agent.effective_effort(),
                     format_duration(max(0.0, env.created - turn_start)),
                     suffix,
                 ))
@@ -738,9 +738,9 @@ class SmithTUI(App):
         mode_style = {"smith": "#808080", "accept_edits": "#e0af68", "auto": "#fab283"}
         mode = Text(permission.MODE_LABELS[self.agent.permission.mode], style=mode_style[self.agent.permission.mode])
         model = Text("· ", style="#808080")
-        model.append(config.MODEL, style="#7aa2f7")
+        model.append(self.agent.effective_model(), style="#7aa2f7")
         thinking = Text("· ", style="#808080")
-        thinking.append(config.REASONING_EFFORT or config.DEFAULT_EFFORT, style="#e0af68")
+        thinking.append(self.agent.effective_effort(), style="#e0af68")
         return mode, model, thinking
 
     def _session_title(self) -> Text:
@@ -993,9 +993,8 @@ class SmithTUI(App):
         # 后缀口径与重放共用（见 render.footer_suffix）：中断 / 流断开才有后缀
         suffix = footer_suffix(status, format_stream_interrupted(self._turn_reason))
         turn = self.agent.last_turn
-        model = turn.model if turn is not None else config.MODEL
-        effort = turn.effort if turn is not None else (
-            config.REASONING_EFFORT or config.DEFAULT_EFFORT)
+        model = turn.model if turn is not None else self.agent.effective_model()
+        effort = turn.effort if turn is not None else self.agent.effective_effort()
         found = self.query(ChatView)
         if found:
             # 轮次已结束，收尾汇总组里没等到结果的子工具（兜底，防转轮永转）

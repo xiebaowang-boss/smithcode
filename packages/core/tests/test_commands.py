@@ -29,7 +29,11 @@ def _fresh_skills():
 
 
 class _StubAgent:
-    """最小 Agent 桩：只带命令会用到的属性与方法。"""
+    """最小 Agent 桩：只带命令会用到的属性与方法。
+
+    会话级 model/effort 覆盖：真 Agent 由 `_model`/`_effort` 字段 + 方法提供，
+    桩上直接给可写属性模拟（`set_session_*` 由命令层经 getattr 调用）。
+    """
 
     def __init__(self):
         self.saved_path = "/tmp/session.json"
@@ -39,16 +43,42 @@ class _StubAgent:
             save=lambda: self.saved_path,
             messages=[],
             usage=SimpleNamespace(summary=lambda: "用量摘要"),
+            record=lambda payload: self.recorded.append(payload),
         )
         self.permission = SimpleNamespace(session_rules=["旧规则"])
         self.context = SimpleNamespace(compact_count=0, last_actual=None)
         self.models = SimpleNamespace(list=lambda: ["a", "b", "c"])
+        self._model = None
+        self._effort = None
+        self.recorded = []
 
     def _reset(self):
         self.reset_called = True
 
     def new_session(self):
         self.reset_called = True
+
+    def effective_model(self):
+        return self._model or config.MODEL
+
+    def effective_effort(self):
+        return self._effort or config.REASONING_EFFORT or config.DEFAULT_EFFORT
+
+    def set_session_model(self, name):
+        from smithcode.event.catalog import ModelSelected
+
+        self._model = str(name)
+        pair = (self.effective_model(), self.effective_effort())
+        self.session.record(ModelSelected(model=pair[0], effort=pair[1]))
+        return pair
+
+    def set_session_effort(self, value):
+        from smithcode.event.catalog import ModelSelected
+
+        self._effort = str(value)
+        pair = (self.effective_model(), self.effective_effort())
+        self.session.record(ModelSelected(model=pair[0], effort=pair[1]))
+        return pair
 
 
 def _run(text, **kwargs):
@@ -110,10 +140,24 @@ def test_effort_builtin_default_is_high():
 
 def test_effort_switches_with_arg(monkeypatch):
     monkeypatch.setattr(config, "REASONING_EFFORT", "low")
-    _, outcome = _run("/effort high")
-    assert config.REASONING_EFFORT == "high"
+    agent, outcome = _run("/effort high")
+    assert agent.effective_effort() == "high"  # 会话级：只改本会话，不碰全局
+    assert config.REASONING_EFFORT == "low"
     assert outcome.text is None  # 静默切换：反馈由底栏状态刷新承担
     assert outcome.refresh_status
+    assert agent.recorded and type(agent.recorded[0]).__name__ == "ModelSelected"
+
+
+def test_effort_without_arg_marks_session_current(monkeypatch):
+    """无参列表按本会话有效值标记 current（会话覆盖优先于全局）。"""
+    monkeypatch.setattr(config, "REASONING_EFFORT", "medium")
+    agent = _StubAgent()
+    agent._effort = "low"
+    outcome = commands.dispatch(agent, "/effort")
+    values = [c.value for c in outcome.select.items]
+    currents = [c.current for c in outcome.select.items]
+    assert currents[values.index("low")] is True
+    assert currents.count(True) == 1
 
 
 def test_effort_without_arg_returns_select(monkeypatch):
@@ -277,11 +321,22 @@ def test_help_text_alignment_covers_all_commands():
 
 def test_model_switches_with_arg(monkeypatch):
     monkeypatch.setattr(config, "MODEL", "old-model")
-    _, outcome = _run("/model new-model")
-    assert config.MODEL == "new-model"
+    agent, outcome = _run("/model new-model")
+    assert agent.effective_model() == "new-model"  # 会话级：只改本会话，不碰全局
+    assert config.MODEL == "old-model"
     assert outcome.text is None  # 静默切换：反馈由底栏状态刷新承担
     assert outcome.refresh_status
     assert outcome.select is None
+    assert agent.recorded and type(agent.recorded[0]).__name__ == "ModelSelected"
+
+
+def test_model_without_arg_marks_session_current(monkeypatch):
+    """无参列表按本会话有效值标记 current（会话覆盖优先于全局）。"""
+    monkeypatch.setattr(config, "MODEL", "b")
+    agent = _StubAgent()
+    agent._model = "c"
+    outcome = commands.dispatch(agent, "/model")
+    assert [c.current for c in outcome.select.items] == [False, False, True]
 
 
 def test_model_without_arg_returns_select(monkeypatch):
@@ -291,6 +346,21 @@ def test_model_without_arg_returns_select(monkeypatch):
     assert outcome.select.command == "model"
     assert [c.value for c in outcome.select.items] == ["a", "b", "c"]
     assert [c.current for c in outcome.select.items] == [False, True, False]
+
+
+def test_model_switch_is_session_scoped(monkeypatch):
+    """两个会话各切各的：互不串扰，全局不动（llm 直接注入替身，不碰包替换点）。"""
+    from smithcode.agent import Agent
+    from smithcode.session import Session
+
+    monkeypatch.setattr(config, "MODEL", "base")
+    llm = SimpleNamespace(chat_stream=lambda *a, **k: iter([]))
+    a = Agent(session=Session(), model="m-a", llm=llm)
+    b = Agent(session=Session(), model="m-b", llm=llm)
+    assert (a.effective_model(), b.effective_model()) == ("m-a", "m-b")
+    a.set_session_model("m-a2")
+    assert (a.effective_model(), b.effective_model()) == ("m-a2", "m-b")
+    assert config.MODEL == "base"
 
 
 def test_model_without_candidates_hints(monkeypatch):

@@ -551,6 +551,35 @@ def test_non_interactive_ask_denied(make_perm, monkeypatch):
     assert asyncio.run(perm.check("write_file", {"path": "a.txt"})) is False
 
 
+def test_remote_answerer_beats_non_interactive_stdin(make_perm, monkeypatch):
+    """挂了跨进程作答者（serve/桌面端）：stdin 非终端照样问，答案由 reply 决定。
+
+    门禁问的是"有没有人可以问"而不是"stdin 是不是终端"——sidecar 的 stdin 是
+    /dev/null，只按 `isatty()` 判会把桌面端的权限确认全部误杀。
+    """
+    from smithcode.event import asks as ask_mod
+
+    monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)
+    refuse_input(monkeypatch)
+    perm = make_perm()
+    port = AskPort(session_id="t")
+    port.set_remote_asker(object())
+    token = ask_mod.activate(port)
+    try:
+        async def scenario():
+            task = asyncio.ensure_future(perm.check("write_file", {"path": "a.txt"}))
+            await asyncio.sleep(0)  # 让它登记进 pending
+            assert len(port.pending) == 1
+            port.reply(port.pending.pending_ids()[0],
+                       AskAnswer(outcome="answered", value="y"))
+            return await task
+
+        assert asyncio.run(scenario()) is True
+    finally:
+        port.set_remote_asker(None)
+        ask_mod.reset(token)
+
+
 def test_non_interactive_outside_access_denied(tmp_path, monkeypatch):
     """非交互 stdin 下越界访问直接拒绝，不尝试询问。"""
     monkeypatch.setattr("smithcode.permission.engine.confirmations_available", lambda: False)

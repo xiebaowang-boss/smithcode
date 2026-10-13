@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .. import config
+from ..event.asks import has_remote
 
 
 @lru_cache(maxsize=1)
@@ -42,8 +43,12 @@ def clear_git_repo_cache() -> None:
 def _env_info() -> str:
     os_name = platform.system()
     shell = "cmd.exe" if os_name == "Windows" else "sh"
+    # 「有没有人可以问」与权限门禁同一口径：跨进程作答者（serve + 桌面端）挂着时
+    # 即便 stdin 是 /dev/null 也是交互模式——否则模型会按"非交互"避开 ask_user。
     interactive = (
-        "交互模式" if sys.stdin.isatty() else "非交互模式（管道/CI）"
+        "交互模式"
+        if (has_remote() or sys.stdin.isatty())
+        else "非交互模式（管道/CI）"
     )
     lines = [
         f"- 主工作区: {config.WORKSPACE_ROOT}",

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx2
@@ -584,6 +585,34 @@ def test_interrupt_writes_context_note_without_new_call(monkeypatch):
     agent.llm = FakeLLM()
     asyncio.run(agent.run("继续"))
     assert any("中断" in m.get("content", "") for m in agent.session.messages)
+
+
+def test_interrupt_during_preflight_window_stops_turn(monkeypatch):
+    """预热窗口中断：prompt 已受理、轮次令牌还没建（装配期）时按停止也要停。
+
+    首条消息的装配（sync_system 读盘）可能要几百毫秒到数秒；这段里桌面端的
+    停止按钮不能被静默吞掉——令牌一建起来就照 interrupt 的记账立刻中止。
+    """
+    agent = _console_agent()
+    entered = threading.Event()
+    release = threading.Event()
+    original = agent.session.sync_system
+
+    def slow_sync():
+        entered.set()
+        assert release.wait(5)  # 阻塞在装配期，制造「令牌尚未建起」的窗口
+        original()
+
+    monkeypatch.setattr(agent.session, "sync_system", slow_sync)
+
+    def press_stop():
+        assert entered.wait(5)
+        agent.interrupt()  # 此刻 _token 是 None：靠 _prompting 记账接力
+        release.set()
+
+    threading.Thread(target=press_stop, daemon=True).start()
+    result = asyncio.run(agent.prompt("跑起来"))
+    assert result.status == "interrupted"
 
 
 def test_interrupt_before_tool_batch_fills_placeholders(monkeypatch):

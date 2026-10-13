@@ -13,7 +13,7 @@ smith（默认）逐个确认；accept_edits 编辑族自动放行；auto 全部
 （与 -y 等价）。Shift+Tab 在 TUI 中循环切换。
 
 内置默认规则含保护路径：`.git` 目录只读（禁止写入与编辑）。匹配在 Windows 下大小写不敏感（与 opencode v2 对齐）。
-标准输入非终端（管道/CI）时交互确认不可用，所有 ask 一律 fail-closed 拒绝。
+标准输入非终端（管道 / CI）且没有跨进程作答者时无人可问，所有 ask 一律 fail-closed 拒绝。
 """
 from __future__ import annotations
 
@@ -35,6 +35,21 @@ ALLOW, ASK, DENY = "allow", "ask", "deny"
 def _roots():
     """当前会话的沙箱目录（无会话时为进程默认那份，见 sandbox.py）。"""
     return sandbox.current()
+
+
+def answerable() -> bool:
+    """当前有没有"人"可以作答——交互确认可用性的唯一判定。
+
+    两条作答通道，占其一即可问：
+
+    - 跨进程作答者（`smith serve` + 桌面端）：询问经 `AskPort` 登记成 pending，
+      由前端 `POST reply` 作答，**不读本进程 stdin**（sidecar 的 stdin 是
+      /dev/null，按 `isatty()` 判会把桌面端的确认全部误杀）；
+    - 本进程 stdin 可交互（终端 REPL / TUI）：进程内直调前端。
+
+    两条都没有 = 无人可问，调用点 fail-closed 拒绝（管道 / CI 语义不变）。
+    """
+    return ask_port.has_remote() or confirmations_available()
 
 # 会话级权限模式：控制 ask 的去向（deny 任何模式下都拒绝）。
 # smith=逐个确认（默认）；accept_edits=编辑族自动放行；auto=全部自动放行（原 -y）。
@@ -342,14 +357,15 @@ class Permission:
         """路径预检发现目标在授权目录之外时的确认。
 
         -y（approved_all）：静默放行本次访问，视为"仅本次"授权，不弹确认、不写入会话级信任。
-        非交互 stdin：无法询问用户，fail-closed 拒绝（不会因 EOFError 崩溃）。
+        无人可问（既没有跨进程作答者、stdin 也不是终端）：fail-closed 拒绝
+        （不会因 EOFError 崩溃）。
         其余：返回 ("once", 信任根) / ("always", 信任根)（根已写入本会话的沙箱信任目录，见 sandbox.py）
         或 ("deny", None)。
         """
         root = infer_trust_root(target)
         if self.approved_all:
             return "once", root
-        if not confirmations_available():
+        if not answerable():
             publish(Notice(f"非交互模式，无法确认越界访问，已拒绝: {raw_path}", level="error"))
             return "deny", None
         descriptions = {
@@ -396,8 +412,10 @@ class Permission:
     @staticmethod
     def _normalize_path_pattern(raw: str) -> str:
         try:
-            # 与工具侧 _resolve 同样的锚定方式：相对路径相对主工作区解析
-            p = (Path(config.WORKSPACE_ROOT) / raw).resolve()
+            # 与工具侧 _resolve 同样的锚定方式：相对路径相对当前会话工作区解析
+            from .. import sandbox
+
+            p = (sandbox.current().workspace / raw).resolve()
         except OSError:
             return raw
         for root in config.allowed_roots():
@@ -460,7 +478,7 @@ class Permission:
         询问本身是 `await` 的（`AskRequest` 交给当前前端）：所以本方法必须在
         **事件循环上**调用——预检因此不再下放线程（见 `agent/tools_run.py`）。
         """
-        if not confirmations_available():
+        if not answerable():
             publish(Notice(
                 f"非交互模式，无法确认，已拒绝: {tool_name}（模式 {patterns[0]}）",
                 level="error",

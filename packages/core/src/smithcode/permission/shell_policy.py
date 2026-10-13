@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
-from .. import config
+from .. import config, sandbox
 
 MAX_SEGMENT_LEN = 10_000  # 超长命令不解析，回退确认（对齐 Claude Code）
 
@@ -460,8 +459,10 @@ def _has_unsafe_redirect(segment: str) -> bool:
 
 
 def _within_allowed_roots(target: str) -> bool:
+    # 相对目标锚定**当前会话**的工作区（与 `tools/shell.py` 真正跑命令的 cwd 同源）：
+    # 多会话下用进程默认目录当基准，`cd ..` 会被算到别人的目录上。
     try:
-        dest = (Path(config.WORKSPACE_ROOT) / target).resolve()
+        dest = (sandbox.current().workspace / target).resolve()
     except OSError:
         return False
     for root in config.allowed_roots():
@@ -645,7 +646,7 @@ def is_dir_change(segment: str) -> bool:
     if target.startswith("-"):
         return True
     try:
-        current = Path(config.WORKSPACE_ROOT).resolve()
+        current = sandbox.current().workspace  # 已是解析后的路径（见 sandbox.Roots）
         return (current / target).resolve() != current
     except OSError:
         return True

@@ -529,6 +529,9 @@ class PromptFinished:
     outcome: PromptOutcome
     #: 用户选择（已脱敏）；denied / cancelled 为空。
     value: str | None = None
+    #: 表单类提问的多题答案（与 `AskRequest.payload["questions"]` 对齐）；
+    #: 跨进程传输时与 `value` 一起保留（`value` 只留首题，兼容只读单题的消费方）。
+    values: tuple[str, ...] = ()
     error: str | None = None
 
 
